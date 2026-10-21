@@ -6,11 +6,11 @@
 //! Channel. It exists only with `native-registryd`, which every registryd
 //! binary shape requires.
 
-use crate::InstalledEndpoint;
 use crate::service::{
     ChannelRights, MAX_RECEIVED_HANDLES, ProbeSignals, ReceiveCounts, ReceivedHandle,
-    RegistryService, Transport, WaitEvent,
+    RegistryService, ServiceError, Transport, WaitEvent,
 };
+use crate::{InstalledEndpoint, RegistryError};
 use deepwyrm_syscall::{
     DW_CHANNEL_MAX_HANDLES, DW_DEADLINE_INFINITE, DW_HANDLE_TRANSFER_MOVE,
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ,
@@ -89,7 +89,58 @@ pub fn run<P: RegistryPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
     let mut service = RegistryService::new(control.0);
     let mut transport = NativeTransport { platform };
     loop {
-        service.step(&mut transport).map_err(|_| 0xB101_0010_u32)?;
+        if let Some(end) = step_outcome(service.step(&mut transport)) {
+            return end;
+        }
+    }
+}
+
+/// What one service step means for the generation: `None` keeps serving;
+/// `Some` ends it, in order (`Ok`) or with that failure's own code.
+///
+/// `ControlPeerClosed` is the orderly end, and the process exits 0. `step`
+/// reports it only on a wait that saw the supervisor-control `PEER_CLOSED`
+/// without `READABLE`, so every committed control datagram has already been
+/// received and dispatched (WYR1-B §8). The close is how registryd learns its
+/// supervisor is gone: system-init's session shutdown closes this channel
+/// before it terminates registryd's task group, so that registryd observes a
+/// peer close (`retire_role_for_shutdown` in system-init's `wyr1c_native.rs`).
+/// Every other error is a failure and keeps its own code: a transport error
+/// its operation's, and each service error one of its own (see
+/// `registry_error_code`).
+fn step_outcome(step: Result<(), ServiceError<u32>>) -> Option<Result<(), u32>> {
+    match step {
+        Ok(()) => None,
+        Err(ServiceError::ControlPeerClosed) => Some(Ok(())),
+        Err(ServiceError::Transport(code)) => Some(Err(code)),
+        Err(ServiceError::InvalidWaitEvent) => Some(Err(0xB101_001B_u32)),
+        Err(ServiceError::State(error)) => Some(Err(registry_error_code(error))),
+    }
+}
+
+/// One failure code per registry state error, written out so a reordered or
+/// added variant cannot silently move an existing code.
+const fn registry_error_code(error: RegistryError) -> u32 {
+    match error {
+        RegistryError::ZeroIdentity => 0xB101_0020,
+        RegistryError::WrongRegistryGeneration => 0xB101_0021,
+        RegistryError::DuplicateEndpoint => 0xB101_0022,
+        RegistryError::DuplicatePublication => 0xB101_0023,
+        RegistryError::DuplicateClient => 0xB101_0024,
+        RegistryError::DuplicateService => 0xB101_0025,
+        RegistryError::StaleServiceGeneration => 0xB101_0026,
+        RegistryError::Capacity => 0xB101_0027,
+        RegistryError::UnknownEndpoint => 0xB101_0028,
+        RegistryError::WrongEndpointGeneration => 0xB101_0029,
+        RegistryError::NotPublished => 0xB101_002A,
+        RegistryError::UnsupportedVersion => 0xB101_002B,
+        RegistryError::EnumerationDenied => 0xB101_002C,
+        RegistryError::TransactionLive => 0xB101_002D,
+        RegistryError::TransactionReplay => 0xB101_002E,
+        RegistryError::OutstandingLimit => 0xB101_002F,
+        RegistryError::WrongEndpointKind => 0xB101_0030,
+        RegistryError::UnknownTransaction => 0xB101_0031,
+        RegistryError::InvalidState => 0xB101_0032,
     }
 }
 

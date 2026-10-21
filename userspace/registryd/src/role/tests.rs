@@ -10,14 +10,17 @@ use std::vec;
 use std::vec::Vec;
 
 use deepwyrm_syscall::{
-    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_READABLE,
-    DW_STATUS_PEER_CLOSED, DwHandle, DwReceivedHandleInfoV1, DwRights, DwWaitResultV1,
+    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_PEER_CLOSED,
+    DW_SIGNAL_READABLE, DW_STATUS_PEER_CLOSED, DwHandle, DwReceivedHandleInfoV1, DwRights,
+    DwSignals, DwWaitResultV1,
 };
 use wyrmroot_loader::launch::{CHILD_CHANNEL_RIGHTS, LaunchProfile, SELF_ROOT_RIGHTS, encode_init};
 use wyrmroot_runtime::platform::recording::{Call, Datagram, RecordingPlatform, Reply};
 use wyrmroot_runtime::{BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, NativeError};
 
-use super::run;
+use super::{registry_error_code, run, step_outcome};
+use crate::RegistryError;
+use crate::service::ServiceError;
 
 const BOOTSTRAP: DwHandle = DwHandle(0x10);
 const SELF_ROOT: DwHandle = DwHandle(0x20);
@@ -206,7 +209,8 @@ fn a_valid_bootstrap_sends_ready_closes_both_handles_and_enters_the_loop_on_one_
     .unwrap();
     ready.truncate(ready_size);
 
-    assert_eq!(run(&mut platform, BOOTSTRAP), Err(failure(0x10)));
+    // A failed wait stops the generation with the wait's own transport code.
+    assert_eq!(run(&mut platform, BOOTSTRAP), Err(failure(0x11)));
     assert_eq!(
         platform.calls(),
         &[
@@ -272,7 +276,8 @@ fn a_control_wait_selects_no_endpoint() {
         })),
         Reply::Wait(Err(status(DW_STATUS_PEER_CLOSED))),
     ]);
-    assert_eq!(run(&mut platform, BOOTSTRAP), Err(failure(0x10)));
+    // A failed wait stops the generation with the wait's own transport code.
+    assert_eq!(run(&mut platform, BOOTSTRAP), Err(failure(0x11)));
     assert!(matches!(
         platform.calls()[8],
         Call::ReceiveChannel {
@@ -281,4 +286,148 @@ fn a_control_wait_selects_no_endpoint() {
         }
     ));
     platform.assert_script_consumed();
+}
+
+/// The replies that take `run` through bootstrap to its first resident wait.
+fn bootstrap_replies() -> Vec<Reply> {
+    vec![
+        valid_bootstrap(),
+        Reply::Receive(Ok(Datagram {
+            bytes: valid_init(),
+            handles: Vec::from(startup_handles()),
+        })),
+        Reply::CapabilityInfo(Ok(CapabilityInfo {
+            object_type: DW_OBJECT_TYPE_ADDRESS_REGION,
+            rights: SELF_ROOT_RIGHTS,
+        })),
+        Reply::CapabilityInfo(Ok(CapabilityInfo {
+            object_type: DW_OBJECT_TYPE_CHANNEL,
+            rights: CHILD_CHANNEL_RIGHTS,
+        })),
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+    ]
+}
+
+/// A resident wait that observed `signals` on the control item (index 0).
+fn control_wait(signals: DwSignals) -> Reply {
+    Reply::Wait(Ok(DwWaitResultV1 {
+        observed: signals,
+        ..DwWaitResultV1::default()
+    }))
+}
+
+const BOOTSTRAP_CALLS: usize = 7;
+
+/// System-init's session shutdown closes registryd's supervisor control before
+/// it terminates the task group. A control `PEER_CLOSED` with nothing readable
+/// is that orderly end: the generation returns `Ok`, so registryd exits 0.
+#[test]
+fn a_control_peer_close_alone_ends_the_generation_in_order() {
+    let mut replies = bootstrap_replies();
+    replies.push(control_wait(DW_SIGNAL_PEER_CLOSED));
+    let mut platform = RecordingPlatform::scripted(replies);
+    assert_eq!(run(&mut platform, BOOTSTRAP), Ok(()));
+    assert_eq!(platform.calls().len(), BOOTSTRAP_CALLS + 1);
+    assert!(matches!(
+        platform.calls().last(),
+        Some(Call::WaitMany { .. })
+    ));
+    platform.assert_script_consumed();
+}
+
+/// WYR1-B §8: when `READABLE` and `PEER_CLOSED` arrive together, the committed
+/// datagram is received and dispatched first; the orderly end needs a fresh
+/// wait that sees the close with nothing readable.
+#[test]
+fn a_control_datagram_beside_the_peer_close_is_dispatched_before_the_orderly_end() {
+    let mut replies = bootstrap_replies();
+    replies.push(control_wait(DwSignals(
+        DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0,
+    )));
+    // A malformed control datagram with no handles: dispatched and dropped.
+    replies.push(Reply::Receive(Ok(Datagram {
+        bytes: vec![0u8; 4],
+        handles: Vec::new(),
+    })));
+    replies.push(control_wait(DW_SIGNAL_PEER_CLOSED));
+    let mut platform = RecordingPlatform::scripted(replies);
+    assert_eq!(run(&mut platform, BOOTSTRAP), Ok(()));
+    let resident = &platform.calls()[BOOTSTRAP_CALLS..];
+    assert_eq!(resident.len(), 3);
+    assert!(matches!(resident[0], Call::WaitMany { .. }));
+    assert!(matches!(
+        resident[1],
+        Call::ReceiveChannel {
+            channel: CONTROL,
+            ..
+        }
+    ));
+    assert!(matches!(resident[2], Call::WaitMany { .. }));
+    platform.assert_script_consumed();
+}
+
+/// Every step failure other than the orderly close stops the generation with
+/// its own code: a transport error keeps its operation's, and each service
+/// error has one written out. None is the old catch-all `0xB101_0010`, and
+/// none repeats a bootstrap or transport code.
+#[test]
+fn every_other_step_failure_has_its_own_code() {
+    assert_eq!(step_outcome(Ok(())), None);
+    assert_eq!(
+        step_outcome(Err(ServiceError::ControlPeerClosed)),
+        Some(Ok(()))
+    );
+    assert_eq!(
+        step_outcome(Err(ServiceError::Transport(failure(0x13)))),
+        Some(Err(failure(0x13)))
+    );
+    let states = [
+        RegistryError::ZeroIdentity,
+        RegistryError::WrongRegistryGeneration,
+        RegistryError::DuplicateEndpoint,
+        RegistryError::DuplicatePublication,
+        RegistryError::DuplicateClient,
+        RegistryError::DuplicateService,
+        RegistryError::StaleServiceGeneration,
+        RegistryError::Capacity,
+        RegistryError::UnknownEndpoint,
+        RegistryError::WrongEndpointGeneration,
+        RegistryError::NotPublished,
+        RegistryError::UnsupportedVersion,
+        RegistryError::EnumerationDenied,
+        RegistryError::TransactionLive,
+        RegistryError::TransactionReplay,
+        RegistryError::OutstandingLimit,
+        RegistryError::WrongEndpointKind,
+        RegistryError::UnknownTransaction,
+        RegistryError::InvalidState,
+    ];
+    let mut codes = vec![match step_outcome(Err(ServiceError::InvalidWaitEvent)) {
+        Some(Err(code)) => code,
+        other => panic!("an invalid wait event must fail, got {other:?}"),
+    }];
+    for state in states {
+        let code = registry_error_code(state);
+        assert_eq!(
+            step_outcome(Err(ServiceError::State(state))),
+            Some(Err(code))
+        );
+        codes.push(code);
+    }
+    assert_eq!(codes[0], failure(0x1B));
+    for (index, code) in codes.iter().enumerate() {
+        assert_eq!(
+            code & 0xFFFF_0000,
+            failure(0),
+            "{code:#X} left registryd's range"
+        );
+        // 0x01..=0x0B bootstrap, 0x10 the old catch-all, 0x11..=0x1A transport.
+        assert!(
+            code & 0xFFFF > 0x1A,
+            "{code:#X} collides with an earlier code"
+        );
+        assert!(!codes[..index].contains(code), "{code:#X} is not distinct");
+    }
 }
