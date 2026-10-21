@@ -115,7 +115,10 @@ impl<P: HandlePlatform + ChannelPlatform + WaitPlatform> Transport for NativeTra
             .map_err(|_| 0xB101_0011_u32)?;
         let index = usize::try_from(observed.index).map_err(|_| 0xB101_0012_u32)?;
         Ok(WaitEvent {
-            endpoint_index: (index != 0).then_some(index - 1),
+            // Index 0 is the control item; endpoint `n` is item `n + 1`. Not
+            // `then_some(index - 1)`, which evaluates the subtraction for the
+            // control item too and underflows.
+            endpoint_index: index.checked_sub(1),
             readable: observed.observed.0 & DW_SIGNAL_READABLE.0 != 0,
             peer_closed: observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0,
         })

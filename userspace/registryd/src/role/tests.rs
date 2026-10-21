@@ -10,8 +10,8 @@ use std::vec;
 use std::vec::Vec;
 
 use deepwyrm_syscall::{
-    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_STATUS_PEER_CLOSED, DwHandle,
-    DwReceivedHandleInfoV1, DwRights,
+    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_READABLE,
+    DW_STATUS_PEER_CLOSED, DwHandle, DwReceivedHandleInfoV1, DwRights, DwWaitResultV1,
 };
 use wyrmroot_loader::launch::{CHILD_CHANNEL_RIGHTS, LaunchProfile, SELF_ROOT_RIGHTS, encode_init};
 use wyrmroot_runtime::platform::recording::{Call, Datagram, RecordingPlatform, Reply};
@@ -237,5 +237,48 @@ fn a_valid_bootstrap_sends_ready_closes_both_handles_and_enters_the_loop_on_one_
             },
         ]
     );
+    platform.assert_script_consumed();
+}
+
+/// A resident wait that selects the control item (index 0) carries no
+/// endpoint index; computing one must not underflow. A readable control
+/// datagram is received, then the next wait's failure ends the generation.
+#[test]
+fn a_control_wait_selects_no_endpoint() {
+    let mut platform = RecordingPlatform::scripted([
+        valid_bootstrap(),
+        Reply::Receive(Ok(Datagram {
+            bytes: valid_init(),
+            handles: Vec::from(startup_handles()),
+        })),
+        Reply::CapabilityInfo(Ok(CapabilityInfo {
+            object_type: DW_OBJECT_TYPE_ADDRESS_REGION,
+            rights: SELF_ROOT_RIGHTS,
+        })),
+        Reply::CapabilityInfo(Ok(CapabilityInfo {
+            object_type: DW_OBJECT_TYPE_CHANNEL,
+            rights: CHILD_CHANNEL_RIGHTS,
+        })),
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+        Reply::Wait(Ok(DwWaitResultV1 {
+            observed: DW_SIGNAL_READABLE,
+            ..DwWaitResultV1::default()
+        })),
+        Reply::Receive(Ok(Datagram {
+            bytes: vec![0u8; 4],
+            handles: Vec::new(),
+        })),
+        Reply::Wait(Err(status(DW_STATUS_PEER_CLOSED))),
+    ]);
+    assert_eq!(run(&mut platform, BOOTSTRAP), Err(failure(0x10)));
+    assert!(matches!(
+        platform.calls()[8],
+        Call::ReceiveChannel {
+            channel: CONTROL,
+            ..
+        }
+    ));
     platform.assert_script_consumed();
 }
