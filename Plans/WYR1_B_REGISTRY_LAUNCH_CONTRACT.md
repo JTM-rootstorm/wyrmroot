@@ -473,6 +473,22 @@ MOVE retains and closes it exactly once and returns `FORWARD_FAILED`; successful
 MOVE transfers ownership to the publisher before `CONNECTED`, and a later
 client-send failure never reclaims publisher-owned authority.
 
+**Amendment (2026-10-20): supervisor-control close is orderly retirement.**
+A supervisor-control `PEER_CLOSED` observed with no `READABLE` message ends
+registryd's generation in order, and registryd exits with status `0`. By the
+rule above, every committed control datagram has been received and dispatched
+first. The close is how registryd learns its supervisor is gone:
+system-init's session shutdown closes the control channel before it
+terminates registryd's task group (`retire_role_for_shutdown`). The production
+COM1 witness already admits only exit `0` from a role. Every other
+service-step failure still ends the generation with that failure's own code.
+
+This records the finding behind the stage 3b normal/SMP runs that refused
+`B1010010`, the same code as F3A.7i/7j. registryd had folded every step error,
+this close included, into one failure code. When it observed the close before
+the termination reached it, it exited with that code, and the verifier
+correctly refused the exit. Implemented in wyrmroot `76576e0`.
+
 ## 9. WRLJ version 1 protocol
 
 `wyrmroot-launch-proto` retains its existing exact 40-byte envelope:
