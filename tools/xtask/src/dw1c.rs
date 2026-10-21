@@ -35,8 +35,8 @@ const TEST_ID: &str = "28";
 // Wyrmroot's accepted toolchain/layout is tied to this generated ABI revision.
 // The product kernel is intentionally built from the explicit Deep candidate;
 // DW1-B uses the same two-revision split.
-const GENERATED_ABI_REVISION: &str = "085b184c32ae1fa3d5ec322c86957dd5d036595c";
-const DEEPWYRM_ABI_TREE: &str = "a9b067107ec38e2be44630f4dce428dab0f48de8";
+const GENERATED_ABI_REVISION: &str = "db15f063d18caff25b93ff8456b910b576f78d4a";
+const DEEPWYRM_ABI_TREE: &str = "e5ba1753926b159e5d4bd390c4f4654e61af1659";
 const MACHINE: &str = "pc-q35-10.2";
 const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
 const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
@@ -1866,7 +1866,7 @@ mod tests {
         assert!(manifest.contains(&format!("rev = \"{GENERATED_ABI_REVISION}\"")));
         assert_eq!(
             DEEPWYRM_ABI_TREE,
-            "a9b067107ec38e2be44630f4dce428dab0f48de8"
+            "e5ba1753926b159e5d4bd390c4f4654e61af1659"
         );
     }
 

@@ -3,7 +3,7 @@ milestone = "WYR0"
 
 [deepwyrm]
 repository = "https://github.com/JTM-rootstorm/deepwyrm"
-revision = "085b184c32ae1fa3d5ec322c86957dd5d036595c"
+revision = "db15f063d18caff25b93ff8456b910b576f78d4a"
 abi_version = 0
 abi_dependency_state = "available"
 

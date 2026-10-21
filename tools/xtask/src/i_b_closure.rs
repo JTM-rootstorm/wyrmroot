@@ -16,7 +16,7 @@ use crate::h_request::{self, ExpectedOutcome, HRequest};
 use crate::metadata::BuildManifest;
 use crate::sha256;
 
-const DEEPWYRM_ABI_REVISION: &str = "085b184c32ae1fa3d5ec322c86957dd5d036595c";
+const DEEPWYRM_ABI_REVISION: &str = "db15f063d18caff25b93ff8456b910b576f78d4a";
 const RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
 const RUST_TOOLCHAIN_NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
 const MAX_SOURCE_FILES: usize = 4096;
@@ -1395,10 +1395,10 @@ mod tests {
     fn local_deepwyrm_transport_is_exact_and_process_scoped() {
         const SOURCE: &str = include_str!("../../../toolchain/cargo-with-local-deepwyrm.sh");
         for expected in [
-            "revision=085b184c32ae1fa3d5ec322c86957dd5d036595c",
-            "abi_tree=a9b067107ec38e2be44630f4dce428dab0f48de8",
+            "revision=db15f063d18caff25b93ff8456b910b576f78d4a",
+            "abi_tree=e5ba1753926b159e5d4bd390c4f4654e61af1659",
             "abi_crate_tree=6f3d546436e10df79a17db610fe9a8383cc26abc",
-            "syscall_crate_tree=a64290953ccc0548e908be88586969ac0b70b589",
+            "syscall_crate_tree=9a013278082e78de04ea4ed8a523288faf3721e1",
             "GIT_CONFIG_GLOBAL=/dev/null",
             "GIT_CONFIG_COUNT=1",
             "CARGO_NET_GIT_FETCH_WITH_CLI=true",

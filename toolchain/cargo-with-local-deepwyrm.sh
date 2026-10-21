@@ -2,10 +2,10 @@
 # Resolve the exact accepted Deepwyrm Git object through a scoped local transport.
 set -eu
 
-revision=085b184c32ae1fa3d5ec322c86957dd5d036595c
-abi_tree=a9b067107ec38e2be44630f4dce428dab0f48de8
+revision=db15f063d18caff25b93ff8456b910b576f78d4a
+abi_tree=e5ba1753926b159e5d4bd390c4f4654e61af1659
 abi_crate_tree=6f3d546436e10df79a17db610fe9a8383cc26abc
-syscall_crate_tree=a64290953ccc0548e908be88586969ac0b70b589
+syscall_crate_tree=9a013278082e78de04ea4ed8a523288faf3721e1
 abi_manifest_blob=0ccaa86fb6fa77a75ffb9a11d2115593ccd29700
 syscall_manifest_blob=3c0a564fe976320447649ae1882e59cf4382f460
 remote=https://github.com/JTM-rootstorm/deepwyrm.git
