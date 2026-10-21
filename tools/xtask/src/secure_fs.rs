@@ -744,6 +744,13 @@ impl ScratchDirectory<'_> {
         Ok(())
     }
 
+    /// Keeps the directory, for example to preserve a failed build's logs,
+    /// and returns its path. Nothing removes it afterwards.
+    pub(crate) fn retain(mut self) -> PathBuf {
+        self.armed = false;
+        self.directory.path().to_path_buf()
+    }
+
     pub(crate) fn finish<T>(mut self, result: Result<T, Failure>) -> Result<T, Failure> {
         // A failed explicit retirement is quarantined for the caller to
         // diagnose. Drop must not silently make a second destructive attempt.
@@ -1260,6 +1267,19 @@ mod tests {
             assert_eq!(scratch.finish(result).is_ok(), succeed);
             assert!(!directory.exists(name, "retired scratch").unwrap());
         }
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn retained_scratch_survives_and_dropped_scratch_does_not() {
+        let parent = temporary("scratch-retain");
+        let directory = Directory::open_exact(&parent, "parent").unwrap();
+        let kept = directory.create_scratch("kept", "scratch").unwrap();
+        fs::write(kept.path().join("cargo.stderr.log"), b"error").unwrap();
+        let kept_path = kept.retain();
+        assert!(kept_path.join("cargo.stderr.log").is_file());
+        drop(directory.create_scratch("dropped", "scratch").unwrap());
+        assert!(!directory.exists("dropped", "dropped scratch").unwrap());
         fs::remove_dir_all(parent).unwrap();
     }
 

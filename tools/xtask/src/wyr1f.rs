@@ -617,9 +617,11 @@ fn build_kernel(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
         .as_nanos();
-    let build = temporary.create_child(
+    // Removed once the kernel has been read, and kept only when the build
+    // fails, for its logs. Each prepare builds from a fresh target, so a
+    // retained success would only leak a full kernel build per product.
+    let build = temporary.create_scratch(
         &format!("wyr1f-kernel-{}-{unique}", std::process::id()),
-        0o700,
         "WYR1-F kernel target",
     )?;
     let target = build.create_child("target", 0o700, "WYR1-F Cargo target")?;
@@ -639,14 +641,16 @@ fn build_kernel(
     if !status.success() {
         return Err(Failure::task(format!(
             "WYR1-F production Deepwyrm kernel build failed; logs preserved in {}",
-            build.path().display()
+            build.retain().display()
         )));
     }
-    target.read_producer(
+    let kernel = target.read_producer(
         &PathBuf::from(KERNEL_TARGET).join("release/deepwyrm-kernel"),
         wyr1c6::MAX_ARTIFACT_BYTES,
         "WYR1-F production kernel",
-    )
+    );
+    drop(target);
+    build.finish(kernel)
 }
 
 fn kernel_build_command(
