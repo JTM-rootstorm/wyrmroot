@@ -6651,7 +6651,7 @@ mod r1_composition_coverage {
 ///   exact expected and observed sequence numbers.
 ///
 /// Each of the first two was fixed correctly at its own site, and the next run
-/// was undiagnosable anyway. `AGENTS.md` §1 requires that the third occurrence of
+/// was undiagnosable anyway. `CLAUDE.md` §1 requires that the third occurrence of
 /// one failure class be classified rather than patched a third time, so this
 /// module states the class as an invariant over the source of the terminal-status
 /// path: **a cause that was carried to a boundary must not be dropped at it.**

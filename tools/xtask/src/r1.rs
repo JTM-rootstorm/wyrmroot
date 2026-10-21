@@ -1290,7 +1290,7 @@ fn render_source_receipt(
 }
 
 /// The approved inactive baseline the GDB harness restores the domain to. Quoted
-/// into the receipt so an operator can check it against `AGENTS.md` §10 without
+/// into the receipt so an operator can check it against `CLAUDE.md` §10 without
 /// reading the harness.
 pub(crate) const BASELINE_DOMAIN_SHA256: &str =
     "a823095e2182f848be0c15fe1a88728fce9f126fbc55e7d9aab30d84a6c5d3c3";
@@ -1316,7 +1316,7 @@ pub(crate) const REQUEST_TIMEOUT_SECONDS: u32 = 300;
 /// rather than a comment.
 pub(crate) const PROBE_WORST_CASE_SECONDS: u32 = 180;
 
-/// Renders the request AGENTS.md §10 requires before a run.
+/// Renders the record CLAUDE.md §10 requires before a run.
 ///
 /// §10 names eight things an acceptable request must carry: project and gate,
 /// exact Deepwyrm and Wyrmroot revisions with dirty qualification, artifact and
@@ -1432,7 +1432,7 @@ fn render_request(
 
     line("schema = \"wyrmroot-r1-vm-request-v1\"".into());
     line(format!("kind = \"{REQUEST_KIND}\""));
-    line("# Accepted by Mike before a run, per AGENTS.md §10. This file is not".into());
+    line("# The record CLAUDE.md §10 requires before a run. This file is not".into());
     line("# consumed by tools/verify-vm-request.py: that tool serves the".into());
     line("# run-verified-vm-request.py capture/recheck flow, and a GDB-attached".into());
     line("# diagnostic run goes through tools/run-active-gdb-vm.sh instead.".into());
