@@ -1,9 +1,17 @@
 schema_version = 1
 milestone = "WYR0"
 
+# The canonical Deepwyrm pin record. `revision` is the exact commit whose
+# generated deepwyrm-abi and deepwyrm-syscall crates Wyrmroot compiles against,
+# kept as provenance. `abi_fingerprint` is that commit's semantic ABI
+# fingerprint (abi/generated/abi_fingerprint.toml), and the revision-pairing
+# gates accept any kernel revision that carries it, so a documentation-only
+# schema edit needs no repin. Cargo.toml and Cargo.lock must restate
+# `revision`; a host test checks them, and every other site derives the pin.
 [deepwyrm]
 repository = "https://github.com/JTM-rootstorm/deepwyrm"
-revision = "db15f063d18caff25b93ff8456b910b576f78d4a"
+revision = "347c092c954b15b7dfcd77bac1e2579a9014bf6f"
+abi_fingerprint = "5ecb9d49b1fde923dfea8259a6a8a29a5742e84cfe505adfd3839cd1dd3a8375"
 abi_version = 0
 abi_dependency_state = "available"
 

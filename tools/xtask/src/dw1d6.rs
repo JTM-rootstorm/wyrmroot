@@ -91,8 +91,12 @@ pub fn freeze(
 
     let manifest = BuildManifest::load(&wyrmroot)?;
     let generated_abi_revision = manifest.deepwyrm_revision()?.to_owned();
-    let deepwyrm_abi_tree =
-        require_matching_abi_tree(&deep_repository, deep_revision, &generated_abi_revision)?;
+    let deepwyrm_abi_tree = require_matching_abi_tree(
+        &deep_repository,
+        deep_revision,
+        &generated_abi_revision,
+        manifest.deepwyrm_abi_fingerprint()?,
+    )?;
     let layout = crate::deep_layout::prepare_current_kernel_source(
         &wyrmroot,
         &deep_repository,
@@ -926,24 +930,24 @@ fn require_d6_loader_contract(repository: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Pair the product Deep candidate with Wyrmroot's generated ABI by semantic
+/// fingerprint (see [`crate::abi_pairing`]) and return the candidate's own
+/// `abi` tree, which the D6 records name `deepwyrm_abi_tree`.
 fn require_matching_abi_tree(
     deep: &Path,
     kernel_revision: &str,
     generated_abi_revision: &str,
+    pinned_abi_fingerprint: &str,
 ) -> Result<String, Failure> {
     validate_lower_hex(generated_abi_revision, 40, "generated_abi_revision")?;
-    let kernel_spec = format!("{kernel_revision}:abi");
-    let generated_spec = format!("{generated_abi_revision}:abi");
-    let kernel_tree = git(deep, &["rev-parse", &kernel_spec])?;
-    let generated_tree = git(deep, &["rev-parse", &generated_spec])?;
-    validate_lower_hex(&kernel_tree, 40, "deepwyrm_abi_tree")?;
-    validate_lower_hex(&generated_tree, 40, "generated_abi_tree")?;
-    if kernel_tree != generated_tree {
-        return Err(Failure::task(
-            "DW1-D6 product Deep candidate does not match the Wyrmroot generated ABI tree",
-        ));
-    }
-    Ok(kernel_tree)
+    crate::abi_pairing::verify(
+        deep,
+        kernel_revision,
+        generated_abi_revision,
+        pinned_abi_fingerprint,
+        "DW1-D6",
+    )
+    .map(|pairing| pairing.kernel_abi_tree)
 }
 
 fn validate_output_location(

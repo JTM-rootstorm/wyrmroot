@@ -16,6 +16,25 @@ the build gate rejects a missing lockfile resolution or consumer. Never replace
 that dependency with copied ABI definitions, a floating branch, or a committed
 host-local path.
 
+The `[deepwyrm]` table is the one canonical Deepwyrm pin record: `revision`
+and `abi_fingerprint`, the semantic ABI fingerprint Deepwyrm generates into
+`abi/generated/abi_fingerprint.toml`. The revision-pairing gates accept a
+product kernel revision whose fingerprint equals `abi_fingerprint`, not one
+whose `abi/` tree is identical, so a documentation-only schema edit does not
+need a repin. A kernel revision older than the fingerprint pairs only when its
+`abi/schema` tree is identical to the pinned revision's. Cargo must restate the
+revision, so `Cargo.toml` and `Cargo.lock` are test-checked against the record.
+Everything else derives it, including `cargo-with-local-deepwyrm.sh`. A real
+ABI repin edits `revision` and `abi_fingerprint` here, the two `rev` values in
+`Cargo.toml`, and then refreshes `Cargo.lock` through the local transport, with
+`CARGO_HOME` set to the project Cargo home and the pinned host Cargo first on
+`PATH`:
+
+```text
+sh toolchain/cargo-with-local-deepwyrm.sh <deepwyrm-repository> -- \
+    update -p deepwyrm-abi -p deepwyrm-syscall
+```
+
 The pinned Wyrmroot Rust fork implements `x86_64-unknown-wyrmroot` as a built-in
 static ELF target. It does not claim `cfg(unix)`, provide `std`, or authorize a
 target JSON substitute. The accepted R0 request record binds the target source,

@@ -4,7 +4,7 @@ manifest_kind = "wyrmroot-build-provenance-template"
 [source]
 wyrmroot_revision = ""
 wyrmroot_dirty = false
-deepwyrm_revision = "db15f063d18caff25b93ff8456b910b576f78d4a"
+deepwyrm_revision = ""
 deepwyrm_dirty = false
 deepwyrm_abi_dependency_state = "available"
 rust_revision = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d"

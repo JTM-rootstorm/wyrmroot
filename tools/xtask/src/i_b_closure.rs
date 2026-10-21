@@ -16,7 +16,6 @@ use crate::h_request::{self, ExpectedOutcome, HRequest};
 use crate::metadata::BuildManifest;
 use crate::sha256;
 
-const DEEPWYRM_ABI_REVISION: &str = "db15f063d18caff25b93ff8456b910b576f78d4a";
 const RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
 const RUST_TOOLCHAIN_NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
 const MAX_SOURCE_FILES: usize = 4096;
@@ -150,7 +149,7 @@ pub(crate) fn audit(first_request: &str, second_request: &str) -> Result<String,
             "\"manual_structural_audit\":\"REQUIRED_SEPARATELY\"}}}}\n"
         ),
         first.deepwyrm_revision,
-        DEEPWYRM_ABI_REVISION,
+        manifest.deepwyrm_revision()?,
         first.wyrmroot_revision,
         RUST_REVISION,
         RUST_TOOLCHAIN_NAME,
@@ -170,12 +169,9 @@ pub(crate) fn audit(first_request: &str, second_request: &str) -> Result<String,
 }
 
 fn require_exact_manifest_pins(manifest: &BuildManifest) -> Result<(), Failure> {
+    // The Deepwyrm ABI revision has one source of truth, toolchain/versions.toml,
+    // which validate_host_build_readiness binds to Cargo.toml and Cargo.lock.
     for (actual, expected, label) in [
-        (
-            manifest.deepwyrm_revision()?,
-            DEEPWYRM_ABI_REVISION,
-            "Deepwyrm ABI revision",
-        ),
         (manifest.rust_revision()?, RUST_REVISION, "Rust revision"),
         (
             manifest.rust_toolchain_name()?,
@@ -209,7 +205,6 @@ fn validate_request_pair(
         &first.rust_revision,
         &second.deepwyrm_revision,
         &second.rust_revision,
-        manifest.deepwyrm_revision()?,
         manifest.rust_revision()?,
     )?;
     for request in [first, second] {
@@ -244,11 +239,9 @@ fn validate_request_source_pins(
     first_rust: &str,
     second_deepwyrm: &str,
     second_rust: &str,
-    manifest_deepwyrm_abi: &str,
     manifest_rust: &str,
 ) -> Result<(), Failure> {
-    if manifest_deepwyrm_abi != DEEPWYRM_ABI_REVISION
-        || manifest_rust != RUST_REVISION
+    if manifest_rust != RUST_REVISION
         || first_deepwyrm != second_deepwyrm
         || first_rust != second_rust
         || first_rust != RUST_REVISION
@@ -1250,7 +1243,6 @@ mod tests {
                 RUST_REVISION,
                 later_product,
                 RUST_REVISION,
-                DEEPWYRM_ABI_REVISION,
                 RUST_REVISION,
             )
             .is_ok()
@@ -1261,7 +1253,6 @@ mod tests {
                 RUST_REVISION,
                 "8eec089bd8c001456f0cf7d030f46b0b6c70dcac",
                 RUST_REVISION,
-                DEEPWYRM_ABI_REVISION,
                 RUST_REVISION,
             )
             .is_err()
@@ -1395,10 +1386,14 @@ mod tests {
     fn local_deepwyrm_transport_is_exact_and_process_scoped() {
         const SOURCE: &str = include_str!("../../../toolchain/cargo-with-local-deepwyrm.sh");
         for expected in [
-            "revision=db15f063d18caff25b93ff8456b910b576f78d4a",
-            "abi_tree=e5ba1753926b159e5d4bd390c4f4654e61af1659",
-            "abi_crate_tree=6f3d546436e10df79a17db610fe9a8383cc26abc",
-            "syscall_crate_tree=9a013278082e78de04ea4ed8a523288faf3721e1",
+            "versions=\"$script_directory/versions.toml\"",
+            "revision=$(pin_value revision)",
+            "abi_fingerprint=$(pin_value abi_fingerprint)",
+            "section == \"[deepwyrm]\"",
+            "fingerprint_path=abi/generated/abi_fingerprint.toml",
+            "fingerprint_schema=deepwyrm-abi-fingerprint-v1",
+            "\"$recorded_fingerprint\" != \"$abi_fingerprint\"",
+            "\"$object_type\" != commit",
             "GIT_CONFIG_GLOBAL=/dev/null",
             "GIT_CONFIG_COUNT=1",
             "CARGO_NET_GIT_FETCH_WITH_CLI=true",
@@ -1407,6 +1402,14 @@ mod tests {
         }
         assert!(SOURCE.contains("exec env"));
         assert!(!SOURCE.contains("git config --global"));
+        assert_eq!(
+            crate::abi_pairing::FINGERPRINT_PATH,
+            "abi/generated/abi_fingerprint.toml"
+        );
+        assert_eq!(
+            crate::abi_pairing::FINGERPRINT_SCHEMA,
+            "deepwyrm-abi-fingerprint-v1"
+        );
     }
 
     #[test]

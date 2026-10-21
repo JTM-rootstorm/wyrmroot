@@ -1005,24 +1005,17 @@ fn certificate_identity(request: &HRequest) -> Result<CertificateIdentity, Failu
         ));
     }
 
-    let consumer_revision = manifest.deepwyrm_revision()?;
-    let consumer_spec = format!("{consumer_revision}:abi");
-    let candidate_spec = format!("{}:abi", request.deepwyrm_revision);
-    let consumer_abi_tree = git_output(&deepwyrm, &["rev-parse", &consumer_spec], "Deepwyrm")?;
-    let candidate_abi_tree = git_output(&deepwyrm, &["rev-parse", &candidate_spec], "Deepwyrm")?;
-    let consumer_abi_tree = required_git_object(
-        consumer_abi_tree.trim(),
-        "Wyrmroot's generated Deepwyrm ABI binding",
-    )?;
-    let candidate_abi_tree = required_git_object(
-        candidate_abi_tree.trim(),
-        "certificate candidate Deepwyrm ABI tree",
-    )?;
-    if consumer_abi_tree != candidate_abi_tree {
-        return Err(Failure::task(
-            "certificate candidate ABI tree differs from Wyrmroot's generated ABI binding",
-        ));
-    }
+    // The candidate pairs with Wyrmroot's generated binding by semantic ABI
+    // fingerprint (crate::abi_pairing); the certificate records the
+    // candidate's own abi tree.
+    let candidate_abi_tree = crate::abi_pairing::verify(
+        &deepwyrm,
+        &request.deepwyrm_revision,
+        manifest.deepwyrm_revision()?,
+        manifest.deepwyrm_abi_fingerprint()?,
+        "WYR0-I certificate candidate",
+    )?
+    .kernel_abi_tree;
 
     let versions_path = repository.join("toolchain/versions.toml");
     let versions = identity_toml(&versions_path, "toolchain versions")?;

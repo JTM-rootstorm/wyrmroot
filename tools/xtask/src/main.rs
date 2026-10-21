@@ -1,3 +1,4 @@
+mod abi_pairing;
 mod cli;
 mod deep_layout;
 mod dw1b;

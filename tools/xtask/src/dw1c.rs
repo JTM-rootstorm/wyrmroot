@@ -32,11 +32,10 @@ const OVMF_VARS_SHA256: &str = "6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59
 
 const SELECTOR: &str = "normal-preemption-smp";
 const TEST_ID: &str = "28";
-// Wyrmroot's accepted toolchain/layout is tied to this generated ABI revision.
-// The product kernel is intentionally built from the explicit Deep candidate;
-// DW1-B uses the same two-revision split.
-const GENERATED_ABI_REVISION: &str = "db15f063d18caff25b93ff8456b910b576f78d4a";
-const DEEPWYRM_ABI_TREE: &str = "e5ba1753926b159e5d4bd390c4f4654e61af1659";
+// Wyrmroot's accepted toolchain/layout is tied to the generated ABI revision
+// pinned in toolchain/versions.toml. The product kernel is intentionally built
+// from the explicit Deep candidate and paired with that pin by its semantic ABI
+// fingerprint (crate::abi_pairing); DW1-B uses the same two-revision split.
 const MACHINE: &str = "pc-q35-10.2";
 const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
 const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
@@ -943,8 +942,9 @@ fn freeze_product(
     // Do not introduce a stripped-symbols pipeline here.
     let symbols = kernel.clone();
     let source_values = scalars(&artifacts.source_receipt)?;
+    let abi_tree = accepted_abi_tree(&repository, deep_repository, deep_revision)?;
     let provenance = render_kernel_provenance(
-        deep_revision,
+        (deep_revision, &abi_tree),
         &rust_revision,
         evidence_nonce,
         progress_digest,
@@ -1138,8 +1138,10 @@ fn read_pinned_firmware(path: &str, expected: &str, label: &str) -> Result<Vec<u
     Ok(bytes)
 }
 
+/// `deep` is the product Deep candidate revision and the accepted generated
+/// ABI tree it was paired with.
 fn render_kernel_provenance(
-    deep: &str,
+    deep: (&str, &str),
     rust: &str,
     nonce: &str,
     digest: &str,
@@ -1147,6 +1149,7 @@ fn render_kernel_provenance(
     kernel: &[u8],
     source: &BTreeMap<String, String>,
 ) -> Result<String, Failure> {
+    let (deep, abi_tree) = deep;
     let mut fields = BTreeMap::new();
     for (key, value) in [
         ("schema_version", "1".to_owned()), ("kind", "wyrmroot-dw1-c-kernel-build".to_owned()),
@@ -1155,7 +1158,7 @@ fn render_kernel_provenance(
         ("kernel_command", "tools/pinned-cargo target build --locked --offline --release --target x86_64-unknown-none --package deepwyrm-kernel --bin deepwyrm-kernel --features test-support".to_owned()),
         ("kernel_sha256", sha256::bytes_digest(kernel)), ("symbols_sha256", sha256::bytes_digest(kernel)),
         ("evidence_nonce", nonce.to_owned()), ("progress_digest", digest.to_owned()), ("bootfs_max_pages", pages.to_string()),
-        ("accepted_abi_tree", DEEPWYRM_ABI_TREE.to_owned()), ("kernel_target", KERNEL_TARGET.to_owned()),
+        ("accepted_abi_tree", abi_tree.to_owned()), ("kernel_target", KERNEL_TARGET.to_owned()),
         ("kernel_output", "x86_64-unknown-none/release/deepwyrm-kernel".to_owned()),
     ] { fields.insert(key.to_owned(), value); }
     for key in [
@@ -1311,20 +1314,26 @@ fn prepare_current_layout(
     deep_repository: &Path,
     deep_revision: &str,
 ) -> Result<crate::deep_layout::DeepLayoutBuild, Failure> {
-    let abi_tree = git_output(
-        deep_repository,
-        &["rev-parse", &format!("{deep_revision}:abi")],
-    )?;
-    let generated_tree = git_output(
-        deep_repository,
-        &["rev-parse", &format!("{GENERATED_ABI_REVISION}:abi")],
-    )?;
-    if abi_tree != DEEPWYRM_ABI_TREE || generated_tree != DEEPWYRM_ABI_TREE {
-        return Err(Failure::task(
-            "DW1-C product Deep candidate does not match the accepted generated ABI tree",
-        ));
-    }
+    accepted_abi_tree(repository, deep_repository, deep_revision)?;
     crate::deep_layout::prepare_current_kernel_source(repository, deep_repository, deep_revision)
+}
+
+/// Pair the product Deep candidate with the pinned generated ABI and return
+/// the generated revision's `abi` tree, recorded as `accepted_abi_tree`.
+fn accepted_abi_tree(
+    repository: &Path,
+    deep_repository: &Path,
+    deep_revision: &str,
+) -> Result<String, Failure> {
+    let manifest = BuildManifest::load(repository)?;
+    crate::abi_pairing::verify(
+        deep_repository,
+        deep_revision,
+        manifest.deepwyrm_revision()?,
+        manifest.deepwyrm_abi_fingerprint()?,
+        "DW1-C",
+    )
+    .map(|pairing| pairing.generated_abi_tree)
 }
 
 fn canonical_repository_path(path: &Path, label: &str) -> Result<PathBuf, Failure> {
@@ -1861,13 +1870,13 @@ mod tests {
     }
 
     #[test]
-    fn generated_abi_lineage_matches_the_current_workspace_dependency() {
-        let manifest = include_str!("../../../Cargo.toml");
-        assert!(manifest.contains(&format!("rev = \"{GENERATED_ABI_REVISION}\"")));
-        assert_eq!(
-            DEEPWYRM_ABI_TREE,
-            "e5ba1753926b159e5d4bd390c4f4654e61af1659"
-        );
+    fn generated_abi_lineage_comes_from_the_canonical_pin() {
+        let source = include_str!("dw1c.rs");
+        let gate = &source[source.find("fn accepted_abi_tree(").unwrap()
+            ..source.find("fn canonical_repository_path(").unwrap()];
+        assert!(gate.contains("manifest.deepwyrm_revision()?"));
+        assert!(gate.contains("manifest.deepwyrm_abi_fingerprint()?"));
+        assert!(gate.contains("crate::abi_pairing::verify("));
     }
 
     #[test]

@@ -205,11 +205,16 @@ pub(crate) fn prepare(
         ));
     }
     // Selector-29 code may live at a newer clean Deepwyrm commit than the
-    // generated ABI consumer pin.  The semantic join is the immutable `abi`
-    // tree, checked below; do not advance the generated ABI pin merely for
-    // private evidence code.
+    // generated ABI consumer pin.  The semantic join is the pinned ABI
+    // fingerprint, checked below; do not advance the generated ABI pin merely
+    // for private evidence code or documentation-only schema edits.
     let abi_revision = manifest.deepwyrm_revision()?.to_owned();
-    let abi_tree = matching_abi_tree(&deep_repository, deep_revision, &abi_revision)?;
+    let abi_tree = matching_abi_tree(
+        &deep_repository,
+        deep_revision,
+        &abi_revision,
+        manifest.deepwyrm_abi_fingerprint()?,
+    )?;
     let layout = crate::deep_layout::prepare_current_kernel_source(
         &repository,
         &deep_repository,
@@ -1320,21 +1325,25 @@ pub(crate) fn canonical_new_output(
     Ok(result)
 }
 
+/// Verify the selected kernel revision against Wyrmroot's pinned generated
+/// ABI and return the generated revision's `abi` tree, which is recorded as
+/// provenance. The pairing compares the semantic ABI fingerprint, not the
+/// `abi` tree, so a documentation-only Deepwyrm schema edit still pairs; see
+/// [`crate::abi_pairing`].
 pub(crate) fn matching_abi_tree(
     deep_repository: &Path,
     kernel_revision: &str,
     generated_abi_revision: &str,
+    pinned_abi_fingerprint: &str,
 ) -> Result<String, Failure> {
-    let kernel_tree = git_revision(deep_repository, &format!("{kernel_revision}:abi"))?;
-    let generated_tree = git_revision(deep_repository, &format!("{generated_abi_revision}:abi"))?;
-    validate_revision(&kernel_tree, "Deepwyrm ABI tree")?;
-    validate_revision(&generated_tree, "generated ABI tree")?;
-    if kernel_tree != generated_tree {
-        return Err(Failure::task(
-            "WYR1-C6 selected kernel does not match the generated ABI tree",
-        ));
-    }
-    Ok(kernel_tree)
+    crate::abi_pairing::verify(
+        deep_repository,
+        kernel_revision,
+        generated_abi_revision,
+        pinned_abi_fingerprint,
+        "WYR1-C6",
+    )
+    .map(|pairing| pairing.generated_abi_tree)
 }
 
 fn git_revision(repository: &Path, spec: &str) -> Result<String, Failure> {
@@ -2316,7 +2325,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_kernel_may_differ_when_the_generated_abi_tree_matches() {
+    fn selected_kernel_may_differ_when_the_abi_fingerprint_matches() {
         let root = std::env::temp_dir().join(format!(
             "wyr1c6-abi-tree-{}-{}",
             std::process::id(),
@@ -2337,25 +2346,66 @@ mod tests {
             assert!(output.status.success(), "git {arguments:?} failed");
             String::from_utf8(output.stdout).unwrap().trim().to_owned()
         };
+        let fingerprint = |digest: &str| {
+            format!(
+                "schema = \"{}\"\nabi_name = \"Deepwyrm\"\nabi_version = 0\nalgorithm = \"sha256\"\nfingerprint = \"{digest}\"\n",
+                crate::abi_pairing::FINGERPRINT_SCHEMA
+            )
+        };
+        let pinned = "1".repeat(64);
         git(&["init", "-q"]);
         git(&["config", "user.name", "C6 Test"]);
         git(&["config", "user.email", "c6@example.invalid"]);
-        fs::create_dir(root.join("abi")).unwrap();
+        fs::create_dir_all(root.join("abi/generated")).unwrap();
         fs::write(root.join("abi/schema"), b"stable").unwrap();
-        git(&["add", "abi/schema"]);
+        fs::write(
+            root.join(crate::abi_pairing::FINGERPRINT_PATH),
+            fingerprint(&pinned),
+        )
+        .unwrap();
+        git(&["add", "abi"]);
         git(&["commit", "-q", "-m", "generated abi"]);
         let generated = git(&["rev-parse", "HEAD"]);
+        let generated_tree = git(&["rev-parse", &format!("{generated}:abi")]);
         fs::write(root.join("selector29-only"), b"private evidence").unwrap();
         git(&["add", "selector29-only"]);
         git(&["commit", "-q", "-m", "selector29 private evidence"]);
         let selected = git(&["rev-parse", "HEAD"]);
         assert_ne!(selected, generated);
-        assert!(matching_abi_tree(&root, &selected, &generated).is_ok());
-        fs::write(root.join("abi/schema"), b"drift").unwrap();
+        assert_eq!(
+            matching_abi_tree(&root, &selected, &generated, &pinned).unwrap(),
+            generated_tree
+        );
+        // A documentation-only schema edit changes the abi tree but keeps the
+        // fingerprint: it still pairs, and the generated tree is recorded.
+        fs::write(root.join("abi/schema"), b"stable, reworded docs").unwrap();
         git(&["add", "abi/schema"]);
+        git(&["commit", "-q", "-m", "abi docs"]);
+        let reworded = git(&["rev-parse", "HEAD"]);
+        assert_ne!(
+            git(&["rev-parse", &format!("{reworded}:abi")]),
+            generated_tree
+        );
+        assert_eq!(
+            matching_abi_tree(&root, &reworded, &generated, &pinned).unwrap(),
+            generated_tree
+        );
+        fs::write(root.join("abi/schema"), b"drift").unwrap();
+        fs::write(
+            root.join(crate::abi_pairing::FINGERPRINT_PATH),
+            fingerprint(&"2".repeat(64)),
+        )
+        .unwrap();
+        git(&["add", "abi"]);
         git(&["commit", "-q", "-m", "abi drift"]);
         let mismatched = git(&["rev-parse", "HEAD"]);
-        assert!(matching_abi_tree(&root, &mismatched, &generated).is_err());
+        let error = matching_abi_tree(&root, &mismatched, &generated, &pinned).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("WYR1-C6 selected kernel's ABI fingerprint")
+        );
+        assert!(matching_abi_tree(&root, &selected, &generated, &"3".repeat(64)).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

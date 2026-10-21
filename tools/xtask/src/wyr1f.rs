@@ -169,7 +169,12 @@ pub(crate) fn prepare(
     wyr1c6::verify_clean_revision(&deep_repository, "Deepwyrm", deep_revision)?;
     let manifest = crate::metadata::BuildManifest::load(&repository)?;
     let abi_revision = manifest.deepwyrm_revision()?.to_owned();
-    let abi_tree = wyr1c6::matching_abi_tree(&deep_repository, deep_revision, &abi_revision)?;
+    let abi_tree = wyr1c6::matching_abi_tree(
+        &deep_repository,
+        deep_revision,
+        &abi_revision,
+        manifest.deepwyrm_abi_fingerprint()?,
+    )?;
     let layout = crate::deep_layout::prepare_current_kernel_source(
         &repository,
         &deep_repository,
@@ -342,6 +347,7 @@ pub(crate) fn inspect(product: &Path) -> Result<String, Failure> {
         &deep_repository,
         field(&request, "deepwyrm_revision")?,
         field(&request, "generated_abi_revision")?,
+        manifest.deepwyrm_abi_fingerprint()?,
     )?;
     if abi_tree != field(&request, "generated_abi_tree")? {
         return Err(Failure::task("WYR1-F generated ABI tree changed"));

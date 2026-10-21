@@ -87,7 +87,12 @@ pub(crate) fn prepare(
         ));
     }
     let abi_revision = manifest.deepwyrm_revision()?.to_owned();
-    let abi_tree = wyr1c6::matching_abi_tree(&deep_repository, deep_revision, &abi_revision)?;
+    let abi_tree = wyr1c6::matching_abi_tree(
+        &deep_repository,
+        deep_revision,
+        &abi_revision,
+        manifest.deepwyrm_abi_fingerprint()?,
+    )?;
     let layout = crate::deep_layout::prepare_current_kernel_source(
         &repository,
         &deep_repository,

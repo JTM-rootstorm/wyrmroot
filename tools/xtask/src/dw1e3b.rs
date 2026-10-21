@@ -259,7 +259,12 @@ pub(crate) fn prepare(
         ));
     }
     let abi_revision = manifest.deepwyrm_revision()?.to_owned();
-    let abi_tree = wyr1c6::matching_abi_tree(&deep_repository, deep_revision, &abi_revision)?;
+    let abi_tree = wyr1c6::matching_abi_tree(
+        &deep_repository,
+        deep_revision,
+        &abi_revision,
+        manifest.deepwyrm_abi_fingerprint()?,
+    )?;
     let output = wyr1c6::canonical_new_output(output, &project, &repository, &deep_repository)?;
     let temporary = project.join(".tmp");
     fs::create_dir_all(&temporary).map_err(|error| {

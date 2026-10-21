@@ -990,11 +990,17 @@ pub(crate) fn prepare(
             "card R1 prepare does not name the accepted a92dc7f Rust toolchain",
         ));
     }
-    // The semantic join with Deepwyrm is the immutable `abi` tree, not the commit:
-    // selector-34 code may sit at a newer clean revision than the generated ABI
-    // pin without changing the ABI either side compiled against.
+    // The semantic join with Deepwyrm is the pinned ABI fingerprint, not the
+    // commit or the `abi` tree: selector-34 code may sit at a newer clean
+    // revision than the generated ABI pin without changing the ABI either side
+    // compiled against.
     let abi_revision = manifest.deepwyrm_revision()?.to_owned();
-    let abi_tree = matching_abi_tree(&deep_repository, deep_revision, &abi_revision)?;
+    let abi_tree = matching_abi_tree(
+        &deep_repository,
+        deep_revision,
+        &abi_revision,
+        manifest.deepwyrm_abi_fingerprint()?,
+    )?;
     let layout = crate::deep_layout::prepare_current_kernel_source(
         &repository,
         &deep_repository,
