@@ -10,6 +10,7 @@ mod elf_runtime;
 mod error;
 mod g3_image;
 mod grammar;
+mod h_build;
 mod h_integration;
 mod h_request;
 mod i_b_closure;
@@ -131,6 +132,7 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         Action::BuildG3Image(arguments) => g3_image::build(&arguments).map(Some),
         Action::InspectG3Image(arguments) => g3_image::inspect(&arguments).map(Some),
         Action::BuildHImage(request) => h_integration::build(&request).map(Some),
+        Action::BuildHInputs(request) => h_build::build(&request).map(Some),
         Action::InspectHImage(request) => h_integration::inspect(&request).map(Some),
         Action::AuditIB {
             first_request,

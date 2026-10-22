@@ -280,7 +280,7 @@ struct CandidateDigests {
 }
 
 #[derive(Debug)]
-struct CertificateIdentity {
+pub(crate) struct CertificateIdentity {
     deepwyrm_abi_tree: String,
     generated_schema_bound: bool,
     rust_target: String,
@@ -991,7 +991,7 @@ fn publish_staged_certificate(
 /// accepted immutable toolchain record.  In particular, the host's currently
 /// installed LLVM programs are not evidence about the toolchain that produced
 /// a WYR0-I candidate.
-fn certificate_identity(request: &HRequest) -> Result<CertificateIdentity, Failure> {
+pub(crate) fn certificate_identity(request: &HRequest) -> Result<CertificateIdentity, Failure> {
     let repository = crate::tasks::repository_root()?;
     let deepwyrm = source_workspace_root(&repository)?.join("deepwyrm");
     let manifest = crate::metadata::BuildManifest::load(&repository)?;
@@ -1301,6 +1301,117 @@ fn git_tree(repository: &Path, revision: &str, label: &str) -> Result<String, Fa
     )
 }
 
+/// SHA-256 identities of every file a schema-2/3 build-lineage receipt binds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReceiptOutputs {
+    pub(crate) loader: String,
+    pub(crate) kernel: String,
+    pub(crate) symbols: String,
+    pub(crate) bootstrap: String,
+    pub(crate) init0: String,
+    pub(crate) hello: String,
+    pub(crate) ovmf_code: String,
+    pub(crate) ovmf_vars_template: String,
+}
+
+/// The source trees a receipt binds, measured from the request's revisions
+/// exactly as [`verify_build_receipt`] later re-derives them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReceiptSources {
+    pub(crate) deepwyrm_tree: String,
+    pub(crate) wyrmroot_tree: String,
+    pub(crate) rust_tree: String,
+}
+
+pub(crate) fn receipt_sources(request: &HRequest) -> Result<ReceiptSources, Failure> {
+    let repository = crate::tasks::repository_root()?;
+    let workspace = source_workspace_root(&repository)?;
+    Ok(ReceiptSources {
+        deepwyrm_tree: git_tree(
+            &workspace.join("deepwyrm"),
+            &request.deepwyrm_revision,
+            "Deepwyrm tree",
+        )?,
+        wyrmroot_tree: git_tree(&repository, &request.wyrmroot_revision, "Wyrmroot tree")?,
+        rust_tree: git_tree(&workspace.join("rust"), &request.rust_revision, "Rust tree")?,
+    })
+}
+
+/// Renders the canonical build-lineage receipt
+/// (`toolchain/templates/wyr0-h-build-receipt.toml`) from measured values.
+/// Only `wyr0 build` writes one; schema-4 requests also bind selector content
+/// and are not rendered here.
+pub(crate) fn render_build_receipt(
+    request: &HRequest,
+    identity: &CertificateIdentity,
+    sources: &ReceiptSources,
+    outputs: &ReceiptOutputs,
+) -> Result<String, Failure> {
+    if request.capability.is_some() {
+        return Err(Failure::task(
+            "WYR0-H receipt rendering does not cover schema-4 selector content",
+        ));
+    }
+    Ok(format!(
+        concat!(
+            "# WYR0-H build-lineage receipt written by `xtask wyr0 build` from\n",
+            "# measured values. Do not edit.\n",
+            "schema_version = 1\nreport_kind = \"{}\"\nstatus = \"PASS\"\n",
+            "source_checkout_clean_before = true\nsource_checkout_clean_after = true\n",
+            "deepwyrm_revision = \"{}\"\ndeepwyrm_tree = \"{}\"\n",
+            "wyrmroot_revision = \"{}\"\nwyrmroot_tree = \"{}\"\n",
+            "rust_revision = \"{}\"\nrust_tree = \"{}\"\n",
+            "accepted_toolchain_request = \"{}\"\n",
+            "accepted_toolchain_request_sha256 = \"{}\"\n",
+            "accepted_toolchain_manifest_sha256 = \"{}\"\n",
+            "toolchain_tree_sha256 = \"{}\"\nrustc_sha256 = \"{}\"\n",
+            "cargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\n",
+            "llvm_sha256 = \"{}\"\nllvm_build_version = \"{}\"\n",
+            "versions_sha256 = \"{}\"\nprofiles_sha256 = \"{}\"\n",
+            "selector = \"{}\"\ntest_id = {}\n",
+            "\n[loader]\ntarget = \"x86_64-unknown-uefi\"\nprofile = \"production\"\nrecipe = \"{}\"\n",
+            "\n[kernel]\ntarget = \"x86_64-unknown-none\"\nprofile = \"release\"\nrecipe = \"{}\"\n",
+            "\n[native]\ntarget = \"{}\"\nprofile = \"release\"\nrecipe = \"{}\"\n",
+            "\n[outputs]\nloader_sha256 = \"{}\"\nkernel_sha256 = \"{}\"\n",
+            "symbols_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\n",
+            "init0_sha256 = \"{}\"\nhello_sha256 = \"{}\"\n",
+            "ovmf_code_sha256 = \"{}\"\novmf_vars_template_sha256 = \"{}\"\n"
+        ),
+        BUILD_RECEIPT_KIND,
+        request.deepwyrm_revision,
+        sources.deepwyrm_tree,
+        request.wyrmroot_revision,
+        sources.wyrmroot_tree,
+        request.rust_revision,
+        sources.rust_tree,
+        BUILD_RECEIPT_TOOLCHAIN_REQUEST,
+        identity.accepted_toolchain_request_sha256,
+        identity.accepted_toolchain_manifest_sha256,
+        identity.toolchain_tree_sha256,
+        identity.rustc_sha256,
+        identity.cargo_sha256,
+        identity.rust_lld_sha256,
+        identity.llvm_sha256,
+        identity.llvm_build_version,
+        identity.versions_sha256,
+        identity.profiles_sha256,
+        request.selector,
+        request.test_id,
+        BUILD_RECEIPT_LOADER_RECIPE,
+        BUILD_RECEIPT_KERNEL_RECIPE,
+        WYR0_I_RUST_TARGET,
+        BUILD_RECEIPT_NATIVE_RECIPE,
+        outputs.loader,
+        outputs.kernel,
+        outputs.symbols,
+        outputs.bootstrap,
+        outputs.init0,
+        outputs.hello,
+        outputs.ovmf_code,
+        outputs.ovmf_vars_template,
+    ))
+}
+
 fn verify_build_receipt(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<(), Failure> {
     let values = build_receipt_values(&artifacts.build_receipt)?;
     let mut expected_keys = BUILD_RECEIPT_KEYS.iter().copied().collect::<BTreeSet<_>>();
@@ -1536,6 +1647,10 @@ fn inspect_loaded(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
         HProfile::Smp.memory_mib(),
         image_report.trim(),
     ))
+}
+
+pub(crate) fn verify_candidate(request: &HRequest) -> Result<(), Failure> {
+    verify_candidate_inputs(request).map(drop)
 }
 
 fn verify_candidate_inputs(request: &HRequest) -> Result<CandidateArtifacts, Failure> {
@@ -3902,7 +4017,7 @@ fn cleanup_after_kill_failure(killed: bool, suffix: &str) -> CleanupDisposition 
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct SourceState {
+pub(crate) struct SourceState {
     revision: String,
     clean: bool,
 }
@@ -3912,6 +4027,12 @@ struct SourceQualification {
     deepwyrm: SourceState,
     wyrmroot: SourceState,
     rust: SourceState,
+}
+
+/// The clean exact-revision qualification `image`, `run` and `wyr0 build`
+/// all apply before touching a candidate.
+pub(crate) fn qualify_request_sources(request: &HRequest) -> Result<(), Failure> {
+    verify_source_revisions(request).map(drop)
 }
 
 fn verify_source_revisions(request: &HRequest) -> Result<SourceQualification, Failure> {
@@ -3926,7 +4047,11 @@ fn verify_source_revisions(request: &HRequest) -> Result<SourceQualification, Fa
     })
 }
 
-fn qualify_source(repository: &Path, expected: &str, label: &str) -> Result<SourceState, Failure> {
+pub(crate) fn qualify_source(
+    repository: &Path,
+    expected: &str,
+    label: &str,
+) -> Result<SourceState, Failure> {
     let revision = git_output(repository, &["rev-parse", "HEAD"], label)?;
     let revision = revision.trim().to_owned();
     if revision != expected {
@@ -3948,7 +4073,7 @@ fn qualify_source(repository: &Path, expected: &str, label: &str) -> Result<Sour
     Ok(SourceState { revision, clean })
 }
 
-fn source_workspace_root(repository: &Path) -> Result<PathBuf, Failure> {
+pub(crate) fn source_workspace_root(repository: &Path) -> Result<PathBuf, Failure> {
     repository
         .ancestors()
         .skip(1)
@@ -4120,7 +4245,7 @@ fn create_run_file(
     })
 }
 
-fn write_new(
+pub(crate) fn write_new(
     outputs: &CheckedOutputRoot,
     path: &Path,
     bytes: &[u8],
@@ -4169,7 +4294,10 @@ fn digest(path: &Path, label: &str) -> Result<String, Failure> {
         .map_err(|error| Failure::task(format!("could not hash {label}: {error}")))
 }
 
-fn rollback_created(outputs: &CheckedOutputRoot, created: &[(&Path, &str)]) -> Result<(), Failure> {
+pub(crate) fn rollback_created(
+    outputs: &CheckedOutputRoot,
+    created: &[(&Path, &str)],
+) -> Result<(), Failure> {
     let mut failures = Vec::new();
     for (path, label) in created {
         if let Err(error) = outputs.remove_file(path, label) {
@@ -4186,7 +4314,7 @@ fn rollback_created(outputs: &CheckedOutputRoot, created: &[(&Path, &str)]) -> R
     }
 }
 
-fn with_rollback(mut primary: Failure, rollback: Result<(), Failure>) -> Failure {
+pub(crate) fn with_rollback(mut primary: Failure, rollback: Result<(), Failure>) -> Failure {
     if let Err(rollback) = rollback {
         primary.message = format!(
             "{}; partial WYR0-H outputs may remain because rollback failed: {}",
@@ -4405,67 +4533,22 @@ mod tests {
             ovmf_vars_template: request.ovmf_vars_template.clone(),
         };
         let identity = certificate_identity(&request).expect("certificate identity");
-        let receipt = format!(
-            concat!(
-                "schema_version = 1\nreport_kind = \"{}\"\nstatus = \"PASS\"\n",
-                "source_checkout_clean_before = true\nsource_checkout_clean_after = true\n",
-                "deepwyrm_revision = \"{}\"\ndeepwyrm_tree = \"{}\"\n",
-                "wyrmroot_revision = \"{}\"\nwyrmroot_tree = \"{}\"\n",
-                "rust_revision = \"{}\"\nrust_tree = \"{}\"\n",
-                "accepted_toolchain_request = \"{}\"\n",
-                "accepted_toolchain_request_sha256 = \"{}\"\n",
-                "accepted_toolchain_manifest_sha256 = \"{}\"\n",
-                "toolchain_tree_sha256 = \"{}\"\nrustc_sha256 = \"{}\"\n",
-                "cargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\n",
-                "llvm_sha256 = \"{}\"\nllvm_build_version = \"{}\"\n",
-                "versions_sha256 = \"{}\"\nprofiles_sha256 = \"{}\"\n",
-                "selector = \"{}\"\ntest_id = {}\n",
-                "[loader]\ntarget = \"x86_64-unknown-uefi\"\nprofile = \"production\"\nrecipe = \"{}\"\n",
-                "[kernel]\ntarget = \"x86_64-unknown-none\"\nprofile = \"release\"\nrecipe = \"{}\"\n",
-                "[native]\ntarget = \"{}\"\nprofile = \"release\"\nrecipe = \"{}\"\n",
-                "[outputs]\nloader_sha256 = \"{}\"\nkernel_sha256 = \"{}\"\n",
-                "symbols_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\n",
-                "init0_sha256 = \"{}\"\nhello_sha256 = \"{}\"\n",
-                "ovmf_code_sha256 = \"{}\"\novmf_vars_template_sha256 = \"{}\"\n"
-            ),
-            BUILD_RECEIPT_KIND,
-            request.deepwyrm_revision,
-            git_tree(
-                &workspace.join("deepwyrm"),
-                &request.deepwyrm_revision,
-                "Deepwyrm tree"
-            )
-            .unwrap(),
-            request.wyrmroot_revision,
-            git_tree(&repository, &request.wyrmroot_revision, "Wyrmroot tree").unwrap(),
-            request.rust_revision,
-            git_tree(&workspace.join("rust"), &request.rust_revision, "Rust tree").unwrap(),
-            BUILD_RECEIPT_TOOLCHAIN_REQUEST,
-            identity.accepted_toolchain_request_sha256,
-            identity.accepted_toolchain_manifest_sha256,
-            identity.toolchain_tree_sha256,
-            identity.rustc_sha256,
-            identity.cargo_sha256,
-            identity.rust_lld_sha256,
-            identity.llvm_sha256,
-            identity.llvm_build_version,
-            identity.versions_sha256,
-            identity.profiles_sha256,
-            request.selector,
-            request.test_id,
-            BUILD_RECEIPT_LOADER_RECIPE,
-            BUILD_RECEIPT_KERNEL_RECIPE,
-            WYR0_I_RUST_TARGET,
-            BUILD_RECEIPT_NATIVE_RECIPE,
-            digest(&artifacts.loader, "loader").unwrap(),
-            digest(&artifacts.kernel, "kernel").unwrap(),
-            digest(&artifacts.symbols, "symbols").unwrap(),
-            digest(&artifacts.bootstrap, "bootstrap").unwrap(),
-            digest(&artifacts.init0, "init0").unwrap(),
-            digest(&artifacts.hello, "hello").unwrap(),
-            digest(&artifacts.ovmf_code, "OVMF code").unwrap(),
-            digest(&artifacts.ovmf_vars_template, "OVMF vars").unwrap(),
-        );
+        let receipt = render_build_receipt(
+            &request,
+            &identity,
+            &receipt_sources(&request).expect("receipt sources"),
+            &ReceiptOutputs {
+                loader: digest(&artifacts.loader, "loader").unwrap(),
+                kernel: digest(&artifacts.kernel, "kernel").unwrap(),
+                symbols: digest(&artifacts.symbols, "symbols").unwrap(),
+                bootstrap: digest(&artifacts.bootstrap, "bootstrap").unwrap(),
+                init0: digest(&artifacts.init0, "init0").unwrap(),
+                hello: digest(&artifacts.hello, "hello").unwrap(),
+                ovmf_code: digest(&artifacts.ovmf_code, "OVMF code").unwrap(),
+                ovmf_vars_template: digest(&artifacts.ovmf_vars_template, "OVMF vars").unwrap(),
+            },
+        )
+        .expect("render lineage receipt");
         fs::write(&artifacts.build_receipt, receipt).expect("write lineage receipt");
         (request, artifacts)
     }
@@ -5449,6 +5532,55 @@ mod tests {
             values.keys().map(String::as_str).collect::<BTreeSet<_>>(),
             BUILD_RECEIPT_KEYS.iter().copied().collect::<BTreeSet<_>>()
         );
+    }
+
+    #[test]
+    fn wyr0_build_receipt_renderer_is_accepted_by_verify_build_receipt() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "xtask-wyr0-build-receipt-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before epoch")
+                    .as_nanos()
+            ));
+        // `lineage_fixture` writes its receipt through `render_build_receipt`.
+        let (request, artifacts) = lineage_fixture(&root);
+        verify_build_receipt(&request, &artifacts).expect("rendered receipt rejected");
+        let receipt = fs::read_to_string(&artifacts.build_receipt).expect("read receipt");
+        assert!(receipt.contains("written by `xtask wyr0 build`"));
+        assert_eq!(
+            build_receipt_values(&artifacts.build_receipt)
+                .expect("parse rendered receipt")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BUILD_RECEIPT_KEYS.iter().copied().collect::<BTreeSet<_>>()
+        );
+        fs::remove_dir_all(&root).expect("remove receipt fixture");
+
+        let (capability_root, capability) = capability_request("wyr0-build-receipt-schema4");
+        let identity = certificate_identity(&HRequest {
+            deepwyrm_revision: request.deepwyrm_revision.clone(),
+            rust_revision: request.rust_revision.clone(),
+            ..capability.clone()
+        })
+        .expect("certificate identity");
+        let sources = receipt_sources(&request).expect("receipt sources");
+        let outputs = ReceiptOutputs {
+            loader: "0".repeat(64),
+            kernel: "0".repeat(64),
+            symbols: "0".repeat(64),
+            bootstrap: "0".repeat(64),
+            init0: "0".repeat(64),
+            hello: "0".repeat(64),
+            ovmf_code: "0".repeat(64),
+            ovmf_vars_template: "0".repeat(64),
+        };
+        assert!(render_build_receipt(&capability, &identity, &sources, &outputs).is_err());
+        fs::remove_dir_all(capability_root).expect("remove capability fixture");
     }
 
     #[test]

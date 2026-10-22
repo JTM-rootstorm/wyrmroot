@@ -55,6 +55,7 @@ Usage:
     tools/pinned-cargo xtask test host wyr1e8-producer-fixture
     cargo xtask test guest [filter]
     cargo xtask test integration wyr0 [default|smp] --request <wyr0-h-request.toml>
+    tools/pinned-cargo xtask wyr0 build --request <wyr0-h-request.toml>
     tools/pinned-cargo xtask wyr1 image --request <wyr1-a-request.toml>
     tools/pinned-cargo xtask wyr1 inspect --request <wyr1-a-request.toml>
     tools/pinned-cargo xtask wyr1 prepare --request <wyr1-a-request.toml>
@@ -178,6 +179,10 @@ the 1-vCPU default and 4-vCPU smp profiles. Guest-test remains unavailable;
 the integration command owns the complete paired profile assertion.
 Each request requires a sibling build-receipt.toml produced by its isolated
 canonical build lane; see toolchain/templates/wyr0-h-build-receipt.toml.
+`wyr0 build` is that lane for every selector in its table: from clean checkouts
+at the request's exact revisions it builds the loader, kernel, bootstrap, init0
+and hello into the request-relative paths the request names, then writes the
+receipt from measured values.
 
 The WYR0-I-B artifact audit consumes two already-built requests in distinct
 output roots. It requires separately recorded clean-build process evidence;
@@ -231,6 +236,7 @@ pub(crate) enum Action {
     BuildG3Image(G3ImageArguments),
     InspectG3Image(G3ImageArguments),
     BuildHImage(String),
+    BuildHInputs(String),
     InspectHImage(String),
     AuditIB {
         first_request: String,
@@ -430,6 +436,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
             expect_arity(arguments, 1, "doc does not accept arguments")?;
             Ok(Action::Rustdoc)
         }
+        "wyr0" => dispatch_wyr0(&arguments[1..]),
         "wyr1" => dispatch_wyr1(&arguments[1..]),
         "wyr1b" => dispatch_wyr1b(&arguments[1..]),
         "r1" => dispatch_r1(&arguments[1..]),
@@ -450,6 +457,17 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
+    }
+}
+
+fn dispatch_wyr0(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [command, flag, request] if command == "build" && flag == "--request" => {
+            Ok(Action::BuildHInputs(request.clone()))
+        }
+        _ => Err(Failure::usage(
+            "wyr0 requires build --request <wyr0-h-request.toml>",
+        )),
     }
 }
 
@@ -1215,11 +1233,22 @@ mod tests {
         assert!(BuildScope::Bootfs.runs_bootfs_package());
         assert!(USAGE.contains("WYR0-H request path"));
         assert!(USAGE.contains("build-receipt.toml"));
+        assert!(USAGE.contains("`wyr0 build` is that lane"));
         assert!(USAGE.contains("requires separately recorded clean-build process evidence"));
     }
 
     #[test]
     fn h_actions_dispatch_and_guest_test_remains_unavailable() {
+        assert_eq!(
+            dispatch(&arguments(&["image", "--request", "request.toml"])),
+            Ok(Action::BuildHImage("request.toml".into()))
+        );
+        assert_eq!(
+            dispatch(&arguments(&["wyr0", "build", "--request", "request.toml"])),
+            Ok(Action::BuildHInputs("request.toml".into()))
+        );
+        assert!(dispatch(&arguments(&["wyr0", "build", "request.toml"])).is_err());
+        assert!(dispatch(&arguments(&["wyr0", "image", "--request", "request.toml"])).is_err());
         assert_eq!(
             dispatch(&arguments(&["image", "--request", "request.toml"])),
             Ok(Action::BuildHImage("request.toml".into()))
