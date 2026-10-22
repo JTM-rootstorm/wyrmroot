@@ -758,7 +758,9 @@ fn start_and_join_resident(
         5,
     )?;
     wait_signal(thread, DW_SIGNAL_EXITED, CONCURRENT_UNMAP_TIMEOUT_NS, 6)?;
-    normal_exit(thread, 7, 8)?;
+    // A Thread B that could not exit ends its whole Process with a stage-7
+    // code instead; report that code rather than B's terminated record.
+    normal_exit(thread, 7, 8).map_err(|code| stage_seven_process_code(process).unwrap_or(code))?;
 
     send_channel(channel, &CONCURRENT_UNMAP_JOIN, &[])
         .map_err(|_| failure(Stage::ConcurrentUnmap, 9))?;
@@ -785,6 +787,22 @@ fn start_and_join_resident(
         return Err(failure(Stage::ConcurrentUnmap, 14));
     }
     Ok(())
+}
+
+/// The child Process's own stage-7 failure code, once it has exited with one.
+fn stage_seven_process_code(process: DwHandle) -> Option<u32> {
+    let mut observed = DwWaitResultV1::default();
+    let deadline = future_deadline(LIFECYCLE_SCHEDULING_TIMEOUT_NS).ok()?;
+    if deepwyrm_syscall::wait_one(process, DW_SIGNAL_EXITED, deadline, &mut observed)
+        != DW_STATUS_SUCCESS
+    {
+        return None;
+    }
+    let info = wyrmroot_runtime::query_task_termination_info(process).ok()?;
+    (info.state == deepwyrm_syscall::DW_TASK_STATE_EXITED
+        && info.reason == deepwyrm_syscall::DW_TERMINATION_NORMAL_EXIT
+        && info.application_code & 0xffff_0000 == failure(Stage::ConcurrentUnmap, 0))
+    .then_some(info.application_code)
 }
 
 /// Requires a normal exit with application code zero.  A nonzero code from
@@ -991,9 +1009,24 @@ extern "C" fn concurrent_unmap_resident(_argument0: u64, _argument1: u64) -> ! {
         previous = now;
         RESIDENT_CLOCK_READS.fetch_add(1, Ordering::Relaxed);
     }
-    let _ = deepwyrm_syscall::thread_exit(code);
+    // `thread_exit` returns only on failure. Spinning here would hide that
+    // failure until the controller's 90-second bound; end the Process with a
+    // named code instead, which also releases Thread A's wait.
+    let status = deepwyrm_syscall::thread_exit(code);
+    let _ = deepwyrm_syscall::process_exit(resident_exit_failure(status));
     loop {
         core::hint::spin_loop();
+    }
+}
+
+/// Thread B's failure when `thread_exit` returned `status`: operation 0x32,
+/// or 0x33 for an unimplemented call.
+#[must_use]
+pub const fn resident_exit_failure(status: deepwyrm_syscall::DwStatus) -> u32 {
+    if status.0 == deepwyrm_syscall::DW_STATUS_NOT_SUPPORTED.0 {
+        failure(Stage::ConcurrentUnmap, 0x33)
+    } else {
+        failure(Stage::ConcurrentUnmap, 0x32)
     }
 }
 
@@ -1226,6 +1259,18 @@ mod tests {
         assert_eq!(resident_stack_pointer(0x60_0004, bytes), None);
         assert_eq!(resident_stack_pointer(u64::MAX - 15, bytes), None);
         assert_eq!(resident_stack_pointer(0x60_0000, 32), None);
+    }
+
+    #[test]
+    fn a_failed_resident_exit_is_a_named_stage_seven_code() {
+        assert_eq!(
+            resident_exit_failure(deepwyrm_syscall::DW_STATUS_NOT_SUPPORTED),
+            0x2207_0033
+        );
+        assert_eq!(
+            resident_exit_failure(deepwyrm_syscall::DW_STATUS_BAD_STATE),
+            0x2207_0032
+        );
     }
 
     #[test]

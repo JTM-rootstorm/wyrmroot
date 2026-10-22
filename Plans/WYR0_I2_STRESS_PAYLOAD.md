@@ -60,7 +60,10 @@ latency.
   for Thread B's normal zero exit, sends `"join"`, and then requires Thread A's
   READY and the Process's normal zero exit. Failures are `0x2207OOOO`
   (controller `0x0001..0x0013`, Thread A `0x0020..0x002e`, Thread B
-  `0x0030..0x0031`); a child or Thread B failure code is returned unchanged.
+  `0x0030..0x0033`); a child or Thread B failure code is returned unchanged.
+  If `thread_exit` returns, Thread B ends the Process with `0x0033`
+  (`NOT_SUPPORTED`) or `0x0032` (any other status) instead of spinning until
+  the controller's bound.
   No new selector, test ID, launch profile, capability, or ABI is involved.
   CPU placement is the scheduler's: nothing pins A and B to different vCPUs,
   so only the four-vCPU profile can put them on different CPUs.
