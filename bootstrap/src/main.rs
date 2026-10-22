@@ -97,6 +97,12 @@ const BOOTSTRAP_SUPERVISION_TIMEOUT_NS: u64 = if cfg!(feature = "dw1c-bootstrap-
     // deadlines. This outer watchdog must contain those phases without
     // replacing them or moving READY ahead of a possible selector failure.
     270_000_000_000
+} else if cfg!(feature = "i2-bootstrap-supervision") {
+    // Selector 22 likewise sends init0 READY only after the whole I2
+    // controller, whose stage-7 concurrent-unmap rounds run for seconds.
+    // init0 bounds that controller by its 120-second I2 deadline; this outer
+    // watchdog contains it.
+    150_000_000_000
 } else {
     5_000_000_000
 };

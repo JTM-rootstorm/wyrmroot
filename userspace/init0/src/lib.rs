@@ -96,6 +96,16 @@ pub const I2_STRESS_PATH: &[u8] = b"bin/hello";
 pub const I_CAPABILITY_PATH: &[u8] = b"bin/hello";
 /// Nonzero WRLP transaction identifier for the `init0 -> hello` launch.
 pub const HELLO_TRANSACTION_ID: u64 = 2;
+/// init0's bound on its child's READY and normal exit, measured from init0's
+/// start.  Selector 22's I2 controller sends READY only after all seven of its
+/// stages, and stage 7 (concurrent unmap) deliberately runs for seconds under
+/// SMP QEMU, so the I2 profile alone gets a bound that contains it.  The
+/// bootstrap's `i2-bootstrap-supervision` watchdog in turn contains this one.
+pub const CHILD_SUPERVISION_DEADLINE_NS: u64 = if cfg!(feature = "i2-stress-integration") {
+    120_000_000_000
+} else {
+    5_000_000_000
+};
 #[cfg(feature = "dw1b-preemption-integration")]
 pub const DW1B_HOG_PATH: &[u8] = b"test/dw1-b/cpu-hog";
 #[cfg(feature = "dw1b-preemption-integration")]

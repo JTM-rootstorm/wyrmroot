@@ -20,7 +20,11 @@ iterations.  An application failure is `0x22SSOOOO`, where `SS` is the stage
 and `OOOO` the exact failed operation.  This propagates through init0's
 existing structured Process exit and the selector's terminal result.
 Lifecycle waits that depend on another vCPU receiving dispatch use a one-second
-active-monotonic bound.  The intentionally tiny nanosecond/millisecond timeout
+active-monotonic bound. Stage 7's waits on the round loop use a 90-second
+bound; init0 built with `i2-stress-integration` bounds the controller's READY
+and exit at 120 seconds instead of the ordinary 5, and the bootstrap built
+with `i2-bootstrap-supervision` bounds init0 at 150 seconds instead of 5. The
+request's `timeout_seconds` must contain all of these plus firmware boot.  The intentionally tiny nanosecond/millisecond timeout
 probes remain unchanged; they test timeout semantics rather than scheduling
 latency.
 
@@ -43,6 +47,23 @@ latency.
   releasing/supervising the other. A third transaction-selected leaf emits a
   valid READY then executes the narrow test-only `UD2`; its generated EXITED
   record must report `UNHANDLED_EXCEPTION` plus `ILLEGAL_INSTRUCTION`.
+- Concurrent-unmap stage (7) loads one more copy of the payload under the
+  existing one-capability `ProbeChild` profile, transaction `0x2207`. That
+  child Process holds only its own root. Its initial Thread A announces Thread
+  B's entry and initial stack pointer (`"I2S7"` plus two little-endian u64),
+  the controller creates and starts Thread B in the child through the
+  loader-returned Process handle (`MODIFY`), and Thread B stays resident
+  alternating a 2048-iteration user spin with `ClockGet` (and checks the clock
+  never goes backwards). Thread A waits until B is resident, then runs 8192
+  rounds of MemoryObject create, RW map through its root, write and read back
+  every word of the page, unmap, close; then sets STOP. The controller waits
+  for Thread B's normal zero exit, sends `"join"`, and then requires Thread A's
+  READY and the Process's normal zero exit. Failures are `0x2207OOOO`
+  (controller `0x0001..0x0013`, Thread A `0x0020..0x002e`, Thread B
+  `0x0030..0x0031`); a child or Thread B failure code is returned unchanged.
+  No new selector, test ID, launch profile, capability, or ABI is involved.
+  CPU placement is the scheduler's: nothing pins A and B to different vCPUs,
+  so only the four-vCPU profile can put them on different CPUs.
 
 ## Explicit present limits
 
@@ -77,7 +98,11 @@ explicit cross-process Event/atomic limit above.
 ```text
 cargo build --offline --package wyrmroot-i2-stress --bin wyrmroot-i2-stress --features native-i2-stress --target x86_64-unknown-wyrmroot
 cargo build --offline --package wyrmroot-init0 --bin wyrmroot-init0 --features native-init0,i2-stress-integration --target x86_64-unknown-wyrmroot
+cargo build --offline --package wyrmroot-bootstrap --bin wyrmroot-bootstrap --features native-bootstrap,wyr0-init0-integration,i2-bootstrap-supervision --target x86_64-unknown-wyrmroot
 ```
+
+No xtask product path builds these three; the unfiltered host gate only
+`cargo check`s their library shapes (`FEATURE_COMBINATIONS_HAND_MAINTAINED`).
 
 Supply the first output as the request's `hello` artifact only for the I2
 image.  The normal image continues to supply `wyrmroot-hello` and an init0

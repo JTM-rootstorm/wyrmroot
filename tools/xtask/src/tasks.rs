@@ -1972,6 +1972,16 @@ const FEATURE_COMBINATIONS_HAND_MAINTAINED: &[(&str, &str)] = &[
         "native-bootstrap,wyr0-init0-integration,dw1c-bootstrap-supervision",
     ),
     ("wyrmroot-bootstrap", "native-bootstrap,dw1d6-synthetic"),
+    // Selector 22 (DW0-I2 runtime stress). No product builder mints its image
+    // (`WYR0_I2_STRESS_PAYLOAD.md` records the manual build), so without these
+    // rows nothing would notice its controller, init0 or bootstrap shape stop
+    // compiling.
+    (
+        "wyrmroot-bootstrap",
+        "native-bootstrap,wyr0-init0-integration,i2-bootstrap-supervision",
+    ),
+    ("wyrmroot-init0", "native-init0,i2-stress-integration"),
+    ("wyrmroot-i2-stress", "native-i2-stress"),
     ("wyrmroot-bootstrap", "wyr1c4-production"),
     ("wyrmroot-bootstrap", "wyr1c5-production"),
     ("wyrmroot-bootstrap", "wyr1c6-production"),

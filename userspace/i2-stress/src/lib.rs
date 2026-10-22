@@ -6,7 +6,15 @@
 //! The I2 image puts this executable at `bin/hello` and builds init0 with
 //! `i2-stress-integration`.  It therefore receives only the ordinary explicit
 //! WYR0 loader capabilities; no test-only kernel ABI or ambient handle exists.
+//!
+//! Stage 7 (concurrent unmap) loads one more copy of this payload under the
+//! existing one-capability `ProbeChild` profile.  That child Process holds only
+//! its own root AddressRegion; its initial Thread A repeatedly creates, maps,
+//! writes, unmaps and closes a page while a second Thread B, created in the
+//! same Process by the controller through the loader-returned Process handle,
+//! stays resident alternating a user spin with `ClockGet`.
 
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use deepwyrm_syscall::{
     self, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
     DW_MEMORY_PROTECTION_READ, DW_MEMORY_PROTECTION_WRITE, DW_RIGHT_DUPLICATE, DW_RIGHT_EXECUTE,
@@ -15,10 +23,12 @@ use deepwyrm_syscall::{
     DW_SIGNAL_SIGNALED, DW_STATUS_SUCCESS, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK,
     DwAddressRegionMapArgsV1, DwAddressRegionMapFlags, DwDeadline, DwHandle, DwHandleTransferV1,
     DwMemoryObjectCreateFlags, DwMemoryProtection, DwOffset, DwReceivedHandleInfoV1, DwRights,
-    DwSize, DwUserAddress, DwWaitResultV1,
+    DwSize, DwThreadStartArgsV1, DwUserAddress, DwWaitResultV1,
 };
 use wyrmroot_bootfs::archive::Archive;
-use wyrmroot_loader::launch::{HEADER_BYTES, INIT0_BYTES, LaunchProfile, encode_ready, parse_init};
+use wyrmroot_loader::launch::{
+    HEADER_BYTES, INIT0_BYTES, LaunchProfile, encode_ready, encode_ready_for_profile, parse_init,
+};
 use wyrmroot_loader::process::{LoadAuthority, LoadRequest, load_process};
 use wyrmroot_runtime::{
     MappingPlan, NativeLoaderPlatform, close_handle, map_bootfs_read_only, monotonic_active_now,
@@ -36,6 +46,27 @@ const PAGE: u64 = 4096;
 // so host scheduling pressure cannot turn the lifecycle oracle into a flake.
 const LIFECYCLE_SCHEDULING_TIMEOUT_NS: u64 = 1_000_000_000;
 
+/// WRLP transaction that selects the stage-7 concurrent-unmap child.
+pub const CONCURRENT_UNMAP_TRANSACTION: u64 = 0x2207;
+/// Thread A's create/map/write/unmap/close rounds.  Sized so the stage spans
+/// seconds under four-vCPU TCG QEMU while every round still leaves the root
+/// with no stage-7 mapping and no live stage-7 MemoryObject.
+pub const CONCURRENT_UNMAP_ROUNDS: u32 = 8192;
+/// Thread B's user-mode spin iterations between consecutive `ClockGet` calls.
+const RESIDENT_SPIN_ITERATIONS: u32 = 2048;
+/// Bound on the whole round loop as observed by the controller, and on every
+/// wait whose release depends on that loop finishing.  It sits inside init0's
+/// 120-second I2 child deadline (`CHILD_SUPERVISION_DEADLINE_NS`).
+const CONCURRENT_UNMAP_TIMEOUT_NS: u64 = 90_000_000_000;
+/// Child -> controller announcement tag; followed by little-endian entry and
+/// initial stack pointer for Thread B.
+pub const RESIDENT_ANNOUNCEMENT_TAG: [u8; 4] = *b"I2S7";
+pub const RESIDENT_ANNOUNCEMENT_BYTES: usize = 20;
+/// Controller -> child release, sent only after Thread B has exited.
+pub const CONCURRENT_UNMAP_JOIN: [u8; 4] = *b"join";
+const RESIDENT_STACK_WORDS: usize = 2048;
+const PAGE_WORDS: usize = (PAGE / 8) as usize;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Stage {
@@ -45,6 +76,7 @@ pub enum Stage {
     Wait = 4,
     Mapping = 5,
     Lifecycle = 6,
+    ConcurrentUnmap = 7,
 }
 
 /// Stable application result carried by init0's existing structured exit path.
@@ -54,9 +86,10 @@ pub const fn failure(stage: Stage, operation: u16) -> u32 {
     0x2200_0000 | ((stage as u32) << 16) | operation as u32
 }
 
-/// Runs as either the I2 controller (`I2Stress` INIT) or a normal no-capability
-/// leaf (`Hello` INIT).  The latter is intentionally tiny and lets the controller
-/// exercise init0's real child create/start/exit/terminate path without another ABI.
+/// Runs as the I2 controller (`I2Stress` INIT), a normal no-capability leaf
+/// (`Hello` INIT), or the stage-7 concurrent-unmap child (`ProbeChild` INIT).
+/// The leaf is intentionally tiny and lets the controller exercise init0's real
+/// child create/start/exit/terminate path without another ABI.
 pub fn run_i2_stress(channel: DwHandle) -> Result<(), u32> {
     let mut bytes = [0_u8; INIT0_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 3];
@@ -88,6 +121,14 @@ pub fn run_i2_stress(channel: DwHandle) -> Result<(), u32> {
             }
         }
         return close_handle(channel).map_err(|_| failure(Stage::Bootstrap, 5));
+    }
+
+    if let Ok(child) = parse_init(
+        LaunchProfile::ProbeChild,
+        &bytes[..received.bytes],
+        &handles[..received.handles],
+    ) {
+        return run_concurrent_unmap_child(channel, handles[0].handle, child.transaction_id);
     }
 
     let message = parse_init(
@@ -523,11 +564,437 @@ fn exercise_lifecycle(root: DwHandle, bootfs: DwHandle, task_group: DwHandle) ->
             return Err(failure(Stage::Lifecycle, 44));
         }
         close_handle(exception.launch_channel).map_err(|_| failure(Stage::Lifecycle, 45))?;
-        close_handle(exception.process).map_err(|_| failure(Stage::Lifecycle, 46))
+        close_handle(exception.process).map_err(|_| failure(Stage::Lifecycle, 46))?;
+
+        // Stage 7 needs the same immutable payload image, so it runs while the
+        // lifecycle stage's read-only bootfs mapping is still live.
+        exercise_concurrent_unmap(&mut loader, authority, entry.data(), display)
     });
     let unmap = unmap_bootfs(mapping).map_err(|_| failure(Stage::Lifecycle, 26));
     result?;
     unmap
+}
+
+// ---------------------------------------------------------------------------
+// Stage 7: concurrent unmap.
+//
+// Protocol on the child's WRLP launch channel (transaction 0x2207):
+//   1. loader -> child   INIT(ProbeChild): exactly the child's own root.
+//   2. child -> ctl      "I2S7" ++ entry:u64le ++ stack_pointer:u64le.
+//   3. ctl               thread_create(child Process) + thread_start(Thread B).
+//   4. Thread B          RESIDENT=1, then spin/ClockGet until STOP, thread_exit.
+//   5. Thread A          waits RESIDENT, runs the rounds, then sets STOP.
+//   6. ctl               waits Thread B EXITED (normal, code 0), sends "join".
+//   7. Thread A          receives "join", sends READY(ProbeChild, 0x2207), exits 0.
+//   8. ctl               waits Process EXITED (normal, code 0) and the READY.
+// A nonzero child or Thread B exit code is already a 0x2207xxxx failure and is
+// returned unchanged by the controller.
+
+/// Thread B's stack.  Atomics make the region interior-mutable, so the CPU
+/// writing it through RSP never aliases a Rust shared reference.
+#[repr(C, align(16))]
+struct ResidentStack([AtomicU64; RESIDENT_STACK_WORDS]);
+
+static RESIDENT_STACK: ResidentStack =
+    ResidentStack([const { AtomicU64::new(0) }; RESIDENT_STACK_WORDS]);
+static RESIDENT: AtomicU32 = AtomicU32::new(0);
+static STOP: AtomicU32 = AtomicU32::new(0);
+static RESIDENT_CLOCK_READS: AtomicU64 = AtomicU64::new(0);
+
+/// Encodes the child's Thread B start announcement.
+#[must_use]
+pub fn encode_resident_announcement(
+    entry: u64,
+    stack_pointer: u64,
+) -> [u8; RESIDENT_ANNOUNCEMENT_BYTES] {
+    let mut bytes = [0_u8; RESIDENT_ANNOUNCEMENT_BYTES];
+    bytes[..4].copy_from_slice(&RESIDENT_ANNOUNCEMENT_TAG);
+    bytes[4..12].copy_from_slice(&entry.to_le_bytes());
+    bytes[12..20].copy_from_slice(&stack_pointer.to_le_bytes());
+    bytes
+}
+
+/// Decodes an exact announcement; any other length or tag is rejected.
+#[must_use]
+pub fn decode_resident_announcement(bytes: &[u8]) -> Option<(u64, u64)> {
+    if bytes.len() != RESIDENT_ANNOUNCEMENT_BYTES || bytes[..4] != RESIDENT_ANNOUNCEMENT_TAG {
+        return None;
+    }
+    let entry = u64::from_le_bytes(bytes[4..12].try_into().ok()?);
+    let stack_pointer = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
+    if entry == 0 || stack_pointer == 0 {
+        return None;
+    }
+    Some((entry, stack_pointer))
+}
+
+/// Initial RSP for a stack occupying `[base, base + bytes)`: one word below a
+/// 16-byte-aligned top, i.e. the SysV state immediately after a `call`.
+#[must_use]
+pub const fn resident_stack_pointer(base: u64, bytes: u64) -> Option<u64> {
+    if bytes < 64 {
+        return None;
+    }
+    let Some(top) = base.checked_add(bytes) else {
+        return None;
+    };
+    if !top.is_multiple_of(16) {
+        return None;
+    }
+    Some(top - 8)
+}
+
+/// Value Thread A writes to word `index` of the page in `round`.
+#[must_use]
+pub const fn concurrent_unmap_word(round: u32, index: usize) -> u64 {
+    ((I2_SEED as u64) << 32) ^ ((round as u64) << 12) ^ index as u64
+}
+
+fn exercise_concurrent_unmap(
+    loader: &mut NativeLoaderPlatform,
+    authority: LoadAuthority,
+    image: &[u8],
+    display: &str,
+) -> Result<(), u32> {
+    let child = load_process(
+        loader,
+        authority,
+        LoadRequest {
+            image,
+            display_path: display,
+            profile: LaunchProfile::ProbeChild,
+            transaction_id: CONCURRENT_UNMAP_TRANSACTION,
+        },
+    )
+    .map_err(|_| failure(Stage::ConcurrentUnmap, 1))?;
+    let result = supervise_concurrent_unmap(child.process, child.launch_channel);
+    let cleanup = if result.is_err() {
+        terminate_concurrent_unmap_child(child.process)
+    } else {
+        Ok(())
+    };
+    let channel_closed = close_handle(child.launch_channel);
+    let process_closed = close_handle(child.process);
+    result?;
+    cleanup?;
+    channel_closed.map_err(|_| failure(Stage::ConcurrentUnmap, 16))?;
+    process_closed.map_err(|_| failure(Stage::ConcurrentUnmap, 17))
+}
+
+fn terminate_concurrent_unmap_child(process: DwHandle) -> Result<(), u32> {
+    let status = deepwyrm_syscall::process_terminate(
+        process,
+        deepwyrm_syscall::DW_TERMINATION_AUTHORIZED,
+        I2_SEED,
+    );
+    if status != DW_STATUS_SUCCESS && status != deepwyrm_syscall::DW_STATUS_BAD_STATE {
+        return Err(failure(Stage::ConcurrentUnmap, 18));
+    }
+    let mut terminal = DwWaitResultV1::default();
+    success(
+        deepwyrm_syscall::wait_one(
+            process,
+            DW_SIGNAL_EXITED,
+            future_deadline(LIFECYCLE_SCHEDULING_TIMEOUT_NS)?,
+            &mut terminal,
+        ),
+        Stage::ConcurrentUnmap,
+        19,
+    )
+}
+
+fn supervise_concurrent_unmap(process: DwHandle, channel: DwHandle) -> Result<(), u32> {
+    wait_signal(
+        channel,
+        DW_SIGNAL_READABLE,
+        LIFECYCLE_SCHEDULING_TIMEOUT_NS,
+        2,
+    )?;
+    let mut announcement = [0_u8; RESIDENT_ANNOUNCEMENT_BYTES + 1];
+    let mut none = [];
+    let received = receive_channel(channel, &mut announcement, &mut none)
+        .map_err(|_| failure(Stage::ConcurrentUnmap, 3))?;
+    let (entry, stack_pointer) = announcement
+        .get(..received.bytes)
+        .filter(|_| received.handles == 0)
+        .and_then(decode_resident_announcement)
+        .ok_or(failure(Stage::ConcurrentUnmap, 3))?;
+
+    let rights =
+        DwRights(DW_RIGHT_EXECUTE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
+    let mut thread = DwHandle(0);
+    success(
+        deepwyrm_syscall::thread_create(process, rights, &mut thread),
+        Stage::ConcurrentUnmap,
+        4,
+    )?;
+    let result = start_and_join_resident(process, channel, thread, entry, stack_pointer);
+    let closed = close_handle(thread);
+    result?;
+    closed.map_err(|_| failure(Stage::ConcurrentUnmap, 15))
+}
+
+fn start_and_join_resident(
+    process: DwHandle,
+    channel: DwHandle,
+    thread: DwHandle,
+    entry: u64,
+    stack_pointer: u64,
+) -> Result<(), u32> {
+    let args = DwThreadStartArgsV1 {
+        size: deepwyrm_syscall::DW_THREAD_START_ARGS_V1_SIZE,
+        version: 1,
+        thread,
+        entry: DwUserAddress(entry),
+        stack_pointer: DwUserAddress(stack_pointer),
+        startup_argument0: 0,
+        startup_argument1: 0,
+        flags: 0,
+        reserved: [0; 3],
+    };
+    success(
+        deepwyrm_syscall::thread_start(&args),
+        Stage::ConcurrentUnmap,
+        5,
+    )?;
+    wait_signal(thread, DW_SIGNAL_EXITED, CONCURRENT_UNMAP_TIMEOUT_NS, 6)?;
+    normal_exit(thread, 7, 8)?;
+
+    send_channel(channel, &CONCURRENT_UNMAP_JOIN, &[])
+        .map_err(|_| failure(Stage::ConcurrentUnmap, 9))?;
+    wait_signal(
+        process,
+        DW_SIGNAL_EXITED,
+        LIFECYCLE_SCHEDULING_TIMEOUT_NS,
+        10,
+    )?;
+    normal_exit(process, 11, 12)?;
+
+    let mut expected = [0_u8; HEADER_BYTES];
+    let expected_size = encode_ready_for_profile(
+        LaunchProfile::ProbeChild,
+        CONCURRENT_UNMAP_TRANSACTION,
+        &mut expected,
+    )
+    .map_err(|_| failure(Stage::ConcurrentUnmap, 14))?;
+    let mut ready = [0_u8; HEADER_BYTES + 1];
+    let mut none = [];
+    let received = receive_channel(channel, &mut ready, &mut none)
+        .map_err(|_| failure(Stage::ConcurrentUnmap, 13))?;
+    if received.handles != 0 || ready.get(..received.bytes) != expected.get(..expected_size) {
+        return Err(failure(Stage::ConcurrentUnmap, 14));
+    }
+    Ok(())
+}
+
+/// Requires a normal exit with application code zero.  A nonzero code from
+/// this payload is already a stage-7 failure record and is returned verbatim.
+fn normal_exit(task: DwHandle, query_operation: u16, state_operation: u16) -> Result<(), u32> {
+    let info = wyrmroot_runtime::query_task_termination_info(task)
+        .map_err(|_| failure(Stage::ConcurrentUnmap, query_operation))?;
+    if info.state != deepwyrm_syscall::DW_TASK_STATE_EXITED
+        || info.reason != deepwyrm_syscall::DW_TERMINATION_NORMAL_EXIT
+    {
+        return Err(failure(Stage::ConcurrentUnmap, state_operation));
+    }
+    match info.application_code {
+        0 => Ok(()),
+        code if code & 0xffff_0000 == failure(Stage::ConcurrentUnmap, 0) => Err(code),
+        _ => Err(failure(Stage::ConcurrentUnmap, state_operation)),
+    }
+}
+
+fn wait_signal(
+    handle: DwHandle,
+    signals: deepwyrm_syscall::DwSignals,
+    timeout: u64,
+    operation: u16,
+) -> Result<(), u32> {
+    let deadline = monotonic_active_now()
+        .ok()
+        .and_then(|now| now.checked_add(timeout))
+        .map(DwDeadline)
+        .ok_or(failure(Stage::ConcurrentUnmap, 0x2e))?;
+    let mut observed = DwWaitResultV1::default();
+    success(
+        deepwyrm_syscall::wait_one(handle, signals, deadline, &mut observed),
+        Stage::ConcurrentUnmap,
+        operation,
+    )
+}
+
+/// Thread A: the child's initial Thread.
+fn run_concurrent_unmap_child(
+    channel: DwHandle,
+    root: DwHandle,
+    transaction_id: u64,
+) -> Result<(), u32> {
+    if transaction_id != CONCURRENT_UNMAP_TRANSACTION {
+        return Err(failure(Stage::ConcurrentUnmap, 0x20));
+    }
+    let entry = concurrent_unmap_resident as extern "C" fn(u64, u64) -> ! as usize as u64;
+    let stack_base = (&raw const RESIDENT_STACK).addr() as u64;
+    let stack_pointer =
+        resident_stack_pointer(stack_base, core::mem::size_of::<ResidentStack>() as u64)
+            .ok_or(failure(Stage::ConcurrentUnmap, 0x20))?;
+    send_channel(
+        channel,
+        &encode_resident_announcement(entry, stack_pointer),
+        &[],
+    )
+    .map_err(|_| failure(Stage::ConcurrentUnmap, 0x21))?;
+
+    let rounds = wait_resident().and_then(|()| concurrent_unmap_rounds(root));
+    // Release Thread B whatever the rounds' outcome so the controller can
+    // observe its clean exit before it releases this Thread.
+    STOP.store(1, Ordering::Release);
+
+    wait_signal(
+        channel,
+        DW_SIGNAL_READABLE,
+        CONCURRENT_UNMAP_TIMEOUT_NS,
+        0x28,
+    )?;
+    let mut join = [0_u8; 5];
+    let mut none = [];
+    let received = receive_channel(channel, &mut join, &mut none)
+        .map_err(|_| failure(Stage::ConcurrentUnmap, 0x29))?;
+    if received.handles != 0 || join.get(..received.bytes) != Some(&CONCURRENT_UNMAP_JOIN[..]) {
+        return Err(failure(Stage::ConcurrentUnmap, 0x29));
+    }
+    rounds?;
+    close_handle(root).map_err(|_| failure(Stage::ConcurrentUnmap, 0x2d))?;
+    let mut ready = [0_u8; HEADER_BYTES];
+    let size = encode_ready_for_profile(LaunchProfile::ProbeChild, transaction_id, &mut ready)
+        .map_err(|_| failure(Stage::ConcurrentUnmap, 0x2a))?;
+    send_channel(channel, &ready[..size], &[])
+        .map_err(|_| failure(Stage::ConcurrentUnmap, 0x2b))?;
+    close_handle(channel).map_err(|_| failure(Stage::ConcurrentUnmap, 0x2c))
+}
+
+fn wait_resident() -> Result<(), u32> {
+    let deadline = monotonic_active_now()
+        .ok()
+        .and_then(|now| now.checked_add(LIFECYCLE_SCHEDULING_TIMEOUT_NS))
+        .ok_or(failure(Stage::ConcurrentUnmap, 0x2e))?;
+    while RESIDENT.load(Ordering::Acquire) == 0 {
+        let now = monotonic_active_now().map_err(|_| failure(Stage::ConcurrentUnmap, 0x2e))?;
+        if now >= deadline {
+            return Err(failure(Stage::ConcurrentUnmap, 0x22));
+        }
+        core::hint::spin_loop();
+    }
+    Ok(())
+}
+
+fn concurrent_unmap_rounds(root: DwHandle) -> Result<(), u32> {
+    let memory_rights =
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0);
+    let map = DwAddressRegionMapArgsV1 {
+        size: DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE,
+        version: DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
+        memory_object_offset: DwOffset(0),
+        byte_len: DwSize(PAGE),
+        requested_address: DwUserAddress(0),
+        protections: DwMemoryProtection(DW_MEMORY_PROTECTION_READ.0 | DW_MEMORY_PROTECTION_WRITE.0),
+        flags: DwAddressRegionMapFlags(0),
+        reserved: [0; 4],
+    };
+    for round in 0..CONCURRENT_UNMAP_ROUNDS {
+        let mut memory = DwHandle(0);
+        success(
+            deepwyrm_syscall::memory_object_create(
+                DwSize(PAGE),
+                DwMemoryObjectCreateFlags(0),
+                memory_rights,
+                &mut memory,
+            ),
+            Stage::ConcurrentUnmap,
+            0x23,
+        )?;
+        let mut address = DwUserAddress(0);
+        let mapped = success(
+            deepwyrm_syscall::address_region_map(root, memory, &map, &mut address),
+            Stage::ConcurrentUnmap,
+            0x24,
+        );
+        let written = mapped.and_then(|()| {
+            if write_and_verify_page(address.0, round) {
+                Ok(())
+            } else {
+                Err(failure(Stage::ConcurrentUnmap, 0x25))
+            }
+        });
+        let unmapped = if mapped.is_ok() {
+            success(
+                deepwyrm_syscall::address_region_unmap(root, address, DwSize(PAGE)),
+                Stage::ConcurrentUnmap,
+                0x26,
+            )
+        } else {
+            Ok(())
+        };
+        let closed = close_handle(memory).map_err(|_| failure(Stage::ConcurrentUnmap, 0x27));
+        written?;
+        unmapped?;
+        closed?;
+    }
+    Ok(())
+}
+
+#[allow(
+    unsafe_code,
+    reason = "I2 stage 7 must store through the one fresh RW page Thread A just mapped and is about to unmap; this is the payload's only raw user-memory access."
+)]
+fn write_and_verify_page(address: u64, round: u32) -> bool {
+    if address == 0 || !address.is_multiple_of(PAGE) {
+        return false;
+    }
+    let page = core::ptr::with_exposed_provenance_mut::<u64>(address as usize);
+    for index in 0..PAGE_WORDS {
+        // SAFETY: `address` is the page-aligned start of a PAGE-byte READ|WRITE
+        // mapping returned by `address_region_map` on this Thread and not yet
+        // unmapped; no other Thread or Rust reference uses it, and `index` stays
+        // within its PAGE / 8 words.
+        unsafe {
+            page.add(index)
+                .write_volatile(concurrent_unmap_word(round, index))
+        };
+    }
+    (0..PAGE_WORDS).all(|index| {
+        // SAFETY: as above; the mapping is still live and exclusively owned.
+        unsafe { page.add(index).read_volatile() == concurrent_unmap_word(round, index) }
+    })
+}
+
+/// Thread B: entered by `thread_start` with RSP one word below a 16-byte
+/// boundary, RDI/RSI = 0, and never returns.
+extern "C" fn concurrent_unmap_resident(_argument0: u64, _argument1: u64) -> ! {
+    RESIDENT.store(1, Ordering::Release);
+    let mut code = 0;
+    let mut previous = 0_u64;
+    while STOP.load(Ordering::Acquire) == 0 {
+        for _ in 0..RESIDENT_SPIN_ITERATIONS {
+            core::hint::spin_loop();
+        }
+        let mut now = 0_u64;
+        if deepwyrm_syscall::clock_get(deepwyrm_syscall::DW_CLOCK_MONOTONIC_ACTIVE.0, &mut now)
+            != DW_STATUS_SUCCESS
+        {
+            code = failure(Stage::ConcurrentUnmap, 0x30);
+            break;
+        }
+        if now < previous {
+            code = failure(Stage::ConcurrentUnmap, 0x31);
+            break;
+        }
+        previous = now;
+        RESIDENT_CLOCK_READS.fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = deepwyrm_syscall::thread_exit(code);
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 fn channel_pair(stage: Stage, operation: u16) -> Result<(DwHandle, DwHandle), u32> {
@@ -688,6 +1155,89 @@ mod tests {
     #[test]
     fn failure_is_stable_and_stage_addressable() {
         assert_eq!(failure(Stage::Channel, 0x55), 0x2203_0055);
+        assert_eq!(failure(Stage::ConcurrentUnmap, 0x26), 0x2207_0026);
         assert_ne!(I2_SEED, 0);
+    }
+
+    #[test]
+    fn stage_seven_uses_its_own_transaction_and_profile() {
+        assert_eq!(Stage::ConcurrentUnmap as u8, 7);
+        assert_eq!(CONCURRENT_UNMAP_TRANSACTION, 0x2207);
+        for leaf in [0x2201, 0x2202, 0x2203, 0x2204] {
+            assert_ne!(CONCURRENT_UNMAP_TRANSACTION, leaf);
+        }
+        // The child is a one-capability ProbeChild: its own root and nothing else.
+        let mut bytes = [0_u8; INIT0_BYTES];
+        let size = wyrmroot_loader::launch::encode_init(
+            LaunchProfile::ProbeChild,
+            CONCURRENT_UNMAP_TRANSACTION,
+            &mut bytes,
+        )
+        .unwrap();
+        let root = [DwReceivedHandleInfoV1 {
+            handle: DwHandle(9),
+            object_type: deepwyrm_syscall::DW_OBJECT_TYPE_ADDRESS_REGION,
+            rights: wyrmroot_loader::launch::SELF_ROOT_RIGHTS,
+            ..DwReceivedHandleInfoV1::default()
+        }];
+        let parsed = parse_init(LaunchProfile::ProbeChild, &bytes[..size], &root).unwrap();
+        assert_eq!(parsed.transaction_id, CONCURRENT_UNMAP_TRANSACTION);
+        assert!(parse_init(LaunchProfile::Hello, &bytes[..size], &root).is_err());
+        assert!(parse_init(LaunchProfile::I2Stress, &bytes[..size], &root).is_err());
+    }
+
+    #[test]
+    fn resident_announcement_round_trips_and_rejects_malformed_records() {
+        let bytes = encode_resident_announcement(0x40_1000, 0x50_3ff8);
+        assert_eq!(&bytes[..4], b"I2S7");
+        assert_eq!(
+            decode_resident_announcement(&bytes),
+            Some((0x40_1000, 0x50_3ff8))
+        );
+        assert_eq!(decode_resident_announcement(&bytes[..19]), None);
+        let mut long = [0_u8; RESIDENT_ANNOUNCEMENT_BYTES + 1];
+        long[..RESIDENT_ANNOUNCEMENT_BYTES].copy_from_slice(&bytes);
+        assert_eq!(decode_resident_announcement(&long), None);
+        let mut wrong_tag = bytes;
+        wrong_tag[0] = b'X';
+        assert_eq!(decode_resident_announcement(&wrong_tag), None);
+        assert_eq!(
+            decode_resident_announcement(&encode_resident_announcement(0, 0x50_3ff8)),
+            None
+        );
+        assert_eq!(
+            decode_resident_announcement(&encode_resident_announcement(0x40_1000, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn resident_stack_pointer_matches_the_post_call_sysv_state() {
+        assert_eq!(
+            core::mem::align_of::<ResidentStack>(),
+            16,
+            "Thread B's stack top must be 16-byte aligned"
+        );
+        let bytes = core::mem::size_of::<ResidentStack>() as u64;
+        assert_eq!(bytes, 16 * 1024);
+        let pointer = resident_stack_pointer(0x60_0000, bytes).unwrap();
+        assert_eq!(pointer, 0x60_0000 + bytes - 8);
+        assert!((pointer + 8).is_multiple_of(16));
+        assert_eq!(resident_stack_pointer(0x60_0004, bytes), None);
+        assert_eq!(resident_stack_pointer(u64::MAX - 15, bytes), None);
+        assert_eq!(resident_stack_pointer(0x60_0000, 32), None);
+    }
+
+    #[test]
+    fn concurrent_unmap_pattern_distinguishes_rounds_and_words() {
+        assert_ne!(concurrent_unmap_word(0, 0), concurrent_unmap_word(1, 0));
+        assert_ne!(concurrent_unmap_word(0, 0), concurrent_unmap_word(0, 1));
+        assert_ne!(
+            concurrent_unmap_word(CONCURRENT_UNMAP_ROUNDS - 1, PAGE_WORDS - 1),
+            concurrent_unmap_word(CONCURRENT_UNMAP_ROUNDS - 2, PAGE_WORDS - 1)
+        );
+        assert_eq!(PAGE_WORDS, 512);
+        const { assert!(CONCURRENT_UNMAP_ROUNDS >= 1024) };
+        assert_eq!(CONCURRENT_UNMAP_JOIN.len(), 4);
     }
 }

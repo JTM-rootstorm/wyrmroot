@@ -12,7 +12,7 @@ use wyrmroot_bootfs as _;
 use wyrmroot_dw1b_preemption as _;
 #[cfg(feature = "i-capability-integration")]
 use wyrmroot_i_capability as _;
-use wyrmroot_init0::{Init0System, run_init0};
+use wyrmroot_init0::{CHILD_SUPERVISION_DEADLINE_NS, Init0System, run_init0};
 use wyrmroot_loader as _;
 #[cfg(feature = "dw1b-preemption-integration")]
 use wyrmroot_runtime::arm_dw1b_preemption;
@@ -27,8 +27,6 @@ use wyrmroot_runtime::{
     DW1C_ACTOR_COUNT, Dw1cActorBindV1, arm_dw1c_preemption, await_dw1c_token2_relay_ready,
     submit_dw1c_workload_complete,
 };
-
-const HELLO_DEADLINE_NS: u64 = 5_000_000_000;
 
 struct NativeSystem;
 
@@ -128,7 +126,7 @@ impl Init0System for NativeSystem {
 
 fn init0_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
-    let deadline = match monotonic_deadline_after(HELLO_DEADLINE_NS) {
+    let deadline = match monotonic_deadline_after(CHILD_SUPERVISION_DEADLINE_NS) {
         Ok(deadline) => deadline,
         Err(error) => return 0x1400_0000 | wyrmroot_runtime::native_error_code(error),
     };

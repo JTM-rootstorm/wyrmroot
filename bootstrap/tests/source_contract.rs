@@ -75,6 +75,20 @@ fn dw1c_bootstrap_watchdog_contains_the_selector_transaction() {
 }
 
 #[test]
+fn i2_bootstrap_watchdog_contains_the_init0_i2_deadline() {
+    assert!(MANIFEST.contains("i2-bootstrap-supervision = [\"wyr0-init0-integration\"]"));
+    assert!(MAIN_SOURCE.contains("cfg!(feature = \"i2-bootstrap-supervision\")"));
+    assert!(MAIN_SOURCE.contains("150_000_000_000"));
+    assert!(MAIN_SOURCE.contains("120-second I2 deadline"));
+    let init0 = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../userspace/init0/src/lib.rs"
+    ));
+    assert!(init0.contains("cfg!(feature = \"i2-stress-integration\")"));
+    assert!(init0.contains("    120_000_000_000\n} else {\n    5_000_000_000\n};"));
+}
+
+#[test]
 fn d6_bootstrap_is_feature_gated_v3_and_keeps_actors_out_of_production_init() {
     assert!(MANIFEST.contains("dw1d6-synthetic = [\"native-bootstrap\""));
     assert!(MAIN_SOURCE.contains("#[cfg(feature = \"dw1d6-synthetic\")]"));
