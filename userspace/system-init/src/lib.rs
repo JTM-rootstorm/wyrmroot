@@ -6443,8 +6443,9 @@ mod r1_failure_status_tests {
         assert_eq!(r1_test_failure_application_status(&output), 0xAF35_8003);
     }
 
-    /// Every base `r1_test_failure_application_status` can produce.
-    const R1_BASES: [u32; 7] = [
+    /// Every base selector 34 can report: the pre-READY encoder's six and the
+    /// resident tick's one.
+    const R1_BASES: [u32; 8] = [
         0xAF34_0000,
         0xAF35_0000,
         0xAF36_0000,
@@ -6452,7 +6453,128 @@ mod r1_failure_status_tests {
         0xAF38_0000,
         0xAF39_0000,
         0xAF3A_0000,
+        0xAF3B_0000,
     ];
+
+    /// One value of every `InitError` variant selector 34 compiles, and of
+    /// every sub-variant the encoder gives its own arm.
+    ///
+    /// `named` matches every variant with no wildcard, so a variant added to
+    /// `InitError` fails to compile in this function until it is named here;
+    /// name it and give it a witness in the same edit, and its base is then
+    /// checked below like every other.
+    fn witnesses() -> [InitError; 43] {
+        use crate::r1_relay::RelayError;
+        const fn named(error: &InitError) -> usize {
+            match error {
+                InitError::WrongManifestProfile
+                | InitError::UnlaunchableRole
+                | InitError::WrongActivationOrder
+                | InitError::MissingAttemptResources
+                | InitError::ResourcesAlreadyInstalled
+                | InitError::ResourceIdentityMismatch
+                | InitError::InvalidResourceHandle
+                | InitError::Restart(_)
+                | InitError::Bootfs(_)
+                | InitError::MissingRetainedMaterial
+                | InitError::NonExecutableRole
+                | InitError::Manifest(_)
+                | InitError::ZeroBootGeneration
+                | InitError::ArtifactIdentityMismatch(_)
+                | InitError::Native(_)
+                | InitError::Capability(_)
+                | InitError::Mapping(_)
+                | InitError::Launch(_)
+                | InitError::LaunchProtocol(_)
+                | InitError::Loader(_)
+                | InitError::Supervision
+                | InitError::Cleanup
+                | InitError::Accounting
+                | InitError::GateConfig(_)
+                | InitError::Evidence(_)
+                | InitError::Wyr1BGateConfig(_)
+                | InitError::RegistryProtocol(_)
+                | InitError::Wyr1BGateProtocol(_)
+                | InitError::Wyr1BGateMismatch
+                | InitError::Wyr1BModel(_)
+                | InitError::Wyr1BEvidence(_)
+                | InitError::AbsentState(_)
+                | InitError::RegistryAbandoned(_)
+                | InitError::SessionShutdown(_)
+                | InitError::RecoveryTransition { .. }
+                | InitError::R1Probe(_)
+                | InitError::R1Relay(_)
+                | InitError::R1RelayGap(_)
+                | InitError::BootstrapRetirement(_) => 1,
+            }
+        }
+        let witnesses = [
+            InitError::WrongManifestProfile,
+            InitError::UnlaunchableRole,
+            InitError::WrongActivationOrder,
+            InitError::MissingAttemptResources,
+            InitError::ResourcesAlreadyInstalled,
+            InitError::ResourceIdentityMismatch,
+            InitError::InvalidResourceHandle,
+            InitError::Restart(RestartTransitionError::InvalidPolicy),
+            InitError::Bootfs(ParseError::TruncatedHeader { offset: 0 }),
+            InitError::MissingRetainedMaterial,
+            InitError::NonExecutableRole,
+            InitError::Manifest(ManifestParseError::TruncatedHeader),
+            InitError::ZeroBootGeneration,
+            InitError::ArtifactIdentityMismatch(RoleId::Registryd),
+            InitError::Native(NativeError::Status(deepwyrm_syscall::DwStatus(-13))),
+            InitError::Capability(CapabilityValidationError::InvalidBootstrapChannel),
+            InitError::Mapping(MappingPlanError::EmptyArchive),
+            InitError::Launch(wyrmroot_loader::launch::LaunchError::BufferSize),
+            InitError::LaunchProtocol(wyrmroot_launch_proto::Error::WrongSize),
+            InitError::Loader(LoadError::Launch(
+                wyrmroot_loader::launch::LaunchError::BufferSize,
+            )),
+            InitError::Supervision,
+            InitError::Cleanup,
+            InitError::Accounting,
+            InitError::GateConfig(GateConfigError::InvalidUtf8),
+            InitError::Evidence(EvidenceError::ZeroNonce),
+            InitError::Wyr1BGateConfig(wyr1b_gate::GateError::InvalidUtf8),
+            InitError::RegistryProtocol(wyrmroot_registry_proto::Error::WrongSize),
+            InitError::Wyr1BGateProtocol(wyrmroot_wyr1b_gate_proto::Error::WrongSize),
+            InitError::Wyr1BGateMismatch,
+            InitError::Wyr1BModel(wyr1b::JobError::ZeroIdentity),
+            InitError::Wyr1BEvidence(wyr1b_gate::GateError::InvalidUtf8),
+            InitError::AbsentState(0x8c),
+            InitError::RegistryAbandoned(1),
+            InitError::SessionShutdown(1),
+            InitError::RecoveryTransition {
+                operation: 1,
+                initiating_kind: 1,
+                payload: 0,
+                emergency_cleanup: EmergencyCleanup::NotRun,
+            },
+            InitError::R1Probe(R1ProbeFailure::ExitCode(0x8100_0007)),
+            InitError::R1Probe(R1ProbeFailure::ReadyUnattributed),
+            InitError::R1Probe(R1ProbeFailure::DrainUnattributed),
+            InitError::R1Probe(R1ProbeFailure::DrainQueryFailed),
+            InitError::R1Relay(RelayError::Full),
+            InitError::R1RelayGap(RelayGapCensus {
+                expected: 3,
+                observed: 5,
+                further: 1,
+                further_gaps: 0,
+            }),
+            InitError::BootstrapRetirement(BootstrapRetirementFailure::Wait(NativeError::Status(
+                deepwyrm_syscall::DwStatus(-1),
+            ))),
+            InitError::BootstrapRetirement(BootstrapRetirementFailure::WrongResult {
+                index: 1,
+                observed: 2,
+            }),
+        ];
+        for witness in &witnesses {
+            assert_eq!(named(witness), 1);
+        }
+        witnesses
+    }
 
     #[test]
     fn the_r1_bases_cannot_be_confused_with_another_selectors() {
@@ -6470,52 +6592,31 @@ mod r1_failure_status_tests {
                 assert_ne!(existing, mine);
             }
         }
-        // Every base selector 34 can report, not the three it had when this test
-        // was written: each cause-preserving fix added one, and a base that joined
-        // the encoder without joining this list would be unguarded.
         for (index, mine) in R1_BASES.iter().enumerate() {
             for other in &R1_BASES[index + 1..] {
                 assert_ne!(mine, other, "two selector-34 bases collide");
             }
         }
-        // The guarded list must match the encoders exactly, in both directions.
-        // A lower bound was tried first and was useless: dropping a base from
-        // R1_BASES still satisfied it, so the list could silently shrink away from
-        // the code it claims to describe. Every `0xAF3X` an encoder arm can
-        // produce is enumerated here, so an added base that is not guarded fails,
-        // and a guarded base no longer produced fails too.
-        // Scanned with this module excised. The table below quotes the patterns
-        // it searches for, so scanning the whole file made the test find its own
-        // literals -- the same self-reference that bit `r1_cause_preservation`.
-        // A renamed module makes this panic, which is the loud failure we want.
-        let lib = include_str!("lib.rs");
-        let encoder = &lib[..lib
-            .find("\nmod r1_failure_status_tests {")
-            .expect("this module's own marker no longer matches")];
-        for (pattern, base) in [
-            ("0xAF30_0000 |", 0xAF30_0000_u32),
-            ("0xAF31_0000 |", 0xAF31_0000),
-            ("0xAF32_0000 |", 0xAF32_0000),
-            ("0xAF33_0000 |", 0xAF33_0000),
-            ("0xAF34_0000 |", 0xAF34_0000),
-            ("0xAF35_0000 |", 0xAF35_0000),
-            ("0xAF36_0000 |", 0xAF36_0000),
-            ("0xAF37_0000 |", 0xAF37_0000),
-            ("0xAF38_0000 |", 0xAF38_0000),
-            ("0xAF39_0000 |", 0xAF39_0000),
-            ("0xAF3A_0000 |", 0xAF3A_0000),
-            ("0xAF3B_0000 |", 0xAF3B_0000),
-            ("0xAF3C_0000 |", 0xAF3C_0000),
-            ("0xAF3D_0000 |", 0xAF3D_0000),
-            ("0xAF3E_0000 |", 0xAF3E_0000),
-            ("0xAF3F_0000 |", 0xAF3F_0000),
-        ] {
-            assert_eq!(
-                encoder.contains(pattern),
-                R1_BASES.contains(&base),
-                "{pattern} is produced by an encoder but not guarded, or guarded \
-                 but no longer produced"
-            );
+        // The guarded list must match what the encoders produce, in both
+        // directions, so it cannot drift from the code it describes: every
+        // base a witness produces is guarded, and every guarded base is
+        // produced. A lower bound was tried first and was useless, because a
+        // base dropped from R1_BASES still satisfied it.
+        let mut produced = [false; R1_BASES.len()];
+        let mut record = |status: u32| {
+            let base = status & 0xffff_0000;
+            let index = R1_BASES
+                .iter()
+                .position(|guarded| *guarded == base)
+                .unwrap_or_else(|| panic!("{base:#010x} is produced but not guarded"));
+            produced[index] = true;
+        };
+        for witness in witnesses() {
+            record(r1_test_failure_application_status(&witness));
+            record(resident_tick_failure_application_status(&witness));
+        }
+        for (base, produced) in R1_BASES.iter().zip(produced) {
+            assert!(produced, "{base:#010x} is guarded but no longer produced");
         }
         // And the coarse production value must no longer be reachable here.
         assert_ne!(
