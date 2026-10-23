@@ -6694,19 +6694,38 @@ mod r1_cause_preservation {
         ("lib.rs", include_str!("lib.rs")),
     ];
 
+    /// Spells each name as the type it names, so the list cannot outlive one.
+    ///
+    /// Every entry is a type path the compiler resolves, and the string the
+    /// scan matches is that path's own last segment. A type renamed out from
+    /// under the list therefore fails to compile here, rather than leaving a
+    /// name the rule silently stops recognising.
+    macro_rules! payload_bearing {
+        ($($name:ident $(<$generic:ty>)?),* $(,)?) => {
+            [$({
+                let _ = core::marker::PhantomData::<$name $(<$generic>)?>;
+                stringify!($name)
+            }),*]
+        };
+    }
+
+    use crate::r1_relay::{RelayError, RelayFailure};
+    use wyrmroot_loader::process::LoadError;
+    use wyrmroot_runtime::{ExitValidationError, ObservedSupervisionError, SupervisionError};
+
     /// Error types on this path whose variants carry a cause worth keeping.
     ///
     /// Curated rather than derived: the rule needs to know that discarding a
     /// `RelayFailure` loses `OutOfOrder { expected, observed }` while discarding
-    /// a unit-like marker loses nothing. `the_curated_types_still_exist` fails if
-    /// one is renamed out from under the list.
-    const PAYLOAD_BEARING: [&str; 6] = [
-        "RelayFailure",
-        "RelayError",
-        "ObservedSupervisionError",
-        "SupervisionError",
-        "LoadError",
-        "ExitValidationError",
+    /// a unit-like marker loses nothing. Each entry is checked by the compiler
+    /// (see `payload_bearing!`), so a rename fails to build.
+    const PAYLOAD_BEARING: [&str; 6] = payload_bearing![
+        RelayFailure,
+        RelayError,
+        ObservedSupervisionError<()>,
+        SupervisionError<()>,
+        LoadError<()>,
+        ExitValidationError,
     ];
 
     /// Sites that drop a carried cause and are not yet fixed.
@@ -7124,20 +7143,6 @@ mod r1_cause_preservation {
             !scanned.contains("fn discards_a_cause"),
             "the self-exclusion did not remove this module's own detector"
         );
-    }
-
-    #[test]
-    fn the_curated_types_still_exist() {
-        // The payload-bearing list is the rule's whole notion of "a cause worth
-        // keeping". If a type is renamed and the list is not, the rule silently
-        // narrows, which is how a gate stops gating without failing.
-        for name in PAYLOAD_BEARING {
-            assert!(
-                SOURCES.iter().any(|(_, source)| source.contains(name)),
-                "{name} is named in PAYLOAD_BEARING but appears in none of the \
-                 sources, so the rule no longer recognises it"
-            );
-        }
     }
 
     #[test]
