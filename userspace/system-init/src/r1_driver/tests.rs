@@ -733,3 +733,78 @@ fn a_failed_ready_handshake_keeps_the_probe_code_from_every_variant_that_carries
         r1_test_failure_application_status(&InitError::R1Probe(R1ProbeFailure::DrainUnattributed)),
     );
 }
+
+/// The probe is launched from what card R1's product stages, at the paths it
+/// stages them.
+///
+/// Card R1's third run booted a product whose gate and probe had no reader
+/// anywhere in permanent init, so it activated its role graph and idled until
+/// the host timeout with no evidence. Here the launch is driven against a
+/// bootfs holding exactly the two staged entries, at
+/// `wyrmroot_bootfs::r1::{R1_GATE_PATH, R1_PROBE_PATH}`: it reads the gate,
+/// reads and identity-checks the image, and gets as far as the first handle
+/// it acquires, which the double refuses. Without either entry it stops at
+/// that entry's lookup instead.
+#[test]
+fn the_probe_is_launched_from_the_paths_the_product_stages() {
+    use wyrmroot_bootfs::builder::{Builder, FileMode};
+    use wyrmroot_bootfs::r1::{R1_GATE_BYTES, encode_gate};
+
+    const IMAGE: &[u8] = b"r1 saturation probe image";
+    let mut gate = [0_u8; R1_GATE_BYTES];
+    encode_gate(
+        ProbeConfiguration {
+            probe_identity: wyrmroot_runtime::sha256::digest(IMAGE),
+            ..configuration(ProbePlan::SMP)
+        },
+        &mut gate,
+    )
+    .expect("the gate encodes");
+    let archive = |gate_staged: bool, probe_staged: bool| {
+        let mut builder = Builder::new();
+        if gate_staged {
+            builder
+                .add(R1_GATE_PATH.as_bytes(), &gate, FileMode::ReadOnly)
+                .expect("the gate path is valid");
+        }
+        if probe_staged {
+            builder
+                .add(R1_PROBE_PATH.as_bytes(), IMAGE, FileMode::Executable)
+                .expect("the probe path is valid");
+        }
+        builder.build().expect("the archive builds")
+    };
+    let authority = LoadAuthority {
+        parent_root: DwHandle(0x3410),
+        bootfs: DwHandle(0x3411),
+        task_group: DwHandle(0x3412),
+    };
+    let launched = |bootfs: &[u8]| {
+        let mut topology = RegistryTopology::new(2).expect("a registry generation");
+        launch(
+            &mut Probe::new(),
+            &mut wyrmroot_runtime::NativeLoaderPlatform,
+            &mut Waits::default(),
+            authority,
+            &mut topology,
+            bootfs,
+        )
+        .map(|_| ())
+    };
+
+    // Both entries found: the launch reaches the task-group creation the
+    // double refuses, which is after both lookups and the identity check.
+    assert_eq!(
+        launched(&archive(true, true)),
+        Err(InitError::Native(FAILURE))
+    );
+    // Either entry missing: the launch stops at that lookup.
+    assert_eq!(
+        launched(&archive(false, true)),
+        Err(InitError::MissingRetainedMaterial)
+    );
+    assert_eq!(
+        launched(&archive(true, false)),
+        Err(InitError::MissingRetainedMaterial)
+    );
+}
