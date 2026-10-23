@@ -7262,83 +7262,74 @@ mod r1_cause_preservation {
         );
     }
 
-    /// The probe crate's *library*, which none of the rules above reach.
+    /// The terminal record carries every word of its failure.
     ///
-    /// `PROBE_SOURCE` is the binary. `encode_terminal` lives in the library
-    /// beside it, and that is where occurrence five of this class was found --
-    /// after §8.13 had already widened the gate from `system-init` to "the probe
-    /// too", which turned out to mean one file of two. A discard here is worse
-    /// than one in the binary: the terminal record is the last thing a run
-    /// produces, so what it drops is unrecoverable even from a complete capture.
-    const PROBE_LIB: (&str, &str) = (
-        "r1-saturation/src/lib.rs",
-        include_str!("../../r1-saturation/src/lib.rs"),
-    );
-
-    /// The body of the terminal-record encoder, comments removed.
-    fn terminal_encoder_body() -> &'static str {
-        let after = PROBE_LIB
-            .1
-            .split("pub fn encode_terminal(")
-            .nth(1)
-            .expect("the probe library still encodes the terminal record");
-        after
-            .split("\n    }")
-            .next()
-            .expect("the terminal encoder is still a bounded function body")
-    }
-
+    /// Occurrence five of this class was in the probe *library*, not its
+    /// binary: `encode_terminal` took the failure ordinal and wrote the other
+    /// two words as zeros, so run 12 reported `FAIL_RUN_STOPPED` and dropped the
+    /// probe's exit code -- the entire reason it stopped. The terminal record is
+    /// the last thing a run produces, so what it drops is unrecoverable even
+    /// from a complete capture. This drives the real encoder with every failure
+    /// variant, each carrying index and detail values no other field shares, and
+    /// reads all three words back from the offsets a `KIND_FAILED` record uses.
     #[test]
     fn the_terminal_record_carries_every_word_of_its_failure() {
-        let body = terminal_encoder_body();
-        // `failure_fields` returns three words: ordinal, index, detail. Taking
-        // one field of that tuple is the discard -- run 12's terminal record
-        // said FAIL_RUN_STOPPED and left the probe's exit code, the entire
-        // reason it stopped, in the word it did not write.
-        for projection in [
-            "failure_fields(failure).0",
-            "failure_fields(failure).1",
-            "failure_fields(failure).2",
-        ] {
-            assert!(
-                !body.contains(projection),
-                "{} projects one word out of failure_fields and drops the rest. \
-                 Bind all three and write all three; the terminal record is the \
-                 last thing the host sees.",
-                PROBE_LIB.0
-            );
-        }
-        // Nor by destructuring: `let (ordinal, _, _) =` erases the same words
-        // while looking like it reads them.
-        for erased in ["(_,", ", _)", ", _,"] {
-            assert!(
-                !body.contains(erased),
-                "{} destructures a failure's words and discards one",
-                PROBE_LIB.0
-            );
-        }
-        // And the three words must actually reach the wire, at the offsets a
-        // KIND_FAILED record already uses for them.
-        for write in ["u32_at(44", "u64_at(48", "u32_at(56"] {
-            assert!(
-                body.contains(write),
-                "the terminal record no longer writes {write}, so one of its \
-                 failure words is zero on the wire again"
-            );
-        }
-    }
+        use wyrmroot_r1_saturation::record::{
+            FAIL_RUN_STOPPED, KIND_TERMINAL, encode_terminal, failure_fields,
+        };
+        use wyrmroot_r1_saturation::{ProbeFailure, ProbeOutcome, ProbePlan};
 
-    #[test]
-    fn the_probe_library_is_actually_reached() {
-        // The §8.13 lesson, applied to this gate: a widened scope that does not
-        // reach its new file is indistinguishable from a clean result.
-        assert!(
-            PROBE_LIB.1.contains("pub mod record"),
-            "the include no longer reaches the probe library's record encoder"
+        let word32 = |record: &[u8], at: usize| {
+            u32::from_le_bytes(record[at..at + 4].try_into().expect("four bytes"))
+        };
+        let word64 = |record: &[u8], at: usize| {
+            u64::from_le_bytes(record[at..at + 8].try_into().expect("eight bytes"))
+        };
+        // Every variant, with an index and a detail that differ from each other
+        // and from every other field the record carries, so a word written to
+        // the wrong offset, or not written at all, reads back wrong.
+        let failures = [
+            ProbeFailure::HogAcceptTimeout { index: 0x31 },
+            ProbeFailure::HogRejected {
+                index: 0x32,
+                status: 0x5132,
+            },
+            ProbeFailure::ProgressResultTimeout { after_hog: 0x33 },
+            ProbeFailure::ProgressRejected {
+                after_hog: 0x34,
+                status: 0x5134,
+            },
+            ProbeFailure::ProgressAcceptTimeout { after_hog: 0x35 },
+            ProbeFailure::ProgressNotNormalZero {
+                after_hog: 0x36,
+                code: 0x5136,
+            },
+            ProbeFailure::CleanupIncomplete { index: 0x37 },
+            ProbeFailure::Uncorrelated {
+                expected: 0x38,
+                observed: 0x5138_0000_0001,
+            },
+            ProbeFailure::RunStopped { code: 0x8100_0030 },
+        ];
+        for failure in failures {
+            let record =
+                encode_terminal(9, 1, ProbePlan::CONTROL, ProbeOutcome::Failed(failure), 5);
+            assert_eq!(word32(&record, 8), KIND_TERMINAL);
+            let (ordinal, index, detail) = failure_fields(failure);
+            assert_ne!(ordinal, 0, "{failure:?} has no failure ordinal");
+            assert_eq!(word32(&record, 56), ordinal, "{failure:?}: the ordinal");
+            assert_eq!(word32(&record, 44), index, "{failure:?}: the index word");
+            assert_eq!(word64(&record, 48), detail, "{failure:?}: the detail word");
+        }
+        // Run 12's own shape, by value: the exit code is the detail word.
+        let stopped = encode_terminal(
+            9,
+            1,
+            ProbePlan::CONTROL,
+            ProbeOutcome::Failed(ProbeFailure::RunStopped { code: 0x8100_0030 }),
+            5,
         );
-        assert!(
-            terminal_encoder_body().contains("KIND_TERMINAL"),
-            "the sliced encoder body is no longer the terminal encoder"
-        );
+        assert_eq!(word32(&stopped, 56), FAIL_RUN_STOPPED);
+        assert_eq!(word64(&stopped, 48), 0x8100_0030);
     }
 }
