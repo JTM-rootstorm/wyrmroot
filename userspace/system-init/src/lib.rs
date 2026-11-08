@@ -31,6 +31,19 @@ compile_error!("wyr1e-production must compose wyr1c6-production and wyr1e-shell-
 ))]
 compile_error!("the WYR1-E7 and E8 selector profiles are additive over wyr1e-production");
 
+// Selector 29 runs on the WYR1-C6 resource product, which is the WYR1-C5
+// four-capability resource product; main.rs selects
+// `continue_system_init_resource_product` for exactly the C4/C5 family. These
+// refuse a build in which the manifest stopped composing them.
+#[cfg(all(
+    feature = "wyr1c6-selector29",
+    not(all(feature = "wyr1c6-production", feature = "wyr1c6-test-evidence"))
+))]
+compile_error!("wyr1c6-selector29 must compose wyr1c6-production and wyr1c6-test-evidence");
+
+#[cfg(all(feature = "wyr1c6-production", not(feature = "wyr1c5-production")))]
+compile_error!("wyr1c6-production must compose the wyr1c5-production resource product");
+
 use core::mem::MaybeUninit;
 
 #[cfg(feature = "wyr1e-production")]

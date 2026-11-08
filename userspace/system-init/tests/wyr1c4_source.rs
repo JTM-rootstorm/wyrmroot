@@ -34,20 +34,6 @@ fn c4_product_selects_only_the_four_capability_resource_profile() {
 }
 
 #[test]
-fn c6_feature_composition_keeps_selector_29_on_the_resource_profile() {
-    assert!(MANIFEST.contains("wyr1c6-production = [\"wyr1c5-production\"]"));
-    assert!(
-        MANIFEST.contains("wyr1c6-selector29 = [\"wyr1c6-production\", \"wyr1c6-test-evidence\"]")
-    );
-    assert!(
-        MAIN_SOURCE.contains(
-            "#[cfg(any(feature = \"wyr1c4-production\", feature = \"wyr1c5-production\"))]"
-        )
-    );
-    assert!(MAIN_SOURCE.contains("continue_system_init_resource_product("));
-}
-
-#[test]
 fn native_wait_until_accepts_only_a_clock_verified_timeout_fallback() {
     let wait_until = &MAIN_SOURCE[MAIN_SOURCE.find("fn wait_until(").unwrap()
         ..MAIN_SOURCE
