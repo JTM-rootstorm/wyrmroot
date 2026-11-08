@@ -23,7 +23,7 @@
 use super::*;
 
 use crate::r1_relay::{
-    R1EvidenceSink, R1Relay, RELAY_CAPACITY, RelayError, RelayFailure, relay_one,
+    R1EvidenceSink, R1Relay, RELAY_CAPACITY, RelayAction, RelayError, RelayFailure,
 };
 use crate::wyr1b::{EndpointGrant, EndpointKind, JobError, RegistryTopology};
 use crate::wyr1b_job::JobDispatcher;
@@ -647,6 +647,22 @@ where
     } else {
         Ok(())
     }
+}
+
+/// Relays exactly one datagram: decide, submit, then record.
+fn relay_one<S: R1EvidenceSink>(
+    relay: &mut R1Relay,
+    sink: &mut S,
+    bytes: &[u8],
+    handles: usize,
+) -> Result<RelayAction, RelayFailure> {
+    let action = relay.check(bytes, handles).map_err(RelayFailure::Refused)?;
+    let mut record = [0_u8; RECORD_BYTES];
+    record.copy_from_slice(bytes);
+    sink.submit_r1_evidence(&record)
+        .map_err(RelayFailure::Rejected)?;
+    relay.commit(action);
+    Ok(action)
 }
 
 #[cfg(test)]

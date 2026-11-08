@@ -161,22 +161,6 @@ pub enum RelayFailure {
     Rejected(NativeError),
 }
 
-/// Relays exactly one datagram: decide, submit, then record.
-pub fn relay_one<S: R1EvidenceSink>(
-    relay: &mut R1Relay,
-    sink: &mut S,
-    bytes: &[u8],
-    handles: usize,
-) -> Result<RelayAction, RelayFailure> {
-    let action = relay.check(bytes, handles).map_err(RelayFailure::Refused)?;
-    let mut record = [0_u8; RECORD_BYTES];
-    record.copy_from_slice(bytes);
-    sink.submit_r1_evidence(&record)
-        .map_err(RelayFailure::Rejected)?;
-    relay.commit(action);
-    Ok(action)
-}
-
 fn validate(bytes: &[u8], plan: ProbePlan) -> Result<Header, RelayError> {
     if bytes.len() != RECORD_BYTES {
         return Err(RelayError::Malformed(record::HeaderError::WrongLength));

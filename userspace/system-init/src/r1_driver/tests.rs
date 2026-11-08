@@ -808,3 +808,128 @@ fn the_probe_is_launched_from_the_paths_the_product_stages() {
         Err(InitError::MissingRetainedMaterial)
     );
 }
+
+/// `relay_one`'s own decision tests, moved with it from `r1_relay::tests`.
+mod relay_one_tests {
+    use super::super::*;
+    use wyrmroot_r1_saturation::record::{encode_step, encode_terminal};
+    use wyrmroot_r1_saturation::{ProbeOutcome, ProbeStep};
+
+    const NONCE: u64 = 0x8100_0000_0000_0001;
+
+    fn step(sequence: u64, plan: ProbePlan) -> [u8; RECORD_BYTES] {
+        encode_step(sequence, NONCE, plan, ProbeStep::LaunchHog { index: 0 }, 9)
+    }
+
+    /// Capturing sink, plus a scripted failure at a chosen submission.
+    struct Sink {
+        records: [[u8; RECORD_BYTES]; 8],
+        count: usize,
+        fail_at: Option<usize>,
+    }
+
+    impl Sink {
+        fn new() -> Self {
+            Self {
+                records: [[0_u8; RECORD_BYTES]; 8],
+                count: 0,
+                fail_at: None,
+            }
+        }
+
+        fn failing_at(index: usize) -> Self {
+            Self {
+                fail_at: Some(index),
+                ..Self::new()
+            }
+        }
+    }
+
+    impl R1EvidenceSink for Sink {
+        fn submit_r1_evidence(&mut self, record: &[u8; RECORD_BYTES]) -> Result<(), NativeError> {
+            if self.fail_at == Some(self.count) {
+                return Err(NativeError::Status(
+                    deepwyrm_syscall::DW_STATUS_INVALID_ARGUMENT,
+                ));
+            }
+            self.records[self.count] = *record;
+            self.count += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn relaying_submits_the_exact_bytes_that_arrived() {
+        let plan = ProbePlan::SMP;
+        let mut relay = R1Relay::new(plan);
+        let mut sink = Sink::new();
+        let first = step(1, plan);
+        assert_eq!(
+            relay_one(&mut relay, &mut sink, &first, 0),
+            Ok(RelayAction::Submit)
+        );
+        // The relay must not rewrite a report on its way through: the kernel
+        // validates the nonce and sequence, so any edit here would be invisible
+        // corruption.
+        assert_eq!(sink.records[0], first);
+        assert_eq!(sink.count, 1);
+        assert_eq!(relay.submitted(), 1);
+    }
+
+    #[test]
+    fn an_inadmissible_record_is_never_submitted() {
+        let mut relay = R1Relay::new(ProbePlan::SMP);
+        let mut sink = Sink::new();
+        let foreign = step(1, ProbePlan::CONTROL);
+        assert!(matches!(
+            relay_one(&mut relay, &mut sink, &foreign, 0),
+            Err(RelayFailure::Refused(RelayError::WrongTopology { .. }))
+        ));
+        assert_eq!(sink.count, 0);
+        assert_eq!(relay.submitted(), 0);
+    }
+
+    #[test]
+    fn a_kernel_refusal_leaves_the_sequence_intact_for_a_retry() {
+        let plan = ProbePlan::SMP;
+        let mut relay = R1Relay::new(plan);
+        // Fail the second submission only.
+        let mut sink = Sink::failing_at(1);
+        assert_eq!(
+            relay_one(&mut relay, &mut sink, &step(1, plan), 0),
+            Ok(RelayAction::Submit)
+        );
+        assert!(matches!(
+            relay_one(&mut relay, &mut sink, &step(2, plan), 0),
+            Err(RelayFailure::Rejected(_))
+        ));
+        assert_eq!(relay.submitted(), 1);
+        // Sequence 2 is still what the relay expects. Had the refusal consumed it,
+        // every later record would be rejected as out of order and the run would
+        // lose its whole transcript to one transport failure.
+        sink.fail_at = None;
+        assert_eq!(
+            relay_one(&mut relay, &mut sink, &step(2, plan), 0),
+            Ok(RelayAction::Submit)
+        );
+        assert_eq!(relay.submitted(), 2);
+        assert_eq!(sink.count, 2);
+    }
+
+    #[test]
+    fn a_refused_terminal_record_does_not_mark_the_run_complete() {
+        let plan = ProbePlan::CONTROL;
+        let mut relay = R1Relay::new(plan);
+        let mut sink = Sink::failing_at(0);
+        let terminal = encode_terminal(1, NONCE, plan, ProbeOutcome::Passed, 18);
+        assert!(matches!(
+            relay_one(&mut relay, &mut sink, &terminal, 0),
+            Err(RelayFailure::Rejected(_))
+        ));
+        // Completion must follow the kernel accepting the terminal record, not the
+        // probe having sent one: the kernel's handling is what flushes the
+        // transcript, so a claimed-complete run with no flush would read as a pass.
+        assert!(!relay.complete());
+        assert!(!relay.terminal_seen());
+    }
+}
