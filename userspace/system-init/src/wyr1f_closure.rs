@@ -279,7 +279,8 @@ mod tests {
         }
     }
 
-    /// The named item's source span, for the two structural checks below.
+    /// The named item's source span (its first `{...}` block after the
+    /// signature), for the structural checks below.
     fn item<'a>(source: &'a str, signature: &'a str) -> &'a str {
         let start = source.find(signature).expect(signature);
         let body = &source[start..];
@@ -362,31 +363,32 @@ mod tests {
         assert!(episode.refuses_activation());
     }
 
-    /// F3A.7k. The wiring around `BringupEvidence` lives on the resident path,
-    /// which no host test drives, so it is pinned from source: every tick
-    /// records what has been observed, the session's end finalizes the log
-    /// only after the roles are retired, and each READY site reports before it
-    /// hands the outcome back.
+    /// F3A.7k. The wiring around `BringupEvidence` lives on the resident path:
+    /// every tick records what has been observed, the session's end finalizes
+    /// the log only after the roles are retired, and each READY site reports
+    /// before it hands the outcome back.
+    ///
+    /// Source text because `wyr1e_resident_step` is reached only from
+    /// `control_tick`, and `poll_observations` only from `poll`, which no host
+    /// fake drives; each anchor is scoped to its own fn body or block.
     #[test]
     fn the_instrumented_tick_records_bringup_and_finalizes_at_session_end() {
-        let squeeze = |text: &str| -> std::string::String {
-            text.chars().filter(|c| !c.is_whitespace()).collect()
-        };
         let tick = squeeze(include_str!("wyr1c_native.rs"));
-        let trigger = tick
+        let step = item(&tick, "fnwyr1e_resident_step<");
+        let trigger = step
             .find("letoutcome=wyr1f_closure_trigger(resident,outcome);")
             .expect("the closure trigger moved");
-        let record = tick
+        let record = step
             .find("record_wyr1f_bringup(resident)?;")
             .expect("the tick no longer records bring-up evidence");
-        let complete = tick
+        let complete = step
             .find("ifoutcome==wyr1e::PollOutcome::SessionComplete{")
             .expect("the session-complete check moved");
         assert!(trigger < record && record < complete);
-        let body = &tick[complete..];
-        let body = &body[..body
-            .find("}if")
-            .expect("the session-complete check never closes")];
+        let body = item(
+            &step[complete..],
+            "ifoutcome==wyr1e::PollOutcome::SessionComplete{",
+        );
         let retire = body
             .find("retire_for_session_shutdown(")
             .expect("no teardown");
@@ -399,18 +401,20 @@ mod tests {
         assert!(retire < finalize && finalize < leave);
 
         let poll = squeeze(include_str!("wyr1e_native.rs"));
-        let uart = poll
+        let observer = item(&poll, "fnpoll_publication_observer_state<");
+        let uart = observer
             .find("crate::wyr1f_closure::BringupRole::Uart,")
             .expect("the UART READY is never observed");
-        assert!(
-            poll[uart..]
-                .find("Ok(Some(PollOutcome::LaunchConsole))")
-                .is_some()
-        );
-        let console = poll
+        // The observation is the last thing before the fn hands back
+        // `LaunchConsole`: no return in between can skip it.
+        let tail = &observer[uart..];
+        assert!(tail.ends_with("Ok(Some(PollOutcome::LaunchConsole))}"));
+        assert!(!tail.contains("return"));
+        let observations = item(&poll, "fnpoll_observations<");
+        let console = observations
             .find("crate::wyr1f_closure::BringupRole::Console,")
             .expect("consoled's READY is never observed");
-        let accepted = poll[console..]
+        let accepted = observations[console..]
             .find("e6.awaiting_ready=false;returnOk(PollOutcome::Stable);")
             .expect("the console observation is not at READY acceptance");
         assert!(
@@ -422,16 +426,13 @@ mod tests {
     /// F3A.7k. The product installs the retained gate before building the
     /// episode from it. Before this, only the fixture did, so every real
     /// instrumented boot ran an inert episode with no evidence log.
+    ///
+    /// Source text because the host fixtures install the gate themselves, so
+    /// only `activate_in_place`'s own body shows the product doing it.
     #[test]
     fn the_product_installs_the_retained_gate_before_the_episode_reads_it() {
-        let squeeze = |text: &str| -> std::string::String {
-            text.chars().filter(|c| !c.is_whitespace()).collect()
-        };
         let native = squeeze(include_str!("wyr1c_native.rs"));
-        let start = native
-            .find("pub(crate)fnactivate_in_place<")
-            .expect("the resident activation moved");
-        let body = &native[start..];
+        let body = item(&native, "pub(crate)fnactivate_in_place<");
         let lookup = body
             .find(".lookup(crate::gate::GATE_CONFIG_PATH.as_bytes())")
             .expect("the product no longer reads the retained gate");
@@ -449,27 +450,23 @@ mod tests {
     /// F3A.7k. DEGRADED has no devmgr, and the tick used to return before the
     /// console/shell step, so nothing after the episode -- `exit`, the
     /// session end, the terminal evidence -- could ever happen.
+    ///
+    /// Source text because the devmgr-absent branch is inline in
+    /// `control_tick`, which no host fake drives; anchors are scoped to the
+    /// branch, `control_tick` and `wyr1e_resident_step`.
     #[test]
     fn the_degraded_tick_still_supervises_the_console_and_shell() {
-        let native: std::string::String = include_str!("wyr1c_native.rs")
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        let absent = native
-            .find("letSome(devmgr)=state.devmgrelse{")
-            .expect("the devmgr-absent branch moved");
-        let branch = &native[absent..absent + 900];
+        let native = squeeze(include_str!("wyr1c_native.rs"));
+        let tick = item(&native, "pub(crate)fncontrol_tick<");
+        let branch = item(tick, "letSome(devmgr)=state.devmgrelse{");
         assert!(
             branch
                 .contains("returnwyr1e_resident_step(resident,system,loader,waits,now_ns,false);")
         );
         assert!(
-            native.contains("returnwyr1e_resident_step(resident,system,loader,waits,now_ns,true);")
+            tick.contains("returnwyr1e_resident_step(resident,system,loader,waits,now_ns,true);")
         );
-        let step = native
-            .find("fnwyr1e_resident_step<")
-            .expect("the console/shell step is gone");
-        let step = &native[step..];
+        let step = item(&native, "fnwyr1e_resident_step<");
         let refuse = step
             .find("if!devmgr_present{returnErr(InitError::AbsentState(0x98));}")
             .expect("without devmgr the step no longer refuses devmgr-dependent outcomes");
@@ -480,6 +477,11 @@ mod tests {
             .find("with_bootfs_bytes(")
             .expect("the recovery dispatch moved");
         assert!(complete < refuse && refuse < dispatch);
+    }
+
+    /// Source text with all whitespace removed, for the structural checks.
+    fn squeeze(text: &str) -> std::string::String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     fn drain(evidence: &mut BringupEvidence) -> std::vec::Vec<(crate::RoleId, u64, u64)> {
