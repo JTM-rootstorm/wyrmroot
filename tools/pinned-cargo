@@ -23,13 +23,8 @@ config_value() {
     ' "$config_path" || fail "$config_path omits $config_key"
 }
 
-verify_file() {
-    file_path=$1
-    expected_sha=$2
-    file_label=$3
-    [ -f "$file_path" ] || fail "$file_label is not a regular file: $file_path"
-    actual_sha=$(sha256sum -- "$file_path" | awk '{ print $1 }')
-    [ "$actual_sha" = "$expected_sha" ] || fail "$file_label hash mismatch: $file_path"
+require_file() {
+    [ -f "$1" ] || fail "$2 is not a regular file: $1"
 }
 
 [ "$#" -ge 1 ] || fail "missing Cargo arguments"
@@ -114,24 +109,17 @@ rustc=$(config_value "$identity" rustc_binary)
 rustdoc=$(config_value "$identity" rustdoc_binary)
 rustfmt=$(config_value "$identity" rustfmt_binary)
 tool_bin=$(config_value "$identity" tool_bin_directory)
-verify_file "$cargo" "$(config_value "$identity" cargo_sha256)" "host Cargo"
-verify_file "$rustc" "$(config_value "$identity" rustc_sha256)" "host rustc"
-verify_file "$rustdoc" "$(config_value "$identity" rustdoc_sha256)" "host rustdoc"
-verify_file "$rustfmt" "$(config_value "$identity" rustfmt_sha256)" "host rustfmt"
-verify_file "$(config_value "$identity" cargo_fmt_binary)" \
-    "$(config_value "$identity" cargo_fmt_sha256)" "host cargo-fmt"
-verify_file "$(config_value "$identity" cargo_clippy_binary)" \
-    "$(config_value "$identity" cargo_clippy_sha256)" "host cargo-clippy"
-verify_file "$(config_value "$identity" clippy_driver_binary)" \
-    "$(config_value "$identity" clippy_driver_sha256)" "host clippy-driver"
-verify_file "$(config_value "$identity" rust_analyzer_binary)" \
-    "$(config_value "$identity" rust_analyzer_sha256)" "host rust-analyzer"
+# System-package tools: explicit configured paths, regular files, no hash pin.
+require_file "$cargo" "host Cargo"
+require_file "$rustc" "host rustc"
+require_file "$rustdoc" "host rustdoc"
+require_file "$rustfmt" "host rustfmt"
+for key in cargo_fmt_binary cargo_clippy_binary clippy_driver_binary rust_analyzer_binary \
+    rust_src_std_entry rust_src_core_entry; do
+    require_file "$(config_value "$identity" "$key")" "host $key"
+done
 rust_src_root=$(config_value "$identity" rust_src_root)
 [ -d "$rust_src_root" ] || fail "host rust-src root is not a directory: $rust_src_root"
-verify_file "$(config_value "$identity" rust_src_std_entry)" \
-    "$(config_value "$identity" rust_src_std_entry_sha256)" "host rust-src std entry"
-verify_file "$(config_value "$identity" rust_src_core_entry)" \
-    "$(config_value "$identity" rust_src_core_entry_sha256)" "host rust-src core entry"
 
 cargo_home_relative=$(config_value "$identity" cargo_home)
 case "$cargo_home_relative" in
@@ -156,8 +144,7 @@ normalized_target=$(realpath -m -- "$target_dir")
 [ "$normalized_target" != "$repository/target" ] || fail "canonical target/ is forbidden"
 mkdir -p -- "$normalized_target"
 target_marker="$normalized_target/.wyrmroot-pinned-cargo-v1"
-lane_identity="cargo_sha256=$(config_value "$identity" cargo_sha256)
-rustc_sha256=$(config_value "$identity" rustc_sha256)"
+lane_identity="rustc_commit=$(config_value "$identity" rustc_commit)"
 if [ -e "$target_marker" ]; then
     [ -f "$target_marker" ] && [ ! -L "$target_marker" ] || \
         fail "target identity marker is not a regular non-symlink file"

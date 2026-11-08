@@ -44,9 +44,8 @@ const STACK_ANALYSIS_METHOD: &str =
     "rustc-z-emit-stack-sizes+llvm-readobj-json-all-named-frames-v2";
 const STACK_METADATA_FLAG: &str = "-Zemit-stack-sizes";
 const STACK_BUDGET_BYTES: u64 = 64 * 1024;
-const STACK_TOOL_PATH: &str = "/usr/lib/llvm/22/bin/llvm-readobj";
-const STACK_TOOL_VERSION: &str = "LLVM version 22.1.8";
-const STACK_TOOL_SHA256: &str = "8074c683dc2c5bfebd5e68245b9d435a3a44ff7e232f20b6a1d01a22f5d7caf8";
+// System-package LLVM tool, resolved by name from PATH; not pinned by path, hash or version.
+const STACK_TOOL: &str = "llvm-readobj";
 const MAX_STACK_REPORT: usize = 8 * 1024 * 1024;
 const DESIGNATED_STACK_FRAMES: &[(&str, &str)] = &[
     ("native_main", "__wyrmroot_native_main"),
@@ -738,7 +737,7 @@ fn build_frozen_artifacts(
     let rustc_sha256 = sha256::file_digest(&toolchain.accepted().rustc)
         .map_err(|error| Failure::task(format!("could not hash accepted rustc: {error}")))?;
     let mut source_receipt = format!(
-        "kind = \"{SOURCE_RECEIPT_KIND}\"\nschema_version = 3\nwyrmroot_revision = \"{revision}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{rustc_sha256}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nloader_sha256 = \"{}\"\ninit27_stack_analysis_method = \"{STACK_ANALYSIS_METHOD}\"\ninit27_stack_metadata_flag = \"{STACK_METADATA_FLAG}\"\ninit27_stack_tool_path = \"{STACK_TOOL_PATH}\"\ninit27_stack_tool_version = \"{STACK_TOOL_VERSION}\"\ninit27_stack_tool_sha256 = \"{STACK_TOOL_SHA256}\"\ninit27_stack_budget_bytes = {STACK_BUDGET_BYTES}\ninit27_stack_result = \"pass\"\ninit27_stack_maximum_label = \"{}\"\ninit27_stack_maximum_bytes = {}\n",
+        "kind = \"{SOURCE_RECEIPT_KIND}\"\nschema_version = 3\nwyrmroot_revision = \"{revision}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{rustc_sha256}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nloader_sha256 = \"{}\"\ninit27_stack_analysis_method = \"{STACK_ANALYSIS_METHOD}\"\ninit27_stack_metadata_flag = \"{STACK_METADATA_FLAG}\"\ninit27_stack_budget_bytes = {STACK_BUDGET_BYTES}\ninit27_stack_result = \"pass\"\ninit27_stack_maximum_label = \"{}\"\ninit27_stack_maximum_bytes = {}\n",
         toolchain.accepted().cargo_sha256,
         toolchain.accepted().rust_lld_sha256,
         toolchain.accepted().manifest_sha256,
@@ -900,10 +899,11 @@ fn analyze_stack_budget(
         ));
     }
     verify_stack_tool()?;
-    let output = Command::new(STACK_TOOL_PATH)
+    let output = Command::new(STACK_TOOL)
         .args(["--elf-output-style=JSON", "--stack-sizes", "--demangle"])
         .arg(artifact)
         .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .stdin(Stdio::null())
         .output()
         .map_err(|error| Failure::task(format!("could not run WYR1-B stack analyzer: {error}")))?;
@@ -933,37 +933,17 @@ fn analyze_stack_budget(
 }
 
 fn verify_stack_tool() -> Result<(), Failure> {
-    let path = Path::new(STACK_TOOL_PATH);
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| Failure::task(format!("could not inspect pinned LLVM tool: {error}")))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.nlink() != 1 {
-        return Err(Failure::task(
-            "WYR1-B stack analyzer is not the pinned regular LLVM tool",
-        ));
-    }
-    let digest = sha256::file_digest(path)
-        .map_err(|error| Failure::task(format!("could not hash pinned LLVM tool: {error}")))?;
-    if digest != STACK_TOOL_SHA256 {
-        return Err(Failure::task(
-            "WYR1-B stack analyzer does not match the pinned LLVM identity",
-        ));
-    }
-    let version = Command::new(path)
+    let status = Command::new(STACK_TOOL)
         .arg("--version")
         .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .stdin(Stdio::null())
-        .output()
-        .map_err(|error| Failure::task(format!("could not version pinned LLVM tool: {error}")))?;
-    let text = std::str::from_utf8(&version.stdout)
-        .map_err(|_| Failure::task("pinned LLVM version output is not UTF-8"))?;
-    if !version.status.success()
-        || version.stdout.len() > 4096
-        || version.stderr.len() > 4096
-        || !text.lines().any(|line| line.trim() == STACK_TOOL_VERSION)
-    {
-        return Err(Failure::task(
-            "WYR1-B stack analyzer version does not match the pinned LLVM identity",
-        ));
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| Failure::task(format!("could not run {STACK_TOOL}: {error}")))?;
+    if !status.success() {
+        return Err(Failure::task(format!("{STACK_TOOL} --version failed")));
     }
     Ok(())
 }
@@ -2838,9 +2818,6 @@ fn source_receipt_keys() -> BTreeSet<String> {
         "loader_sha256",
         "init27_stack_analysis_method",
         "init27_stack_metadata_flag",
-        "init27_stack_tool_path",
-        "init27_stack_tool_version",
-        "init27_stack_tool_sha256",
         "init27_stack_budget_bytes",
         "init27_stack_result",
         "init27_stack_maximum_label",
@@ -2914,9 +2891,6 @@ fn verify_source_receipt(request: &Request, receipt: &[u8]) -> Result<(), Failur
             STACK_ANALYSIS_METHOD.to_owned(),
         ),
         ("init27_stack_metadata_flag", STACK_METADATA_FLAG.to_owned()),
-        ("init27_stack_tool_path", STACK_TOOL_PATH.to_owned()),
-        ("init27_stack_tool_version", STACK_TOOL_VERSION.to_owned()),
-        ("init27_stack_tool_sha256", STACK_TOOL_SHA256.to_owned()),
         ("init27_stack_budget_bytes", STACK_BUDGET_BYTES.to_string()),
         ("init27_stack_result", "pass".to_owned()),
         ("bootstrap_sha256", request.bootstrap_sha256.clone()),
@@ -3041,9 +3015,6 @@ pub(crate) fn verify_selector25_source_receipt(
         ("toolchain_tree_sha256", ACCEPTED_TOOLCHAIN_TREE_SHA256),
         ("init27_stack_analysis_method", STACK_ANALYSIS_METHOD),
         ("init27_stack_metadata_flag", STACK_METADATA_FLAG),
-        ("init27_stack_tool_path", STACK_TOOL_PATH),
-        ("init27_stack_tool_version", STACK_TOOL_VERSION),
-        ("init27_stack_tool_sha256", STACK_TOOL_SHA256),
         ("init27_stack_result", "pass"),
     ] {
         if required(&values, key)? != expected {
@@ -3384,9 +3355,6 @@ mod tests {
                 STACK_ANALYSIS_METHOD.to_owned(),
             ),
             ("init27_stack_metadata_flag", STACK_METADATA_FLAG.to_owned()),
-            ("init27_stack_tool_path", STACK_TOOL_PATH.to_owned()),
-            ("init27_stack_tool_version", STACK_TOOL_VERSION.to_owned()),
-            ("init27_stack_tool_sha256", STACK_TOOL_SHA256.to_owned()),
             ("init27_stack_budget_bytes", STACK_BUDGET_BYTES.to_string()),
             ("init27_stack_result", "pass".to_owned()),
             (

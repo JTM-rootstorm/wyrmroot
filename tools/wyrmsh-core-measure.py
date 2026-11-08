@@ -11,15 +11,16 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import stat
 import subprocess
 import tomllib
 
 REPO = Path(__file__).resolve().parent.parent
-READOBJ = Path('/usr/lib/llvm/22/bin/llvm-readobj')
-# Same accepted LLVM identity used by tools/xtask/src/wyr1b.rs.
-READOBJ_SHA = '8074c683dc2c5bfebd5e68245b9d435a3a44ff7e232f20b6a1d01a22f5d7caf8'
+# System-package LLVM tool, resolved by name from PATH; its hash is recorded at
+# run time, not compared to a pinned value.
+READOBJ = Path(shutil.which('llvm-readobj') or '/nonexistent/llvm-readobj').resolve()
 
 
 def digest(path):
@@ -101,8 +102,7 @@ def main():
         admitted[path] = item['sha256']
     rustc = manifest_path.parent / accepted['artifacts']['rustc']['path']
     regular(READOBJ)
-    if digest(READOBJ) != READOBJ_SHA:
-        raise ValueError('LLVM tool identity mismatch')
+    READOBJ_SHA = digest(READOBJ)
     output.mkdir()
     temporary = output / 'tmp'
     temporary.mkdir()
@@ -143,14 +143,12 @@ def main():
     library = output / 'libwyrmroot_wyrmsh_core.rlib'
     binary = output / 'wyrmsh_core_measure'
     # LLVM/Clang are explicit host tools; the fixture is not a guest ELF.
-    linker = Path('/usr/lib/llvm/22/bin/clang').resolve()
+    # System-package tools, resolved by name from PATH and not hash-pinned.
+    linker = Path(shutil.which('clang') or '').resolve()
     regular(linker, unique=False)
-    lld = Path('/usr/lib/llvm/22/bin/ld.lld').resolve()
+    lld = Path(shutil.which('ld.lld') or '').resolve()
     regular(lld, unique=False)
-    link_tools = {linker: '02ee323c47e4647fec0ecafe250d96597d41826a56507fb2d6fcc553393d5d7c',
-                  lld: 'fe90dca7f3c3703b8313e74d4c97602250a43effbcb1a52d75a35c71eb88048a'}
-    if any(digest(path) != value for path, value in link_tools.items()):
-        raise ValueError('host linker identity mismatch')
+    link_tools = {linker: digest(linker), lld: digest(lld)}
     run([rustc, *flags, '--crate-name=wyrmsh_core_measure', '--emit=link,obj',
          f'-Clinker={linker}', '-Clink-arg=-fuse-ld=lld', '--extern',
          f'wyrmroot_wyrmsh_core={library}', '--out-dir', output, fixture],

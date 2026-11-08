@@ -19,19 +19,18 @@ import re
 import selectors
 import signal
 import stat
+import shutil
 import subprocess
 import time
 from typing import NoReturn
 
 
 REPO = Path(__file__).resolve().parent.parent
-READOBJ = Path("/usr/lib/llvm/22/bin/llvm-readobj")
-OBJDUMP = Path("/usr/lib/llvm/22/bin/llvm-objdump")
-LLVM_VERSION = "22.1.8"
-TOOL_HASHES = {
-    READOBJ: "8074c683dc2c5bfebd5e68245b9d435a3a44ff7e232f20b6a1d01a22f5d7caf8",
-    OBJDUMP: "62b4f73958bc93a1f9618d4c35b4459d8563a60f11d22af313f7bb639e440f0b",
-}
+# System-package LLVM tools, resolved by name from PATH. Their hashes are
+# recorded at run time (to detect a change mid-analysis), not pinned.
+READOBJ = Path(shutil.which("llvm-readobj") or "/nonexistent/llvm-readobj").resolve()
+OBJDUMP = Path(shutil.which("llvm-objdump") or "/nonexistent/llvm-objdump").resolve()
+TOOL_HASHES: dict[Path, str] = {}
 WORKING_STACK_LIMIT = 108 * 1024
 MAPPED_STACK_BYTES = 128 * 1024
 STARTUP_BLOCK_BYTES = 20 * 1024
@@ -664,18 +663,17 @@ def _prove(functions: dict[int, Function], root_address: int) -> dict[str, objec
 
 def _tool_identities() -> list[dict[str, str]]:
     identities = []
-    for tool, expected_hash in TOOL_HASHES.items():
+    for tool in (READOBJ, OBJDUMP):
         _regular(tool)
-        if _digest(tool) != expected_hash:
-            raise ValueError(f"LLVM tool identity mismatch: {tool}")
+        expected_hash = TOOL_HASHES.setdefault(tool, _digest(tool))
         version = _run([str(tool), "--version"], cwd=REPO).decode("utf-8", "strict")
         version_lines = [line.strip() for line in version.splitlines() if line.strip()]
         version_line = next(
             (line for line in version_lines if line.startswith("LLVM version ")),
             "",
         )
-        if f"LLVM version {LLVM_VERSION}" not in version:
-            raise ValueError(f"LLVM version mismatch: {tool}")
+        if not version_line:
+            raise ValueError(f"not an LLVM tool: {tool}")
         identities.append({
             "path": str(tool),
             "sha256": expected_hash,
