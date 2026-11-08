@@ -12857,11 +12857,19 @@ mod tests {
                     action: expected,
                 }))
             );
+            // The bare nonce, a near miss of either stage's token, the other
+            // stage's exact token, and lower-case hex are all refused.
+            let other_stage = if stage == 2 {
+                "112233445566758A"
+            } else {
+                "112233445566768A"
+            };
             for rejected in [
                 "1122334455667788",
                 "112233445566768B",
                 "112233445566758B",
                 "112233445566768a",
+                other_stage,
             ] {
                 assert_eq!(
                     classify_e8_trigger_for_test(stage, action, rejected),

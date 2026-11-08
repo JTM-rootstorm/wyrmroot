@@ -152,16 +152,6 @@ fn e8_holds_the_real_terminal_wait_until_exact_quiescence_and_cleanup() {
 }
 
 #[test]
-fn e8_trigger_token_is_derived_per_recovery_stage() {
-    assert!(JOBS.contains("const E8_DRIVER_TRIGGER_TOKEN_INDEX: u64 = 0x0102;"));
-    assert!(JOBS.contains("const E8_REGISTRY_TRIGGER_TOKEN_INDEX: u64 = 0x0202;"));
-    assert!(JOBS.contains("let expected_token = nonce ^ token_index;"));
-    assert!(JOBS.contains(
-        "expected_token == 0 || launch.arg(2).and_then(parse_e8_nonce) != Some(expected_token)"
-    ));
-}
-
-#[test]
 fn driver_retire_uses_all_six_current_d5_identity_fields() {
     let identity = &JOBS[JOBS.find("pub(crate) fn e8_driver_identity").unwrap()
         ..JOBS.find("pub(crate) fn record_e8_forced_retired").unwrap()];
