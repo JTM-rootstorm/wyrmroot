@@ -142,229 +142,140 @@ fn c6_joins_wrdm_to_the_validated_retained_uart_identity() {
     assert!(!NATIVE_SOURCE.contains("manifest.executable_identity(RoleId::Uart16550d)"));
 }
 
-#[test]
-fn selector31_controller_rejoins_response_temt_then_retires_u1_before_fresh_u2() {
-    let response = NATIVE_SOURCE
-        .find("E3AControllerMessage::ResponseCommitted")
-        .unwrap();
-    let temt = NATIVE_SOURCE
-        .find("DevmgrControlInput::TransportEmpty(fact)")
-        .unwrap();
-    let begin = NATIVE_SOURCE.find("fn maybe_begin_e3a_retire").unwrap();
-    let stage1 = NATIVE_SOURCE[temt..]
-        .find("DevmgrControlInput::RetireStage1Ready")
-        .unwrap()
-        + temt;
-    let closed = NATIVE_SOURCE
-        .find("E3AControllerMessage::StreamPeerClosed")
-        .unwrap();
-    let report = NATIVE_SOURCE
-        .find("Dw1e3ReportEvent::Driver1PeerClosed")
-        .unwrap();
-    let finalize = NATIVE_SOURCE.find("fn send_e3a_finalize_retire").unwrap();
-    assert!(begin < temt && begin < response);
-    assert!(temt < stage1 && stage1 < closed && closed < report);
-    assert!(finalize < closed);
-    assert!(NATIVE_SOURCE.contains("reap_e3a_probe(resident, system, waits, true)?"));
-    assert!(NATIVE_SOURCE.contains("if cleanup_failed || !admit_u2 {"));
-    assert!(NATIVE_SOURCE.contains("state.e3a_next_challenge_generation = 0;"));
-    assert!(NATIVE_SOURCE.contains("} else if retired_generation == 1 {"));
-    assert!(NATIVE_SOURCE.contains("state.e3a_next_challenge_generation = 2;"));
-    assert!(NATIVE_SOURCE.contains("fn e3a_probe_client_id(challenge_generation: u64)"));
-    assert!(
-        NATIVE_SOURCE.contains("let probe_client_id = e3a_probe_client_id(challenge_generation)?;")
-    );
-    assert!(NATIVE_SOURCE.contains("E3A_PROBE_TRANSACTION_ID,\n            probe_client_id,"));
+/// The text of `fn name`, up to its closing brace at column 0.
+fn native_fn(name: &str) -> &'static str {
+    let start = NATIVE_SOURCE
+        .find(&format!("fn {name}"))
+        .unwrap_or_else(|| panic!("missing fn {name}"));
+    let end = NATIVE_SOURCE[start..].find("\n}\n").unwrap() + start;
+    &NATIVE_SOURCE[start..end]
 }
 
-#[test]
-fn selector31_u1_exit_requires_complete_finalize_state_and_zero_normal_exit() {
-    let validate = NATIVE_SOURCE
-        .find("fn validate_e3a_u1_finalize_exit")
-        .unwrap();
-    let body = &NATIVE_SOURCE[validate..];
-    for requirement in [
-        "!state.e3a_response_committed",
-        "!state.e3a_begin_retire_sent",
-        "!state.e3a_stage1_ready",
-        "!state.e3a_peer_closed",
-        "!state.e3a_finalize_retire_sent",
-        "validate_successful_exit(&exit)",
-    ] {
-        assert!(body.contains(requirement), "missing {requirement}");
+/// The text of one match arm of `body`, from `start` to the next `end`.
+fn arm<'a>(body: &'a str, start: &str, end: &str) -> &'a str {
+    let from = body
+        .find(start)
+        .unwrap_or_else(|| panic!("missing arm {start}"));
+    let to = body[from..]
+        .find(end)
+        .unwrap_or_else(|| panic!("missing end {end}"))
+        + from;
+    &body[from..to]
+}
+
+fn in_order(text: &str, needles: &[&str]) {
+    let mut at = 0;
+    for needle in needles {
+        at += text[at..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle} in order"))
+            + needle.len();
     }
-    let exit = NATIVE_SOURCE
-        .find("ResidentPollEvent::DriverExited =>")
-        .unwrap();
-    let gate = NATIVE_SOURCE[exit..]
-        .find("validate_e3a_u1_finalize_exit(resident, waits)")
-        .unwrap()
-        + exit;
-    let reap = NATIVE_SOURCE[exit..]
-        .find("let _request = reap_driver")
-        .unwrap()
-        + exit;
-    assert!(gate < reap);
 }
 
+/// Selector 31's resident dispatch routes each probe and driver event to the
+/// join that owns it. Source text, because the arms are inline in
+/// `control_tick`, which no host fake drives in the selector-31 shape (it needs
+/// a scripted multi-handle wait and receive); the joins themselves are
+/// host-tested in `wyr1c_native::tests::selector31` (S3 rows 201-207).
 #[test]
-fn selector31_supervises_probe_channel_and_process_failure_without_advancement() {
-    // The probe can die before C1 response, after stage1 but before its close
-    // proof, or during U2.  All three paths share the same exact cleanup
-    // fence: no lifecycle edge may turn such a death into a new admission.
-    for required in [
-        "ProbeControlLost",
-        "ProbeExited",
-        "DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0)",
-        "handle: probe.loaded.process",
-        "signals: DW_SIGNAL_EXITED",
-        "fn fail_e3a_probe_supervision",
-        "fn reap_e3a_u2_probe_after_response",
-        "fn e3a_u2_probe_may_exit",
-        "fn fail_e3a_u2_probe_exit",
-        "fn fail_closed_e3a_recovery",
-        "validate_successful_exit(&exit)",
-        "reap_e3a_probe(resident, system, waits, false)",
-        "reap_driver(resident, system, waits, true)",
-        "state.e3a_next_challenge_generation = 0;",
+fn selector31_resident_dispatch_routes_each_probe_and_driver_event_to_its_join() {
+    let tick = native_fn("control_tick<");
+    in_order(
+        tick,
+        &[
+            "if let Some(probe) = state.e3a_probe",
+            "handle: probe.loaded.launch_channel",
+            "DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0",
+            "handle: probe.loaded.process",
+            "signals: DW_SIGNAL_EXITED",
+            "system.wait_many(",
+        ],
+    );
+    in_order(
+        arm(
+            tick,
+            "Ok(DevmgrControlInput::TransportEmpty(fact)) =>",
+            "Ok(DevmgrControlInput::BindingReady",
+        ),
+        &[
+            "exact_transport_empty(binding, fact)?",
+            ".e3a_transport_empty = Some(fact);",
+            "maybe_begin_e3a_retire(resident, system)",
+        ],
+    );
+    in_order(
+        arm(
+            tick,
+            "Ok(DevmgrControlInput::RetireStage1Ready(binding)) =>",
+            "Ok(DevmgrControlInput::C6Fact",
+        ),
+        &[
+            "!state.e3a_begin_retire_sent",
+            "state.e3a_stage1_ready = true;",
+            "send_e3a_finalize_retire(resident, system)",
+        ],
+    );
+    in_order(
+        arm(
+            tick,
+            "ResidentPollEvent::DriverExited =>",
+            "ResidentPollEvent::ProbeControlReadable =>",
+        ),
+        &[
+            "validate_e3a_u1_finalize_exit(resident, waits)",
+            "let _request = reap_driver(resident, system, waits, false);",
+            "reap_e3a_probe(resident, system, waits, true)?",
+            "acknowledge_driver_reaped(",
+        ],
+    );
+    let readable = arm(
+        tick,
+        "ResidentPollEvent::ProbeControlReadable =>",
+        "ResidentPollEvent::ProbeControlLost =>",
+    );
+    in_order(
+        readable,
+        &[
+            "E3AControllerMessage::ResponseCommitted",
+            "state.e3a_response_committed = true;",
+            "maybe_begin_e3a_retire(resident, system)",
+            "E3AControllerMessage::StreamPeerClosed",
+            "!state.e3a_response_committed",
+            "Dw1e3ReportEvent::Driver1PeerClosed",
+            ".e3a_peer_closed = true;",
+            "send_e3a_finalize_retire(resident, system)",
+        ],
+    );
+    for (event, end, validate) in [
+        (
+            "ResidentPollEvent::ProbeControlLost =>",
+            "ResidentPollEvent::ProbeExited =>",
+            "false",
+        ),
+        (
+            "ResidentPollEvent::ProbeExited =>",
+            "selector32::poll(",
+            "true",
+        ),
     ] {
-        assert!(NATIVE_SOURCE.contains(required), "missing {required}");
+        in_order(
+            arm(tick, event, end),
+            &[
+                "if e3a_u2_probe_may_exit(resident)",
+                "reap_e3a_u2_probe_after_response(resident, system, waits)",
+                "fail_e3a_u2_probe_exit(resident, system, waits, error)",
+                &format!("fail_e3a_probe_supervision(resident, system, waits, {validate})"),
+            ],
+        );
     }
-    let lost = NATIVE_SOURCE
-        .find("ResidentPollEvent::ProbeControlLost")
-        .unwrap();
-    let exited = NATIVE_SOURCE
-        .find("ResidentPollEvent::ProbeExited")
-        .unwrap();
-    let failed = NATIVE_SOURCE.find("fail_e3a_probe_supervision").unwrap();
-    let u2 = NATIVE_SOURCE
-        .find("start_e3a_probe(resident, system, loader, waits, bootfs)")
-        .unwrap();
-    assert!(lost < u2 && exited < u2 && failed < u2);
-    let u2_reap = NATIVE_SOURCE
-        .find("reap_e3a_u2_probe_after_response(resident, system, waits)")
-        .unwrap();
-    let u2_failure = NATIVE_SOURCE[u2_reap..]
-        .find("fail_e3a_probe_supervision(resident, system, waits")
-        .unwrap()
-        + u2_reap;
-    assert!(u2_reap < u2_failure);
-}
-
-#[test]
-fn selector31_reaps_only_exact_normal_u1_or_u2_probe_exits() {
-    let u1_reap = NATIVE_SOURCE.find("fn reap_e3a_probe").unwrap();
-    let u1_body = &NATIVE_SOURCE[u1_reap..];
-    assert!(
-        u1_body.contains("!admit_u2 || wyrmroot_runtime::validate_successful_exit(&info).is_ok()")
-    );
-    assert!(u1_body.contains("if cleanup_failed || !admit_u2"));
-    assert!(u1_body.contains("state.e3a_next_challenge_generation = 0;"));
-
-    let u2_reap = NATIVE_SOURCE
-        .find("fn reap_e3a_u2_probe_after_response")
-        .unwrap();
-    let u2_body = &NATIVE_SOURCE[u2_reap..];
-    assert!(u2_body.contains("validate_successful_exit(&exit)"));
-    assert!(u2_body.contains("if observed_exit"));
-    assert!(u2_body.contains("terminate_task_group(probe.task_group)"));
-    assert!(u2_body.contains("Err(InitError::Supervision)"));
-    assert!(u2_body.contains("let fallback_exited"));
-    assert!(u2_body.contains("e3a_probe = Some(probe)"));
-    assert!(u2_body.contains("e3a_u2_probe_reaped_successfully = true"));
-    assert!(u2_body.contains("maybe_begin_e3a_retire(resident, system)"));
-    let nonzero = u2_body.find("validate_successful_exit(&exit)").unwrap();
-    let terminate = u2_body
-        .find("terminate_task_group(probe.task_group)")
-        .unwrap();
-    assert!(nonzero < terminate);
-}
-
-#[test]
-fn selector31_devmgr_or_registry_loss_poison_active_q1_and_q2_before_recovery() {
-    let cleanup = NATIVE_SOURCE.find("fn fail_closed_e3a_recovery").unwrap();
-    let body = &NATIVE_SOURCE[cleanup..];
-    for required in [
-        "reap_e3a_probe(resident, system, waits, false)",
-        "reap_driver(resident, system, waits, true)",
-        "poison_e3a_lifecycle(resident)",
-        "resident.result = RecoveryResult::Fatal;",
-        "Some(probe_cleanup.is_err() || driver_cleanup.is_err())",
-    ] {
-        assert!(body.contains(required), "missing {required}");
+    for recovery in ["recover_registry<", "recover_devmgr<"] {
+        in_order(
+            native_fn(recovery),
+            &[
+                "if let Some(child_cleanup_failed) = fail_closed_e3a_recovery(resident, system, waits)",
+                "return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);",
+            ],
+        );
     }
-    assert!(NATIVE_SOURCE.contains("state.e3a_next_challenge_generation = 0;"));
-    let terminal_cleanup = NATIVE_SOURCE.find("fn finish_e3a_fatal_recovery").unwrap();
-    let terminal_body = &NATIVE_SOURCE[terminal_cleanup..];
-    for required in [
-        "state.registry.take()",
-        "state.devmgr.take()",
-        "cleanup_loaded(system, waits, devmgr.loaded, devmgr.task_group, true)",
-        "registry.active.loaded",
-        "system.close_handle(registry.control_channel)",
-        "retire_attempt_after_fatal(RoleId::Devmgr)",
-        "retire_attempt_after_fatal(RoleId::Registryd)",
-        "resident.controller.fatal();",
-        "resident.result = RecoveryResult::Fatal;",
-        "let mut cleanup_failed = child_cleanup_failed;",
-    ] {
-        assert!(terminal_body.contains(required), "missing {required}");
-    }
-    let registry = NATIVE_SOURCE.find("fn recover_registry").unwrap();
-    let devmgr = NATIVE_SOURCE.find("fn recover_devmgr").unwrap();
-    assert!(
-        NATIVE_SOURCE[registry..]
-            .contains("if let Some(child_cleanup_failed) = fail_closed_e3a_recovery")
-    );
-    assert!(
-        NATIVE_SOURCE[registry..]
-            .contains("finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);")
-    );
-    assert!(
-        NATIVE_SOURCE[devmgr..]
-            .contains("if let Some(child_cleanup_failed) = fail_closed_e3a_recovery")
-    );
-    assert!(
-        NATIVE_SOURCE[devmgr..]
-            .contains("finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);")
-    );
-}
-
-#[test]
-fn selector31_drains_queued_u2_response_before_a_combined_peer_close_is_classified() {
-    let classifier = NATIVE_SOURCE.find("fn classify_resident_poll").unwrap();
-    let readable = NATIVE_SOURCE[classifier..]
-        .find("Ok(ResidentPollEvent::ProbeControlReadable)")
-        .unwrap()
-        + classifier;
-    let closed = NATIVE_SOURCE[classifier..]
-        .find("Ok(ResidentPollEvent::ProbeControlLost)")
-        .unwrap()
-        + classifier;
-    assert!(readable < closed);
-    let response = NATIVE_SOURCE
-        .find("E3AControllerMessage::ResponseCommitted")
-        .unwrap();
-    let u2_exit = NATIVE_SOURCE
-        .find("e3a_u2_probe_may_exit(resident)")
-        .unwrap();
-    assert!(response < u2_exit);
-    assert!(NATIVE_SOURCE.contains("combined READABLE|PEER_CLOSED wake"));
-}
-
-#[test]
-fn selector31_u2_temt_and_normal_probe_reap_join_before_the_only_terminal_claim_path() {
-    let terminal = NATIVE_SOURCE
-        .find("dw1e3_terminal_claim(binding.nonce)")
-        .unwrap();
-    let join = NATIVE_SOURCE[..terminal]
-        .rfind("exact_transport_empty(")
-        .unwrap();
-    let response = NATIVE_SOURCE[..terminal]
-        .rfind("if !response_committed || transport_empty.is_none()")
-        .unwrap();
-    let u2_reaped = NATIVE_SOURCE[..terminal]
-        .rfind("if !u2_probe_reaped_successfully")
-        .unwrap();
-    assert!(response < u2_reaped && u2_reaped < join && join < terminal);
 }

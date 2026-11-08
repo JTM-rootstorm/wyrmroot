@@ -4822,7 +4822,7 @@ mod native_cleanup_tests {
 
     /// Two ready early roles under one resident. With `ResidentWaits`, the
     /// first legacy tick reaps the registry's peer close and succeeds.
-    fn two_role_resident() -> (ResidentSystemInit, ActiveNativeRole, ActiveNativeRole) {
+    pub(crate) fn two_role_resident() -> (ResidentSystemInit, ActiveNativeRole, ActiveNativeRole) {
         let mut controller = SystemInit {
             mode: SystemMode::Bootstrap,
             roles: [

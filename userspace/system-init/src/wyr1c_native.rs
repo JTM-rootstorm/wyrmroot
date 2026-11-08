@@ -5516,8 +5516,16 @@ mod tests {
         inbound_len: usize,
         send_count: usize,
         fail_send_at: usize,
-        closed: [DwHandle; 4],
+        closed: [DwHandle; 16],
         close_count: usize,
+        /// Plain `send_channel` calls are refused unless a test opts in.
+        accept_sends: bool,
+        sent: [DwHandle; 4],
+        send_plain_count: usize,
+        /// `terminate_task_group` is refused unless a test opts in.
+        accept_terminate: bool,
+        terminated: [DwHandle; 8],
+        terminate_count: usize,
         registry_service_generation: Option<u64>,
         controller_service_generation: Option<u64>,
         controller_request: Option<ControllerMessage>,
@@ -5538,8 +5546,14 @@ mod tests {
                 inbound_len: wyrmroot_device_proto::controller::STATUS_BYTES,
                 send_count: 0,
                 fail_send_at: usize::MAX,
-                closed: [DwHandle(0); 4],
+                closed: [DwHandle(0); 16],
                 close_count: 0,
+                accept_sends: false,
+                sent: [DwHandle(0); 4],
+                send_plain_count: 0,
+                accept_terminate: false,
+                terminated: [DwHandle(0); 8],
+                terminate_count: 0,
                 registry_service_generation: None,
                 controller_service_generation: None,
                 controller_request: None,
@@ -5592,8 +5606,13 @@ mod tests {
             Err(FAILURE)
         }
 
-        fn send_channel(&mut self, _channel: DwHandle, _bytes: &[u8]) -> Result<(), NativeError> {
-            Err(FAILURE)
+        fn send_channel(&mut self, channel: DwHandle, _bytes: &[u8]) -> Result<(), NativeError> {
+            if !self.accept_sends {
+                return Err(FAILURE);
+            }
+            self.sent[self.send_plain_count] = channel;
+            self.send_plain_count += 1;
+            Ok(())
         }
 
         fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
@@ -5609,8 +5628,13 @@ mod tests {
             Err(FAILURE)
         }
 
-        fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
-            Err(FAILURE)
+        fn terminate_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError> {
+            if !self.accept_terminate {
+                return Err(FAILURE);
+            }
+            self.terminated[self.terminate_count] = task_group;
+            self.terminate_count += 1;
+            Ok(())
         }
 
         fn now(&mut self) -> Result<u64, NativeError> {
@@ -5698,6 +5722,9 @@ mod tests {
 
     struct StatusWaits {
         fail: bool,
+        /// When set, every wait observes EXITED and every termination query
+        /// answers this record.
+        exit: Option<DwTaskTerminationInfoV1>,
     }
 
     impl SupervisionPlatform for StatusWaits {
@@ -5713,7 +5740,11 @@ mod tests {
             } else {
                 Ok(DwWaitResultV1 {
                     index: 0,
-                    observed: DW_SIGNAL_READABLE,
+                    observed: if self.exit.is_some() {
+                        DW_SIGNAL_EXITED
+                    } else {
+                        DW_SIGNAL_READABLE
+                    },
                     ..DwWaitResultV1::default()
                 })
             }
@@ -5732,7 +5763,7 @@ mod tests {
             &mut self,
             _process: DwHandle,
         ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
-            Err(FAILURE)
+            self.exit.ok_or(FAILURE)
         }
     }
 
@@ -5911,7 +5942,10 @@ mod tests {
                 topology.issue(7, EndpointKind::Publication).unwrap();
                 let result = perform_rebind(
                     &mut platform,
-                    &mut StatusWaits { fail: false },
+                    &mut StatusWaits {
+                        fail: false,
+                        exit: None,
+                    },
                     &mut topology,
                     &mut PublicationAllocator::new(),
                     DwHandle(40),
@@ -5948,7 +5982,10 @@ mod tests {
             assert_eq!(
                 perform_rebind(
                     &mut platform,
-                    &mut StatusWaits { fail: false },
+                    &mut StatusWaits {
+                        fail: false,
+                        exit: None,
+                    },
                     &mut topology,
                     &mut PublicationAllocator::new(),
                     DwHandle(40),
@@ -6031,7 +6068,10 @@ mod tests {
             attempt_generation: None,
         };
         let mut platform = RebindPlatform::with_status(status);
-        let mut waits = StatusWaits { fail: false };
+        let mut waits = StatusWaits {
+            fail: false,
+            exit: None,
+        };
         let mut topology = RegistryTopology::new(2).unwrap();
         let initial_grant = topology.issue(7, EndpointKind::Publication).unwrap();
         assert_eq!(initial_grant.endpoint_id, 1);
@@ -6074,7 +6114,10 @@ mod tests {
     #[test]
     fn e8_rebind_expiry_precedes_namespace_and_endpoint_effects() {
         let mut platform = RebindPlatform::with_status(waiting_device_status());
-        let mut waits = StatusWaits { fail: false };
+        let mut waits = StatusWaits {
+            fail: false,
+            exit: None,
+        };
         let mut topology = RegistryTopology::new(2).unwrap();
         let mut publications = PublicationAllocator::new();
 
@@ -6131,7 +6174,10 @@ mod tests {
         platform.fail_send_at = 2;
         let error = perform_rebind(
             &mut platform,
-            &mut StatusWaits { fail: false },
+            &mut StatusWaits {
+                fail: false,
+                exit: None,
+            },
             &mut RegistryTopology::new(2).unwrap(),
             &mut PublicationAllocator::new(),
             DwHandle(40),
@@ -6150,7 +6196,10 @@ mod tests {
         let mut platform = RebindPlatform::with_status(waiting_device_status());
         let error = perform_rebind(
             &mut platform,
-            &mut StatusWaits { fail: true },
+            &mut StatusWaits {
+                fail: true,
+                exit: None,
+            },
             &mut RegistryTopology::new(2).unwrap(),
             &mut PublicationAllocator::new(),
             DwHandle(40),
@@ -6622,5 +6671,551 @@ mod tests {
             selector29_terminal_fact_for_event(crate::wyr1c6_gate::GateEvent::P2Publish),
             Err(InitError::WrongManifestProfile)
         );
+    }
+
+    /// Selector 31's lifecycle joins, driven through the functions that make
+    /// them. Structural refactor S3 rows 201-207; these replace text tests that
+    /// read the joins' spelling from this file.
+    #[cfg(feature = "dw1e3-selector31")]
+    mod selector31 {
+        use super::*;
+        use deepwyrm_syscall::{DW_TASK_STATE_EXITED, DW_TERMINATION_NORMAL_EXIT, DwSignals};
+
+        const PROBE: InstalledPeer = InstalledPeer {
+            grant: crate::wyr1b::EndpointGrant {
+                registry_generation: 1,
+                endpoint_id: 0x31,
+                endpoint_generation: 1,
+                role_generation: 1,
+                kind: crate::wyr1b::EndpointKind::RegistryClient,
+            },
+            loaded: LoadedProcess {
+                process: DwHandle(0x3101),
+                launch_channel: DwHandle(0x3102),
+            },
+            task_group: DwHandle(0x3103),
+        };
+        const DRIVER_PROCESS: DwHandle = DwHandle(0x3201);
+
+        fn exit(application_code: u64) -> DwTaskTerminationInfoV1 {
+            DwTaskTerminationInfoV1 {
+                size: deepwyrm_syscall::DW_TASK_TERMINATION_INFO_V1_SIZE,
+                version: 1,
+                state: DW_TASK_STATE_EXITED,
+                reason: DW_TERMINATION_NORMAL_EXIT,
+                application_code: application_code as _,
+                ..DwTaskTerminationInfoV1::default()
+            }
+        }
+
+        fn waits(application_code: u64) -> StatusWaits {
+            StatusWaits {
+                fail: false,
+                exit: Some(exit(application_code)),
+            }
+        }
+
+        fn platform() -> RebindPlatform {
+            let mut platform =
+                RebindPlatform::with_reply([0; wyrmroot_device_proto::controller::STATUS_BYTES]);
+            platform.accept_sends = true;
+            platform.accept_terminate = true;
+            platform
+        }
+
+        /// A binding for `generation`. Only generation 1 is exact on the host:
+        /// generation 2's challenge nonce comes from the product build, so any
+        /// path that reaches `exact_e3a_response` for it fails.
+        fn binding(generation: u64) -> ChallengeBinding {
+            let challenge = e3a_challenge(wyrmroot_runtime::dw1e3_challenge_nonce(1).unwrap());
+            ChallengeBinding {
+                nonce: 0x3131,
+                attempt_generation: 2,
+                publication_generation: 3,
+                stream_generation: 4,
+                challenge_generation: generation,
+                expected_length: E3A_CHALLENGE_BYTES as u64,
+                expected_hash: e3a_fnv1a64(&challenge),
+            }
+        }
+
+        fn temt(binding: ChallengeBinding) -> TransportEmptyFact {
+            let (response_length, response_hash) = exact_e3a_response(binding).unwrap();
+            TransportEmptyFact {
+                nonce: binding.nonce,
+                attempt_generation: binding.attempt_generation,
+                publication_generation: binding.publication_generation,
+                stream_generation: binding.stream_generation,
+                challenge_generation: binding.challenge_generation,
+                response_length,
+                response_hash,
+            }
+        }
+
+        fn fixture(binding: Option<ChallengeBinding>) -> (ResidentSystemInit, ActiveNativeRole) {
+            let (mut resident, _registry, devmgr) =
+                crate::native_cleanup_tests::two_role_resident();
+            resident.wyr1c = Some(ResidentState {
+                resource_domain: None,
+                registry: None,
+                topology: RegistryTopology::new(1).unwrap(),
+                devmgr: Some(devmgr),
+                binding: None,
+                publication_service_generation: 1,
+                waiting_registry_observed: false,
+                publication_allocator: PublicationAllocator::new(),
+                last_controller_transaction: 0,
+                next_controller_transaction: 1,
+                driver: Some(DriverNativeAttempt {
+                    loaded: LoadedProcess {
+                        process: DRIVER_PROCESS,
+                        launch_channel: DwHandle(0x3202),
+                    },
+                    task_group: DwHandle(0x3203),
+                    request: driver_request(),
+                }),
+                last_reaped_driver: None,
+                e3a_probe: Some(PROBE),
+                e3a_stream_generation: Some(4),
+                e3a_binding: binding,
+                e3a_response_committed: false,
+                e3a_transport_empty: None,
+                e3a_begin_retire_sent: false,
+                e3a_stage1_ready: false,
+                e3a_peer_closed: false,
+                e3a_finalize_retire_sent: false,
+                e3a_next_challenge_generation: binding.map_or(1, |b| b.challenge_generation),
+                e3a_terminal_claimed: false,
+                e3a_u2_probe_reaped_successfully: false,
+                last_driver_attempt: 0,
+                last_driver_session: 0,
+                last_driver_endpoint: 0,
+                last_driver_transaction: 0,
+            });
+            (resident, devmgr)
+        }
+
+        fn selector(resident: &mut ResidentSystemInit) -> &mut ResidentState {
+            resident.wyr1c.as_mut().unwrap()
+        }
+
+        /// Row 201: U1's retirement begins only once the probe's committed
+        /// response and the driver's exact TEMT fact have both been rejoined,
+        /// and only once.
+        #[test]
+        fn u1_retirement_begins_only_after_the_response_and_its_exact_temt_join() {
+            let u1 = binding(1);
+            let (mut resident, devmgr) = fixture(Some(u1));
+            let mut system = platform();
+
+            selector(&mut resident).e3a_transport_empty = Some(temt(u1));
+            assert_eq!(maybe_begin_e3a_retire(&mut resident, &mut system), Ok(()));
+            assert_eq!(system.send_plain_count, 0, "no response yet");
+
+            selector(&mut resident).e3a_response_committed = true;
+            selector(&mut resident).e3a_transport_empty = None;
+            assert_eq!(maybe_begin_e3a_retire(&mut resident, &mut system), Ok(()));
+            assert_eq!(system.send_plain_count, 0, "no TEMT yet");
+
+            let mut stale = temt(u1);
+            stale.stream_generation += 1;
+            selector(&mut resident).e3a_transport_empty = Some(stale);
+            assert_eq!(
+                maybe_begin_e3a_retire(&mut resident, &mut system),
+                Err(InitError::WrongManifestProfile)
+            );
+            assert_eq!(system.send_plain_count, 0, "a stale TEMT is not a join");
+
+            selector(&mut resident).e3a_transport_empty = Some(temt(u1));
+            assert_eq!(maybe_begin_e3a_retire(&mut resident, &mut system), Ok(()));
+            assert_eq!(
+                &system.sent[..system.send_plain_count],
+                &[devmgr.loaded.launch_channel]
+            );
+            assert!(selector(&mut resident).e3a_begin_retire_sent);
+            assert_eq!(
+                maybe_begin_e3a_retire(&mut resident, &mut system),
+                Err(InitError::WrongManifestProfile),
+                "begin-retire is sent once"
+            );
+            assert_eq!(system.send_plain_count, 1);
+        }
+
+        /// Row 201: finalize-retire waits for both stage-1 readiness and the
+        /// probe's stream peer-close proof, and is sent once.
+        #[test]
+        fn u1_finalize_retire_waits_for_stage1_and_the_peer_close() {
+            let (mut resident, devmgr) = fixture(Some(binding(1)));
+            let mut system = platform();
+            for (stage1, closed) in [(false, false), (true, false), (false, true)] {
+                selector(&mut resident).e3a_stage1_ready = stage1;
+                selector(&mut resident).e3a_peer_closed = closed;
+                assert_eq!(send_e3a_finalize_retire(&mut resident, &mut system), Ok(()));
+                assert_eq!(
+                    system.send_plain_count, 0,
+                    "stage1={stage1} closed={closed}"
+                );
+            }
+            selector(&mut resident).e3a_stage1_ready = true;
+            selector(&mut resident).e3a_peer_closed = true;
+            assert_eq!(send_e3a_finalize_retire(&mut resident, &mut system), Ok(()));
+            assert_eq!(
+                &system.sent[..system.send_plain_count],
+                &[devmgr.loaded.launch_channel]
+            );
+            assert!(selector(&mut resident).e3a_finalize_retire_sent);
+            assert_eq!(
+                send_e3a_finalize_retire(&mut resident, &mut system),
+                Err(InitError::WrongManifestProfile)
+            );
+        }
+
+        /// Rows 201 and 204: only an exact normal-zero U1 probe exit, reaped
+        /// with U2 admitted, advances the selector to a fresh U2; every other
+        /// reap poisons it. Every probe owner is consumed either way.
+        #[test]
+        fn only_a_clean_u1_probe_reap_admits_u2() {
+            for (admit_u2, code, next, result) in [
+                (true, 0, 2, Ok(())),
+                (true, 1, 0, Err(InitError::Cleanup)),
+                (false, 0, 0, Ok(())),
+            ] {
+                let (mut resident, _) = fixture(Some(binding(1)));
+                selector(&mut resident).e3a_response_committed = true;
+                let mut system = platform();
+                assert_eq!(
+                    reap_e3a_probe(&mut resident, &mut system, &mut waits(code), admit_u2),
+                    result,
+                    "admit_u2={admit_u2} code={code}"
+                );
+                assert_eq!(
+                    &system.closed[..system.close_count],
+                    &[
+                        PROBE.loaded.launch_channel,
+                        PROBE.loaded.process,
+                        PROBE.task_group
+                    ]
+                );
+                assert_eq!(
+                    system.terminate_count, 0,
+                    "a probe that exited is not terminated"
+                );
+                let state = selector(&mut resident);
+                assert_eq!(state.e3a_next_challenge_generation, next);
+                assert_eq!(state.e3a_probe, None);
+                assert_eq!(state.e3a_binding, None);
+                assert!(!state.e3a_response_committed);
+            }
+        }
+
+        /// Row 202: U1's exit is accepted only with the whole finalize state
+        /// joined and an exact normal-zero exit.
+        #[test]
+        fn u1_exit_requires_complete_finalize_state_and_a_zero_normal_exit() {
+            let u1 = binding(1);
+            let complete = |resident: &mut ResidentSystemInit| {
+                let state = selector(resident);
+                state.e3a_response_committed = true;
+                state.e3a_transport_empty = Some(temt(u1));
+                state.e3a_begin_retire_sent = true;
+                state.e3a_stage1_ready = true;
+                state.e3a_peer_closed = true;
+                state.e3a_finalize_retire_sent = true;
+            };
+            let (mut resident, _) = fixture(Some(u1));
+            complete(&mut resident);
+            assert_eq!(
+                validate_e3a_u1_finalize_exit(&resident, &mut waits(0)),
+                Ok(())
+            );
+            assert_eq!(
+                validate_e3a_u1_finalize_exit(&resident, &mut waits(1)),
+                Err(InitError::WrongManifestProfile)
+            );
+            let breaks: [fn(&mut ResidentState); 8] = [
+                |state| state.e3a_response_committed = false,
+                |state| state.e3a_begin_retire_sent = false,
+                |state| state.e3a_stage1_ready = false,
+                |state| state.e3a_peer_closed = false,
+                |state| state.e3a_finalize_retire_sent = false,
+                |state| state.e3a_terminal_claimed = true,
+                |state| state.e3a_transport_empty = None,
+                |state| state.driver = None,
+            ];
+            for (index, broken) in breaks.into_iter().enumerate() {
+                let (mut resident, _) = fixture(Some(u1));
+                complete(&mut resident);
+                broken(selector(&mut resident));
+                assert_eq!(
+                    validate_e3a_u1_finalize_exit(&resident, &mut waits(0)),
+                    Err(InitError::WrongManifestProfile),
+                    "break {index}"
+                );
+            }
+            let (mut resident, _) = fixture(Some(binding(2)));
+            complete(&mut resident);
+            assert_eq!(
+                validate_e3a_u1_finalize_exit(&resident, &mut waits(0)),
+                Err(InitError::WrongManifestProfile),
+                "a U2 binding is not a U1 exit"
+            );
+        }
+
+        /// Row 203: a probe channel loss or exit outside the U2 post-response
+        /// window is a failure that consumes the probe and the driver and
+        /// poisons the selector, even when the exit itself was clean.
+        #[test]
+        fn probe_loss_outside_the_u2_window_fails_without_advancement() {
+            for validate_exit in [false, true] {
+                let (mut resident, _) = fixture(Some(binding(1)));
+                selector(&mut resident).e3a_response_committed = true;
+                assert!(!e3a_u2_probe_may_exit(&resident));
+                let mut system = platform();
+                assert_eq!(
+                    fail_e3a_probe_supervision(
+                        &mut resident,
+                        &mut system,
+                        &mut waits(0),
+                        validate_exit
+                    ),
+                    Err(InitError::WrongManifestProfile)
+                );
+                assert_eq!(
+                    &system.terminated[..system.terminate_count],
+                    &[DwHandle(0x3203)]
+                );
+                let state = selector(&mut resident);
+                assert_eq!(state.e3a_probe, None);
+                assert_eq!(state.driver, None);
+                assert_eq!(state.e3a_next_challenge_generation, 0);
+                assert_eq!(state.e3a_binding, None);
+            }
+            let (mut resident, _) = fixture(Some(binding(1)));
+            assert_eq!(
+                fail_e3a_probe_supervision(&mut resident, &mut platform(), &mut waits(7), true),
+                Err(InitError::WrongManifestProfile)
+            );
+        }
+
+        /// Row 203: only U2, after its committed response and before the
+        /// terminal claim, may exit as a lifecycle edge.
+        #[test]
+        fn only_a_committed_unclaimed_u2_probe_may_exit() {
+            for (generation, committed, claimed, may_exit) in [
+                (2, true, false, true),
+                (1, true, false, false),
+                (2, false, false, false),
+                (2, true, true, false),
+            ] {
+                let (mut resident, _) = fixture(Some(binding(generation)));
+                selector(&mut resident).e3a_response_committed = committed;
+                selector(&mut resident).e3a_terminal_claimed = claimed;
+                assert_eq!(e3a_u2_probe_may_exit(&resident), may_exit);
+            }
+        }
+
+        /// Row 204: U2's post-response reap accepts only an exact normal-zero
+        /// exit, terminates only on timeout, and keeps the probe's owners when
+        /// even the fallback wait cannot prove it exited.
+        #[test]
+        fn the_u2_reap_accepts_only_a_normal_zero_exit() {
+            let committed_u2 = || {
+                let (mut resident, _) = fixture(Some(binding(2)));
+                selector(&mut resident).e3a_response_committed = true;
+                resident
+            };
+
+            let (mut u1, _) = fixture(Some(binding(1)));
+            selector(&mut u1).e3a_response_committed = true;
+            assert_eq!(
+                reap_e3a_u2_probe_after_response(&mut u1, &mut platform(), &mut waits(0)),
+                Err(InitError::WrongManifestProfile)
+            );
+            assert_eq!(
+                selector(&mut u1).e3a_probe,
+                Some(PROBE),
+                "U1 is not reaped here"
+            );
+
+            let mut resident = committed_u2();
+            let mut system = platform();
+            assert_eq!(
+                reap_e3a_u2_probe_after_response(&mut resident, &mut system, &mut waits(3)),
+                Err(InitError::WrongManifestProfile)
+            );
+            assert_eq!(system.terminate_count, 0);
+            assert!(!selector(&mut resident).e3a_u2_probe_reaped_successfully);
+
+            let mut resident = committed_u2();
+            let mut system = platform();
+            assert_eq!(
+                reap_e3a_u2_probe_after_response(&mut resident, &mut system, &mut waits(0)),
+                Ok(())
+            );
+            assert_eq!(system.terminate_count, 0);
+            let reaped = selector(&mut resident);
+            assert!(reaped.e3a_u2_probe_reaped_successfully);
+            assert_eq!(reaped.e3a_probe, None);
+            assert_eq!(
+                reaped.e3a_binding,
+                Some(binding(2)),
+                "U2's binding survives its reap"
+            );
+
+            let mut resident = committed_u2();
+            let mut system = platform();
+            let mut silent = StatusWaits {
+                fail: false,
+                exit: None,
+            };
+            assert_eq!(
+                reap_e3a_u2_probe_after_response(&mut resident, &mut system, &mut silent),
+                Err(InitError::Cleanup)
+            );
+            assert_eq!(
+                &system.terminated[..system.terminate_count],
+                &[PROBE.task_group]
+            );
+            assert_eq!(
+                selector(&mut resident).e3a_probe,
+                Some(PROBE),
+                "owners are kept"
+            );
+        }
+
+        /// Row 205: a recovery with a live selector correlation consumes the
+        /// probe and driver, poisons Q1/Q2 and leaves the resident fatal; a
+        /// recovery with none is not touched.
+        #[test]
+        fn recovery_poisons_an_active_selector_lifecycle_and_is_fatal() {
+            let (mut idle, _) = fixture(None);
+            selector(&mut idle).e3a_probe = None;
+            selector(&mut idle).e3a_stream_generation = None;
+            assert_eq!(
+                fail_closed_e3a_recovery(&mut idle, &mut platform(), &mut waits(0)),
+                None
+            );
+            assert_eq!(idle.result, RecoveryResult::Recovered);
+
+            // A binding with no probe left (its reap already ran) is still a
+            // live correlation, and only the poison clears it.
+            let (mut orphaned, _) = fixture(Some(binding(1)));
+            selector(&mut orphaned).e3a_probe = None;
+            selector(&mut orphaned).e3a_response_committed = true;
+            assert_eq!(
+                fail_closed_e3a_recovery(&mut orphaned, &mut platform(), &mut waits(0)),
+                Some(false)
+            );
+            assert_eq!(selector(&mut orphaned).e3a_binding, None);
+            assert!(!selector(&mut orphaned).e3a_response_committed);
+            assert_eq!(selector(&mut orphaned).e3a_next_challenge_generation, 0);
+            assert_eq!(orphaned.result, RecoveryResult::Fatal);
+
+            let (mut resident, devmgr) = fixture(Some(binding(1)));
+            selector(&mut resident).e3a_response_committed = true;
+            let mut system = platform();
+            assert_eq!(
+                fail_closed_e3a_recovery(&mut resident, &mut system, &mut waits(0)),
+                Some(false)
+            );
+            assert_eq!(resident.result, RecoveryResult::Fatal);
+            {
+                let state = selector(&mut resident);
+                assert_eq!(state.e3a_probe, None);
+                assert_eq!(state.driver, None);
+                assert_eq!(state.e3a_binding, None);
+                assert_eq!(state.e3a_next_challenge_generation, 0);
+                assert!(!state.e3a_response_committed);
+            }
+
+            assert_eq!(
+                finish_e3a_fatal_recovery(&mut resident, &mut system, &mut waits(0), true),
+                Err(InitError::Cleanup),
+                "a child cleanup failure stays fatal"
+            );
+            assert_eq!(selector(&mut resident).devmgr, None);
+            assert_eq!(resident.active, [None, None]);
+            assert_eq!(resident.controller.mode(), SystemMode::Fatal);
+            assert!(
+                system.terminated[..system.terminate_count].contains(&devmgr.task_group),
+                "devmgr is consumed, not relaunched"
+            );
+        }
+
+        /// Row 206: a combined READABLE|PEER_CLOSED wake on the probe channel
+        /// is classified readable first, so a queued response is consumed
+        /// before the close.
+        #[test]
+        fn a_combined_probe_wake_drains_the_queued_message_first() {
+            let classify = |index, observed: DwSignals| {
+                classify_resident_poll(
+                    DwWaitResultV1 {
+                        index,
+                        observed,
+                        ..DwWaitResultV1::default()
+                    },
+                    true,
+                    true,
+                    true,
+                )
+            };
+            assert_eq!(
+                classify(5, DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0)),
+                Ok(ResidentPollEvent::ProbeControlReadable)
+            );
+            assert_eq!(
+                classify(5, DW_SIGNAL_PEER_CLOSED),
+                Ok(ResidentPollEvent::ProbeControlLost)
+            );
+            assert_eq!(
+                classify(6, DW_SIGNAL_EXITED),
+                Ok(ResidentPollEvent::ProbeExited)
+            );
+            assert_eq!(classify(7, DW_SIGNAL_EXITED), Err(InitError::Supervision));
+        }
+
+        /// Row 207: U2's terminal claim waits for its committed response, the
+        /// TEMT fact and the exact normal-zero reap of the U2 probe, and is
+        /// made once. The claim itself is a kernel call, so the host can only
+        /// show every way it is withheld.
+        #[test]
+        fn the_u2_terminal_claim_waits_for_the_response_temt_and_reap_join() {
+            let u2 = binding(2);
+            let fact = TransportEmptyFact {
+                nonce: u2.nonce,
+                attempt_generation: u2.attempt_generation,
+                publication_generation: u2.publication_generation,
+                stream_generation: u2.stream_generation,
+                challenge_generation: 2,
+                response_length: E3A_RESPONSE_BYTES as u64,
+                response_hash: 0,
+            };
+            for (committed, temt, reaped) in [
+                (false, true, true),
+                (true, false, true),
+                (true, true, false),
+            ] {
+                let (mut resident, _) = fixture(Some(u2));
+                let state = selector(&mut resident);
+                state.e3a_response_committed = committed;
+                state.e3a_transport_empty = temt.then_some(fact);
+                state.e3a_u2_probe_reaped_successfully = reaped;
+                let mut system = platform();
+                assert_eq!(maybe_begin_e3a_retire(&mut resident, &mut system), Ok(()));
+                assert!(!selector(&mut resident).e3a_terminal_claimed);
+                assert_eq!(system.send_plain_count, 0, "U2 never sends begin-retire");
+            }
+            let (mut resident, _) = fixture(Some(u2));
+            let state = selector(&mut resident);
+            state.e3a_response_committed = true;
+            state.e3a_transport_empty = Some(fact);
+            state.e3a_u2_probe_reaped_successfully = true;
+            state.e3a_terminal_claimed = true;
+            assert_eq!(
+                maybe_begin_e3a_retire(&mut resident, &mut platform()),
+                Err(InitError::WrongManifestProfile),
+                "the claim is made once"
+            );
+        }
     }
 }
