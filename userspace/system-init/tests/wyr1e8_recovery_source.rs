@@ -49,6 +49,12 @@ fn item<'a>(source: &'a str, anchor: &str) -> &'a str {
     &source[start..end]
 }
 
+/// E8's shell READY needs the matching tuple and authenticated serial facts.
+///
+/// Source text because the `ReadyFacts` arm is inline in
+/// `poll_observations`, which no host fake drives, and consoled's
+/// `attach_serial` is another role's code with no host test here. Each span is
+/// a fn body or the region between two named fns.
 #[test]
 fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
     let poll = item(NATIVE, "fn poll_observations<");
@@ -60,7 +66,9 @@ fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
     // R7B-4 class D1b. The dispatcher asks the policy which launch may open an
     // episode; it does not know the path. Assert the negative too, since
     // reintroducing the comparison would not change how the call site reads.
-    assert!(JOBS.contains("policy.opens_recovery_episode(request.path)"));
+    let launch = &JOBS[JOBS.find("fn dispatch_one_job_request_inner").unwrap()
+        ..JOBS.find("pub(crate) fn poll_job_dispatcher").unwrap()];
+    assert!(launch.contains("policy.opens_recovery_episode(request.path)"));
     let classify = &JOBS[JOBS.find("fn e8_trigger_from_launch").unwrap()
         ..JOBS.find("fn e8_trigger_from_request").unwrap()];
     assert!(classify.contains("if !opens_episode {"));
@@ -79,8 +87,6 @@ fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
     assert!(admission.contains("self.e8_evidence.tuple_waiting_for_serial()"));
     assert!(!admission.contains("self.e8_held"));
 
-    let launch = &JOBS[JOBS.find("fn dispatch_one_job_request_inner").unwrap()
-        ..JOBS.find("pub(crate) fn poll_job_dispatcher").unwrap()];
     assert!(launch.contains("stage_e8_shell_ready"));
     assert!(launch.contains("ShellTuple"));
     assert!(CONSOLED.contains("Message::ReadyFacts(facts)"));
@@ -118,6 +124,13 @@ fn driver_retire_uses_all_six_current_d5_identity_fields() {
     assert!(poll[encode..send].contains("identity,"));
 }
 
+/// Forced retirement disconnects, then removes only the held barrier result,
+/// records it, and consumes the hold, in that order.
+///
+/// Source text because `retire_dependents` is reached only from
+/// `control_tick` and the recovery paths, which no host fake drives, and
+/// `finish_e8_dependent_retirement` only from it and the E8 producer fixture,
+/// which does not observe the order. Each span runs between two named fns.
 #[test]
 fn forced_retirement_disconnects_then_removes_only_the_held_barrier_result() {
     let retire = &NATIVE[NATIVE.find("pub(super) fn retire_dependents").unwrap()
@@ -154,6 +167,11 @@ fn forced_retirement_disconnects_then_removes_only_the_held_barrier_result() {
     assert!(remove_body.contains("pending.job_id"));
 }
 
+/// The driver-exit arm retires dependents, reaps, then acknowledges.
+///
+/// Source text because the arm is inline in `control_tick`, which no host
+/// fake drives; scoped to the arm. The UART and devmgr step names are other
+/// roles' code, outside this lane; their host tests belong to those crates.
 #[test]
 fn driver_exit_uses_the_reached_production_owner_order() {
     let driver_exit = &RESIDENT[RESIDENT.find("ResidentPollEvent::DriverExited =>").unwrap()..];
@@ -161,9 +179,11 @@ fn driver_exit_uses_the_reached_production_owner_order() {
         .find("ResidentPollEvent::ProbeControlReadable =>")
         .unwrap()];
     let dependents = driver_exit.find("wyr1e::retire_dependents(").unwrap();
+    // The retirement's failure stops the arm before the reap.
+    let checked = driver_exit.find("dependent_retirement?;").unwrap();
     let reap = driver_exit.find("reap_driver_before(").unwrap();
     let acknowledge = driver_exit.find("acknowledge_driver_reaped(").unwrap();
-    assert!(dependents < reap && reap < acknowledge);
+    assert!(dependents < checked && checked < reap && reap < acknowledge);
 
     for reached_uart_step in [
         "GracefulRetireDrain::new",
@@ -182,6 +202,11 @@ fn driver_exit_uses_the_reached_production_owner_order() {
     }
 }
 
+/// The supervision discriminator stays at its three failure sources.
+///
+/// Source text because the late-READY and quiesce-response sites are inline
+/// in `poll_observations`, and the fallback in `wyr1e_resident_step`, which
+/// no host fake drives. Each span is bounded by named anchors in its fn.
 #[test]
 fn supervision_discriminator_stays_at_the_three_existing_failure_sources() {
     let guard = &NATIVE[NATIVE.find("pub(super) fn ensure_recovery_live(").unwrap()
@@ -227,12 +252,14 @@ fn supervision_discriminator_stays_at_the_three_existing_failure_sources() {
     assert!(!fallback.contains("RecoveryOperation::Quiesced"));
 }
 
+/// Each registry-recovery phase failure carries its own operation.
+///
+/// Source text because `recover_registry` and the console-start arm are
+/// reached only from `control_tick`, which no host fake drives. Scoped to
+/// `recover_registry`'s body, the arm, and `poll`'s region.
 #[test]
 fn registry_recovery_phase_failures_are_wrapped_at_existing_boundaries() {
-    let recovery = &RESIDENT[RESIDENT.find("fn recover_registry<").unwrap()
-        ..RESIDENT
-            .find("pub(crate) const E8_REGISTRY_FIXTURE_DEVMGR_CONTROL")
-            .unwrap()];
+    let recovery = item(RESIDENT, "fn recover_registry<");
     let dependents = &recovery[recovery.find("let dependent_cleanup_error =").unwrap()
         ..recovery.find("let registry = resident").unwrap()];
     assert!(dependents.contains("RecoveryOperation::RetireDependents"));
@@ -272,12 +299,14 @@ fn registry_recovery_phase_failures_are_wrapped_at_existing_boundaries() {
     );
 }
 
+/// Registry episode admission needs a live, quiesced, coordinated recovery.
+///
+/// Source text because `recover_registry` is reached only from
+/// `control_tick`, which no host fake drives. Scoped to `recover_registry`
+/// and `retire_registry_generation`.
 #[test]
 fn registry_episode_admission_is_only_for_live_quiesced_coordinated_recovery() {
-    let recovery = &RESIDENT[RESIDENT.find("fn recover_registry<").unwrap()
-        ..RESIDENT
-            .find("pub(crate) const E8_REGISTRY_FIXTURE_DEVMGR_CONTROL")
-            .unwrap()];
+    let recovery = item(RESIDENT, "fn recover_registry<");
     let quiesced = recovery
         .find("action_deadline.is_some() && !_e8_quiesced")
         .unwrap();
@@ -300,12 +329,12 @@ fn registry_episode_admission_is_only_for_live_quiesced_coordinated_recovery() {
             .count(),
         1
     );
-    assert!(JOBS.contains("RegistryRetirement::Failure => controller.fail("));
-    assert!(JOBS.contains("if deadline_cap.is_some_and(|deadline| now < deadline)"));
     let retirement = &JOBS[JOBS.find("fn retire_registry_generation<").unwrap()
         ..JOBS
             .find("pub(crate) fn restart_topology_or_poison<")
             .unwrap()];
+    assert!(retirement.contains("RegistryRetirement::Failure => controller.fail("));
+    assert!(retirement.contains("if deadline_cap.is_some_and(|deadline| now < deadline)"));
     assert_eq!(retirement.matches("controller.admit_recovery(").count(), 1);
 }
 
@@ -383,6 +412,14 @@ fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
     }
 }
 
+/// The publication rebind passes each context's real postcondition inputs.
+///
+/// What each context expects is host-tested by
+/// `rebind_postconditions_require_the_reached_resource_and_reaped_owner_context`
+/// and `real_rebind_acknowledgements_are_lifecycle_exact_and_reject_swapped_or_stale_replies`
+/// (wyr1c_native.rs). Source text for the call sites and the arguments,
+/// because `rebind_publication` is reached only from `control_tick` and
+/// `recover_registry`, which no host fake drives. Scoped to its body.
 #[test]
 fn publication_rebind_joins_use_exact_lifecycle_postconditions_and_a_real_producer() {
     let production = &RESIDENT[..RESIDENT.find("#[cfg(test)]\nmod tests {").unwrap()];
@@ -398,7 +435,7 @@ fn publication_rebind_joins_use_exact_lifecycle_postconditions_and_a_real_produc
             .count(),
         1
     );
-    let rebind = &production[production.find("fn rebind_publication<").unwrap()..];
+    let rebind = item(production, "fn rebind_publication<");
     assert!(rebind.contains("context.expected_status("));
     assert!(rebind.contains("state.resource_domain"));
     assert!(rebind.contains("state.last_reaped_driver"));
@@ -420,6 +457,11 @@ fn publication_rebind_joins_use_exact_lifecycle_postconditions_and_a_real_produc
 /// ACCEPTED reply cannot be sent -- did exactly that, and no test caught it.
 /// So pin the shape instead of the symptom: both fields are written in exactly
 /// one place each outside construction, and that place is the helper.
+///
+/// Source text because "no other site clears either half" is an absence over
+/// the whole module, which no host test can enumerate; the STATIC alternative
+/// (one private sub-struct for both fields) touches about fifty sites across
+/// wyr1b_native.rs and the E8 producer fixture and is not done in this pass.
 #[test]
 fn a_recovery_episodes_budget_is_cleared_with_the_trigger_that_opened_it() {
     assert_eq!(JOBS.matches("self.e8_trigger = None;").count(), 1);
