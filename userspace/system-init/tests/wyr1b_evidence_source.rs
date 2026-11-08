@@ -14,25 +14,60 @@ const WYR1B_MODEL: &str = include_str!("../src/wyr1b.rs");
 const NATIVE: &str = include_str!("../src/wyr1b_native.rs");
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
+/// The text of the item that starts at `start`, up to its closing brace at
+/// `indent`.
+fn item<'a>(source: &'a str, start: &str, indent: &str) -> &'a str {
+    let from = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing {start}"));
+    let close = format!("\n{indent}}}\n");
+    let to = source[from..].find(&close).unwrap() + from;
+    &source[from..to]
+}
+
+/// Selector 27's resident drain submits its own records, under its own
+/// feature, through the runtime's selector-27 call. Source text: selector 27's
+/// shape (`wyr1b-test-evidence`) is only `check`ed by the gate, so no host
+/// test can run its drain, and `main.rs`'s native submission is type-checked
+/// only. Selector 25's drain is host-tested through `MockNative` in the shapes
+/// that run it (`a_fatal_control_tick_submits_its_evidence_before_reporting_the_failure`
+/// and `finalized_evidence_is_submitted_after_a_successful_tick` in lib.rs).
 #[test]
 fn selector_27_submission_feature_is_separate_from_selector_25() {
-    assert!(MANIFEST.contains(
+    let feature = |name: &str| {
+        MANIFEST
+            .lines()
+            .find(|line| line.split_once(" = ").is_some_and(|(left, _)| left == name))
+            .unwrap_or_else(|| panic!("{name} is not declared"))
+    };
+    assert_eq!(
+        feature("wyr1-test-evidence"),
         "wyr1-test-evidence = [\"native-init\", \"wyrmroot-runtime/wyr1-test-evidence\"]"
-    ));
-    assert!(MANIFEST.contains(
+    );
+    assert_eq!(
+        feature("wyr1b-test-evidence"),
         "wyr1b-test-evidence = [\"native-init\", \"wyrmroot-runtime/wyr1b-test-evidence\"]"
+    );
+    let resident_loop = item(LOOP, "pub fn continue_resident<", "");
+    assert!(resident_loop.contains(
+        "    #[cfg(feature = \"wyr1b-test-evidence\")]
+    {
+        let mut index = 0;
+        while let Some(record) = resident.wyr1b_evidence_record(index) {
+            if system.submit_wyr1b_evidence(record).is_err() {"
     ));
-    // The drains are in the resident loop; the native submissions they call
-    // through `ResidentLoopPlatform` are in `main.rs`.
-    assert!(LOOP.contains("#[cfg(feature = \"wyr1b-test-evidence\")]"));
-    assert!(LOOP.contains("resident.wyr1b_evidence_record(index)"));
-    assert!(LOOP.contains("system.submit_wyr1b_evidence(record)"));
-    assert!(MAIN.contains("wyrmroot_runtime::submit_wyr1b_evidence(record)"));
-    assert!(LOOP.contains("#[cfg(feature = \"wyr1-test-evidence\")]"));
-    assert!(LOOP.contains("system.submit_wyr1_evidence(record)"));
-    assert!(MAIN.contains("wyrmroot_runtime::submit_wyr1_evidence(record)"));
-    assert!(LIB.contains("wyr1b_evidence: None"));
-    assert!(NATIVE.contains("*wyr1b_evidence = Some(evidence)"));
+    assert!(
+        item(MAIN, "fn submit_wyr1b_evidence(", "    ")
+            .contains("wyrmroot_runtime::submit_wyr1b_evidence(record)")
+    );
+    assert!(
+        item(MAIN, "fn submit_wyr1_evidence(", "    ")
+            .contains("wyrmroot_runtime::submit_wyr1_evidence(record)")
+    );
+    assert_eq!(
+        NATIVE.matches("*wyr1b_evidence = Some(evidence)").count(),
+        1
+    );
 }
 
 #[test]
