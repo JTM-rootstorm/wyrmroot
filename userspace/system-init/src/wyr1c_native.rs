@@ -7218,4 +7218,68 @@ mod tests {
             );
         }
     }
+
+    /// The session teardown retires each role once. `active[0]` and
+    /// `active[1]` mirror the registry's and devmgr's handles; run 6 of
+    /// F3A.7j retired both twice, once from the resident state and again from
+    /// the early-role table, on handles already closed.
+    #[cfg(feature = "wyr1e-production")]
+    mod session_shutdown {
+        use super::*;
+
+        #[test]
+        fn a_shutdown_retires_each_mirrored_role_once() {
+            const GENERATION: u64 = 2;
+            let (mut resident, devmgr, _) = recovery_fixture_resident(
+                [0x5A; 32],
+                GENERATION,
+                wyr1e::State::new(GENERATION).unwrap(),
+                RegistryTopology::new(GENERATION).unwrap(),
+                None,
+            )
+            .unwrap();
+            let registry = resident.active[0].unwrap();
+            assert_eq!(resident.active[1], Some(devmgr));
+            let mut system =
+                RebindPlatform::with_reply([0; wyrmroot_device_proto::controller::STATUS_BYTES]);
+            system.accept_terminate = true;
+            let mut waits = StatusWaits {
+                fail: false,
+                exit: Some(DwTaskTerminationInfoV1 {
+                    size: deepwyrm_syscall::DW_TASK_TERMINATION_INFO_V1_SIZE,
+                    version: 1,
+                    state: DW_TASK_STATE_EXITED,
+                    reason: DW_TERMINATION_NORMAL_EXIT,
+                    ..DwTaskTerminationInfoV1::default()
+                }),
+            };
+
+            assert_eq!(
+                retire_for_session_shutdown(&mut resident, &mut system, &mut waits),
+                Ok(())
+            );
+            let terminated = &system.terminated[..system.terminate_count];
+            for task_group in [registry.task_group, devmgr.task_group] {
+                assert_eq!(
+                    terminated
+                        .iter()
+                        .filter(|handle| **handle == task_group)
+                        .count(),
+                    1,
+                    "{task_group:?} must be retired exactly once: {terminated:?}"
+                );
+            }
+            let closed = &system.closed[..system.close_count];
+            for handle in [registry.loaded.process, devmgr.loaded.process] {
+                assert_eq!(
+                    closed.iter().filter(|closed| **closed == handle).count(),
+                    1,
+                    "{handle:?} must be closed exactly once: {closed:?}"
+                );
+            }
+            assert_eq!(resident.active, [None, None]);
+            let state = resident.wyr1c.as_ref().unwrap();
+            assert!(state.devmgr.is_none() && state.registry.is_none());
+        }
+    }
 }
