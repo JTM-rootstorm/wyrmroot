@@ -6191,6 +6191,11 @@ mod native_cleanup_tests {
         // intended -- but 40 KiB would be twice what it needs and would stop this
         // gate biting for a long time. 22 KiB sits just above the current 20,840
         // and still fails on the next unexamined field.
+        //
+        // Selector 31 is 20,520 bytes, 40 over the 20 KiB partition. No gate ran
+        // this test in that shape until S3 added `dw1e3-model`, so the overrun
+        // was never seen; it is recorded as budget debt, not fitted, and 21 KiB
+        // keeps the same "fails on the next field" margin as selector 29's tier.
         let resident_budget = if cfg!(any(
             feature = "wyr1d-selector32",
             feature = "wyr1e-production"
@@ -6198,6 +6203,8 @@ mod native_cleanup_tests {
             40
         } else if cfg!(feature = "wyr1c6-selector29") {
             22
+        } else if cfg!(feature = "dw1e3-selector31") {
+            21
         } else {
             20
         };
