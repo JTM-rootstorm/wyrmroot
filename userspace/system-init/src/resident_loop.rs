@@ -57,6 +57,21 @@ pub const RESIDENT_TICK_NS: u64 = WYR0_I_SUPERVISION_POLICY.backoff_ns;
 )))]
 pub const RESIDENT_TICK_NS: u64 = 1_000_000_000;
 
+// Selectors 29, 31 and 32 run handshakes inside the resident loop, and a
+// 1 s tick leaves them no headroom against their peers' deadlines: they tick
+// at the supervision policy's backoff. The `selectors` host gate checks the
+// library in each of these shapes, so losing one from the list above fails
+// to build there.
+#[cfg(any(
+    feature = "wyr1c6-selector29",
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32"
+))]
+const _: () = assert!(
+    RESIDENT_TICK_NS == WYR0_I_SUPERVISION_POLICY.backoff_ns,
+    "a selector with resident handshakes must tick at the supervision backoff"
+);
+
 /// Permanent init's resident loop, entered once the product has activated.
 ///
 /// It returns only to end permanent init's process: `0` when the interactive

@@ -4046,6 +4046,7 @@ mod native_cleanup_tests {
         closed: [DwHandle; 4],
         close_count: usize,
         wake_now: Option<u64>,
+        wait_deadline: Option<u64>,
         wyr1b_calls: usize,
     }
 
@@ -4058,6 +4059,7 @@ mod native_cleanup_tests {
                 closed: [DwHandle(0); 4],
                 close_count: 0,
                 wake_now: None,
+                wait_deadline: None,
                 wyr1b_calls: 0,
             }
         }
@@ -4127,7 +4129,8 @@ mod native_cleanup_tests {
             Ok(self.now)
         }
 
-        fn wait_until(&mut self, _deadline_ns: u64) -> Result<(), NativeError> {
+        fn wait_until(&mut self, deadline_ns: u64) -> Result<(), NativeError> {
+            self.wait_deadline = Some(deadline_ns);
             match self.wake_now {
                 Some(now) => {
                     self.now = now;
@@ -4935,6 +4938,31 @@ mod native_cleanup_tests {
             0xAF01_0005
         );
         assert_eq!(waits.wait_count, 3);
+    }
+
+    /// The loop sleeps one tick period past the tick's own instant. Products
+    /// with resident handshakes (selectors 29, 31, 32 and production) tick at
+    /// the supervision backoff, the rest once a second; the selectors' half
+    /// is a build-time assertion beside `RESIDENT_TICK_NS`.
+    #[cfg(not(any(feature = "wyr1c6-selector29", feature = "r1-selector34")))]
+    #[test]
+    fn the_resident_loop_waits_one_tick_period_past_the_tick() {
+        let expected = if cfg!(feature = "wyr1e-production") {
+            WYR0_I_SUPERVISION_POLICY.backoff_ns
+        } else {
+            1_000_000_000
+        };
+        assert_eq!(resident_loop::RESIDENT_TICK_NS, expected);
+
+        let (mut resident, _, _) = two_role_resident();
+        let mut native = MockNative::new();
+        let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
+        let mut waits = ResidentWaits { wait_count: 0 };
+        assert_eq!(
+            resident_loop::continue_resident(&mut resident, &mut native, &mut loader, &mut waits),
+            0xAF01_0005
+        );
+        assert_eq!(native.wait_deadline, Some(native.now + expected));
     }
 
     #[test]
