@@ -3846,51 +3846,6 @@ pub const fn cleanup_is_permanent(state: RestartState) -> bool {
 mod native_cleanup_tests {
     use super::*;
 
-    /// The last step of F3A.7g, which no host test can reach.
-    ///
-    /// Permanent init's loop is in `resident_loop.rs` (it was in `main.rs`,
-    /// whose host build only type-checks the guest entry, until S3 moved it),
-    /// and until a host test drives it there, no host test runs the loop. What the loop does with `session_complete` is the whole point of
-    /// the flag -- a supervisor that latches the fact and keeps ticking has
-    /// changed nothing -- so it is read out of the source rather than left
-    /// unstated.
-    ///
-    /// Positions, not presence. A check that returns a failure status, or one
-    /// placed after the tick's own early returns so it is never reached on the
-    /// tick that set it, both fail here.
-    #[test]
-    fn permanent_init_leaves_its_loop_when_the_session_is_complete() {
-        const MAIN: &str = include_str!("resident_loop.rs");
-        const SIGNATURE: &str = "fn continue_resident<";
-
-        let start = MAIN.find(SIGNATURE).expect("continue_resident is gone");
-        let body = &MAIN[start + SIGNATURE.len()..];
-
-        let guard = body
-            .find("if resident.session_complete() {")
-            .expect("the loop no longer asks whether the session completed");
-        let tail = &body[guard..];
-        let returned = tail
-            .find("\n            return 0;\n        }\n")
-            .expect("a completed session must leave the loop with a success status");
-
-        // The wait is what makes this a loop rather than a sequence, so the
-        // check has to come before it or the tick that set the flag sleeps a
-        // full backoff first -- and, worse, a later failure could overtake it.
-        let waited = body
-            .find("InitPlatform::wait_until(system, deadline)")
-            .expect("the loop no longer waits");
-        assert!(
-            guard < waited,
-            "the completion check must precede the tick wait: guard {guard}, wait {waited}"
-        );
-        assert!(
-            returned < 64,
-            "the success return must be the body of the completion check, not something \
-             further down it: {returned} bytes after the guard"
-        );
-    }
-
     /// The other half of the same wiring: what `SessionComplete` makes the
     /// tick do. It is ordinary compiled code under `wyr1e-production`, but no
     /// host fixture reaches `control_tick` with a retired console, so the
@@ -4839,8 +4794,9 @@ mod native_cleanup_tests {
         ));
     }
 
-    #[test]
-    fn resident_drains_peer_close_to_clean_exit_without_dropping_other_role() {
+    /// Two ready early roles under one resident. With `ResidentWaits`, the
+    /// first legacy tick reaps the registry's peer close and succeeds.
+    fn two_role_resident() -> (ResidentSystemInit, ActiveNativeRole, ActiveNativeRole) {
         let mut controller = SystemInit {
             mode: SystemMode::Bootstrap,
             roles: [
@@ -4867,7 +4823,7 @@ mod native_cleanup_tests {
         );
         let devmgr =
             install_ready_attempt(&mut controller, RoleId::Devmgr, 1, 0x1002, (11, 21, 31), 3);
-        let mut resident = ResidentSystemInit {
+        let resident = ResidentSystemInit {
             controller,
             authority: LoadAuthority {
                 parent_root: DwHandle(100),
@@ -4885,6 +4841,12 @@ mod native_cleanup_tests {
             #[cfg(feature = "wyr1f-closure")]
             wyr1f: wyr1f_closure::ClosureEpisode::new(None),
         };
+        (resident, registry, devmgr)
+    }
+
+    #[test]
+    fn resident_drains_peer_close_to_clean_exit_without_dropping_other_role() {
+        let (mut resident, registry, devmgr) = two_role_resident();
         let mut native = MockNative::new();
         let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
         let mut waits = ResidentWaits { wait_count: 0 };
@@ -4912,6 +4874,65 @@ mod native_cleanup_tests {
                 registry.loaded.process,
                 registry.task_group
             ]
+        );
+        assert_eq!(waits.wait_count, 3);
+    }
+
+    /// The resident loop's own platform for `MockNative`. Selectors 29 and 34
+    /// drive their own scenario from the loop on every tick, which this fixture
+    /// does not carry, so the loop tests below run in every other shape.
+    #[cfg(not(any(feature = "wyr1c6-selector29", feature = "r1-selector34")))]
+    impl resident_loop::ResidentLoopPlatform for MockNative {
+        #[cfg(feature = "wyr1-test-evidence")]
+        fn submit_wyr1_evidence(&mut self, _record: &[u8; 114]) -> Result<(), NativeError> {
+            Err(FAILURE)
+        }
+
+        #[cfg(feature = "wyr1b-test-evidence")]
+        fn submit_wyr1b_evidence(
+            &mut self,
+            _record: &[u8; wyr1b_gate::RECORD_BYTES],
+        ) -> Result<(), NativeError> {
+            Err(FAILURE)
+        }
+    }
+
+    /// F3A.7g, the last step: a completed session ends permanent init's
+    /// process with success, on the tick that observed it.
+    ///
+    /// The tick runs first (the registry is reaped), and the check comes
+    /// before the wait: `MockNative` fails any wait, so a loop that slept
+    /// before checking, or checked only after a later tick, would report
+    /// 0xAF01_0005 instead.
+    #[cfg(not(any(feature = "wyr1c6-selector29", feature = "r1-selector34")))]
+    #[test]
+    fn permanent_init_leaves_its_loop_when_the_session_is_complete() {
+        let (mut resident, _, _) = two_role_resident();
+        resident.session_complete = true;
+        let mut native = MockNative::new();
+        let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
+        let mut waits = ResidentWaits { wait_count: 0 };
+
+        assert_eq!(
+            resident_loop::continue_resident(&mut resident, &mut native, &mut loader, &mut waits),
+            0
+        );
+        assert_eq!(waits.wait_count, 3, "the tick ran before the loop returned");
+    }
+
+    /// The control for the test above: the same resident with its session
+    /// still open does not leave the loop, and reaches the tick wait.
+    #[cfg(not(any(feature = "wyr1c6-selector29", feature = "r1-selector34")))]
+    #[test]
+    fn an_open_session_keeps_permanent_init_in_its_loop() {
+        let (mut resident, _, _) = two_role_resident();
+        let mut native = MockNative::new();
+        let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
+        let mut waits = ResidentWaits { wait_count: 0 };
+
+        assert_eq!(
+            resident_loop::continue_resident(&mut resident, &mut native, &mut loader, &mut waits),
+            0xAF01_0005
         );
         assert_eq!(waits.wait_count, 3);
     }
