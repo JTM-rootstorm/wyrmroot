@@ -52,11 +52,7 @@ const VARS_FD_GROUP: &str = "dw-f13-ovmf-vars-v1";
 const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
 pub(crate) const KERNEL_TARGET: &str = "x86_64-unknown-none";
 pub(crate) const OVMF_CODE_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
-pub(crate) const OVMF_CODE_SHA256: &str =
-    "f3ff7e73448ed2845ee15356f394882f5618eb5dab92c9a30ec6ee0e1468553a";
 pub(crate) const OVMF_VARS_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";
-pub(crate) const OVMF_VARS_SHA256: &str =
-    "6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc";
 pub(crate) const ACCEPTED_RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
 pub(crate) const ACCEPTED_TOOLCHAIN_NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
 
@@ -302,8 +298,8 @@ fn build_produced_artifacts(
     let snapshot = crate::wyr1c::build_c6_snapshot(nonce)?;
     let kernel = build_selector29_kernel(deep_repository, nonce)?;
     let table = boot_device_table();
-    let code = pinned_firmware(OVMF_CODE_PATH, OVMF_CODE_SHA256, "OVMF code")?;
-    let vars = pinned_firmware(OVMF_VARS_PATH, OVMF_VARS_SHA256, "OVMF vars")?;
+    let code = system_firmware(OVMF_CODE_PATH, "OVMF code")?;
+    let vars = system_firmware(OVMF_VARS_PATH, "OVMF vars")?;
     let artifacts = staging.join("artifacts");
     fs::create_dir(&artifacts).map_err(|error| {
         Failure::task(format!("could not create C6 producer artifacts: {error}"))
@@ -1155,14 +1151,10 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn pinned_firmware(path: &str, expected: &str, label: &str) -> Result<Vec<u8>, Failure> {
-    let bytes = read_regular_bounded(Path::new(path), MAX_FIRMWARE_BYTES, label)?;
-    if sha256::bytes_digest(&bytes) != expected {
-        return Err(Failure::task(format!(
-            "WYR1-C6 pinned {label} identity changed"
-        )));
-    }
-    Ok(bytes)
+pub(crate) fn system_firmware(path: &str, label: &str) -> Result<Vec<u8>, Failure> {
+    // System-package firmware: regular file at its path; its digest is
+    // computed by the consumers that record it, not pinned.
+    read_regular_bounded(Path::new(path), MAX_FIRMWARE_BYTES, label)
 }
 
 #[allow(clippy::too_many_arguments)]

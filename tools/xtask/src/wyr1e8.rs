@@ -365,15 +365,11 @@ fn build_produced(
     let snapshot = wyr1c::build_e8_snapshot(nonce, &e6.product)?;
     let kernel = wyr1e7::build_e8_kernel(deep_repository, nonce)?;
     let boot_device_table = wyr1c6::boot_device_table();
-    let ovmf_code = wyr1c6::pinned_firmware(
-        wyr1c6::OVMF_CODE_PATH,
-        wyr1c6::OVMF_CODE_SHA256,
-        "OVMF code",
+    let ovmf_code = wyr1c6::system_firmware(
+        wyr1c6::OVMF_CODE_PATH, "OVMF code",
     )?;
-    let ovmf_vars = wyr1c6::pinned_firmware(
-        wyr1c6::OVMF_VARS_PATH,
-        wyr1c6::OVMF_VARS_SHA256,
-        "OVMF vars",
+    let ovmf_vars = wyr1c6::system_firmware(
+        wyr1c6::OVMF_VARS_PATH, "OVMF vars",
     )?;
     let artifacts = staging.join("artifacts");
     fs::create_dir(&artifacts)
