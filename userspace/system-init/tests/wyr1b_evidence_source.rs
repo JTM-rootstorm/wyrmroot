@@ -103,22 +103,32 @@ fn native_product_activation_constructs_and_continues_one_resident_in_place() {
     assert!(!MAIN.contains("let mut resident = match"));
 }
 
+/// Selector 27's resident tick borrows its large state where it lives, and
+/// the replacement gate keeps its frame out of the tick.
+///
+/// Source text because the property is the target build's stack frame: a
+/// moved or inlined copy behaves identically on the host, and selector 27's
+/// shape is only `check`ed by the gate. Scoped to `control_tick`'s body and
+/// to the named items' own declarations.
 #[test]
 fn selector_27_resident_control_borrows_large_state_in_place() {
-    let control_start = NATIVE.find("pub(crate) fn control_tick").unwrap();
-    let control_end = NATIVE[control_start..]
-        .find("#[cfg(test)]")
-        .map(|offset| control_start + offset)
-        .unwrap();
-    let control = &NATIVE[control_start..control_end];
+    let control = item(NATIVE, "pub(crate) fn control_tick<", "");
     assert!(control.contains("let ResidentSystemInit {"));
     assert!(control.contains("let state = wyr1b.as_mut()"));
-    assert!(!control.contains(".wyr1b.take()"));
+    // Through the destructured binding as well as through `resident`.
+    assert!(!control.contains("wyr1b.take()"));
     assert!(NATIVE.contains("#[inline(never)]\nfn run_registry_replacement_gate"));
     assert!(NATIVE.contains("enum ReplacementGateOutcome"));
     assert!(NATIVE.contains(") -> Result<Option<RegistryNativeAttempt>, InitError>"));
 }
 
+/// The selector-27 dispatcher family holds one protocol-sized payload buffer
+/// and one stream set, and its large helpers are inlined into one frame.
+///
+/// Source text because both are properties of the target build's stack
+/// frame, which no host test observes, and selector 27's shape is only
+/// `check`ed by the gate. Scoped to the dispatch family, from
+/// `dispatch_one_job_request` to `poll_job_dispatcher`.
 #[test]
 fn selector_27_dispatcher_keeps_one_protocol_sized_payload_and_stream_set() {
     let dispatch_start = NATIVE.find("fn dispatch_one_job_request").unwrap();
@@ -169,6 +179,11 @@ fn selector_27_ordinary_mapping_diagnostic_names_each_remaining_site() {
     assert!(!NATIVE.contains(".map_err(InitError::Mapping)?"));
 }
 
+/// The selector-27 gate records its relational joins in contract order.
+///
+/// Source text because `run_registry_gate` and `run_job_gate` are reached
+/// only from `activate_resident` and the resident `control_tick`, which no
+/// host fake drives. Each span runs between two named fns.
 #[test]
 fn controller_records_all_relational_joins_in_contract_order() {
     let registry_start = NATIVE.find("fn run_registry_gate").unwrap();
@@ -234,9 +249,10 @@ fn controller_records_all_relational_joins_in_contract_order() {
             .unwrap_or_else(|| panic!("missing or reordered clean-reap evidence join {join}"));
         cursor += relative + join.len();
     }
-    assert!(NATIVE.contains("orphan_result.cleanup_result != 0"));
-    assert!(NATIVE.contains("jobs.jobs.live_jobs() != 0"));
-    assert!(NATIVE.contains("jobs.jobs.orphan_jobs() != 0"));
+    // The job gate's own closing checks, not another fn's.
+    assert!(job.contains("orphan_result.cleanup_result != 0"));
+    assert!(job.contains("jobs.jobs.live_jobs() != 0"));
+    assert!(job.contains("jobs.jobs.orphan_jobs() != 0"));
 }
 
 /// Reset card R6D, for the two clients a model test cannot reach: registry
