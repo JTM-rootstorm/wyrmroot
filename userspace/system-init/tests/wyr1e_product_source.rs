@@ -334,27 +334,16 @@ fn a_registry_recovery_that_installs_no_replacement_does_not_report_success() {
 /// `RegistryLost` word, so F3A.6g could report the restart budget exhausted
 /// without saying what kept spending it. Each poll arm must name its own
 /// trigger, and no two may share one -- a shared code collapses them again.
+///
+/// That the two signals classify to two events is host-tested by
+/// `resident_poll_distinguishes_devmgr_and_registry_failures`
+/// (wyr1c_native.rs). Source text for the rest because the arms that carry
+/// each event's trigger into `recover_registry` are inline in `control_tick`,
+/// and the READY-deadline and console-receive sites in `poll_observations`,
+/// which no host fake drives.
 #[test]
 fn every_registry_recovery_caller_names_a_distinct_trigger() {
-    let calls = without_whitespace(NATIVE);
-
-    // The split arms exist and dispatch on the two different signals.
-    let classify = item(NATIVE, "fn classify_resident_poll(");
-    let classify = without_whitespace(classify);
-    assert!(
-        classify.contains(
-            "2ifregistry_present&&result.observed.0&DW_SIGNAL_PEER_CLOSED.0!=0=>{\
-             Ok(ResidentPollEvent::RegistryControlLost)"
-        ),
-        "the peer-closed arm no longer names its own event"
-    );
-    assert!(
-        classify.contains(
-            "3ifregistry_present&&result.observed.0&DW_SIGNAL_EXITED.0!=0=>{\
-             Ok(ResidentPollEvent::RegistryExited)"
-        ),
-        "the exited arm no longer names its own event"
-    );
+    let calls = without_whitespace(item(NATIVE, "pub(crate) fn control_tick<S, L, W>("));
 
     // Each arm carries its own trigger into the recovery.
     for (arm, trigger) in [
