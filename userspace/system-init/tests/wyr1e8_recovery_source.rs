@@ -340,19 +340,23 @@ fn registry_episode_admission_is_only_for_live_quiesced_coordinated_recovery() {
     assert_eq!(retirement.matches("controller.admit_recovery(").count(), 1);
 }
 
-/// Source text until S3 converts it (triage HOST): the per-region
-/// `attribute_failure` spies over the resident fakes that would hold each
-/// join's operation by behaviour do not exist yet. The status word's layout is
-/// not checked here; it is pinned by value, in
+/// Each E8 transition join names its own `RecoveryOperation`. The status
+/// word's layout is not checked here; it is pinned by value, in
 /// `a_payload_free_tick_failure_status_is_unchanged_by_the_widening` below and
 /// by the attributed-status tests in lib.rs.
+///
+/// Source text because the `Quiesced`, `DriverRetired` and `DriverExited`
+/// arms are inline in `poll_observations` and `control_tick`, which no host
+/// fake drives; each span is scoped to its fn body or arm.
 #[test]
 fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
     // The resident loop, which reports a tick failure, moved out of `main.rs`.
-    let resident_loop = include_str!("../src/resident_loop.rs");
-    let jobs = include_str!("../src/wyr1b_native.rs");
-    let console = include_str!("../src/wyr1e_native.rs");
-    let driver = include_str!("../src/wyr1c_native.rs");
+    let resident_loop = item(
+        include_str!("../src/resident_loop.rs"),
+        "pub fn continue_resident<",
+    );
+    let jobs = item(JOBS, "fn service_pending_wait_inner<");
+    let driver = item(RESIDENT, "pub(crate) fn control_tick<");
 
     assert!(resident_loop.contains("resident_tick_failure_application_status(&error)"));
     let held_wait_start = jobs
@@ -368,6 +372,7 @@ fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
         2
     );
 
+    let console = item(NATIVE, "fn poll_observations<");
     let quiesced = &console[console.find("Message::Quiesced(identity)").unwrap()
         ..console.find("Message::Quiesce(_)").unwrap()];
     for operation in [
