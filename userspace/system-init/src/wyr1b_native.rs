@@ -281,6 +281,13 @@ impl ShellControllerState {
         )
     }
 
+    /// Whether the E7 evidence has observed the serial publication, for the
+    /// publication observer's host test.
+    #[cfg(all(test, feature = "wyr1e-selector33"))]
+    pub(crate) const fn e7_serial_observed(&self) -> bool {
+        self.evidence.armed()
+    }
+
     #[cfg(feature = "wyr1e-selector33")]
     fn submit_e7<S: Wyr1BPlatform>(
         system: &mut S,

@@ -45,25 +45,6 @@ fn console_launcher_is_installed_before_consoled_can_send_shell_v1() {
 }
 
 #[test]
-fn selector33_observes_only_the_validated_current_serial_publication() {
-    let observer = &E6[E6.find("fn poll_publication_observer_state").unwrap()
-        ..E6.find("fn poll_publication_observer<S, W>").unwrap()];
-    let datagram = observer.find("validate_publication_datagram(").unwrap();
-    let current = observer
-        .find("current.request != observer.expected_driver")
-        .unwrap();
-    let hook = observer.find("e6.shell.observe_serial_for_e7(").unwrap();
-    let cleanup = observer.rfind("clear_publication_observer(").unwrap();
-    assert!(datagram < current && current < hook && hook < cleanup);
-    assert!(
-        observer.contains(
-            "#[cfg(feature = \"wyr1e-selector33\")]\n    e6.shell.observe_serial_for_e7("
-        )
-    );
-    assert_eq!(E6.matches("observe_serial_for_e7(").count(), 1);
-}
-
-#[test]
 fn resident_services_shell_v1_before_waiting_for_consoled_ready() {
     // The console readiness/exit wait admission now lives in
     // `poll_console_event`. The property is that the resident services the

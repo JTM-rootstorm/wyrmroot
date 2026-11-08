@@ -2257,6 +2257,87 @@ mod tests {
         assert_eq!(waits.query_count, 0);
     }
 
+    /// Selector 33's E7 serial hook sees only a publication that validated,
+    /// from the exact driver attempt init expected, still running: every
+    /// refusal returns before it, and the accepted one reaches it once.
+    #[cfg(feature = "wyr1e-selector33")]
+    #[test]
+    fn only_the_validated_current_serial_publication_reaches_the_e7_hook() {
+        let observed = observer();
+        let registry = observed.grant.registry_generation;
+        let mut stale = driver_attempt();
+        stale.request.transaction_id += 1;
+        for (label, driver, task_state, now) in [
+            (
+                "past its deadline",
+                driver_attempt(),
+                DW_TASK_STATE_RUNNING,
+                observed.deadline,
+            ),
+            (
+                "exited",
+                driver_attempt(),
+                DW_TASK_STATE_EXITED,
+                observed.deadline - 1,
+            ),
+            (
+                "not yet running",
+                driver_attempt(),
+                DW_TASK_STATE_CREATED,
+                observed.deadline - 1,
+            ),
+            (
+                "another attempt",
+                stale,
+                DW_TASK_STATE_RUNNING,
+                observed.deadline - 1,
+            ),
+        ] {
+            let mut e6 = State::new(registry).unwrap();
+            e6.publication_observer = Some(observed);
+            let mut platform = ObserverPlatform::generation(observed, now);
+            let mut waits = ObserverWaits {
+                state: task_state,
+                query_count: 0,
+            };
+            assert_eq!(
+                poll_publication_observer_state(
+                    &mut e6,
+                    Some(driver),
+                    registry,
+                    &mut platform,
+                    &mut waits,
+                    now,
+                ),
+                Ok(Some(PollOutcome::RecoverDevmgr)),
+                "{label}"
+            );
+            assert!(!e6.shell.e7_serial_observed(), "{label}");
+            assert!(e6.publication_observer.is_none(), "{label}");
+        }
+
+        let mut e6 = State::new(registry).unwrap();
+        e6.publication_observer = Some(observed);
+        let mut platform = ObserverPlatform::generation(observed, observed.deadline - 1);
+        let mut waits = ObserverWaits {
+            state: DW_TASK_STATE_RUNNING,
+            query_count: 0,
+        };
+        assert_eq!(
+            poll_publication_observer_state(
+                &mut e6,
+                Some(driver_attempt()),
+                registry,
+                &mut platform,
+                &mut waits,
+                observed.deadline - 1,
+            ),
+            Ok(Some(PollOutcome::LaunchConsole))
+        );
+        assert!(e6.shell.e7_serial_observed());
+        assert!(e6.publication_observer.is_none());
+    }
+
     #[test]
     fn exact_queued_watch_cannot_launch_an_already_exited_driver() {
         let observed = observer();
