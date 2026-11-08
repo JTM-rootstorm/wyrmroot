@@ -1996,6 +1996,9 @@ mod tests {
 
     /// Every route's outcome must pass through `conclude_session`, or a new
     /// route reopens run 7's relaunch.
+    ///
+    /// Source text because `poll` runs `poll_observations` first, which no
+    /// host fake drives; `conclude_session` itself is host-tested below.
     #[test]
     fn poll_concludes_every_outcome_through_one_decision() {
         const SOURCE: &str = include_str!("wyr1e_native.rs");

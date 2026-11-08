@@ -3878,16 +3878,24 @@ mod native_cleanup_tests {
     /// tick do. It is ordinary compiled code under `wyr1e-production`, but no
     /// host fixture reaches `control_tick` with a retired console, so the
     /// property is stated here rather than only compiled.
+    ///
+    /// Source text because `wyr1e_resident_step` is reached only through
+    /// `control_tick`, which no host fake drives; scoped to that fn's body.
     #[test]
     fn a_complete_session_is_recorded_and_never_treated_as_a_recovery() {
-        const TICK: &str = include_str!("wyr1c_native.rs");
+        const NATIVE: &str = include_str!("wyr1c_native.rs");
+        let step = NATIVE
+            .find("fn wyr1e_resident_step<")
+            .expect("the console/shell step moved");
+        let step = &NATIVE[step..];
+        let step = &step[..step.find("\n}\n").expect("the step never closes")];
 
         const CHECK: &str = "if outcome == wyr1e::PollOutcome::SessionComplete {";
 
-        let handled = TICK
+        let handled = step
             .find(CHECK)
             .expect("the tick no longer recognises a completed session");
-        let after = &TICK[handled + CHECK.len()..];
+        let after = &step[handled + CHECK.len()..];
         let close = after
             .find("\n        }\n")
             .expect("the completed-session check never closes");
@@ -3916,7 +3924,7 @@ mod native_cleanup_tests {
         // The recovery dispatch maps every other outcome onto something to
         // rebuild out of the bootfs archive. Reaching it with a completed
         // session would relaunch the console the poll just retired.
-        let dispatch = TICK
+        let dispatch = step
             .find("if outcome != wyr1e::PollOutcome::Stable {")
             .expect("the tick no longer dispatches recoveries");
         assert!(
