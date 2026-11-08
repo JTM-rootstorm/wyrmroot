@@ -267,6 +267,9 @@ fn the_console_and_shell_supervisor_never_reads_or_writes_the_supervisor_mode() 
 /// test reached either exit -- they need an exhausted restart budget behind a
 /// full platform fixture -- so the guard is positional, on the one property
 /// that matters: under `wyr1e-production` neither exit may report success.
+///
+/// Source text because `recover_registry` is reached only from
+/// `control_tick`'s dispatch, which no host fake drives; scoped to its body.
 #[test]
 fn a_registry_recovery_that_installs_no_replacement_does_not_report_success() {
     let recovery = item(NATIVE, "fn recover_registry<S, L, W>(");
@@ -288,23 +291,23 @@ fn a_registry_recovery_that_installs_no_replacement_does_not_report_success() {
     // field, so the pairing is what has to hold: the budget exit reports
     // `RetireRegistry` and the declining exit `LaunchRegistry`. If these ever
     // report the same operation the collapse stops being lossless.
-    for (exit, operation) in [
+    // Each exit's block ends at its own closing line: the match arm closes at
+    // eight spaces, the let-else at four. (A shared "first of either" end let
+    // the arm's span run on into the let-else and borrow its gates.)
+    for (exit, close, operation) in [
         (
             "RegistryRecoveryStep::Degraded => {",
+            "\n        }\n",
             "RecoveryOperation::RetireRegistry",
         ),
         (
             "let Some(replacement) = replacement else {",
+            "\n    };\n",
             "RecoveryOperation::LaunchRegistry",
         ),
     ] {
         let start = recovery.find(exit).expect("the give-up exit");
-        // The exit's own block, to the first line closing at its indentation.
-        let end = start
-            + recovery[start..]
-                .find("\n    };")
-                .or_else(|| recovery[start..].find("\n        }"))
-                .expect("the exit block's end");
+        let end = start + recovery[start..].find(close).expect("the exit block's end");
         let block = &recovery[start..end];
         assert!(
             block.contains("#[cfg(feature = \"wyr1e-production\")]"),
