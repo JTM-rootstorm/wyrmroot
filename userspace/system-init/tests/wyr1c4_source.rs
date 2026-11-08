@@ -49,12 +49,19 @@ fn c6_feature_composition_keeps_selector_29_on_the_resource_profile() {
 
 #[test]
 fn bounded_resident_ticks_leave_headroom_for_selector_handshakes() {
-    let resident = &LOOP_SOURCE[LOOP_SOURCE.find("fn continue_resident<").unwrap()..];
+    let tick = &LOOP_SOURCE[LOOP_SOURCE
+        .find("/// The period of the resident loop's tick.")
+        .unwrap()
+        ..LOOP_SOURCE.find("pub fn continue_resident<").unwrap()];
     for selector in ["wyr1c6-selector29", "dw1e3-selector31", "wyr1d-selector32"] {
-        assert!(resident.contains(&format!("feature = \"{selector}\"")));
+        assert!(tick.contains(&format!("feature = \"{selector}\"")));
     }
-    assert!(resident.contains("let tick_ns = WYR0_I_SUPERVISION_POLICY.backoff_ns;"));
-    assert!(resident.contains("let tick_ns = 1_000_000_000;"));
+    assert!(
+        tick.contains("pub const RESIDENT_TICK_NS: u64 = WYR0_I_SUPERVISION_POLICY.backoff_ns;")
+    );
+    assert!(tick.contains("pub const RESIDENT_TICK_NS: u64 = 1_000_000_000;"));
+    let resident = &LOOP_SOURCE[LOOP_SOURCE.find("pub fn continue_resident<").unwrap()..];
+    assert!(resident.contains("let tick_ns = RESIDENT_TICK_NS;"));
     assert!(resident.contains("now.checked_add(tick_ns)"));
 }
 

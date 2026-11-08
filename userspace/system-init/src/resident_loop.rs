@@ -40,6 +40,23 @@ pub trait ResidentLoopPlatform: Wyr1BPlatform + ResidentR1Sink {
     ) -> Result<(), NativeError>;
 }
 
+/// The period of the resident loop's tick.
+#[cfg(any(
+    feature = "wyr1c6-selector29",
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32",
+    feature = "wyr1e-production"
+))]
+pub const RESIDENT_TICK_NS: u64 = WYR0_I_SUPERVISION_POLICY.backoff_ns;
+/// The period of the resident loop's tick.
+#[cfg(not(any(
+    feature = "wyr1c6-selector29",
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32",
+    feature = "wyr1e-production"
+)))]
+pub const RESIDENT_TICK_NS: u64 = 1_000_000_000;
+
 /// Permanent init's resident loop, entered once the product has activated.
 ///
 /// It returns only to end permanent init's process: `0` when the interactive
@@ -79,20 +96,7 @@ where
         let Ok(now) = InitPlatform::now(system) else {
             return 0xAF01_0003;
         };
-        #[cfg(any(
-            feature = "wyr1c6-selector29",
-            feature = "dw1e3-selector31",
-            feature = "wyr1d-selector32",
-            feature = "wyr1e-production"
-        ))]
-        let tick_ns = WYR0_I_SUPERVISION_POLICY.backoff_ns;
-        #[cfg(not(any(
-            feature = "wyr1c6-selector29",
-            feature = "dw1e3-selector31",
-            feature = "wyr1d-selector32",
-            feature = "wyr1e-production"
-        )))]
-        let tick_ns = 1_000_000_000;
+        let tick_ns = RESIDENT_TICK_NS;
         let Some(deadline) = now.checked_add(tick_ns) else {
             return 0xAF01_0004;
         };
