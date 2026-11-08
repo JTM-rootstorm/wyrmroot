@@ -300,48 +300,6 @@ mod tests {
         panic!("unbalanced body for {signature}");
     }
 
-    /// F1B.4: "old READY or endpoint tuple used as full-console trigger".
-    ///
-    /// The closure episode's READY join is read from the two owners' live state,
-    /// not from a recorded tuple. There is nothing for a stale generation, a stale
-    /// endpoint or a replayed READY message to be presented as, because the join
-    /// carries no identity at all -- only "consoled is installed and validated"
-    /// and "a wyrmsh generation has reached READY".
-    ///
-    /// The shell half is deliberately never cleared: it means "the first
-    /// generation was READY", not "a generation is READY now", so a shell that
-    /// exits and is replaced after DEGRADED cannot re-arm an episode.
-    #[test]
-    fn the_closure_ready_join_reads_live_owner_state_and_no_tuple() {
-        let join = item(
-            include_str!("wyr1e_native.rs"),
-            "pub(super) fn wyr1f_ready_join",
-        );
-        assert!(join.contains("e6.console.is_some() && !e6.awaiting_ready"));
-        assert!(join.contains("e6.shell.wyr1f_shell_ready()"));
-        for forbidden in [
-            "generation",
-            "endpoint",
-            "transaction",
-            "identity",
-            "nonce",
-            "tuple",
-        ] {
-            assert!(
-                !join.contains(forbidden),
-                "the join must carry no {forbidden}: an identity here is \
-                 something a stale one could be presented as"
-            );
-        }
-        // The shell half is set and never cleared: it means "the first
-        // generation was READY", not "a generation is READY now", so a shell
-        // replaced after DEGRADED cannot re-arm an episode.
-        let shell = include_str!("wyr1b_native.rs");
-        assert!(shell.contains("if self.wyr1f_shell_ready.is_none() {"));
-        assert!(shell.contains("self.wyr1f_shell_ready = Some((generation, transaction));"));
-        assert!(!shell.contains("self.wyr1f_shell_ready = None;"));
-    }
-
     /// F1B.4: "extra method/right/handle added to shell or job".
     ///
     /// The episode adds no shell or job surface at all. It is confined to

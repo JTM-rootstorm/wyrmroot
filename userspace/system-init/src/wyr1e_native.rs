@@ -2305,4 +2305,63 @@ mod tests {
         assert_eq!(platform.closed[..platform.close_count], [observed.client]);
         assert!(e6.publication_observer.is_none());
     }
+
+    /// F1B.4: the closure episode's READY join reads the two owners' live
+    /// state and carries no identity, so a stale generation, endpoint or
+    /// replayed READY has nothing to be presented as. The shell half is the
+    /// first generation's latch and is never replaced.
+    #[cfg(feature = "wyr1f-closure")]
+    #[test]
+    fn the_closure_ready_join_reads_live_owner_state_and_no_tuple() {
+        let join_for = |registry_generation: u64, console: InstalledPeer, shell: (u64, u64)| {
+            let mut e6 = State::wyr1f_degraded_fixture(registry_generation, console).unwrap();
+            // The fixture's own latch is (1, 1); this one arrives later and
+            // must not replace it.
+            e6.shell.observe_wyr1f_shell_ready(shell.0, shell.1);
+            assert_eq!(e6.shell.wyr1f_shell_ready(), Some((1, 1)));
+            let (resident, _, _) = crate::wyr1c_native::recovery_fixture_resident(
+                [0x1F; 32],
+                registry_generation,
+                e6,
+                RegistryTopology::new(registry_generation).unwrap(),
+                None,
+            )
+            .unwrap();
+            resident
+        };
+        let mut other = console_peer();
+        other.grant.registry_generation = 9;
+        other.grant.endpoint_id = 40;
+        other.grant.endpoint_generation = 41;
+        other.grant.role_generation = 42;
+        other.loaded.process = DwHandle(0x9400);
+        // Every identity the owners hold may differ; the join cannot tell.
+        for resident in [
+            join_for(7, console_peer(), (2, 3)),
+            join_for(8, other, (0x55, 0x66)),
+        ] {
+            assert_eq!(wyr1f_ready_join(&resident), (true, true));
+        }
+
+        // Each half follows its owner's live state.
+        let mut resident = join_for(7, console_peer(), (2, 3));
+        fn e6(resident: &mut ResidentSystemInit) -> &mut State {
+            resident.wyr1c.as_mut().unwrap().e6.as_mut().unwrap()
+        }
+        e6(&mut resident).awaiting_ready = true;
+        assert_eq!(wyr1f_ready_join(&resident), (false, true));
+        e6(&mut resident).awaiting_ready = false;
+        e6(&mut resident).console = None;
+        assert_eq!(wyr1f_ready_join(&resident), (false, true));
+        let mut fresh = ShellControllerState::new(7).unwrap();
+        assert_eq!(fresh.wyr1f_shell_ready(), None);
+        core::mem::swap(&mut e6(&mut resident).shell, &mut fresh);
+        assert_eq!(wyr1f_ready_join(&resident), (false, false));
+        // A session that ended keeps the first generation's latch.
+        core::mem::swap(&mut e6(&mut resident).shell, &mut fresh);
+        e6(&mut resident).shell.observe_session_shutdown();
+        assert_eq!(e6(&mut resident).shell.wyr1f_shell_ready(), Some((1, 1)));
+        resident.wyr1c.as_mut().unwrap().e6 = None;
+        assert_eq!(wyr1f_ready_join(&resident), (false, false));
+    }
 }
