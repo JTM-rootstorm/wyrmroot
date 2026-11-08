@@ -1428,6 +1428,7 @@ const NAMED_HOST_FILTERS: &[(&str, Route)] = &[
     ("wyr1d5-clippy", Route::Host),
     ("r1-clippy", Route::Host),
     ("r1-status", Route::Host),
+    ("dw1e3-model", Route::Host),
     ("wyr1e3-model", Route::Host),
     ("wyr1e3-clippy", Route::Host),
     ("wyr1e3-controller-model", Route::Host),
@@ -1630,6 +1631,17 @@ fn named_host_runs(filter: &str) -> Result<Vec<CargoRun>, Failure> {
         // module: the driver's own tests are gated the same way, and naming
         // them individually is how a later one would be added and never run.
         "r1-status" => vec![CargoRun::plain(r1_status_command())],
+        // Selector 31's system-init tests used to run in no gate: the shape was
+        // only `check`ed by `selectors`, so a test such as
+        // `selector31_probe_generations_use_distinct_sticky_registry_client_ids`
+        // compiled nowhere it could run. The runtime's `dw1e3` module stamps
+        // the evidence nonce in with `env!`, so this run takes the same
+        // placeholder the library check does.
+        "dw1e3-model" => vec![CargoRun {
+            arguments: dw1e3_model_command(),
+            selector_nonce: true,
+            require_tests: false,
+        }],
         _ => host_test_commands(Some(filter))?
             .into_iter()
             .map(|arguments| CargoRun::plain(arguments).requiring_named_tests())
@@ -2152,6 +2164,21 @@ fn r1_status_command() -> Vec<String> {
         "--lib",
         "--",
         "--nocapture",
+    ]
+    .map(str::to_owned)
+    .into()
+}
+
+/// system-init's library and integration tests under selector 31.
+fn dw1e3_model_command() -> Vec<String> {
+    [
+        "test",
+        "--locked",
+        "--offline",
+        "--package",
+        "wyrmroot-system-init",
+        "--features",
+        "dw1e3-selector31",
     ]
     .map(str::to_owned)
     .into()
