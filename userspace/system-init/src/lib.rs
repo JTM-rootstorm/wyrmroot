@@ -16,6 +16,21 @@ compile_error!("WYR1-E production and selector-only init policies are mutually e
 #[cfg(all(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
 compile_error!("WYR1-E7 and E8 selector profiles are mutually exclusive");
 
+// The WYR1-E production product is the WYR1-C6 resource product plus the
+// shell controller; every selector built on it inherits both. The manifest's
+// feature lists say so, and these refuse a build in which one stopped doing so.
+#[cfg(all(
+    feature = "wyr1e-production",
+    not(all(feature = "wyr1c6-production", feature = "wyr1e-shell-controller"))
+))]
+compile_error!("wyr1e-production must compose wyr1c6-production and wyr1e-shell-controller");
+
+#[cfg(all(
+    any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"),
+    not(feature = "wyr1e-production")
+))]
+compile_error!("the WYR1-E7 and E8 selector profiles are additive over wyr1e-production");
+
 use core::mem::MaybeUninit;
 
 #[cfg(feature = "wyr1e-production")]

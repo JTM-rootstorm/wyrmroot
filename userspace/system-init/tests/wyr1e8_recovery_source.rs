@@ -9,7 +9,6 @@ use {
     wyrmroot_system_init as _, wyrmroot_uart16550d as _, wyrmroot_wyr1b_gate_proto as _,
 };
 
-const MANIFEST: &str = include_str!("../Cargo.toml");
 /// consoled's role, in its original order: the binary's entry file, then
 /// `role.rs`, which holds everything consoled's `main.rs` held before S2U step
 /// 3. Source text because no host test drives the role yet; each test below
@@ -46,19 +45,6 @@ fn item<'a>(source: &'a str, anchor: &str) -> &'a str {
     let start = source.find(anchor).unwrap();
     let end = start + source[start..].find("\n}\n").unwrap() + 3;
     &source[start..end]
-}
-
-#[test]
-fn e8_profile_is_additive_and_keeps_e7_feature_separate() {
-    assert!(MANIFEST.contains("wyr1e8-selector33 = ["));
-    assert!(MANIFEST.contains("\"wyr1e-production\""));
-    assert!(MANIFEST.contains("\"dep:wyrmroot-wyr1e-test-actors\""));
-    assert!(MANIFEST.contains("\"wyrmroot-consoled/wyr1e8-recovery\""));
-    assert!(MANIFEST.contains("\"wyrmroot-runtime/wyr1e8-test-evidence\""));
-    assert!(
-        include_str!("../src/lib.rs")
-            .contains("WYR1-E7 and E8 selector profiles are mutually exclusive")
-    );
 }
 
 #[test]

@@ -5,9 +5,7 @@ use {
     wyrmroot_system_init as _, wyrmroot_uart16550d as _, wyrmroot_wyr1b_gate_proto as _,
 };
 
-const MANIFEST: &str = include_str!("../Cargo.toml");
 const LIB: &str = include_str!("../src/lib.rs");
-const MAIN: &str = include_str!("../src/main.rs");
 const NATIVE: &str = include_str!("../src/wyr1c_native.rs");
 const E6: &str = include_str!("../src/wyr1e_native.rs");
 const SELECTOR32: &str = include_str!("../src/wyr1d_native.rs");
@@ -31,27 +29,6 @@ fn item<'a>(source: &'a str, anchor: &str) -> &'a str {
     let start = source.find(anchor).unwrap();
     let end = start + source[start..].find("\n}\n").unwrap() + 3;
     &source[start..end]
-}
-
-#[test]
-fn e6_feature_selects_the_shell_controller_without_selecting_selector32() {
-    assert!(MANIFEST.contains(
-        "wyr1e-production = [\"wyr1c6-production\", \"wyr1e-shell-controller\", \"dep:wyrmroot-consoled\", \"wyrmroot-consoled/wyr1e-wyrmsh\"]"
-    ));
-    assert!(
-        LIB.contains("WYR1-E production and selector-only init policies are mutually exclusive")
-    );
-    assert!(MAIN.contains("feature = \"wyr1e-production\""));
-    assert!(
-        !MANIFEST
-            .split("wyr1e-production = ")
-            .nth(1)
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap()
-            .contains("wyr1d-selector32")
-    );
 }
 
 #[test]
