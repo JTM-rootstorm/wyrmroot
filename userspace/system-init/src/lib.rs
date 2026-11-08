@@ -5065,7 +5065,11 @@ mod native_cleanup_tests {
     #[cfg(not(any(feature = "wyr1c6-selector29", feature = "r1-selector34")))]
     #[test]
     fn the_resident_loop_waits_one_tick_period_past_the_tick() {
-        let expected = if cfg!(feature = "wyr1e-production") {
+        let expected = if cfg!(any(
+            feature = "dw1e3-selector31",
+            feature = "wyr1d-selector32",
+            feature = "wyr1e-production"
+        )) {
             WYR0_I_SUPERVISION_POLICY.backoff_ns
         } else {
             1_000_000_000

@@ -1,3 +1,5 @@
+#[cfg(feature = "dw1e3-selector31")]
+use wyrmroot_dw1e3_com2_test as _;
 use {
     deepwyrm_syscall as _, wyrmroot_bootfs as _, wyrmroot_device_proto as _, wyrmroot_devmgr as _,
     wyrmroot_launch_proto as _, wyrmroot_loader as _, wyrmroot_registry_proto as _,

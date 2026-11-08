@@ -6195,6 +6195,8 @@ mod tests {
                 },
                 true,
                 false,
+                #[cfg(feature = "dw1e3-selector31")]
+                false,
             )
             .unwrap()
         };
@@ -6563,6 +6565,8 @@ mod tests {
                 },
                 true,
                 true,
+                #[cfg(feature = "dw1e3-selector31")]
+                false,
             ),
             Ok(ResidentPollEvent::DriverExited)
         );
@@ -6575,6 +6579,8 @@ mod tests {
                 },
                 false,
                 true,
+                #[cfg(feature = "dw1e3-selector31")]
+                false,
             ),
             Ok(ResidentPollEvent::DriverExited)
         );

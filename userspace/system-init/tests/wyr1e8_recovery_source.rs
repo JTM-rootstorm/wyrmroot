@@ -1,5 +1,7 @@
 #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
 use wyrmroot_consoled as _;
+#[cfg(feature = "dw1e3-selector31")]
+use wyrmroot_dw1e3_com2_test as _;
 #[cfg(feature = "wyr1e8-selector33")]
 use wyrmroot_wyr1e_test_actors as _;
 use {
