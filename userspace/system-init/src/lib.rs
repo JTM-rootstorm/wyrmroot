@@ -3931,73 +3931,86 @@ mod native_cleanup_tests {
     fn e6_manifest_constructor_admits_only_the_production_shell_profile() {
         use wyrmroot_rrc_manifest::builder::{Builder, DependencySpec, RoleSpec};
 
+        // The same five-role closure with the shell's startup profile varied.
+        // The E6 constructor is additive: it admits only `Wyrmsh`, and the
+        // historical WYR1-C constructor keeps admitting only `Retained`.
         let boot_generation = [0x42; 32];
-        let mut builder = Builder::new(boot_generation);
-        for (id, path, activation, profile) in [
-            (
-                RoleId::Registryd,
-                "system/registryd",
-                Activation::Early,
-                StartupProfile::BootstrapRegistry,
-            ),
-            (
-                RoleId::Devmgr,
-                "system/devmgr",
-                Activation::Early,
-                StartupProfile::DeviceCoordinator,
-            ),
-            (
-                RoleId::Uart16550d,
-                "system/uart16550d",
-                Activation::DeviceBound,
-                StartupProfile::Retained,
-            ),
-            (
-                RoleId::Consoled,
-                "system/consoled",
-                Activation::ConsoleBound,
-                StartupProfile::Retained,
-            ),
-            (
-                RoleId::Wyrmsh,
-                "system/wyrmsh",
-                Activation::ConsoleBound,
-                StartupProfile::Wyrmsh,
-            ),
-        ] {
-            builder
-                .add_role(RoleSpec {
-                    id,
-                    required: true,
-                    requires_ready: true,
-                    activation,
-                    startup_profile: profile,
-                    path,
-                    justification: "fixed retained recovery closure",
-                    executable_identity: [id as u8; 32],
-                })
-                .unwrap();
-        }
-        for (owner, target) in [
-            (RoleId::Devmgr, RoleId::Registryd),
-            (RoleId::Uart16550d, RoleId::Devmgr),
-            (RoleId::Consoled, RoleId::Uart16550d),
-            (RoleId::Wyrmsh, RoleId::Consoled),
-        ] {
-            builder
-                .add_dependency(DependencySpec {
-                    owner,
-                    kind: DependencyKind::RoleReady,
-                    target_role: Some(target),
-                    target_path: None,
-                })
-                .unwrap();
-        }
-        let bytes = builder.build_structural().unwrap();
-        let manifest = Manifest::parse_structural(&bytes, &boot_generation).unwrap();
+        let build = |shell_profile: StartupProfile| {
+            let mut builder = Builder::new(boot_generation);
+            for (id, path, activation, profile) in [
+                (
+                    RoleId::Registryd,
+                    "system/registryd",
+                    Activation::Early,
+                    StartupProfile::BootstrapRegistry,
+                ),
+                (
+                    RoleId::Devmgr,
+                    "system/devmgr",
+                    Activation::Early,
+                    StartupProfile::DeviceCoordinator,
+                ),
+                (
+                    RoleId::Uart16550d,
+                    "system/uart16550d",
+                    Activation::DeviceBound,
+                    StartupProfile::Retained,
+                ),
+                (
+                    RoleId::Consoled,
+                    "system/consoled",
+                    Activation::ConsoleBound,
+                    StartupProfile::Retained,
+                ),
+                (
+                    RoleId::Wyrmsh,
+                    "system/wyrmsh",
+                    Activation::ConsoleBound,
+                    shell_profile,
+                ),
+            ] {
+                builder
+                    .add_role(RoleSpec {
+                        id,
+                        required: true,
+                        requires_ready: true,
+                        activation,
+                        startup_profile: profile,
+                        path,
+                        justification: "fixed retained recovery closure",
+                        executable_identity: [id as u8; 32],
+                    })
+                    .unwrap();
+            }
+            for (owner, target) in [
+                (RoleId::Devmgr, RoleId::Registryd),
+                (RoleId::Uart16550d, RoleId::Devmgr),
+                (RoleId::Consoled, RoleId::Uart16550d),
+                (RoleId::Wyrmsh, RoleId::Consoled),
+            ] {
+                builder
+                    .add_dependency(DependencySpec {
+                        owner,
+                        kind: DependencyKind::RoleReady,
+                        target_role: Some(target),
+                        target_path: None,
+                    })
+                    .unwrap();
+            }
+            builder.build_structural().unwrap()
+        };
+        let production = build(StartupProfile::Wyrmsh);
+        let manifest = Manifest::parse_structural(&production, &boot_generation).unwrap();
         assert!(SystemInit::from_wyr1e_manifest(manifest).is_ok());
         assert_eq!(
             SystemInit::from_wyr1c_manifest(manifest),
+            Err(InitError::WrongManifestProfile)
+        );
+        let historical = build(StartupProfile::Retained);
+        let manifest = Manifest::parse_structural(&historical, &boot_generation).unwrap();
+        assert!(SystemInit::from_wyr1c_manifest(manifest).is_ok());
+        assert_eq!(
+            SystemInit::from_wyr1e_manifest(manifest),
             Err(InitError::WrongManifestProfile)
         );
     }

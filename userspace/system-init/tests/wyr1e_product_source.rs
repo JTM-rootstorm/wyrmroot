@@ -7,7 +7,6 @@ use {
     wyrmroot_system_init as _, wyrmroot_uart16550d as _, wyrmroot_wyr1b_gate_proto as _,
 };
 
-const LIB: &str = include_str!("../src/lib.rs");
 const NATIVE: &str = include_str!("../src/wyr1c_native.rs");
 const E6: &str = include_str!("../src/wyr1e_native.rs");
 const SELECTOR32: &str = include_str!("../src/wyr1d_native.rs");
@@ -31,17 +30,6 @@ fn item<'a>(source: &'a str, anchor: &str) -> &'a str {
     let start = source.find(anchor).unwrap();
     let end = start + source[start..].find("\n}\n").unwrap() + 3;
     &source[start..end]
-}
-
-#[test]
-fn e6_manifest_admission_is_additive_and_historical_profiles_stay_retained() {
-    let historical = &LIB[LIB.find("pub(crate) fn from_wyr1c_manifest").unwrap()
-        ..LIB.find("fn from_manifest_with_profiles").unwrap()];
-    assert!(historical.contains("StartupProfile::Retained"));
-    assert!(historical.contains("pub(crate) fn from_wyr1e_manifest"));
-    assert!(historical.contains("StartupProfile::Wyrmsh"));
-    assert!(JOBS.contains("SystemInit::from_wyr1e_manifest(manifest)"));
-    assert!(JOBS.contains("SystemInit::from_wyr1c_manifest(manifest)"));
 }
 
 #[test]
