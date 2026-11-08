@@ -4047,6 +4047,10 @@ mod native_cleanup_tests {
         close_count: usize,
         wake_now: Option<u64>,
         wait_deadline: Option<u64>,
+        #[cfg(feature = "wyr1-test-evidence")]
+        wyr1_submitted: [[u8; 114]; 2],
+        #[cfg(feature = "wyr1-test-evidence")]
+        wyr1_submissions: usize,
         wyr1b_calls: usize,
     }
 
@@ -4060,6 +4064,10 @@ mod native_cleanup_tests {
                 close_count: 0,
                 wake_now: None,
                 wait_deadline: None,
+                #[cfg(feature = "wyr1-test-evidence")]
+                wyr1_submitted: [[0; 114]; 2],
+                #[cfg(feature = "wyr1-test-evidence")]
+                wyr1_submissions: 0,
                 wyr1b_calls: 0,
             }
         }
@@ -4886,8 +4894,14 @@ mod native_cleanup_tests {
     /// does not carry, so the loop tests below run in every other shape.
     #[cfg(not(any(feature = "wyr1c6-selector29", feature = "r1-selector34")))]
     impl resident_loop::ResidentLoopPlatform for MockNative {
+        /// Records each submission, then refuses it, as a kernel that will
+        /// not take the record would.
         #[cfg(feature = "wyr1-test-evidence")]
-        fn submit_wyr1_evidence(&mut self, _record: &[u8; 114]) -> Result<(), NativeError> {
+        fn submit_wyr1_evidence(&mut self, record: &[u8; 114]) -> Result<(), NativeError> {
+            if let Some(slot) = self.wyr1_submitted.get_mut(self.wyr1_submissions) {
+                *slot = *record;
+            }
+            self.wyr1_submissions += 1;
             Err(FAILURE)
         }
 
@@ -4938,6 +4952,95 @@ mod native_cleanup_tests {
             0xAF01_0005
         );
         assert_eq!(waits.wait_count, 3);
+    }
+
+    /// F3A.6: a fatally failed bring-up submits the evidence it already
+    /// encoded before it reports the failure, and a refused submission does
+    /// not replace the failure's own status.
+    ///
+    /// The tick fails because its instant is older than the last tick's.
+    /// Selector 25's drain is the only one that runs on a failed tick, so this
+    /// runs where `wyr1-test-evidence` is compiled (the wyr1f shape).
+    #[cfg(all(
+        feature = "wyr1-test-evidence",
+        not(any(feature = "wyr1c6-selector29", feature = "r1-selector34"))
+    ))]
+    #[test]
+    fn a_fatal_control_tick_submits_its_evidence_before_reporting_the_failure() {
+        let failing_resident = || {
+            let (mut resident, _, _) = two_role_resident();
+            let mut log = EvidenceLog::new(0x00ff, crate::gate::GateScenario::Normal).unwrap();
+            log.record(EvidenceEvent::Ready, 1, 1, 0x1001, 0).unwrap();
+            log.record(EvidenceEvent::Ready, 2, 1, 0x1002, 0).unwrap();
+            resident.controller.evidence = Some(log);
+            resident.last_tick_ns = MockNative::new().now + 1;
+            resident
+        };
+        let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
+
+        let mut twin = failing_resident();
+        let error = twin
+            .control_tick_product(
+                &mut MockNative::new(),
+                &mut loader,
+                &mut ResidentWaits { wait_count: 0 },
+                MockNative::new().now,
+            )
+            .expect_err("the fixture's tick fails");
+
+        let mut resident = failing_resident();
+        let records = [
+            *resident
+                .controller
+                .evidence
+                .as_ref()
+                .unwrap()
+                .line(0)
+                .unwrap(),
+            *resident
+                .controller
+                .evidence
+                .as_ref()
+                .unwrap()
+                .line(1)
+                .unwrap(),
+        ];
+        let mut native = MockNative::new();
+        let mut waits = ResidentWaits { wait_count: 0 };
+        assert_eq!(
+            resident_loop::continue_resident(&mut resident, &mut native, &mut loader, &mut waits),
+            resident_tick_failure_application_status(&error)
+        );
+        assert!(!resident.evidence_finalized());
+        assert_eq!(native.wyr1_submissions, 2);
+        assert_eq!(native.wyr1_submitted, records);
+    }
+
+    /// The ordinary drain: once the evidence is finalized, the loop submits
+    /// every record, and a refused submission is the loop's failure.
+    #[cfg(all(
+        feature = "wyr1-test-evidence",
+        not(any(feature = "wyr1c6-selector29", feature = "r1-selector34"))
+    ))]
+    #[test]
+    fn finalized_evidence_is_submitted_after_a_successful_tick() {
+        let (mut resident, _, _) = two_role_resident();
+        let mut log = EvidenceLog::new(0x00ff, crate::gate::GateScenario::Normal).unwrap();
+        log.record(EvidenceEvent::Ready, 1, 1, 0x1001, 0).unwrap();
+        let record = *log.line(0).unwrap();
+        resident.controller.evidence = Some(log);
+        resident.evidence_finalized = true;
+        let mut native = MockNative::new();
+        let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
+        let mut waits = ResidentWaits { wait_count: 0 };
+
+        assert_eq!(
+            resident_loop::continue_resident(&mut resident, &mut native, &mut loader, &mut waits),
+            0xAF01_0008
+        );
+        assert_eq!(waits.wait_count, 3, "the tick succeeded first");
+        assert_eq!(native.wyr1_submissions, 1);
+        assert_eq!(native.wyr1_submitted[0], record);
     }
 
     /// The loop sleeps one tick period past the tick's own instant. Products

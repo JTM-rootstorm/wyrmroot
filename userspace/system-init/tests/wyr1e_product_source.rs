@@ -8,7 +8,6 @@ use {
 const MANIFEST: &str = include_str!("../Cargo.toml");
 const LIB: &str = include_str!("../src/lib.rs");
 const MAIN: &str = include_str!("../src/main.rs");
-const LOOP: &str = include_str!("../src/resident_loop.rs");
 const NATIVE: &str = include_str!("../src/wyr1c_native.rs");
 const E6: &str = include_str!("../src/wyr1e_native.rs");
 const SELECTOR32: &str = include_str!("../src/wyr1d_native.rs");
@@ -325,52 +324,6 @@ fn the_console_and_shell_supervisor_never_reads_or_writes_the_supervisor_mode() 
     let gate = poll.find("if poll_shell_jobs {").unwrap();
     let dispatch = poll.find("poll_job_dispatcher_with_shell(").unwrap();
     assert!(gate < dispatch);
-}
-
-/// F3A.6: a fatally failed bring-up must not discard its own evidence.
-///
-/// The ordinary drain is gated on `evidence_finalized()`, and a tick that
-/// returns an error never finalizes, so before this every record produced
-/// before a fatal failure was thrown away and COM1 carried one error class and
-/// nothing else. The first three F3A boots were diagnosed from that alone.
-///
-/// The assertion is positional rather than a bare substring. A substring test
-/// would stay green if the drain were moved out of the failure arm, or if a
-/// `return` were inserted above it -- which is exactly how this guard would be
-/// lost.
-#[test]
-fn a_fatal_control_tick_submits_its_evidence_before_reporting_the_failure() {
-    let arm_start = LOOP
-        .find("if let Err(error) = resident.control_tick_product(system, loader, waits, now) {")
-        .expect("the resident tick failure arm");
-    let report = "return resident_tick_failure_application_status(&error);";
-    let report_offset = LOOP[arm_start..]
-        .find(report)
-        .map(|offset| arm_start + offset)
-        .expect("the tick failure status report");
-    let arm = &LOOP[arm_start..report_offset];
-
-    // The drain sits inside the failure arm, ahead of the status report.
-    assert!(arm.contains("#[cfg(feature = \"wyr1-test-evidence\")]"));
-    assert!(arm.contains("if !evidence_submitted {"));
-    assert!(arm.contains("resident.controller().evidence_line(index)"));
-    assert!(arm.contains("system.submit_wyr1_evidence(record)"));
-    // The arm returns right after the drain, so it does not set
-    // `evidence_submitted`: the write would never be read, and the guest
-    // build refuses it under `-D warnings`.
-
-    // Nothing may return before the drain runs, or the arm is dead code.
-    assert!(
-        !arm.contains("return "),
-        "a return above the fatal evidence drain makes it unreachable"
-    );
-
-    // A submission failure must not replace the status that explains the run.
-    assert!(arm.contains("let _ = system.submit_wyr1_evidence(record);"));
-
-    // The ordinary finalized drain still exists, after the failure arm.
-    let ordinary = &LOOP[report_offset..];
-    assert!(ordinary.contains("if resident.evidence_finalized() && !evidence_submitted {"));
 }
 
 /// F3A.6f. `recover_registry` empties `state.registry` and `state.binding`
