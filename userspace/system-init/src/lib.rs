@@ -6330,6 +6330,12 @@ mod selector_status_coverage {
     /// *not* reach `fatal_application_status`, so a selector can be named all
     /// over the dispatch and still collapse. What matters is that some arm
     /// positively gated on it returns something else.
+    ///
+    /// The gated statement must follow its `cfg` directly. S3 found that
+    /// skipping attribute lines let a selector's `cfg` whose own `return` had
+    /// been deleted borrow the next arm's: the orphaned attribute then stacks
+    /// onto that arm, which a stacked `not(...)` of the same selector removes
+    /// from the selector's build, so the selector collapses while this passed.
     fn preserves_category(dispatch: &str, selector: &str) -> bool {
         let mut lines = dispatch.lines();
         while let Some(line) = lines.next() {
@@ -6339,13 +6345,25 @@ mod selector_status_coverage {
             }
             for next in lines.by_ref() {
                 let next = next.trim();
-                if next.is_empty() || next.starts_with('#') || next.starts_with("//") {
+                if next.is_empty() || next.starts_with("//") {
                     continue;
+                }
+                if next.starts_with('#') {
+                    break;
                 }
                 return next.contains("return") && !next.contains("fatal_application_status");
             }
         }
         false
+    }
+
+    /// True when the manifest declares `name` as a feature, not merely
+    /// mentions it (a dependency feature can carry the same name).
+    fn declares_feature(manifest: &str, name: &str) -> bool {
+        manifest.lines().any(|line| {
+            line.split_once('=')
+                .is_some_and(|(left, _)| left.trim() == name)
+        })
     }
 
     /// Visits every feature whose definition turns on a selector-private
@@ -6451,7 +6469,7 @@ mod selector_status_coverage {
     fn the_recorded_debt_is_real_and_not_stale() {
         for selector in KNOWN_COLLAPSING {
             assert!(
-                MANIFEST.contains(selector),
+                declares_feature(MANIFEST, selector),
                 "{selector} is recorded as collapsing but no longer exists"
             );
             assert!(
@@ -6494,6 +6512,21 @@ return r1_test_failure_application_status(&error);\n";
 return wyr1_test_failure_application_status(&error);\n";
         assert!(preserves_category(composed, "wyr1-test-evidence"));
         assert!(!preserves_category(composed, "wyr1b-test-evidence"));
+
+        // A selector whose own return was deleted leaves its cfg stacked onto
+        // the next arm; that arm is not the selector's.
+        let orphaned = "\
+#[cfg(feature = \"wyr1b-test-evidence\")]\n\
+#[cfg(all(feature = \"wyr1-test-evidence\", not(feature = \"wyr1b-test-evidence\")))]\n\
+return wyr1_test_failure_application_status(&error);\n";
+        assert!(!preserves_category(orphaned, "wyr1b-test-evidence"));
+    }
+
+    #[test]
+    fn a_feature_is_declared_only_by_its_own_line() {
+        let manifest = "a = []\nb = [\"dep/a-selector\"]\n";
+        assert!(declares_feature(manifest, "a"));
+        assert!(!declares_feature(manifest, "a-selector"));
     }
 }
 
