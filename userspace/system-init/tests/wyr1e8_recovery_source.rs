@@ -128,31 +128,25 @@ fn e8_holds_the_real_terminal_wait_until_exact_quiescence_and_cleanup() {
     assert!(state.contains("identity != held.identity || held.acknowledged"));
 }
 
+/// The resident sends the D5 retire with the identity `e8_driver_identity`
+/// built, which `e8_driver_identity_joins_every_current_d5_identity_field`
+/// (wyr1b_native.rs) holds field by field. Source text for the send because
+/// it is inline in `poll_observations`, which no host fake drives; scoped to
+/// the `Quiesced` arm.
 #[test]
 fn driver_retire_uses_all_six_current_d5_identity_fields() {
-    let identity = &JOBS[JOBS.find("pub(crate) fn e8_driver_identity").unwrap()
-        ..JOBS.find("pub(crate) fn record_e8_forced_retired").unwrap()];
-    for field in [
-        "request.role_id.0",
-        "request.attempt_generation.0",
-        "request.endpoint.id.0",
-        "request.endpoint.generation.0",
-        "request.transaction_id",
-        "request.supervisor_generation.0",
-        "bundle_generation: bundle",
-    ] {
-        assert!(
-            identity.contains(field),
-            "missing current identity join: {field}"
-        );
-    }
-    let poll = &NATIVE[NATIVE.find("Message::Quiesced(identity)").unwrap()
-        ..NATIVE
-            .find("if wyrmroot_loader::launch::parse_ready_for_profile")
-            .unwrap()];
-    assert!(poll.contains("D5ControllerMessage::RequestRetire("));
-    assert!(poll.contains("identity,"));
-    assert!(poll.contains(".send_channel(devmgr.loaded.launch_channel, &request_bytes)"));
+    let poll = item(NATIVE, "fn poll_observations<");
+    let poll = &poll[poll.find("Message::Quiesced(identity)").unwrap()
+        ..poll.find("Message::Quiesce(_)").unwrap()];
+    let identity = poll
+        .find("let identity = e6.shell.e8_driver_identity(request)?;")
+        .unwrap();
+    let encode = poll.find("D5ControllerMessage::RequestRetire(\n").unwrap();
+    let send = poll
+        .find(".send_channel(devmgr.loaded.launch_channel, &request_bytes)")
+        .unwrap();
+    assert!(identity < encode && encode < send);
+    assert!(poll[encode..send].contains("identity,"));
 }
 
 #[test]

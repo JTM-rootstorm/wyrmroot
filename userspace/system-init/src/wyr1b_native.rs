@@ -11685,6 +11685,71 @@ mod tests {
         state
     }
 
+    /// The D5 retire identity is joined to all six fields of the current
+    /// serial publication's driver, and refused if any one differs.
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_driver_identity_joins_every_current_d5_identity_field() {
+        use wyrmroot_device_proto::coordinator::{
+            AttemptGeneration, EndpointGeneration, EndpointId, LaunchSessionGeneration,
+            SupervisorGeneration,
+        };
+        // `e8_state_for_held_wait` observed the serial facts 11..=16 and a
+        // READY with bundle generation 19.
+        let state = e8_state_for_held_wait(4);
+        let current = DriverLaunchRequest {
+            supervisor_generation: SupervisorGeneration(16),
+            role_id: wyrmroot_device_proto::RoleId(11),
+            attempt_generation: AttemptGeneration(12),
+            launch_session: LaunchSessionGeneration(2),
+            endpoint: wyrmroot_device_proto::ControlEndpoint {
+                id: EndpointId(13),
+                generation: EndpointGeneration(14),
+            },
+            transaction_id: 15,
+            driver_path: wyrmroot_device_proto::DEVICE_DRIVER_PATH,
+            actor_identity: wyrmroot_device_proto::manifest::ContentIdentity([0x5a; 32]),
+            child_is_channel: true,
+            child_rights: wyrmroot_device_proto::DirectControlRights::ExactReduced,
+        };
+        assert_eq!(
+            state.e8_driver_identity(current),
+            Ok(wyrmroot_device_proto::D5DriverIdentity {
+                device_role_id: 11,
+                bundle_generation: 19,
+                driver_attempt_generation: 12,
+                driver_control_endpoint_id: 13,
+                driver_control_endpoint_generation: 14,
+                launch_transaction_id: 15,
+            })
+        );
+        // The launch session is not part of the D5 identity.
+        let mut other_session = current;
+        other_session.launch_session = LaunchSessionGeneration(3);
+        assert!(state.e8_driver_identity(other_session).is_ok());
+
+        let mut stale = [current; 6];
+        stale[0].role_id = wyrmroot_device_proto::RoleId(12);
+        stale[1].attempt_generation = AttemptGeneration(13);
+        stale[2].endpoint.id = EndpointId(14);
+        stale[3].endpoint.generation = EndpointGeneration(15);
+        stale[4].transaction_id = 16;
+        stale[5].supervisor_generation = SupervisorGeneration(17);
+        for request in stale {
+            assert_eq!(
+                state.e8_driver_identity(request),
+                Err(InitError::Accounting),
+                "{request:?}"
+            );
+        }
+        // No current serial publication, no identity.
+        let empty = ShellControllerState::new(7).unwrap();
+        assert_eq!(
+            empty.e8_driver_identity(current),
+            Err(InitError::WrongActivationOrder)
+        );
+    }
+
     #[cfg(feature = "wyr1e8-selector33")]
     fn e8_pending_wait(transaction_id: u64) -> PendingWait {
         let reservation = reservation(transaction_id);
