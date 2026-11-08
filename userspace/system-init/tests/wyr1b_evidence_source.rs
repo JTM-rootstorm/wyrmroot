@@ -70,6 +70,13 @@ fn selector_27_submission_feature_is_separate_from_selector_25() {
     );
 }
 
+/// The product's first bootfs mapping reports the startup diagnostic, once.
+///
+/// Source text because the startup and ordinary diagnostics differ only in
+/// selector 27's shape (`wyr1b-test-evidence`), which the gate only `check`s;
+/// in every tested shape both collapse to `InitError::Mapping`, so no gated
+/// host test can tell the sites apart. Scoped to the product activation and
+/// to `startup_mapping_error`.
 #[test]
 fn selector_27_startup_mapping_diagnostic_is_bound_to_the_initial_mapping_only() {
     let product_start = LIB.find("fn activate_received_product_in_place").unwrap();
@@ -84,8 +91,14 @@ fn selector_27_startup_mapping_diagnostic_is_bound_to_the_initial_mapping_only()
             .count(),
         1
     );
-    assert!(LIB.contains("fn startup_mapping_error(error: MappingPlanError, size: u64)"));
-    assert!(LIB.contains("InitError::StartupMapping(StartupMappingDiagnostic"));
+    assert!(
+        item(
+            LIB,
+            "fn startup_mapping_error(error: MappingPlanError, size: u64)",
+            ""
+        )
+        .contains("InitError::StartupMapping(StartupMappingDiagnostic")
+    );
     assert!(MAIN.contains("return wyr1b_test_failure_application_status(&error);"));
 }
 
@@ -159,6 +172,11 @@ fn selector_27_dispatcher_keeps_one_protocol_sized_payload_and_stream_set() {
     ));
 }
 
+/// Each post-startup bootfs mapping names its own site.
+///
+/// Source text for the reason the startup check above gives: the site is
+/// carried only in selector 27's shape, which the gate only `check`s. The
+/// per-file call counts bound each assertion to the one call it names.
 #[test]
 fn selector_27_ordinary_mapping_diagnostic_names_each_remaining_site() {
     // Exclude the test module, not a test-only branch inside production code.
