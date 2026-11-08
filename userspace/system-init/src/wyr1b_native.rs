@@ -15346,4 +15346,17 @@ mod tests {
     mod e8_producer_fixture {
         include!("wyr1e8_producer_fixture.rs");
     }
+
+    /// The resident is written straight into the caller's slot: a by-value
+    /// constructor here fails to build. Type-check only; see
+    /// `crate::in_place_activation_signatures`.
+    #[allow(dead_code)]
+    fn the_resident_is_initialized_in_the_callers_slot() {
+        type Initialize = for<'a> fn(
+            &'a mut MaybeUninit<ResidentSystemInit>,
+            LoadAuthority,
+            &[u8],
+        ) -> Result<&'a mut ResidentSystemInit, InitError>;
+        let _: Initialize = initialize_resident_in_place;
+    }
 }
