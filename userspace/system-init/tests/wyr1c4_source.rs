@@ -99,6 +99,11 @@ fn c5_driver_attempt_is_parented_under_init_not_the_devmgr_generation() {
     assert!(!construct[..create].contains("driver_parent = devmgr.task_group"));
 }
 
+/// Selector 29's terminal facts are emitted by init, from its own predicates.
+///
+/// Source text because `emit_c6_terminal_facts` runs only from
+/// `accept_c6_fact`'s event 22, and no host fixture builds a selector-29
+/// resident holding a D2 lease and a C6 evidence log. Scoped to the two fns.
 #[test]
 fn c6_terminal_facts_are_init_owned_and_bound_to_real_predicates() {
     // devmgr's role moved from `main.rs` to `role.rs` in S2U step 3; read both.
@@ -106,26 +111,54 @@ fn c6_terminal_facts_are_init_owned_and_bound_to_real_predicates() {
         include_str!("../../devmgr/src/main.rs"),
         include_str!("../../devmgr/src/role.rs")
     );
-    assert!(NATIVE_SOURCE.contains("emit_c6_terminal_facts(resident)"));
+    let accept = native_fn("accept_c6_fact(");
+    assert!(accept.contains("if fact.event == 22 {\n        emit_c6_terminal_facts(resident)?;"));
     assert!(!devmgr.contains("emit_selector29_final_facts"));
-    assert!(NATIVE_SOURCE.contains("c6_startup_profiles_exclude_direct_device_authority"));
-    assert!(NATIVE_SOURCE.contains("ResourceDomainMembership::InitOutsideDomain"));
-    assert!(NATIVE_SOURCE.contains("physical_io_not_performed"));
-    assert!(NATIVE_SOURCE.contains("role_failure_count(RoleId::Devmgr)"));
-    assert!(NATIVE_SOURCE.contains("WYR0_I_SUPERVISION_POLICY.max_attempts"));
-    assert!(NATIVE_SOURCE.contains("WYR0_I_SUPERVISION_POLICY.backoff_ns"));
+    let emit = native_fn("emit_c6_terminal_facts(");
+    for predicate in [
+        "c6_startup_profiles_exclude_direct_device_authority()",
+        ".devmgr_claim_authority(ResourceDomainMembership::InitOutsideDomain)",
+        "|| !state.c6_gate_config.physical_io_not_performed",
+        ".role_failure_count(RoleId::Devmgr)",
+        "WYR0_I_SUPERVISION_POLICY.max_attempts",
+        "WYR0_I_SUPERVISION_POLICY.backoff_ns",
+    ] {
+        assert!(emit.contains(predicate), "{predicate}");
+    }
 }
 
+/// The WRDM UART identity is joined to the one the retained WRRM validation
+/// produced. The comparison itself is host-tested by
+/// `wrdm_uart_identity_must_match_the_independent_wrrm_identity`
+/// (wyr1c_native.rs); this holds which value reaches it.
+///
+/// Source text because `activate_in_place` is reached only from the product
+/// entry, which no host fake drives. Scoped to `validate_retained_bootfs_c1`
+/// and `activate_in_place`.
 #[test]
 fn c6_joins_wrdm_to_the_validated_retained_uart_identity() {
-    assert!(RETAINED_SOURCE.contains("let uart_identity = *manifest"));
-    assert!(RETAINED_SOURCE.contains(".role(RoleId::Uart16550d)"));
-    assert!(RETAINED_SOURCE.contains("Ok((controller, uart_identity))"));
-    assert!(NATIVE_SOURCE.contains(
-        "let (manifest, uart_identity) = crate::wyr1b_native::validate_retained_bootfs_c1(bootfs)?;"
-    ));
-    assert!(NATIVE_SOURCE.contains("validate_device_identity(device_manifest, uart_identity)?;"));
-    assert!(!NATIVE_SOURCE.contains("manifest.executable_identity(RoleId::Uart16550d)"));
+    let start = RETAINED_SOURCE
+        .find("pub(crate) fn validate_retained_bootfs_c1(")
+        .unwrap();
+    let end = RETAINED_SOURCE[start..].find("\n}\n").unwrap() + start;
+    let retained = &RETAINED_SOURCE[start..end];
+    let identity = retained.find("let uart_identity = *manifest").unwrap();
+    assert!(
+        retained[identity..]
+            .starts_with("let uart_identity = *manifest\n        .role(RoleId::Uart16550d)")
+    );
+    assert!(retained.ends_with("Ok((controller, uart_identity))"));
+    let activate = native_fn("activate_in_place<");
+    let validated = activate
+        .find(
+            "let (manifest, uart_identity) = crate::wyr1b_native::validate_retained_bootfs_c1(bootfs)?;",
+        )
+        .unwrap();
+    let joined = activate
+        .find("validate_device_identity(device_manifest, uart_identity)?;")
+        .unwrap();
+    assert!(validated < joined);
+    assert!(!activate.contains("executable_identity(RoleId::Uart16550d)"));
 }
 
 /// The text of `fn name`, up to its closing brace at column 0.
