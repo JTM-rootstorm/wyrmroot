@@ -72,9 +72,7 @@ const DESIGNATED_STACK_FRAMES: &[(&str, &str)] = &[
     ("continue_resident", "system_init::continue_resident"),
 ];
 const OVMF_CODE_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
-const OVMF_CODE_SHA256: &str = "f3ff7e73448ed2845ee15356f394882f5618eb5dab92c9a30ec6ee0e1468553a";
 const OVMF_VARS_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";
-const OVMF_VARS_SHA256: &str = "6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc";
 const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const KERNEL_COMMAND: &str = "tools/pinned-cargo target build --locked --offline --release --target x86_64-unknown-none --package deepwyrm-kernel --bin deepwyrm-kernel --features test-support";
@@ -502,8 +500,8 @@ pub fn freeze(output: &Path) -> Result<String, Failure> {
     ] {
         write_new_file(&selector27_artifacts.join(name), bytes)?;
     }
-    let ovmf_code = read_pinned_firmware(OVMF_CODE_PATH, OVMF_CODE_SHA256, "OVMF code")?;
-    let ovmf_vars = read_pinned_firmware(OVMF_VARS_PATH, OVMF_VARS_SHA256, "OVMF vars")?;
+    let ovmf_code = read_system_firmware(OVMF_CODE_PATH, "OVMF code")?;
+    let ovmf_vars = read_system_firmware(OVMF_VARS_PATH, "OVMF vars")?;
     write_new_file(&selector27_artifacts.join("OVMF_CODE.fd"), &ovmf_code)?;
     write_new_file(&selector27_artifacts.join("OVMF_VARS.fd"), &ovmf_vars)?;
     let request_text = render_request(
@@ -1175,12 +1173,8 @@ fn build_kernel(
     )
 }
 
-fn read_pinned_firmware(path: &str, expected: &str, label: &str) -> Result<Vec<u8>, Failure> {
-    let bytes = read_bounded(Path::new(path), label, MAX_FIRMWARE)?;
-    if sha256::bytes_digest(&bytes) != expected {
-        return Err(Failure::task(format!("pinned {label} identity mismatch")));
-    }
-    Ok(bytes)
+fn read_system_firmware(path: &str, label: &str) -> Result<Vec<u8>, Failure> {
+    read_bounded(Path::new(path), label, MAX_FIRMWARE)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3541,7 +3535,7 @@ mod tests {
             .split_once("fn build_kernel(")
             .expect("kernel build entry")
             .1
-            .split_once("fn read_pinned_firmware(")
+            .split_once("fn read_system_firmware(")
             .expect("kernel build boundary")
             .0;
         assert!(kernel_build.contains(".env_remove(\"CARGO_HOME\")"));

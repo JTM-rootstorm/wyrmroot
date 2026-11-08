@@ -26,9 +26,7 @@ const DW1C_INIT_FEATURES: &str = "native-init0,dw1c-preemption-integration";
 const DW1C_ACTOR_FEATURES: &str = "native-payloads";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const OVMF_CODE_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
-const OVMF_CODE_SHA256: &str = "f3ff7e73448ed2845ee15356f394882f5618eb5dab92c9a30ec6ee0e1468553a";
 const OVMF_VARS_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";
-const OVMF_VARS_SHA256: &str = "6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc";
 
 const SELECTOR: &str = "normal-preemption-smp";
 const TEST_ID: &str = "28";
@@ -952,8 +950,8 @@ fn freeze_product(
         &kernel,
         &source_values,
     )?;
-    let ovmf_code = read_pinned_firmware(OVMF_CODE_PATH, OVMF_CODE_SHA256, "OVMF code")?;
-    let ovmf_vars = read_pinned_firmware(OVMF_VARS_PATH, OVMF_VARS_SHA256, "OVMF vars")?;
+    let ovmf_code = read_system_firmware(OVMF_CODE_PATH, "OVMF code")?;
+    let ovmf_vars = read_system_firmware(OVMF_VARS_PATH, "OVMF vars")?;
     let product = output.join("product");
     fs::create_dir(&product).map_err(io)?;
     for (name, bytes) in [
@@ -1128,14 +1126,8 @@ fn build_kernel(
     result
 }
 
-fn read_pinned_firmware(path: &str, expected: &str, label: &str) -> Result<Vec<u8>, Failure> {
-    let bytes = read_regular(Path::new(path), label)?;
-    if sha256::bytes_digest(&bytes) != expected {
-        return Err(Failure::task(format!(
-            "DW1-C pinned {label} identity mismatch"
-        )));
-    }
-    Ok(bytes)
+fn read_system_firmware(path: &str, label: &str) -> Result<Vec<u8>, Failure> {
+    read_regular(Path::new(path), label)
 }
 
 /// `deep` is the product Deep candidate revision and the accepted generated

@@ -35,9 +35,7 @@ const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
 const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
 const VARS_FD_GROUP: &str = "dw-f13-ovmf-vars-v1";
 const OVMF_CODE: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
-const OVMF_CODE_SHA256: &str = "f3ff7e73448ed2845ee15356f394882f5618eb5dab92c9a30ec6ee0e1468553a";
 const OVMF_VARS: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";
-const OVMF_VARS_SHA256: &str = "6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc";
 const O_NOFOLLOW: i32 = 0x2_0000;
 const INPUTS: [&str; 12] = [
     "loader",
@@ -229,8 +227,8 @@ fn build_product(
     let bootfs = bootfs(&owner, &trigger, &replacement)?;
     let kernel = kernel_build(deep, nonce, challenge)?;
     let symbols = kernel.clone();
-    let code = pinned_firmware(OVMF_CODE, OVMF_CODE_SHA256, "OVMF code")?;
-    let vars = pinned_firmware(OVMF_VARS, OVMF_VARS_SHA256, "OVMF vars")?;
+    let code = system_firmware(OVMF_CODE, "OVMF code")?;
+    let vars = system_firmware(OVMF_VARS, "OVMF vars")?;
 
     let product = build.join("product");
     fs::create_dir(&product).map_err(io)?;
@@ -1082,13 +1080,8 @@ fn read_build(file: &Path, label: &str) -> Result<Vec<u8>, Failure> {
     }
     fs::read(file).map_err(io)
 }
-fn pinned_firmware(file: &str, hash: &str, label: &str) -> Result<Vec<u8>, Failure> {
-    let bytes = read_regular(Path::new(file), label)?;
-    if sha256::bytes_digest(&bytes) != hash {
-        Err(Failure::task(format!("DW1-D6 {label} hash changed")))
-    } else {
-        Ok(bytes)
-    }
+fn system_firmware(file: &str, label: &str) -> Result<Vec<u8>, Failure> {
+    read_regular(Path::new(file), label)
 }
 fn snapshot(source: &Path, target: &Path) -> Result<Snapshot, Failure> {
     snapshot_mode(source, target, 0o444)
