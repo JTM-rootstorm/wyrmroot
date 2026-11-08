@@ -650,6 +650,10 @@ where
 }
 
 /// Relays exactly one datagram: decide, submit, then record.
+///
+/// Private on purpose: this driver is the only module that may relay the
+/// probe's records, because two callers would mean two places decide custody
+/// of one transcript. A caller anywhere else fails to compile (E0603).
 fn relay_one<S: R1EvidenceSink>(
     relay: &mut R1Relay,
     sink: &mut S,

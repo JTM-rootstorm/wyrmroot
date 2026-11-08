@@ -6853,69 +6853,6 @@ mod r1_failure_status_tests {
     }
 }
 
-/// Card R1's relay custody: exactly one module decides the probe's transcript.
-///
-/// That the driver relays each record, in order and once, is held by behaviour
-/// in `r1_driver::tests` (`a_whole_transcript_reaches_the_collector_in_order_and_ends_once`),
-/// and that it consumes the staged gate and probe by
-/// `the_probe_is_launched_from_the_paths_the_product_stages`. What remains is
-/// an absence: no second module calls `relay_one`, because two callers would
-/// mean two places decide custody of one transcript.
-///
-/// Source text because the property is the absence of a caller that does not
-/// exist yet; no host test can observe a call that was never written, and
-/// Rust visibility cannot name a sibling module as the only caller.
-#[cfg(test)]
-mod r1_composition_coverage {
-    /// This module's own marker in `lib.rs`; the scan excises everything from
-    /// here to the end of the module, whose literals name the call it counts.
-    const SELF_MARKER: &str = "\nmod r1_composition_coverage {";
-
-    /// The crate's non-test modules that could drive a selector's evidence.
-    /// `r1_relay.rs` defines `relay_one<` and is not a caller.
-    const SOURCES: [(&str, &str); 8] = [
-        ("lib.rs", include_str!("lib.rs")),
-        ("main.rs", include_str!("main.rs")),
-        ("resident_loop.rs", include_str!("resident_loop.rs")),
-        ("r1_driver.rs", include_str!("r1_driver.rs")),
-        ("wyr1b_native.rs", include_str!("wyr1b_native.rs")),
-        ("wyr1c_native.rs", include_str!("wyr1c_native.rs")),
-        ("wyr1d_native.rs", include_str!("wyr1d_native.rs")),
-        ("wyr1e_native.rs", include_str!("wyr1e_native.rs")),
-    ];
-
-    /// Calls to `relay_one` in one source. For `lib.rs` this module is cut out
-    /// first, and only this module, so a caller elsewhere in the file is still
-    /// counted.
-    fn calls(name: &str, source: &str) -> usize {
-        const CALL: &str = "relay_one(";
-        if name != "lib.rs" {
-            return source.matches(CALL).count();
-        }
-        let start = source
-            .find(SELF_MARKER)
-            .expect("this module's own marker no longer matches");
-        let end = start
-            + source[start..]
-                .find("\n}\n")
-                .expect("this module no longer closes");
-        source[..start].matches(CALL).count() + source[end..].matches(CALL).count()
-    }
-
-    #[test]
-    fn only_the_scenario_driver_relays_the_probes_records() {
-        for (name, source) in SOURCES {
-            let calls = calls(name, source);
-            let expected = usize::from(name == "r1_driver.rs");
-            assert_eq!(
-                calls, expected,
-                "{name} calls relay_one {calls} times; only the scenario driver \
-                 may, once, or two places decide custody of one transcript"
-            );
-        }
-    }
-}
-
 /// Card R1's third repetition of one defect, gated instead of patched again.
 ///
 /// Three runs of this card failed with a status that proved something had gone
