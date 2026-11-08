@@ -32,6 +32,11 @@ fn item<'a>(source: &'a str, anchor: &str) -> &'a str {
     &source[start..end]
 }
 
+/// The console launcher session is installed before consoled is loaded and
+/// attached, so consoled cannot send shell-v1 to nothing.
+///
+/// Source text because `launch_console` is reached only from the resident
+/// step and selector 32's poll, which no host fake drives; scoped to it.
 #[test]
 fn console_launcher_is_installed_before_consoled_can_send_shell_v1() {
     let launch = &E6
@@ -44,6 +49,8 @@ fn console_launcher_is_installed_before_consoled_can_send_shell_v1() {
     assert!(!launch.contains("wyr1d-selector32"));
 }
 
+/// Source text because the dispatcher-before-console-wait order is inline in
+/// `poll_observations`, which no host fake drives; scoped to the named fns.
 #[test]
 fn resident_services_shell_v1_before_waiting_for_consoled_ready() {
     // The console readiness/exit wait admission now lives in
@@ -77,6 +84,8 @@ fn resident_services_shell_v1_before_waiting_for_consoled_ready() {
     assert!(poll.contains("validated_at >= e6.ready_deadline"));
 }
 
+/// Source text because `recover_registry` and `recover_devmgr` are reached
+/// only from `control_tick`, which no host fake drives; scoped to each fn.
 #[test]
 fn registry_and_devmgr_recovery_retire_dependents_before_replacement() {
     let registry = item(NATIVE, "fn recover_registry");
@@ -142,6 +151,9 @@ fn registry_and_devmgr_recovery_retire_dependents_before_replacement() {
     assert!(teardown < install);
 }
 
+/// Source text because the property is an absence: no entry in the
+/// retirement family reaches the shared drain, and a host test cannot
+/// enumerate calls that are never made. Scoped to the family's fns.
 #[test]
 fn targeted_console_retirement_preserves_the_dispatcher_for_orphan_reaping() {
     // `retire_console_product` only delegates now. Assert the entry point and
@@ -171,25 +183,23 @@ fn targeted_console_retirement_preserves_the_dispatcher_for_orphan_reaping() {
     assert!(!family.contains("drain_job_dispatcher("));
 }
 
+/// The budget itself (finite, and replenished only by a fresh registry
+/// generation) is host-tested by
+/// `console_launch_budget_is_finite_and_only_fresh_registry_replenishes_it`
+/// (wyr1e_native.rs). Source text for the dispatch: ordinary recovery passes
+/// `false, false` to `recover_registry`, which is inline in
+/// `wyr1e_resident_step`, reached only from `control_tick`, which no host fake
+/// drives. Scoped to that fn.
 #[test]
 fn console_relaunch_is_finite_and_registry_replacement_is_the_only_budget_reset() {
-    assert!(E6.contains("console_launch_attempts"));
-    assert!(E6.contains("WYR0_I_SUPERVISION_POLICY.max_attempts"));
-    let transaction = &E6[E6.find("fn take_console_transaction").unwrap()
-        ..E6.find("fn commit_registry_replacement").unwrap()];
-    assert!(!transaction.contains("console_launch_attempts = 0"));
-    let replacement = &E6[E6.find("fn commit_registry_replacement").unwrap()
-        ..E6.find("pub(super) fn start_after_driver_constructed")
-            .unwrap()];
-    assert!(replacement.contains("console_launch_attempts = 0"));
-
-    assert!(NATIVE.contains("let outcome = wyr1e::poll(resident"));
-    assert!(NATIVE.contains("wyr1e::PollOutcome::RecoverRegistry(phase) =>"));
+    let step = item(NATIVE, "fn wyr1e_resident_step<");
+    assert!(step.contains("let outcome = wyr1e::poll(resident"));
+    assert!(step.contains("wyr1e::PollOutcome::RecoverRegistry(phase) =>"));
     // `recover_registry` gained an E8-quiescence argument and the call is now
     // wrapped, so compare the call shape instead of one formatted line.
     // Ordinary recovery passes `status_already_consumed = false`, so the
     // replacement still awaits WRCS status, and `_e8_quiesced = false`.
-    let native = without_whitespace(NATIVE);
+    let native = without_whitespace(step);
     assert!(native.contains(
         "wyr1e::PollOutcome::RecoverRegistry(phase)=>recover_registry(resident,system,loader,waits,\
          bootfs,false,false,abandoned::reason(abandoned::trigger::WYR1E_POLL,phase),)"
@@ -199,6 +209,9 @@ fn console_relaunch_is_finite_and_registry_replacement_is_the_only_budget_reset(
     ));
 }
 
+/// Source text because selector 32's resident poll is reached only from the
+/// resident `control_tick`, which no host fake drives, and the property is
+/// partly an absence (no shell-v1 dispatcher, no console launcher scope).
 #[test]
 fn selector32_resident_remains_on_historical_launch_and_gate_paths() {
     assert!(SELECTOR32.contains("d5.jobs.install_session(launch_grant, launch_endpoint)"));
@@ -218,6 +231,9 @@ fn selector32_resident_remains_on_historical_launch_and_gate_paths() {
 /// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4 also forbids the converse: a
 /// replacement shell must not restore NORMAL, which no code here could do
 /// because none of it can reach the mode.
+///
+/// Source text because mode-blindness is an absence over two modules, which
+/// no host test can enumerate.
 #[test]
 fn the_console_and_shell_supervisor_never_reads_or_writes_the_supervisor_mode() {
     for (name, source) in [
