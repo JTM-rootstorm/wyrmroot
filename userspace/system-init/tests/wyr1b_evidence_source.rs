@@ -259,56 +259,30 @@ fn controller_records_all_relational_joins_in_contract_order() {
 /// supervision and service control.
 ///
 /// Those live in `control_tick`, which supervises the active roles and then
-/// polls the launch dispatcher. Nothing in a unit test can show that a parked
-/// child did not *delay* them, because the harness never actually blocks -- the
-/// claim is about wall time, and what decides it is the deadline every wait in
-/// the tick is given.
+/// polls the launch dispatcher. The claim is about wall time, and what decides
+/// it is the deadline every wait in the tick is given: `DwDeadline(now_ns)`,
+/// the tick's own instant, which is already in the past by the time the
+/// syscall runs and therefore cannot wait.
 ///
-/// So this reads them. Every `wait_many` on the resident tick path -- the role
-/// supervision poll, the session poll, and R6C's parked-child poll -- is called
-/// with `DwDeadline(now_ns)`, the tick's own instant, which is already in the
-/// past by the time the syscall runs and therefore cannot wait. A tick composed
-/// only of such calls terminates whatever its children are doing, so one child
-/// that never reaches READY cannot delay the next tick's role supervision or
-/// the mode `control_tick` returns.
+/// The dispatcher's waits (the session poll and R6C's parked-child poll) are
+/// host-tested by `every_dispatcher_tick_wait_is_a_poll_of_the_ticks_own_instant`
+/// in wyr1b_native.rs. The one wait on the dispatcher path that is *not* a
+/// poll, inside `observe_prepared_ready`, is bounded by R6C's gate, asserted by
+/// `the_parked_child_poll_asks_only_for_signals_it_can_act_on_at_once`.
 ///
-/// The one wait on this path that is *not* a poll is inside
-/// `observe_prepared_ready`, which is reached only through
-/// `finish_deferred_launch`. R6C's gate is what keeps it bounded: it is entered
-/// only when the child's own handles already carry a signal the observation can
-/// act on without waiting again. That is asserted separately, by
-/// `the_parked_child_poll_asks_only_for_signals_it_can_act_on_at_once`; here the
-/// point is that nothing else on the path waits at all.
+/// Source text for `control_tick`'s own role-supervision poll, because no
+/// host fake drives the selector-27 `control_tick`. Scoped to its body.
 #[test]
 fn every_wait_on_the_resident_tick_path_is_a_poll_of_the_ticks_own_instant() {
-    fn body<'a>(source: &'a str, name: &str) -> &'a str {
-        let start = source
-            .find(name)
-            .unwrap_or_else(|| panic!("{name} missing"));
-        let rest = &source[start..];
-        let end = rest[1..]
-            .find("\nfn ")
-            .or_else(|| rest[1..].find("\npub(crate) fn "))
-            .map(|offset| offset + 1)
-            .unwrap_or(rest.len());
-        &rest[..end]
-    }
-
-    for name in [
-        "fn control_tick<S, L, W>(",
-        "fn poll_job_dispatcher_inner<S, L, W>(",
-        "fn parked_launch_disposition<S: Wyr1BPlatform>(",
-    ] {
-        let source = body(NATIVE, name);
-        let calls = source.matches(".wait_many(").count();
-        assert!(
-            calls > 0,
-            "{name} no longer waits at all; re-read this test"
-        );
-        assert_eq!(
-            calls,
-            source.matches("DwDeadline(now_ns)").count(),
-            "{name} has a wait whose deadline is not the tick's own instant"
-        );
-    }
+    let control = item(NATIVE, "pub(crate) fn control_tick<", "");
+    let calls = control.matches(".wait_many(").count();
+    assert!(
+        calls > 0,
+        "control_tick no longer waits at all; re-read this test"
+    );
+    assert_eq!(
+        calls,
+        control.matches("DwDeadline(now_ns)").count(),
+        "control_tick has a wait whose deadline is not the tick's own instant"
+    );
 }

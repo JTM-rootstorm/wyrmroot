@@ -7798,6 +7798,8 @@ mod tests {
         child_poll_readable: Option<bool>,
         /// The signals the last parked-child poll asked about, for R6D.
         child_poll_signals: Vec<u64>,
+        /// The deadline of every platform wait, in order, for R6D.
+        wait_deadlines: Vec<u64>,
         /// Which session Channel the last reply went to, so a test with two
         /// launch clients can say which one was answered.
         last_sent_channel: Option<DwHandle>,
@@ -8135,6 +8137,7 @@ mod tests {
                 session_poll_peer_closed: false,
                 child_poll_readable: None,
                 child_poll_signals: Vec::new(),
+                wait_deadlines: Vec::new(),
                 last_sent_channel: None,
             }
         }
@@ -8788,8 +8791,9 @@ mod tests {
         fn wait_many(
             &mut self,
             items: &[DwWaitItemV1],
-            _deadline: DwDeadline,
+            deadline: DwDeadline,
         ) -> Result<DwWaitResultV1, NativeError> {
+            self.wait_deadlines.push(deadline.0);
             let child_poll = items
                 .iter()
                 .any(|item| item.signals.0 & DW_SIGNAL_EXITED.0 != 0);
@@ -14051,6 +14055,84 @@ mod tests {
             vec![DW_SIGNAL_READABLE.0, DW_SIGNAL_EXITED.0],
             "the Channel is polled for READY and the Process for exit, and \
              PEER_CLOSED is not asked for on either"
+        );
+    }
+
+    /// Reset card R6D, the dispatcher's half of the tick-path wait rule (the
+    /// resident `control_tick`'s half stays in
+    /// `every_wait_on_the_resident_tick_path_is_a_poll_of_the_ticks_own_instant`,
+    /// tests/wyr1b_evidence_source.rs). Every platform wait the dispatcher's
+    /// tick makes -- the session poll and R6C's parked-child poll -- is given
+    /// the tick's own instant, which is already past when the call runs, so a
+    /// child that never answers cannot delay the next tick.
+    #[test]
+    fn every_dispatcher_tick_wait_is_a_poll_of_the_ticks_own_instant() {
+        let image = executable();
+        let (bootfs, _) = job_policy_bootfs(&image);
+        let mut platform = MockPlatform::new();
+        platform.bootfs = Some(bootfs);
+        platform.fail_send = false;
+        platform.now = Some(1);
+        platform.task_group = Some(DwHandle(77));
+        platform.session_poll_readable = true;
+        let mut waits = AcceptedJobV2Waits {
+            transaction_id: reservation(1).transaction_id,
+            profile: LaunchProfile::JobV2,
+            exited: false,
+            console_status_lost_process: None,
+            running_process: None,
+        };
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        // The tick at 10 polls the session and parks the launch it reads.
+        park_one_launch(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            &mut jobs,
+            owner,
+            authority,
+        );
+        assert!(!platform.wait_deadlines.is_empty());
+        assert!(
+            platform
+                .wait_deadlines
+                .iter()
+                .all(|&deadline| deadline == 10),
+            "{:?}",
+            platform.wait_deadlines
+        );
+
+        // The tick at 11 polls the parked child and then the session.
+        platform.wait_deadlines.clear();
+        platform.child_poll_readable = Some(false);
+        platform.session_poll_readable = false;
+        platform.session_poll_timeout = true;
+        poll_job_dispatcher(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            &mut jobs,
+            11,
+        )
+        .unwrap();
+        assert!(platform.wait_deadlines.len() >= 2);
+        assert!(
+            platform
+                .wait_deadlines
+                .iter()
+                .all(|&deadline| deadline == 11),
+            "{:?}",
+            platform.wait_deadlines
         );
     }
 
