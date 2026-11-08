@@ -19,13 +19,6 @@ use wyrmroot_loader as _;
 use wyrmroot_r1_saturation as _;
 use wyrmroot_registry_proto as _;
 use wyrmroot_rrc_manifest as _;
-#[cfg(any(
-    feature = "wyr1c6-selector29",
-    feature = "dw1e3-selector31",
-    feature = "wyr1d-selector32",
-    feature = "wyr1e-production"
-))]
-use wyrmroot_runtime::WYR0_I_SUPERVISION_POLICY;
 use wyrmroot_runtime::{
     CapabilityInfo, MappingPlan, NativeError, NativeLoaderPlatform, NativeSupervisionPlatform,
     ReceiveCounts, StartupBlock, close_handle, create_channel, create_task_group, create_timer,
@@ -45,16 +38,14 @@ use wyrmroot_system_init::continue_system_init_resource_product;
 use wyrmroot_system_init::fatal_application_status;
 #[cfg(feature = "r1-selector34")]
 use wyrmroot_system_init::r1_test_failure_application_status;
+use wyrmroot_system_init::validate_wait_until_completion;
 #[cfg(feature = "wyr1-test-evidence")]
 use wyrmroot_system_init::wyr1_test_failure_application_status;
 #[cfg(feature = "wyr1b-test-evidence")]
 use wyrmroot_system_init::wyr1b_test_failure_application_status;
-use wyrmroot_system_init::{InitPlatform, ResidentSystemInit, Wyr1BPlatform};
-use wyrmroot_system_init::{
-    resident_tick_failure_application_status, validate_wait_until_completion,
-};
 #[cfg(feature = "wyr1c6-selector29")]
-use wyrmroot_system_init::{wyr1c_native, wyr1c6_gate, wyr1c6_test_failure_application_status};
+use wyrmroot_system_init::wyr1c6_test_failure_application_status;
+use wyrmroot_system_init::{InitPlatform, Wyr1BPlatform, resident_loop};
 use wyrmroot_wyr1b_gate_proto as _;
 #[cfg(feature = "wyr1e8-selector33")]
 use wyrmroot_wyr1e_test_actors as _;
@@ -186,6 +177,29 @@ impl Wyr1BPlatform for NativeSystem {
     }
 }
 
+impl resident_loop::ResidentLoopPlatform for NativeSystem {
+    #[cfg(feature = "wyr1-test-evidence")]
+    fn submit_wyr1_evidence(&mut self, record: &[u8; 114]) -> Result<(), NativeError> {
+        wyrmroot_runtime::submit_wyr1_evidence(record)
+    }
+
+    #[cfg(feature = "wyr1b-test-evidence")]
+    fn submit_wyr1b_evidence(
+        &mut self,
+        record: &[u8; wyrmroot_system_init::wyr1b_gate::RECORD_BYTES],
+    ) -> Result<(), NativeError> {
+        wyrmroot_runtime::submit_wyr1b_evidence(record)
+    }
+
+    #[cfg(feature = "wyr1c6-selector29")]
+    fn submit_wyr1c6_evidence(
+        &mut self,
+        record: &[u8; wyrmroot_system_init::wyr1c6_gate::RECORD_BYTES],
+    ) -> Result<(), NativeError> {
+        wyrmroot_runtime::submit_wyr1c6_evidence(record)
+    }
+}
+
 /// Reset card R1's evidence seam. The whole native side of the relay is this
 /// one call: the decision to forward, and every refusal, lives in
 /// `r1_relay` where it is host tested against a capturing double.
@@ -209,7 +223,7 @@ fn native_main(startup: StartupBlock<'_>) -> u32 {
         &mut loader,
         &mut waits,
         startup.bootstrap_channel().as_abi(),
-        continue_resident,
+        resident_loop::continue_resident,
     );
     #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
     let result = continue_system_init_resource_product(
@@ -217,7 +231,7 @@ fn native_main(startup: StartupBlock<'_>) -> u32 {
         &mut loader,
         &mut waits,
         startup.bootstrap_channel().as_abi(),
-        continue_resident,
+        resident_loop::continue_resident,
     );
     match result {
         Ok(status) => status,
@@ -237,143 +251,6 @@ fn native_main(startup: StartupBlock<'_>) -> u32 {
                 feature = "r1-selector34"
             )))]
             return fatal_application_status(&error) as u32;
-        }
-    }
-}
-
-fn continue_resident(
-    resident: &mut ResidentSystemInit,
-    system: &mut NativeSystem,
-    loader: &mut NativeLoaderPlatform,
-    waits: &mut NativeSupervisionPlatform,
-) -> u32 {
-    #[cfg(feature = "wyr1b-test-evidence")]
-    {
-        let mut index = 0;
-        while let Some(record) = resident.wyr1b_evidence_record(index) {
-            if wyrmroot_runtime::submit_wyr1b_evidence(record).is_err() {
-                return 0xAF1B_0001;
-            }
-            index += 1;
-        }
-    }
-    // Card R1's scenario driver. Its state lives here rather than in
-    // ResidentSystemInit because the probe, its launch session and its relay are
-    // one selector's scenario, and no production product has a field for them.
-    #[cfg(feature = "r1-selector34")]
-    let mut r1 = None;
-    #[cfg(feature = "wyr1-test-evidence")]
-    let mut evidence_submitted = false;
-    #[cfg(feature = "wyr1c6-selector29")]
-    let mut c6_evidence_submitted = false;
-    loop {
-        let Ok(now) = monotonic_active_now() else {
-            return 0xAF01_0003;
-        };
-        #[cfg(any(
-            feature = "wyr1c6-selector29",
-            feature = "dw1e3-selector31",
-            feature = "wyr1d-selector32",
-            feature = "wyr1e-production"
-        ))]
-        let tick_ns = WYR0_I_SUPERVISION_POLICY.backoff_ns;
-        #[cfg(not(any(
-            feature = "wyr1c6-selector29",
-            feature = "dw1e3-selector31",
-            feature = "wyr1d-selector32",
-            feature = "wyr1e-production"
-        )))]
-        let tick_ns = 1_000_000_000;
-        let Some(deadline) = now.checked_add(tick_ns) else {
-            return 0xAF01_0004;
-        };
-        if let Err(error) = resident.control_tick_product(system, loader, waits, now) {
-            // A fatally failed bring-up would otherwise discard its own
-            // account of itself. The ordinary drain below is gated on
-            // `evidence_finalized()`, and a tick that fails never finalizes,
-            // so every record produced before the failure was thrown away and
-            // the only thing reaching COM1 was the application status -- one
-            // error class, with no indication of how far activation got.
-            //
-            // Nothing is added or rewritten here: the records already encoded
-            // are submitted before the failure is reported. The transcript
-            // will carry no terminal record, which is correct, because the run
-            // did not reach one; a consumer that requires a terminal must
-            // still refuse it. Submission errors are ignored deliberately --
-            // this path is already failing, and the status that explains why
-            // must not be replaced by a complaint about reporting it.
-            #[cfg(feature = "wyr1-test-evidence")]
-            if !evidence_submitted {
-                let mut index = 0;
-                while let Some(line) = resident.controller().evidence_line(index) {
-                    if let Ok(record) = <&[u8; 114]>::try_from(line) {
-                        let _ = wyrmroot_runtime::submit_wyr1_evidence(record);
-                    }
-                    index += 1;
-                }
-            }
-            return resident_tick_failure_application_status(&error);
-        }
-        // The probe named by the staged `WRR1` gate is launched on the first tick
-        // and pumped on every later one. Its records are relayed through this
-        // process because the kernel accepts R1 evidence only from permanent
-        // init; `r1_driver` holds the paths and the sequence.
-        #[cfg(feature = "r1-selector34")]
-        if let Err(error) =
-            wyrmroot_system_init::r1_driver::drive(resident, &mut r1, system, loader, waits, now)
-        {
-            return r1_test_failure_application_status(&error);
-        }
-        #[cfg(feature = "wyr1c6-selector29")]
-        if !c6_evidence_submitted {
-            match wyr1c_native::finish_c6_evidence(resident) {
-                Ok(true) => {
-                    for index in 0..wyr1c6_gate::EVIDENCE_RECORDS {
-                        let mut record = [0u8; wyr1c6_gate::RECORD_BYTES];
-                        let Some(()) = resident.write_wyr1c6_evidence_record(index, &mut record)
-                        else {
-                            return 0xAF1C_0001;
-                        };
-                        if wyrmroot_runtime::submit_wyr1c6_evidence(&record).is_err() {
-                            return 0xAF1C_0002;
-                        }
-                    }
-                    c6_evidence_submitted = true;
-                }
-                Ok(false) => {}
-                Err(_) => return 0xAF1C_0003,
-            }
-        }
-        #[cfg(feature = "wyr1-test-evidence")]
-        if resident.evidence_finalized() && !evidence_submitted {
-            let mut index = 0;
-            while let Some(line) = resident.controller().evidence_line(index) {
-                let Ok(record) = <&[u8; 114]>::try_from(line) else {
-                    return 0xAF01_0007;
-                };
-                if wyrmroot_runtime::submit_wyr1_evidence(record).is_err() {
-                    return 0xAF01_0008;
-                }
-                index += 1;
-            }
-            evidence_submitted = true;
-        }
-        // F3A.7g. The one way out of this loop that is not a failure.
-        //
-        // It is placed after every per-product drain above rather than beside
-        // the tick that sets it: an instrumented product still owes its
-        // evidence records, and a session that ended is not a reason to throw
-        // them away. Production compiles none of those blocks and reaches
-        // here directly.
-        //
-        // Returning ends permanent init's process, which is what leaves the
-        // system with nothing runnable -- the condition the kernel's
-        // primordial completion is waiting on.
-        if resident.session_complete() {
-            return 0;
-        }
-        if InitPlatform::wait_until(system, deadline).is_err() {
-            return 0xAF01_0005;
         }
     }
 }

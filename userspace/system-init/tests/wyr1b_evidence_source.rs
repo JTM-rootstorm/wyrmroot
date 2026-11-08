@@ -6,6 +6,7 @@ use {
 };
 
 const MAIN: &str = include_str!("../src/main.rs");
+const LOOP: &str = include_str!("../src/resident_loop.rs");
 const LIB: &str = include_str!("../src/lib.rs");
 const WYR1B_MODEL: &str = include_str!("../src/wyr1b.rs");
 const NATIVE: &str = include_str!("../src/wyr1b_native.rs");
@@ -19,10 +20,14 @@ fn selector_27_submission_feature_is_separate_from_selector_25() {
     assert!(MANIFEST.contains(
         "wyr1b-test-evidence = [\"native-init\", \"wyrmroot-runtime/wyr1b-test-evidence\"]"
     ));
-    assert!(MAIN.contains("#[cfg(feature = \"wyr1b-test-evidence\")]"));
-    assert!(MAIN.contains("resident.wyr1b_evidence_record(index)"));
+    // The drains are in the resident loop; the native submissions they call
+    // through `ResidentLoopPlatform` are in `main.rs`.
+    assert!(LOOP.contains("#[cfg(feature = \"wyr1b-test-evidence\")]"));
+    assert!(LOOP.contains("resident.wyr1b_evidence_record(index)"));
+    assert!(LOOP.contains("system.submit_wyr1b_evidence(record)"));
     assert!(MAIN.contains("wyrmroot_runtime::submit_wyr1b_evidence(record)"));
-    assert!(MAIN.contains("#[cfg(feature = \"wyr1-test-evidence\")]"));
+    assert!(LOOP.contains("#[cfg(feature = \"wyr1-test-evidence\")]"));
+    assert!(LOOP.contains("system.submit_wyr1_evidence(record)"));
     assert!(MAIN.contains("wyrmroot_runtime::submit_wyr1_evidence(record)"));
     assert!(LIB.contains("wyr1b_evidence: None"));
     assert!(NATIVE.contains("*wyr1b_evidence = Some(evidence)"));
@@ -57,7 +62,7 @@ fn native_product_activation_constructs_and_continues_one_resident_in_place() {
     assert!(!NATIVE.contains("struct Activation"));
     assert!(!LIB.contains("pub fn run_system_init_product"));
     assert!(MAIN.contains("continue_system_init_product("));
-    assert!(MAIN.contains("continue_resident,"));
+    assert!(MAIN.contains("resident_loop::continue_resident,"));
     assert!(!MAIN.contains("let mut resident = match"));
 }
 

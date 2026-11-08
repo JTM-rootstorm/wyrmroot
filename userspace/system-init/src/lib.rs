@@ -32,6 +32,7 @@ mod launch_transaction;
 pub mod r1_driver;
 #[cfg(feature = "r1-selector34")]
 pub mod r1_relay;
+pub mod resident_loop;
 pub mod wyr1b;
 pub mod wyr1b_gate;
 mod wyr1b_job;
@@ -3847,9 +3848,9 @@ mod native_cleanup_tests {
 
     /// The last step of F3A.7g, which no host test can reach.
     ///
-    /// Permanent init's loop is in `main.rs`, whose host build only
-    /// type-checks the guest entry (S2U step 2), so no host test can run the
-    /// loop. What the loop does with `session_complete` is the whole point of
+    /// Permanent init's loop is in `resident_loop.rs` (it was in `main.rs`,
+    /// whose host build only type-checks the guest entry, until S3 moved it),
+    /// and until a host test drives it there, no host test runs the loop. What the loop does with `session_complete` is the whole point of
     /// the flag -- a supervisor that latches the fact and keeps ticking has
     /// changed nothing -- so it is read out of the source rather than left
     /// unstated.
@@ -3859,8 +3860,8 @@ mod native_cleanup_tests {
     /// tick that set it, both fail here.
     #[test]
     fn permanent_init_leaves_its_loop_when_the_session_is_complete() {
-        const MAIN: &str = include_str!("main.rs");
-        const SIGNATURE: &str = "fn continue_resident(";
+        const MAIN: &str = include_str!("resident_loop.rs");
+        const SIGNATURE: &str = "fn continue_resident<";
 
         let start = MAIN.find(SIGNATURE).expect("continue_resident is gone");
         let body = &MAIN[start + SIGNATURE.len()..];
@@ -6100,9 +6101,12 @@ mod selector_status_coverage {
             .find("match result {")
             .expect("main dispatches on the init result");
         let rest = &main[start..];
+        // `native_main` is a top-level item, so rustfmt closes it with `}` in
+        // column zero; the resident loop that used to follow it moved to
+        // `resident_loop.rs` in S3.
         let end = rest
-            .find("fn continue_resident")
-            .expect("the dispatch ends before the resident hook");
+            .find("\n}\n")
+            .expect("the dispatch ends with native_main");
         let region = &rest[..end];
         // If the dispatch moves, fail loudly rather than searching an empty
         // region and silently passing.
@@ -6658,9 +6662,10 @@ mod r1_composition_coverage {
 
     /// The crate's non-test modules that could drive a selector's evidence.
     /// `r1_relay.rs` defines `relay_one<` and is not a caller.
-    const SOURCES: [(&str, &str); 7] = [
+    const SOURCES: [(&str, &str); 8] = [
         ("lib.rs", include_str!("lib.rs")),
         ("main.rs", include_str!("main.rs")),
+        ("resident_loop.rs", include_str!("resident_loop.rs")),
         ("r1_driver.rs", include_str!("r1_driver.rs")),
         ("wyr1b_native.rs", include_str!("wyr1b_native.rs")),
         ("wyr1c_native.rs", include_str!("wyr1c_native.rs")),

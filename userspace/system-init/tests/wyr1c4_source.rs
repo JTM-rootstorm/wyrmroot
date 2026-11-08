@@ -15,6 +15,8 @@ use wyrmroot_wyr1b_gate_proto as _;
 const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
 const LIB_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
 const MAIN_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+const LOOP_SOURCE: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/resident_loop.rs"));
 const NATIVE_SOURCE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/wyr1c_native.rs"));
 const RETAINED_SOURCE: &str =
@@ -47,7 +49,7 @@ fn c6_feature_composition_keeps_selector_29_on_the_resource_profile() {
 
 #[test]
 fn bounded_resident_ticks_leave_headroom_for_selector_handshakes() {
-    let resident = &MAIN_SOURCE[MAIN_SOURCE.find("fn continue_resident(").unwrap()..];
+    let resident = &LOOP_SOURCE[LOOP_SOURCE.find("fn continue_resident<").unwrap()..];
     for selector in ["wyr1c6-selector29", "dw1e3-selector31", "wyr1d-selector32"] {
         assert!(resident.contains(&format!("feature = \"{selector}\"")));
     }

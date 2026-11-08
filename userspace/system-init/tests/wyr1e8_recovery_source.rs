@@ -387,12 +387,13 @@ fn registry_episode_admission_is_only_for_live_quiesced_coordinated_recovery() {
 /// by the attributed-status tests in lib.rs.
 #[test]
 fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
-    let main = include_str!("../src/main.rs");
+    // The resident loop, which reports a tick failure, moved out of `main.rs`.
+    let resident_loop = include_str!("../src/resident_loop.rs");
     let jobs = include_str!("../src/wyr1b_native.rs");
     let console = include_str!("../src/wyr1e_native.rs");
     let driver = include_str!("../src/wyr1c_native.rs");
 
-    assert!(main.contains("resident_tick_failure_application_status(&error)"));
+    assert!(resident_loop.contains("resident_tick_failure_application_status(&error)"));
     let held_wait_start = jobs
         .find("if scope == LaunchSessionScope::ShellJobs")
         .unwrap();

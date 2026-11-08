@@ -8,6 +8,7 @@ use {
 const MANIFEST: &str = include_str!("../Cargo.toml");
 const LIB: &str = include_str!("../src/lib.rs");
 const MAIN: &str = include_str!("../src/main.rs");
+const LOOP: &str = include_str!("../src/resident_loop.rs");
 const NATIVE: &str = include_str!("../src/wyr1c_native.rs");
 const E6: &str = include_str!("../src/wyr1e_native.rs");
 const SELECTOR32: &str = include_str!("../src/wyr1d_native.rs");
@@ -339,21 +340,21 @@ fn the_console_and_shell_supervisor_never_reads_or_writes_the_supervisor_mode() 
 /// lost.
 #[test]
 fn a_fatal_control_tick_submits_its_evidence_before_reporting_the_failure() {
-    let arm_start = MAIN
+    let arm_start = LOOP
         .find("if let Err(error) = resident.control_tick_product(system, loader, waits, now) {")
         .expect("the resident tick failure arm");
     let report = "return resident_tick_failure_application_status(&error);";
-    let report_offset = MAIN[arm_start..]
+    let report_offset = LOOP[arm_start..]
         .find(report)
         .map(|offset| arm_start + offset)
         .expect("the tick failure status report");
-    let arm = &MAIN[arm_start..report_offset];
+    let arm = &LOOP[arm_start..report_offset];
 
     // The drain sits inside the failure arm, ahead of the status report.
     assert!(arm.contains("#[cfg(feature = \"wyr1-test-evidence\")]"));
     assert!(arm.contains("if !evidence_submitted {"));
     assert!(arm.contains("resident.controller().evidence_line(index)"));
-    assert!(arm.contains("wyrmroot_runtime::submit_wyr1_evidence(record)"));
+    assert!(arm.contains("system.submit_wyr1_evidence(record)"));
     // The arm returns right after the drain, so it does not set
     // `evidence_submitted`: the write would never be read, and the guest
     // build refuses it under `-D warnings`.
@@ -365,10 +366,10 @@ fn a_fatal_control_tick_submits_its_evidence_before_reporting_the_failure() {
     );
 
     // A submission failure must not replace the status that explains the run.
-    assert!(arm.contains("let _ = wyrmroot_runtime::submit_wyr1_evidence(record);"));
+    assert!(arm.contains("let _ = system.submit_wyr1_evidence(record);"));
 
     // The ordinary finalized drain still exists, after the failure arm.
-    let ordinary = &MAIN[report_offset..];
+    let ordinary = &LOOP[report_offset..];
     assert!(ordinary.contains("if resident.evidence_finalized() && !evidence_submitted {"));
 }
 
