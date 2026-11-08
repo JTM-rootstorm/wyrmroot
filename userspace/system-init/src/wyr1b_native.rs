@@ -11912,6 +11912,82 @@ mod tests {
         assert_eq!(overflow_platform.sent_len, 0);
     }
 
+    /// The held WAIT admits only the trigger's clean exit, and its quiesce
+    /// acknowledgement only once, for the exact identity, before the
+    /// episode's deadline.
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_held_wait_admits_only_a_clean_result_and_one_exact_acknowledgement() {
+        for (field, unclean) in [
+            ("classification", {
+                let mut result = e8_normal_result();
+                result.classification = TerminationClassification::UnhandledException.as_u32();
+                result
+            }),
+            (
+                "application_code",
+                ControllerJobResult {
+                    application_code: 1,
+                    ..e8_normal_result()
+                },
+            ),
+            (
+                "cleanup_result",
+                ControllerJobResult {
+                    cleanup_result: 1,
+                    ..e8_normal_result()
+                },
+            ),
+        ] {
+            let mut state = e8_state_for_held_wait(40);
+            let mut platform = MockPlatform::new();
+            platform.fail_send = false;
+            platform.now = Some(100);
+            assert_eq!(
+                state.hold_e8_wait(&mut platform, e8_pending_wait(41), unclean),
+                Err(InitError::Supervision),
+                "{field}"
+            );
+            assert_eq!(state.e8_held, None, "{field}");
+            assert_eq!(platform.sent_len, 0, "{field}");
+        }
+
+        let held_state = || {
+            let mut state = e8_state_for_held_wait(40);
+            let mut platform = MockPlatform::new();
+            platform.fail_send = false;
+            platform.now = Some(100);
+            assert_eq!(
+                state.hold_e8_wait(&mut platform, e8_pending_wait(41), e8_normal_result()),
+                Ok(true)
+            );
+            state
+        };
+        let mut state = held_state();
+        let identity = state.e8_held.unwrap().identity;
+        let mut other = identity;
+        other.stage_nonce ^= 1;
+        assert_eq!(
+            state.accept_e8_quiesced(other, 199),
+            Err(InitError::Supervision)
+        );
+        assert_eq!(
+            state.accept_e8_quiesced(identity, 199),
+            Ok(E8RecoveryAction::Driver)
+        );
+        assert_eq!(
+            state.accept_e8_quiesced(identity, 199),
+            Err(InitError::Supervision),
+            "a second acknowledgement is refused"
+        );
+        let mut late = held_state();
+        assert_eq!(
+            late.accept_e8_quiesced(identity, 200),
+            Err(InitError::Supervision),
+            "the episode's deadline bounds acceptance"
+        );
+    }
+
     #[cfg(feature = "wyr1e8-selector33")]
     #[test]
     fn e8_quiesce_send_crossing_deadline_keeps_the_held_owner() {

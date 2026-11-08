@@ -97,37 +97,6 @@ fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
     assert!(correlation.contains("connector_client_transaction: identity.client_transaction_id"));
 }
 
-#[test]
-fn e8_holds_the_real_terminal_wait_until_exact_quiescence_and_cleanup() {
-    let service = &JOBS[JOBS.find("fn service_pending_wait_inner").unwrap()
-        ..JOBS.find("fn cleanup_session_owner").unwrap()];
-    let terminal = service.find("result_for_owner").unwrap();
-    let held = service
-        .find("state.hold_e8_wait(system, pending, result)")
-        .unwrap();
-    let send = service
-        .find("system.send_channel(session, &response[..size])")
-        .unwrap();
-    assert!(terminal < held && held < send);
-
-    let state = &JOBS
-        [JOBS.find("fn hold_e8_wait").unwrap()..JOBS.find("pub(crate) const fn health").unwrap()];
-    // R7B-4 class D1c. The admitted result is named once and compared by name;
-    // both halves are asserted, because a constant nothing compares against
-    // would pass a `contains` on either alone.
-    assert!(JOBS.contains("const E8_HELD_WAIT_RESULT: ControllerJobResult"));
-    assert!(JOBS.contains("classification: TerminationClassification::NormalExit.as_u32()"));
-    assert!(state.contains("result != E8_HELD_WAIT_RESULT"));
-    assert!(state.contains(".launch_transaction\n            .checked_add(1)"));
-    assert!(state.contains("pending.reservation.transaction_id != expected_wait_transaction"));
-    assert!(state.contains("Message::Quiesce(identity)"));
-    // The barrier stopped carrying its own deadline copy; quiesce acceptance
-    // reads the episode's. The check itself is unchanged and still asserted.
-    assert!(state.contains("now >= deadline"));
-    assert!(state.contains("let deadline = self\n            .recovery_deadline"));
-    assert!(state.contains("identity != held.identity || held.acknowledged"));
-}
-
 /// The resident sends the D5 retire with the identity `e8_driver_identity`
 /// built, which `e8_driver_identity_joins_every_current_d5_identity_field`
 /// (wyr1b_native.rs) holds field by field. Source text for the send because
