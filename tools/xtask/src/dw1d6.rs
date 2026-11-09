@@ -1314,7 +1314,11 @@ mod tests {
             ),
             (
                 "loader/src/uefi_app.rs",
-                ["BOOT_DEVICE_TABLE_PATH", "plan_modules_with_boot_device_table"].as_slice(),
+                [
+                    "BOOT_DEVICE_TABLE_PATH",
+                    "plan_modules_with_boot_device_table",
+                ]
+                .as_slice(),
             ),
             ("loader/src/artifacts.rs", ["BDEVICE.BIN"].as_slice()),
             (
