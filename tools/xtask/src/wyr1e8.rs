@@ -2173,6 +2173,9 @@ for key in verify.E8_RESULT_KEYS:
         );
     }
 
+    /// Source text: `prepare` and `inspect` run git, Cargo and the filesystem
+    /// in sequence; a host check of their order needs a fault-injection seam
+    /// for each stage, which this crate does not have.
     #[test]
     fn current_kernel_layout_is_preflighted_before_e8_output_and_build_effects() {
         let source = include_str!("wyr1e8.rs");

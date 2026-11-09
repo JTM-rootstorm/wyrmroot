@@ -1861,6 +1861,10 @@ mod tests {
         }
     }
 
+    /// Source text: `accepted_abi_tree` passes the pinned revision and
+    /// fingerprint from `toolchain/versions.toml` to `abi_pairing::verify`,
+    /// which reads that revision from a Deepwyrm git repository; a host
+    /// fixture cannot hold a commit with the pinned 40-hex id.
     #[test]
     fn generated_abi_lineage_comes_from_the_canonical_pin() {
         let source = include_str!("dw1c.rs");
