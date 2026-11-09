@@ -36,6 +36,10 @@ fn fault_instruction_is_narrow_and_other_actor_sources_forbid_unsafe() {
     assert!(library.contains("#![forbid(unsafe_code)]"));
 }
 
+/// Source text: the actors must link `wyrmroot-runtime` and `deepwyrm-syscall`,
+/// which export the device, publication and test-syscall surface
+/// unconditionally (e.g. `wyrmroot_runtime::device_pio_read`), so neither the
+/// dependency graph nor a feature set can keep these calls out.
 #[test]
 fn actors_have_no_privileged_or_test_evidence_calls() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
