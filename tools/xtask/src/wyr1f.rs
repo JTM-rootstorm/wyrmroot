@@ -2323,11 +2323,16 @@ mod tests {
         }
         assert!(!request.contains(&"test_id".to_owned()));
         assert!(!request.contains(&"evidence_nonce".to_owned()));
-        // The instrumented gate configuration is F1B's and is not referenced.
-        let module = include_str!("wyr1f.rs");
-        let code = &module[..module.find("mod tests").unwrap()];
-        assert!(!code.contains("wyr1f_gate_config("));
-        assert!(code.contains("WYR1F_NORMAL_GATE_CONFIG"));
+        // The production product's gate configuration is the frozen
+        // no-scenario literal and takes no nonce. The instrumented encoder,
+        // `wyr1c::wyr1f_gate_config`, is private to `wyr1c`, so this module
+        // cannot reference it at all.
+        let normal = wyr1c::Wyr1fProduct::Normal;
+        assert_eq!(
+            normal.gate_config(None).unwrap(),
+            wyr1c::WYR1F_NORMAL_GATE_CONFIG
+        );
+        assert!(normal.gate_config(Some("0123456789ABCDEF")).is_err());
     }
 
     #[test]

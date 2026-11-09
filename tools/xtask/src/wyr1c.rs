@@ -2548,6 +2548,10 @@ pub(crate) const WYR1F_TEST_ID: &str = "35";
 /// The nonce must be sixteen uppercase hex digits and nonzero, matching what
 /// `gate::parse_gate_config` demands; a caller-supplied value is rejected here
 /// rather than producing a file that only fails at boot.
+///
+/// Private to this module: the production producer (`wyr1f`) reaches a gate
+/// configuration only through [`Wyr1fProduct::gate_config`], so it cannot build
+/// the instrumented one directly.
 #[cfg_attr(
     not(test),
     allow(
@@ -2555,7 +2559,7 @@ pub(crate) const WYR1F_TEST_ID: &str = "35";
         reason = "the instrumented gate configuration's only consumer is F1B's degraded product"
     )
 )]
-pub(crate) fn wyr1f_gate_config(scenario: Wyr1fScenario, nonce: &str) -> Result<Vec<u8>, Failure> {
+fn wyr1f_gate_config(scenario: Wyr1fScenario, nonce: &str) -> Result<Vec<u8>, Failure> {
     if nonce.len() != 16
         || !nonce
             .bytes()
