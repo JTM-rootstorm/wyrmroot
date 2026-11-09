@@ -587,6 +587,17 @@ mod tests {
         );
     }
 
+    /// Each actor validates its argv0 against the path the WYR1-E bootfs
+    /// places it at, so the two must be the same strings.
+    #[test]
+    fn actor_paths_are_the_bootfs_placements() {
+        use wyrmroot_bootfs::wyr1;
+        assert_eq!(EXIT_NONZERO_PATH, wyr1::E7_EXIT_NONZERO_PATH);
+        assert_eq!(FAULT_PATH, wyr1::E7_FAULT_PATH);
+        assert_eq!(RECOVERY_TRIGGER_PATH, wyr1::E8_RECOVERY_TRIGGER_PATH);
+        assert_eq!(STDOUT_PRESSURE_PATH, wyr1::E8_STDOUT_PRESSURE_PATH);
+    }
+
     #[test]
     fn startup_identity_is_exact_and_nonzero_actor_exit_is_37() {
         assert_eq!(NONZERO_EXIT_CODE, 37);

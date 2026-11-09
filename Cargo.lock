@@ -459,6 +459,7 @@ name = "wyrmroot-wyr1e-test-actors"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
+ "wyrmroot-bootfs",
  "wyrmroot-loader",
  "wyrmroot-runtime",
 ]

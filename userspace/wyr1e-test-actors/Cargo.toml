@@ -49,6 +49,10 @@ deepwyrm-syscall.workspace = true
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
 
+[dev-dependencies]
+# Host tests only: the actors' paths are compared with the bootfs placements.
+wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }
+
 [lints.rust]
 unsafe_code = "deny"
 unused_crate_dependencies = "deny"

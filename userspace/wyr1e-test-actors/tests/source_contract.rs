@@ -1,26 +1,49 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
 use deepwyrm_syscall as _;
+use wyrmroot_bootfs as _;
 use wyrmroot_loader as _;
 use wyrmroot_runtime as _;
 use wyrmroot_wyr1e_test_actors as _;
 
+/// Source text: the link arguments are `cargo:` directives a build script
+/// prints for rustc; no host test or type can observe them, and the guest
+/// link that consumes them runs only in the native product builds.
 #[test]
 fn binaries_use_canonical_linker_and_exact_paths() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let build = fs::read_to_string(root.join("build.rs")).unwrap();
-    assert!(build.contains("../../toolchain/native-user.ld"));
-    assert!(build.contains("wyrmroot-wyr1e-exit-nonzero"));
-    assert!(build.contains("wyrmroot-wyr1e-fault"));
-    assert!(build.contains("wyrmroot-recovery-trigger"));
-    assert!(build.contains("wyrmroot-stdout-pressure"));
-    let library = fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    assert!(library.contains("test/wyr1-e/exit-nonzero"));
-    assert!(library.contains("test/wyr1-e/fault"));
-    assert!(library.contains("test/wyr1-e/recovery-trigger"));
-    assert!(library.contains("test/wyr1-e/stdout-pressure"));
-    assert!(library.contains("LaunchProfile::JobV2Streams"));
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let build = fs::read_to_string(manifest_dir.join("build.rs")).unwrap();
+    let main = &build[build.find("fn main()").expect("build script entry")..];
+    assert!(main.contains("manifest.join(\"../../toolchain/native-user.ld\")"));
+    // Every `[[bin]]` the manifest declares, and only those, is linked by
+    // the loop, and the loop gives each one both arguments.
+    let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+    let declared = manifest
+        .split("[[bin]]")
+        .skip(1)
+        .map(|table| {
+            table
+                .lines()
+                .find_map(|line| line.strip_prefix("name = \""))
+                .and_then(|name| name.strip_suffix('"'))
+                .expect("bin name")
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    let list = &main[main.find("for binary in [").expect("binary loop")..];
+    let (list, body) = list.split_once("] {").expect("binary list");
+    let linked = list
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(linked, declared);
+    let body = &body[..body.find("\n    }").expect("loop body")];
+    assert!(body.contains("cargo:rustc-link-arg-bin={binary}=-T{}"));
+    assert!(body.contains("cargo:rustc-link-arg-bin={binary}=--build-id=none"));
 }
 
 #[test]
