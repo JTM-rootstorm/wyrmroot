@@ -8,6 +8,8 @@ mod dw1e3a;
 mod dw1e3b;
 mod elf_runtime;
 mod error;
+#[cfg(test)]
+mod feature_graph;
 mod g3_image;
 mod grammar;
 mod h_build;

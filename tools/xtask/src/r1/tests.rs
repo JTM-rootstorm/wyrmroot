@@ -280,33 +280,36 @@ mod media {
     /// with `BUFFER_TOO_SMALL`.
     #[test]
     fn the_init_features_match_the_bootstrap_that_launches_it() {
-        const C6: &str = include_str!("../wyr1c6.rs");
-        let bootstrap_is_resource_product = C6.contains("\"wyr1c6-production\"")
-            || C6.contains("\"wyr1c5-production\"")
-            || C6.contains("\"wyr1c4-production\"");
-        assert!(
-            bootstrap_is_resource_product,
-            "card R1 builds its bootstrap through wyr1c6; if that stopped being \
-             a production bootstrap, re-derive the handoff shape below"
-        );
+        let features = crate::feature_graph::WorkspaceFeatures::load();
+        let bootstrap =
+            features.closure("wyrmroot-bootstrap", crate::wyr1c6::C6_BOOTSTRAP_FEATURES);
+        let launches_resource_domain = [
+            "wyr1c4-production",
+            "wyr1c5-production",
+            "wyr1c6-production",
+        ]
+        .iter()
+        .any(|feature| bootstrap.contains(*feature));
         let init = NATIVE_SPECS
             .iter()
             .find(|spec| spec.label == "system-init")
             .expect("card R1 stages permanent init");
-        // The spec names one feature and Cargo resolves the rest, so the receive
-        // shape is decided in the manifest. Read it there rather than in the
-        // spec string, which is what an earlier version of this check got wrong.
-        const INIT_MANIFEST: &str = include_str!("../../../../userspace/system-init/Cargo.toml");
-        let selected = INIT_MANIFEST
-            .split(&format!("\n{} = [", init.features))
-            .nth(1)
-            .and_then(|rest| rest.split(']').next())
-            .unwrap_or_else(|| panic!("system-init declares no {} feature list", init.features));
+        // The spec names one feature and Cargo resolves the rest, so the
+        // receive shape is the spec feature's closure, not the spec string.
+        let selected = features.closure("wyrmroot-system-init", init.features);
+        let receives_resource_domain = ["wyr1c4-production", "wyr1c5-production"]
+            .iter()
+            .any(|feature| selected.contains(*feature));
         assert!(
-            selected.contains("wyr1c5-production") || selected.contains("wyr1c4-production"),
+            launches_resource_domain,
+            "card R1 builds its bootstrap through wyr1c6; if that stopped being \
+             a production bootstrap, re-derive the handoff shape below"
+        );
+        assert_eq!(
+            receives_resource_domain, launches_resource_domain,
             "the bootstrap launches init as SupervisorResourceDomain but {} \
              selects the plain Supervisor receive shape, so the handoff fails \
-             with BUFFER_TOO_SMALL: the feature list was {selected:?}",
+             with BUFFER_TOO_SMALL: it enables {selected:?}",
             init.features
         );
     }
