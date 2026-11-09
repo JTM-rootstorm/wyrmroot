@@ -2452,9 +2452,19 @@ mod tests {
         assert!(source.contains("ensure_run_directory(&request.run_directory)?"));
     }
 
+    /// Source text: the order of `build_product`'s preflight, input check,
+    /// directory creation and artifact writes is only observable by running
+    /// a real source build (Cargo, toolchain, Deepwyrm checkout); a host
+    /// version needs a fault-injection seam this crate does not have.
     #[test]
     fn source_build_preflights_the_project_cargo_home_before_outputs() {
         let source = include_str!("dw1b.rs");
+        // Each anchor must be present: comparing two `Option`s let a deleted
+        // call (`None`) order before anything.
+        let at = |body: &str, needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        };
         let build = source
             .split_once("fn build_product(path: &Path, verify_rebuild: bool)")
             .expect("build entry")
@@ -2463,16 +2473,15 @@ mod tests {
             .expect("build boundary")
             .0;
         assert!(
-            build.find("preflight_source_build_environment()")
-                < build.find("verify_product_inputs(")
+            at(build, "preflight_source_build_environment()") < at(build, "verify_product_inputs(")
         );
         assert!(
-            build.find("verify_product_inputs(")
-                < build.find("fs::create_dir_all(&request.run_directory)")
+            at(build, "verify_product_inputs(")
+                < at(build, "fs::create_dir_all(&request.run_directory)")
         );
         assert!(
-            build.find("canonical_build_wyr_artifacts(&request)")
-                < build.find("fs::write(&request.bootfs")
+            at(build, "canonical_build_wyr_artifacts(&request)")
+                < at(build, "fs::write(&request.bootfs")
         );
         let image_entry = source
             .split_once("pub fn build(path: &Path)")
@@ -2502,8 +2511,8 @@ mod tests {
             .expect("freeze boundary")
             .0;
         assert!(
-            freeze.find("preflight_source_build_environment()")
-                < freeze.find("fs::create_dir(&output)")
+            at(freeze, "preflight_source_build_environment()")
+                < at(freeze, "fs::create_dir(&output)")
         );
         let preflight = source
             .split_once("fn preflight_source_build_environment()")
