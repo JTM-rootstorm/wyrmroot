@@ -3547,6 +3547,10 @@ mod tests {
         fs::remove_dir_all(&fixture).expect("remove current layout source fixture");
     }
 
+    /// Source text: each builder resolves its layout inside an entrypoint
+    /// that runs git, Cargo and the filesystem; a host check needs a layout
+    /// resolver seam threaded through seven builders, which does not exist.
+    /// `prepare` itself has other live callers, so it cannot be removed.
     #[test]
     fn current_product_builders_do_not_reselect_layout_from_the_abi_dependency() {
         for (name, source) in [
@@ -3562,10 +3566,22 @@ mod tests {
                 source.contains("deep_layout::prepare_current_kernel_source("),
                 "{name} does not select layout from its current kernel source"
             );
-            assert!(
-                !source.contains("crate::deep_layout::prepare("),
-                "{name} still selects layout from the historical ABI dependency"
-            );
+            // Any path to the historical selector: qualified, through a
+            // `deep_layout` import, or by importing `prepare` itself.
+            // A module's own tests may name the historical call they forbid.
+            let code = source
+                .split_once("\n#[cfg(test)]\nmod tests")
+                .map_or(source, |(code, _)| code);
+            for historical in [
+                "deep_layout::prepare(",
+                "deep_layout::prepare;",
+                "deep_layout::prepare as",
+            ] {
+                assert!(
+                    !code.contains(historical),
+                    "{name} still selects layout from the historical ABI dependency"
+                );
+            }
         }
     }
 
