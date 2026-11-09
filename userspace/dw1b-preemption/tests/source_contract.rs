@@ -146,14 +146,3 @@ fn executable_mock_trace_proves_the_complete_selector_26_order() {
     assert!(runtime.contains("[1, hog_process.0, progress_process.0, 8, 0, 0]"));
     assert!(runtime.contains("[2, 8, digest, 0, 0, 0]"));
 }
-
-#[test]
-fn selector_25_and_27_identities_remain_distinct() {
-    let root = repository();
-    let wyr1 = fs::read_to_string(root.join("tools/xtask/src/wyr1.rs")).unwrap();
-    let wyr1b = fs::read_to_string(root.join("tools/xtask/src/wyr1b.rs")).unwrap();
-    let dw1b = fs::read_to_string(root.join("tools/xtask/src/dw1b.rs")).unwrap();
-    assert!(wyr1.contains("pub const TEST_ID: u32 = 25;"));
-    assert!(wyr1b.contains("pub const TEST_ID: u32 = 27;"));
-    assert!(dw1b.contains("pub const TEST_ID: u32 = 26;"));
-}

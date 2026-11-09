@@ -2722,6 +2722,16 @@ mod tests {
         assert!(!template.contains("revision = \"0000000000000000000000000000000000000000\""));
     }
 
+    /// Selectors 25, 26 and 27 are adjacent products; each keeps its frozen
+    /// test id, so no two can be confused.
+    #[test]
+    fn selector_25_26_and_27_identities_remain_distinct() {
+        assert_eq!(
+            [crate::wyr1::TEST_ID, TEST_ID, crate::wyr1b::TEST_ID],
+            [25, 26, 27]
+        );
+    }
+
     #[test]
     fn selector_26_bootstrap_uses_the_init0_launch_profile() {
         assert_eq!(
