@@ -1288,18 +1288,23 @@ mod tests {
         assert!(archive.lookup(b"test/dw1-d6/boot-device-table").is_err());
     }
 
+    /// The freeze refuses an ambient value for either evidence name set, the
+    /// D6 build pair and the D kernel pair, and for the boot-device table;
+    /// with none of them set it proceeds.
     #[test]
     fn ambient_environment_rejects_both_d6_evidence_name_sets() {
-        let source = include_str!("dw1d6.rs");
+        assert_eq!(refuse_ambient_environment(|_| false), Ok(()));
         for variable in [
             "DEEPWYRM_DW1D6_BUILD_NONCE",
             "DEEPWYRM_DW1D6_BUILD_CHALLENGE",
             "DEEPWYRM_DW1D_EVIDENCE_NONCE",
             "DEEPWYRM_DW1D_EVIDENCE_CHALLENGE",
+            "DEEPWYRM_DW1D6_BOOT_DEVICE_TABLE",
         ] {
-            assert!(source.contains(variable));
+            let refused = refuse_ambient_environment(|key| key == variable)
+                .expect_err("an ambient evidence variable was accepted");
+            assert!(refused.message.contains(variable), "{}", refused.message);
         }
-        assert!(!source.contains(".env(\"DEEPWYRM_DW1D6_BOOT_DEVICE_TABLE\""));
     }
 
     /// The freeze preflight passes on this checkout's own loader and image
