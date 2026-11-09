@@ -134,4 +134,23 @@ mod tests {
                 .contains("native-devmgr")
         );
     }
+
+    /// Row 254. devmgr's WYR1-E production features enable the neutral
+    /// staged connector (D production) and C6, and none of the selector-only
+    /// policies that `main.rs`'s `compile_error!` refuses beside them.
+    #[test]
+    fn devmgr_e_production_enables_the_staged_connector_without_selector_policies() {
+        let features = WorkspaceFeatures::load();
+        for production in ["wyr1e-production", "wyr1e8-production"] {
+            let enabled = features.closure("wyrmroot-devmgr", production);
+            assert!(enabled.contains("wyr1d-production"), "{production}");
+            assert!(enabled.contains("wyr1c6-production"), "{production}");
+            for selector in ["wyr1d-selector32", "dw1e3-selector31", "wyr1c6-selector29"] {
+                assert!(
+                    !enabled.contains(selector),
+                    "{production} enables {selector}"
+                );
+            }
+        }
+    }
 }

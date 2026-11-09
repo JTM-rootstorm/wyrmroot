@@ -14,25 +14,6 @@ const NATIVE: &str = concat!(
 );
 
 #[test]
-fn e6_feature_enables_the_neutral_staged_connector_without_selector32() {
-    assert!(MANIFEST.contains("wyr1e-production = [\"wyr1d-production\", \"wyr1c6-production\"]"));
-    assert!(
-        NATIVE
-            .contains("WYR1-E production and selector-only devmgr policies are mutually exclusive")
-    );
-    assert!(
-        !MANIFEST
-            .split("wyr1e-production = ")
-            .nth(1)
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap()
-            .contains("wyr1d-selector32")
-    );
-}
-
-#[test]
 fn connector_broker_activation_is_shared_but_wdr5_remains_selector_only() {
     let activation = &NATIVE[NATIVE.find("fn selector32_driver_ready").unwrap()
         ..NATIVE.find("fn send_d5_controller").unwrap()];
