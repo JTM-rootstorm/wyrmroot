@@ -804,37 +804,17 @@ fn build_native(
         .map_err(|error| Failure::task(format!("could not create native target: {error}")))?;
     let emit_stack_sizes = spec.label == "init27";
     let flags = native_remap_flags(repository, cargo_home, &target, emit_stack_sizes)?;
-    let arguments = [
-        "build",
-        "--offline",
-        "--locked",
-        "--release",
-        "--target",
-        NATIVE_TARGET,
-        "--package",
-        spec.package,
-        "--bin",
-        spec.binary,
-        "--features",
-        spec.features,
-    ];
-    let status = Command::new(&toolchain.cargo)
-        .args(arguments)
-        .arg("--target-dir")
-        .arg(&target)
-        .env("RUSTC", &toolchain.rustc)
-        .env("CARGO_HOME", cargo_home)
-        .env("CARGO_ENCODED_RUSTFLAGS", flags)
-        .env("CARGO_INCREMENTAL", "0")
-        .env("CARGO_NET_OFFLINE", "true")
-        .env("SOURCE_DATE_EPOCH", "0")
-        .env_remove("LD_AUDIT")
-        .env_remove("LD_LIBRARY_PATH")
-        .env_remove("LD_PRELOAD")
-        .current_dir(repository)
-        .stdin(Stdio::null())
-        .status()
-        .map_err(|error| Failure::task(format!("could not build {}: {error}", spec.label)))?;
+    let status = native_build_command(
+        repository,
+        cargo_home,
+        &toolchain.cargo,
+        &toolchain.rustc,
+        &target,
+        spec,
+        flags,
+    )
+    .status()
+    .map_err(|error| Failure::task(format!("could not build {}: {error}", spec.label)))?;
     if !status.success() {
         return Err(Failure::task(format!(
             "WYR1-B canonical {} build failed",
@@ -850,6 +830,50 @@ fn build_native(
         .then(|| analyze_stack_budget(&artifact, &sha256::bytes_digest(&bytes)))
         .transpose()?;
     Ok((bytes, native_command(*spec), stack_report))
+}
+
+/// The Cargo command that builds one native payload under the project's own
+/// Cargo home and the accepted toolchain.
+fn native_build_command(
+    repository: &Path,
+    cargo_home: &Path,
+    cargo: &Path,
+    rustc: &Path,
+    target: &Path,
+    spec: &NativeSpec<'_>,
+    flags: String,
+) -> Command {
+    let arguments = [
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "--target",
+        NATIVE_TARGET,
+        "--package",
+        spec.package,
+        "--bin",
+        spec.binary,
+        "--features",
+        spec.features,
+    ];
+    let mut command = Command::new(cargo);
+    command
+        .args(arguments)
+        .arg("--target-dir")
+        .arg(target)
+        .env("RUSTC", rustc)
+        .env("CARGO_HOME", cargo_home)
+        .env("CARGO_ENCODED_RUSTFLAGS", flags)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("SOURCE_DATE_EPOCH", "0")
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .current_dir(repository)
+        .stdin(Stdio::null());
+    command
 }
 
 fn native_remap_flags(
@@ -1128,6 +1152,28 @@ fn build_kernel(
     };
     fs::create_dir_all(&target)
         .map_err(|error| Failure::task(format!("could not create kernel target: {error}")))?;
+    let status = kernel_build_command(repository, &target, selector, environment)
+        .status()
+        .map_err(|error| Failure::task(format!("could not build {label} kernel: {error}")))?;
+    if !status.success() {
+        return Err(Failure::task(format!(
+            "WYR1-B canonical {label} Deepwyrm build failed"
+        )));
+    }
+    read_cargo_build_output(
+        &target.join(KERNEL_TARGET).join("release/deepwyrm-kernel"),
+        label,
+        64 * 1024 * 1024,
+    )
+}
+
+/// The pinned target-launcher command that builds one Deepwyrm kernel.
+fn kernel_build_command(
+    repository: &Path,
+    target: &Path,
+    selector: &str,
+    environment: &[(&str, String)],
+) -> Command {
     let mut command = Command::new(repository.join("tools/pinned-cargo"));
     command
         .arg("target")
@@ -1145,7 +1191,7 @@ fn build_kernel(
             "--features",
             "test-support",
         ])
-        .env("DEEPWYRM_PINNED_TARGET_DIR", &target)
+        .env("DEEPWYRM_PINNED_TARGET_DIR", target)
         .env("DEEPWYRM_GUEST_TEST_SELECTOR", selector)
         // The outer Wyrmroot launcher owns its Cargo home. Deepwyrm's target
         // launcher must select and validate its own independently.
@@ -1158,19 +1204,7 @@ fn build_kernel(
     for (key, value) in environment {
         command.env(key, value);
     }
-    let status = command
-        .status()
-        .map_err(|error| Failure::task(format!("could not build {label} kernel: {error}")))?;
-    if !status.success() {
-        return Err(Failure::task(format!(
-            "WYR1-B canonical {label} Deepwyrm build failed"
-        )));
-    }
-    read_cargo_build_output(
-        &target.join(KERNEL_TARGET).join("release/deepwyrm-kernel"),
-        label,
-        64 * 1024 * 1024,
-    )
+    command
 }
 
 fn read_system_firmware(path: &str, label: &str) -> Result<Vec<u8>, Failure> {
