@@ -69,20 +69,58 @@ fn executed_hog_loop_is_syscall_yield_and_block_free() {
     }
 }
 
+/// Source text: both entry points are guest-only `no_std`/`no_main` binaries
+/// with no host build, and the shared body never returns, so no host test
+/// can observe that an entry delegates to it.
 #[test]
 fn historical_and_job_v2_entries_share_the_only_hog_body() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = fs::read_to_string(manifest.join("src/lib.rs")).unwrap();
     let job = fs::read_to_string(manifest.join("src/bin/job_cpu_hog.rs")).unwrap();
+    let hog = fs::read_to_string(manifest.join("src/bin/cpu_hog.rs")).unwrap();
+    let progress = fs::read_to_string(manifest.join("src/bin/progress.rs")).unwrap();
+    let body = |text: &str, start: &str| {
+        let from = text
+            .find(start)
+            .unwrap_or_else(|| panic!("missing {start}"));
+        let rest = &text[from..];
+        rest[..rest.find("\n}\n").expect("item end")].to_owned()
+    };
+    let at = |text: &str, needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}"))
+    };
+    // The spin loop exists once in the whole crate, inside the shared body.
+    for (file, text) in [
+        ("cpu_hog", &hog),
+        ("job_cpu_hog", &job),
+        ("progress", &progress),
+    ] {
+        assert!(!text.contains("spin_loop"), "{file} spins on its own");
+    }
     assert_eq!(source.matches("core::hint::spin_loop()").count(), 1);
-    assert!(source.contains("pub fn run_cpu_hog(channel: DwHandle)"));
-    assert!(source.contains("receive_hog_startup_and_ready(channel)?;"));
-    assert!(source.contains("run_cpu_hog_body()"));
-    assert!(job.contains("prepare_job_cpu_hog"));
-    assert!(job.contains("run_cpu_hog_body()"));
-    assert!(job.contains("startup.version()"));
-    assert!(job.contains("startup.arg(0)"));
-    assert!(job.contains("startup.envc()"));
+    assert!(body(&source, "pub fn run_cpu_hog_body()").contains("core::hint::spin_loop()"));
+    // The historical entry readies, then runs the shared body.
+    let historical = body(&source, "pub fn run_cpu_hog(channel: DwHandle)");
+    assert!(
+        at(&historical, "receive_hog_startup_and_ready(channel)?;")
+            < at(&historical, "run_cpu_hog_body()")
+    );
+    assert!(body(&hog, "fn payload_main(").contains("run_cpu_hog(startup.bootstrap_channel()"));
+    // The JobV2 entry validates its startup, prepares, then runs the same body.
+    let entry = body(&job, "fn job_cpu_hog_main(");
+    let validate = at(&entry, "validate_job_cpu_hog_entry(");
+    for argument in [
+        "startup.version()",
+        "startup.argc()",
+        "startup.arg(0)",
+        "startup.envc()",
+    ] {
+        assert!(validate < at(&entry, argument), "{argument}");
+    }
+    let prepare = at(&entry, "prepare_job_cpu_hog(&mut system");
+    assert!(at(&entry, "startup.envc()") < prepare);
+    assert!(prepare < at(&entry, "run_cpu_hog_body()"));
 }
 
 #[test]
