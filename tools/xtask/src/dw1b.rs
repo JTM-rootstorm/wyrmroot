@@ -2710,16 +2710,36 @@ mod tests {
         }
     }
 
+    /// The checked-in request template parses with the request's own scalar
+    /// parser, carries exactly the request key set, and names the frozen
+    /// candidate, ABI tree, Rust revision, digest and bootfs size.
     #[test]
     fn canonical_template_names_exact_candidate_and_digest() {
-        let template = include_str!("../../../toolchain/templates/dw1-b-request.toml");
-        assert!(template.contains(DEEPWYRM_CANDIDATE));
-        assert!(template.contains(DEEPWYRM_ABI_TREE));
-        assert!(template.contains("challenge_digest = \"5E4E054B5C244ACE\""));
-        assert!(template.contains("bootfs_pages = 31"));
-        assert!(template.contains(ACCEPTED_RUST_REVISION));
-        assert!(template.contains("REPLACE_WITH_INTEGRATED_WYRMROOT_COMMIT"));
-        assert!(!template.contains("revision = \"0000000000000000000000000000000000000000\""));
+        let values = parse_scalars(include_str!(
+            "../../../toolchain/templates/dw1-b-request.toml"
+        ))
+        .unwrap();
+        exact_keys(&values, REQUEST_KEYS, "DW1-B request template").unwrap();
+        for (key, expected) in [
+            ("schema_version", SCHEMA_VERSION.to_string()),
+            ("selector", SELECTOR.to_owned()),
+            ("test_id", TEST_ID.to_string()),
+            ("deepwyrm_revision", DEEPWYRM_CANDIDATE.to_owned()),
+            ("deepwyrm_abi_tree", DEEPWYRM_ABI_TREE.to_owned()),
+            ("rust_revision", ACCEPTED_RUST_REVISION.to_owned()),
+            ("challenge_digest", format!("{DIGEST:016X}")),
+            ("bootfs_pages", "31".to_owned()),
+            (
+                "wyrmroot_revision",
+                "REPLACE_WITH_INTEGRATED_WYRMROOT_COMMIT".to_owned(),
+            ),
+        ] {
+            assert_eq!(
+                values.get(key).map(String::as_str),
+                Some(expected.as_str()),
+                "{key}"
+            );
+        }
     }
 
     /// Selectors 25, 26 and 27 are adjacent products; each keeps its frozen
