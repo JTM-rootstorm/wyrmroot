@@ -99,6 +99,11 @@ fn selector31_finalize_is_the_exact_client_release_certificate_before_driver_rea
     assert!(reaped < broker_reaped && broker_reaped < empty && empty < clear);
 }
 
+/// Source text: the two arrival arms are inside system-init's `control_tick`,
+/// and the peer-close arm reports through the native
+/// `wyrmroot_runtime::dw1e3_report` syscall rather than the `InitPlatform`
+/// seam, so no host fake can drive that order. The join itself is
+/// host-tested by `wyr1c_native` `u1_finalize_retire_waits_for_stage1_and_the_peer_close`.
 #[test]
 fn selector31_finalize_rejoins_stage1_and_peer_close_in_either_arrival_order() {
     let stage1 = SYSTEM_INIT
