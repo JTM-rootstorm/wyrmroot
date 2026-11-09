@@ -20,7 +20,12 @@ use wyrmroot_runtime::{
     WYR0_I_SUPERVISION_POLICY,
 };
 
-use super::{ConsoledStreams, run};
+use wyrmroot_launch_proto::{
+    MAX_LAUNCH_MESSAGE_BYTES, Message as LaunchMessage, Reservation as LaunchReservation,
+    parse_message,
+};
+
+use super::{ConsoledStreams, encode_console_echo_launch, run};
 
 const BOOTSTRAP: DwHandle = DwHandle(0x10);
 const ENDPOINT: DwHandle = DwHandle(0x40);
@@ -254,4 +259,30 @@ fn a_failed_self_root_close_releases_the_authorities_then_the_bootstrap() {
     expected.extend(closes(&[0x20, 0x22, 0x21, BOOTSTRAP.0]));
     assert_eq!(platform.calls(), expected);
     platform.assert_script_consumed();
+}
+
+/// The historical console-echo child stays an explicit launch of its own
+/// path: argv0 only, no environment, and the three stream handles, under the
+/// caller's reservation.
+#[test]
+fn historical_policy_remains_an_explicit_three_stream_launch() {
+    let reservation = LaunchReservation {
+        connection_id: 3,
+        generation: 4,
+        transaction_id: 5,
+    };
+    let mut bytes = [0u8; MAX_LAUNCH_MESSAGE_BYTES];
+    let size = encode_console_echo_launch(reservation, &mut bytes).unwrap();
+    let parsed = parse_message(&bytes[..size], 3).unwrap();
+    assert_eq!(parsed.reservation, reservation);
+    let LaunchMessage::Launch(request) = parsed.message else {
+        panic!("console-echo is not a plain launch: {:?}", parsed.message);
+    };
+    assert_eq!(request.path, "bin/console-echo");
+    assert_eq!(
+        (request.argc(), request.arg(0)),
+        (1, Some("bin/console-echo"))
+    );
+    assert_eq!(request.environment_count(), 0);
+    assert_eq!(request.stream_count, 3);
 }

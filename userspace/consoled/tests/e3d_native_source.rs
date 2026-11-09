@@ -10,7 +10,6 @@ const NATIVE: &str = concat!(
     include_str!("../src/main.rs"),
     include_str!("../src/role.rs")
 );
-const MODEL: &str = include_str!("../src/lib.rs");
 const TRANSFER: &str = include_str!("../src/stream_transfer.rs");
 
 #[test]
@@ -33,21 +32,6 @@ fn shell_policy_uses_exact_four_handle_move_and_correlations() {
     }
     assert!(TRANSFER.contains("requested_rights: CHILD_CHANNEL_TRANSFER_RIGHTS"));
     assert!(TRANSFER.contains("operation: DW_HANDLE_TRANSFER_MOVE"));
-}
-
-#[test]
-fn historical_policy_remains_an_explicit_three_stream_launch() {
-    for required in [
-        "ChildPolicy::ConsoleEcho => encode_console_echo_launch(",
-        "policy.path(),\n        &[policy.path()],\n        &[],\n        true",
-        "Self::ConsoleEcho => \"bin/console-echo\"",
-        "Self::Wyrmsh => wyrmroot_console_proto::SHELL_PATH",
-    ] {
-        assert!(
-            NATIVE.contains(required) || MODEL.contains(required),
-            "missing historical contract: {required}"
-        );
-    }
 }
 
 /// Source text: no host test drives consoled's role yet. The status close
