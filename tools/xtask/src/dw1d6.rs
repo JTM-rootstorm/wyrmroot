@@ -991,6 +991,12 @@ fn canonical_deep_repository(input: &Path) -> Result<PathBuf, Failure> {
     Ok(canonical)
 }
 fn validate_environment() -> Result<(), Failure> {
+    refuse_ambient_environment(|key| env::var_os(key).is_some())
+}
+
+/// Refuses the first of the freeze's controlled variables that `present`
+/// reports set in the ambient environment.
+fn refuse_ambient_environment(present: impl Fn(&str) -> bool) -> Result<(), Failure> {
     for key in [
         "RUSTUP_TOOLCHAIN",
         "RUSTC_BOOTSTRAP",
@@ -1004,7 +1010,7 @@ fn validate_environment() -> Result<(), Failure> {
         "DEEPWYRM_DW1D_EVIDENCE_CHALLENGE",
         "DEEPWYRM_DW1D6_BOOT_DEVICE_TABLE",
     ] {
-        if env::var_os(key).is_some() {
+        if present(key) {
             return Err(Failure::task(format!(
                 "DW1-D6 freeze refuses ambient {key}"
             )));
