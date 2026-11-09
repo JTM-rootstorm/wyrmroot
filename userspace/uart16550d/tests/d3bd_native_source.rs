@@ -391,6 +391,12 @@ fn ordinary_retire_drains_raw_tx_and_temt_before_ier_zero_release() {
     assert!(pending < probe && probe < queued && queued < service);
 }
 
+/// Source text: the property holds only where debug assertions are compiled
+/// out, and every host test runs with them on, so a host test cannot tell
+/// `assert_eq!` from `debug_assert_eq!` here; clippy's
+/// `debug_assert_with_mut_call` does not flag the discard moved inside one
+/// (checked). The commit's effect in a debug build is host-tested by lib.rs
+/// `send_peer_close_preserves_final_inbound_data_until_empty_queue_proof`.
 #[test]
 fn native_stream_commit_consumes_uart_prefix_in_optimized_builds() {
     let commit = DRIVER_POLICY.find("pub fn commit_stream_send").unwrap();
