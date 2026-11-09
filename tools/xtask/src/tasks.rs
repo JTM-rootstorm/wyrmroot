@@ -1637,11 +1637,18 @@ fn named_host_runs(filter: &str) -> Result<Vec<CargoRun>, Failure> {
         // compiled nowhere it could run. The runtime's `dw1e3` module stamps
         // the evidence nonce in with `env!`, so this run takes the same
         // placeholder the library check does.
-        "dw1e3-model" => vec![CargoRun {
-            arguments: dw1e3_model_command(),
-            selector_nonce: true,
-            require_tests: false,
-        }],
+        //
+        // S3 row 261: the uart16550d driver's selector-31 evidence drain is
+        // host-tested in its library under the same feature, which no other
+        // gate compiles tests for.
+        "dw1e3-model" => [dw1e3_model_command(), dw1e3_uart_model_command()]
+            .into_iter()
+            .map(|arguments| CargoRun {
+                arguments,
+                selector_nonce: true,
+                require_tests: false,
+            })
+            .collect(),
         _ => host_test_commands(Some(filter))?
             .into_iter()
             .map(|arguments| CargoRun::plain(arguments).requiring_named_tests())
@@ -2179,6 +2186,21 @@ fn dw1e3_model_command() -> Vec<String> {
         "wyrmroot-system-init",
         "--features",
         "dw1e3-selector31",
+    ]
+    .map(str::to_owned)
+    .into()
+}
+
+fn dw1e3_uart_model_command() -> Vec<String> {
+    [
+        "test",
+        "--locked",
+        "--offline",
+        "--package",
+        "wyrmroot-uart16550d",
+        "--features",
+        "dw1e3-selector31",
+        "--lib",
     ]
     .map(str::to_owned)
     .into()

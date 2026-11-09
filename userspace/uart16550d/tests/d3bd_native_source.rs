@@ -53,19 +53,6 @@ fn native_loop_checks_control_and_pio_before_interrupt_ack() {
     );
 }
 
-/// Source text until S3: the role runs over the platform seam, but no
-/// RecordingPlatform script drives this path yet.
-#[test]
-fn selector31_allows_an_empty_coalesced_ack_epoch_after_the_challenge_drain() {
-    let record = DRIVER
-        .find("fn record<P: UartPlatform>(&mut self, platform: &mut P, bytes: &[u8])")
-        .unwrap();
-    let body = &DRIVER[record..];
-    let empty = body.find("if bytes.is_empty()").unwrap();
-    let reported = body.find("if self.reported").unwrap();
-    assert!(empty < reported);
-}
-
 #[test]
 fn selector31_stage1_blocks_stale_finalize_and_post_ier_interrupt_drains() {
     let begin = DRIVER

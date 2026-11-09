@@ -544,3 +544,22 @@ mod resident {
         platform.assert_script_consumed();
     }
 }
+
+/// Selector 31. After the challenge drain is reported, an empty coalesced
+/// acknowledgement epoch is still admissible (the driver must rearm the exact
+/// Interrupt), while any further UART bytes fail closed as a second
+/// challenge. The report is the drain's only platform call.
+#[cfg(feature = "dw1e3-selector31")]
+#[test]
+fn selector31_allows_an_empty_coalesced_ack_epoch_after_the_challenge_drain() {
+    use wyrmroot_dw1e3_com2_test::{CHALLENGE_GENERATION, challenge};
+
+    let expected = challenge(7);
+    let mut drain = super::EvidenceDrain::new(5, CHALLENGE_GENERATION, 7);
+    let mut platform = RecordingPlatform::scripted([Reply::Unit(Ok(()))]);
+    assert_eq!(drain.record(&mut platform, &expected), Ok(()));
+    platform.assert_script_consumed();
+    assert_eq!(drain.record(&mut platform, &[]), Ok(()));
+    assert_eq!(drain.record(&mut platform, &expected[..1]), Err(()));
+    assert_eq!(platform.calls().len(), 1);
+}
