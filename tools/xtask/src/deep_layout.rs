@@ -2714,7 +2714,7 @@ fn is_upper_canonical_four_level(address: u64) -> bool {
 }
 
 #[derive(Debug)]
-enum JsonValue {
+pub(crate) enum JsonValue {
     Null,
     Bool,
     Number,
@@ -2724,7 +2724,7 @@ enum JsonValue {
 }
 
 impl JsonValue {
-    fn object_field(&self, key: &str) -> Result<&Self, Failure> {
+    pub(crate) fn object_field(&self, key: &str) -> Result<&Self, Failure> {
         let Self::Object(values) = self else {
             return Err(Failure::task("Cargo metadata JSON value is not an object"));
         };
@@ -2733,14 +2733,14 @@ impl JsonValue {
             .ok_or_else(|| Failure::task(format!("Cargo metadata is missing field '{key}'")))
     }
 
-    fn as_array(&self, label: &str) -> Result<&[Self], Failure> {
+    pub(crate) fn as_array(&self, label: &str) -> Result<&[Self], Failure> {
         match self {
             Self::Array(values) => Ok(values),
             _ => Err(Failure::task(format!("{label} is not an array"))),
         }
     }
 
-    fn as_string(&self, label: &str) -> Result<&str, Failure> {
+    pub(crate) fn as_string(&self, label: &str) -> Result<&str, Failure> {
         match self {
             Self::String(value) => Ok(value),
             _ => Err(Failure::task(format!("{label} is not a string"))),
@@ -2748,14 +2748,14 @@ impl JsonValue {
     }
 }
 
-struct JsonParser<'a> {
+pub(crate) struct JsonParser<'a> {
     bytes: &'a [u8],
     offset: usize,
     values: usize,
 }
 
 impl<'a> JsonParser<'a> {
-    fn new(input: &'a str) -> Self {
+    pub(crate) fn new(input: &'a str) -> Self {
         Self {
             bytes: input.as_bytes(),
             offset: 0,
@@ -2763,7 +2763,7 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse(mut self) -> Result<JsonValue, Failure> {
+    pub(crate) fn parse(mut self) -> Result<JsonValue, Failure> {
         if self.bytes.len() > MAX_METADATA_STDOUT_BYTES as usize {
             return Err(self.error("metadata document exceeds the admitted output limit"));
         }

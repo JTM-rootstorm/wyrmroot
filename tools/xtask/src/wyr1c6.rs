@@ -906,6 +906,10 @@ fn parse_evidence(bytes: &[u8], nonce: &str) -> Result<ParsedEvidence, Failure> 
     })
 }
 
+/// The feature set the C6 bootstrap is built with. A `wyr1c*-production`
+/// bootstrap launches permanent init as `SupervisorResourceDomain`.
+pub(crate) const C6_BOOTSTRAP_FEATURES: &str = "wyr1c6-production";
+
 pub(crate) fn build_c6_bootstrap(
     repository: &Path,
     toolchain: &tasks::LoaderToolchain,
@@ -947,7 +951,7 @@ pub(crate) fn build_c6_bootstrap(
             "--bin",
             "wyrmroot-bootstrap",
             "--features",
-            "wyr1c6-production",
+            C6_BOOTSTRAP_FEATURES,
         ])
         .arg("--target-dir")
         .arg(&target)
