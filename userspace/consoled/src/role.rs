@@ -1226,14 +1226,7 @@ fn launch_child_once<P: ConsoledPlatform>(
     };
     let mut bytes = [0u8; MAX_LAUNCH_MESSAGE_BYTES];
     let encoded = match policy {
-        ChildPolicy::ConsoleEcho => encode_launch(
-            reservation,
-            policy.path(),
-            &[policy.path()],
-            &[],
-            true,
-            &mut bytes,
-        ),
+        ChildPolicy::ConsoleEcho => encode_console_echo_launch(reservation, &mut bytes),
         ChildPolicy::Wyrmsh => encode_shell_v1_request(
             reservation,
             ShellV1Request {
@@ -1432,6 +1425,23 @@ fn launch_child_once<P: ConsoledPlatform>(
             session,
         }),
     }))
+}
+
+/// Encodes the historical console-echo child's launch: a plain launch of its
+/// own path, argv0 only, no environment, with the three streams.
+fn encode_console_echo_launch(
+    reservation: LaunchReservation,
+    bytes: &mut [u8],
+) -> Result<usize, wyrmroot_launch_proto::Error> {
+    let policy = ChildPolicy::ConsoleEcho;
+    encode_launch(
+        reservation,
+        policy.path(),
+        &[policy.path()],
+        &[],
+        true,
+        bytes,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
