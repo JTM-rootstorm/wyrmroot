@@ -2427,6 +2427,10 @@ mod tests {
         assert!(archive.lookup(b"system/init").is_err());
     }
 
+    /// Source text: `run` reaches the product only through free functions
+    /// (`inspect_recorded`, `build_product`) that read a real built product;
+    /// a host check that it never rebuilds needs a build-spy seam this crate
+    /// does not have.
     #[test]
     fn canonical_run_reuses_the_inspected_product_without_rebuilding() {
         let source = include_str!("dw1b.rs");
@@ -2449,7 +2453,14 @@ mod tests {
             .0;
         assert!(execution.contains("inspect_recorded(request_path)"));
         assert!(!execution.contains("inspect(request_path)"));
-        assert!(source.contains("ensure_run_directory(&request.run_directory)?"));
+        let loaded = source
+            .split_once("fn execute_run_loaded_with_validation(")
+            .expect("loaded run execution")
+            .1
+            .split_once("\nfn ")
+            .expect("loaded run execution boundary")
+            .0;
+        assert!(loaded.contains("ensure_run_directory(&request.run_directory)?"));
     }
 
     /// Source text: the order of `build_product`'s preflight, input check,
