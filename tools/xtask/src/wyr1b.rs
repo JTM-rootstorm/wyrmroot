@@ -3563,16 +3563,36 @@ mod tests {
             .is_err()
         );
 
-        let source = include_str!("wyr1b.rs");
-        assert!(source.contains(".env(\"CARGO_HOME\", cargo_home)"));
-        let kernel_build = source
-            .split_once("fn build_kernel(")
-            .expect("kernel build entry")
-            .1
-            .split_once("fn read_system_firmware(")
-            .expect("kernel build boundary")
-            .0;
-        assert!(kernel_build.contains(".env_remove(\"CARGO_HOME\")"));
+        // The product's own native builds run under the project Cargo home.
+        // The Deepwyrm kernel build hands its target launcher none, so that
+        // launcher selects and validates its own.
+        let native = native_build_command(
+            Path::new("/project"),
+            cargo_home,
+            Path::new("/accepted/cargo"),
+            Path::new("/accepted/rustc"),
+            Path::new("/project/.tmp/native"),
+            &NATIVE_SPECS[0],
+            String::new(),
+        );
+        assert!(
+            native
+                .get_envs()
+                .any(|(key, value)| key == "CARGO_HOME" && value == Some(cargo_home.as_os_str())),
+            "the native build does not use the project Cargo home"
+        );
+        let kernel = kernel_build_command(
+            Path::new("/project"),
+            Path::new("/project/.tmp/kernel"),
+            "selector",
+            &[],
+        );
+        assert!(
+            kernel
+                .get_envs()
+                .any(|(key, value)| key == "CARGO_HOME" && value.is_none()),
+            "the kernel build inherits the outer Cargo home"
+        );
     }
 
     #[test]
