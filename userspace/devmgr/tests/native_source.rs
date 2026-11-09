@@ -194,22 +194,6 @@ fn selector29_malformed_mapping_probe_moves_wrong_second_type_and_requires_typed
 /// Source text until S3: the role runs over the platform seam, but no
 /// RecordingPlatform script drives this path yet.
 #[test]
-fn c6_retirement_uses_a_fresh_endpoint_local_registry_transaction() {
-    let retire = &NATIVE[NATIVE.find("fn retire_driver_publication<").unwrap()
-        ..NATIVE.find("fn probe_stale_driver_endpoint<").unwrap()];
-    let allocate = retire
-        .find("publication_retire_transaction(request)")
-        .expect("resident allocates the post-publish retirement transaction");
-    let header = retire
-        .find("transaction_id: retire_transaction")
-        .expect("Retire carries the fresh transaction");
-    assert!(allocate < header);
-    assert!(!retire.contains("transaction_id: request.transaction_id"));
-}
-
-/// Source text until S3: the role runs over the platform seam, but no
-/// RecordingPlatform script drives this path yet.
-#[test]
 fn c6_inline_publication_rebind_is_acknowledged_before_driver_backoff() {
     let cleanup = &NATIVE[NATIVE
         .find("send_driver_retired(platform, bootstrap, request)?")

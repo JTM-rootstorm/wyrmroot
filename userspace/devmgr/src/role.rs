@@ -2196,7 +2196,7 @@ fn record_driver_terminal(
 }
 
 #[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
-fn retire_driver_publication<P: DevmgrPlatform>(
+pub(crate) fn retire_driver_publication<P: DevmgrPlatform>(
     platform: &mut P,
     publication: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,

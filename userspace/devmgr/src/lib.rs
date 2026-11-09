@@ -1955,4 +1955,78 @@ mod tests {
             Err(DevmgrError::DriverLaunch(DriverLaunchError::StaleEndpoint))
         );
     }
+
+    /// A resident whose driver is launched, ready and published, as the role
+    /// holds it when the driver's readiness has just been committed.
+    fn published_ready_driver() -> (
+        ResidentController,
+        wyrmroot_device_proto::DriverLaunchRequest,
+    ) {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        resident.admit_device_resource(exact_resource(19)).unwrap();
+        let request = resident
+            .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        resident.driver_constructed().unwrap();
+        resident.resource_bundle_message().unwrap();
+        resident.bundle_transferred().unwrap();
+        resident
+            .accept_driver_ready(wyrmroot_device_proto::ControlMessage::Ready {
+                role_id: request.role_id,
+                bundle_generation: BundleGeneration(19),
+                attempt_generation: request.attempt_generation,
+                endpoint: request.endpoint,
+                transaction_id: request.transaction_id,
+            })
+            .unwrap();
+        resident.publication_committed().unwrap();
+        (resident, request)
+    }
+
+    /// The Retire that withdraws a failed driver's publication carries the
+    /// resident's fresh endpoint-local transaction, launch transaction + 1,
+    /// never the launch transaction the publication was made under: the
+    /// registry's replay protection would refuse a reused one.
+    #[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
+    #[test]
+    fn c6_retirement_uses_a_fresh_endpoint_local_registry_transaction() {
+        use deepwyrm_syscall::{DW_STATUS_BAD_STATE, DwHandle};
+        use wyrmroot_runtime::NativeError;
+        use wyrmroot_runtime::platform::recording::{Call, RecordingPlatform, Reply};
+
+        let (mut resident, request) = published_ready_driver();
+        resident.driver_failed(request.endpoint).unwrap();
+        let publication = DwHandle(0x51);
+        // The send succeeds; the reply deadline then fails, which stops the
+        // exchange right after the one message under test.
+        let mut platform = RecordingPlatform::scripted([
+            Reply::Unit(Ok(())),
+            Reply::Deadline(Err(NativeError::Status(DW_STATUS_BAD_STATE))),
+        ]);
+        assert!(
+            crate::role::retire_driver_publication(&mut platform, publication, request, &resident)
+                .is_err()
+        );
+        let [
+            Call::SendChannel {
+                channel,
+                bytes,
+                transfers,
+            },
+            Call::MonotonicDeadlineAfter { .. },
+        ] = platform.calls()
+        else {
+            panic!("unexpected calls {:?}", platform.calls());
+        };
+        assert_eq!(*channel, publication);
+        assert!(transfers.is_empty());
+        let retire = wyrmroot_registry_proto::parse(bytes, 0).unwrap().header;
+        assert_eq!(
+            retire.message_type,
+            wyrmroot_registry_proto::MessageType::Retire
+        );
+        assert_eq!(retire.transaction_id, request.transaction_id + 1);
+    }
 }
