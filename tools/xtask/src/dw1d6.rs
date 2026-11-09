@@ -1296,18 +1296,63 @@ mod tests {
         assert!(!source.contains(".env(\"DEEPWYRM_DW1D6_BOOT_DEVICE_TABLE\""));
     }
 
+    /// The freeze preflight passes on this checkout's own loader and image
+    /// sources, and refuses a tree that lacks any one handoff marker.
     #[test]
     fn preflight_requires_the_real_efi_table_handoff_path() {
-        let modules = include_str!("../../../loader/src/modules.rs");
-        let adapter = include_str!("../../../loader/src/uefi_app.rs");
-        let artifacts = include_str!("../../../loader/src/artifacts.rs");
-        let image = include_str!("g3_image.rs");
-        assert!(modules.contains("plan_modules_with_boot_device_table"));
-        assert!(adapter.contains("BOOT_DEVICE_TABLE_PATH"));
-        assert!(adapter.contains("plan_modules_with_boot_device_table"));
-        assert!(artifacts.contains("BDEVICE.BIN"));
-        assert!(image.contains("build_d6"));
-        assert!(image.contains("BOOT_DEVICE_TABLE_SHORT"));
+        let repository = crate::tasks::repository_root().unwrap();
+        require_d6_loader_contract(&repository).unwrap();
+
+        let files = [
+            (
+                "loader/src/modules.rs",
+                [
+                    "DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1",
+                    "plan_modules_with_boot_device_table",
+                ]
+                .as_slice(),
+            ),
+            (
+                "loader/src/uefi_app.rs",
+                ["BOOT_DEVICE_TABLE_PATH", "plan_modules_with_boot_device_table"].as_slice(),
+            ),
+            ("loader/src/artifacts.rs", ["BDEVICE.BIN"].as_slice()),
+            (
+                "tools/xtask/src/g3_image.rs",
+                ["build_d6", "BOOT_DEVICE_TABLE_SHORT"].as_slice(),
+            ),
+        ];
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("wyrmroot-dw1d6-contract-{nonce}"));
+        let write = |omit: Option<(usize, usize)>| {
+            for (file_index, (path, markers)) in files.iter().enumerate() {
+                let text = markers
+                    .iter()
+                    .enumerate()
+                    .filter(|(marker_index, _)| omit != Some((file_index, *marker_index)))
+                    .map(|(_, marker)| *marker)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let path = root.join(path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, text).unwrap();
+            }
+        };
+        write(None);
+        assert_eq!(require_d6_loader_contract(&root), Ok(()));
+        for (file_index, (path, markers)) in files.iter().enumerate() {
+            for (marker_index, marker) in markers.iter().enumerate() {
+                write(Some((file_index, marker_index)));
+                assert!(
+                    require_d6_loader_contract(&root).is_err(),
+                    "{path} without {marker} was accepted"
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn request_and_receipt_bind_every_verifier_label() {
