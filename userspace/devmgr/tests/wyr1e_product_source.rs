@@ -13,18 +13,34 @@ const NATIVE: &str = concat!(
     include_str!("../src/role.rs")
 );
 
+/// Source text: production's three driver-ready call sites are inside
+/// `run`'s event loop, which no RecordingPlatform script reaches (it needs a
+/// mapped manifest, an installed publication and a launched driver). What
+/// activation does is host-tested by lib.rs
+/// `connector_broker_activation_publishes_the_ready_driver_once`; it takes no
+/// platform, so it cannot itself send a WDR5 (D5) message.
 #[test]
 fn connector_broker_activation_is_shared_but_wdr5_remains_selector_only() {
-    let activation = &NATIVE[NATIVE.find("fn selector32_driver_ready").unwrap()
-        ..NATIVE.find("fn send_d5_controller").unwrap()];
-    assert!(activation.contains("activate_connector_broker(resident, broker)"));
-    assert!(activation.contains("D5ControllerMessage::DriverReady"));
-    let neutral = &activation[activation.find("fn activate_connector_broker").unwrap()..];
-    assert!(neutral.contains("ConnectorBroker::new"));
-    assert!(!neutral.contains("D5ControllerMessage"));
-    assert!(NATIVE.contains(
-        "#[cfg(all(feature = \"wyr1e-production\", not(feature = \"wyr1d-selector32\")))]\n                activate_connector_broker"
-    ));
+    // Selector 32 activates through the same function, then reports WDR5.
+    let selector32 = &NATIVE[NATIVE.find("fn selector32_driver_ready<").unwrap()
+        ..NATIVE.find("fn activate_connector_broker(").unwrap()];
+    let activate = selector32
+        .find("activate_connector_broker(resident, broker)?")
+        .unwrap();
+    let report = selector32
+        .find("D5ControllerMessage::DriverReady(current.d5_identity())")
+        .unwrap();
+    assert!(activate < report);
+    // Production activates, without WDR5, at each driver-ready point of `run`.
+    let run = &NATIVE
+        [NATIVE.find("pub fn run<").unwrap()..NATIVE.find("fn receive_controller<").unwrap()];
+    assert_eq!(
+        run.matches(
+            "#[cfg(all(feature = \"wyr1e-production\", not(feature = \"wyr1d-selector32\")))]\n                activate_connector_broker(&mut resident, &mut connector_broker)?;"
+        )
+        .count(),
+        3
+    );
 }
 
 /// Source text until S3: the role runs over the platform seam, but no

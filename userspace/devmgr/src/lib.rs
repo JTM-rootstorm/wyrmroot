@@ -1964,7 +1964,15 @@ mod tests {
     ) {
         let mut resident =
             ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
-        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        resident
+            .accept_publication(
+                wyrmroot_device_proto::controller_v1_1::PublicationMessage {
+                    controller: install(binding(1, 7), 41),
+                    service_generation: 0xC1_0801,
+                },
+                0,
+            )
+            .unwrap();
         resident.admit_device_resource(exact_resource(19)).unwrap();
         let request = resident
             .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
@@ -2028,5 +2036,45 @@ mod tests {
             wyrmroot_registry_proto::MessageType::Retire
         );
         assert_eq!(retire.transaction_id, request.transaction_id + 1);
+    }
+
+    /// Activating the connector broker for the ready, published driver is a
+    /// model step with no platform: the first activation builds the broker
+    /// around that driver, a second for the same driver is refused, and an
+    /// empty broker with no current driver is re-pointed at it.
+    #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
+    #[test]
+    fn connector_broker_activation_publishes_the_ready_driver_once() {
+        use crate::connector::ConnectorBroker;
+        use crate::role::activate_connector_broker;
+
+        let (mut resident, request) = published_ready_driver();
+        let mut broker = None;
+        let current = activate_connector_broker(&mut resident, &mut broker).unwrap();
+        assert_eq!(current.control.transaction_id, request.transaction_id);
+        assert_eq!(current.control.endpoint, request.endpoint);
+        assert_eq!(current.publication_generation, 0xC1_0801);
+        assert_eq!(
+            broker.as_ref().and_then(ConnectorBroker::current),
+            Some(current)
+        );
+
+        let built = broker;
+        assert_eq!(
+            activate_connector_broker(&mut resident, &mut broker),
+            Err(0xC101_0000 | 246),
+            "a broker already serving the driver is not activated again"
+        );
+        assert_eq!(broker, built);
+
+        let mut empty = Some(ConnectorBroker::new(None, 1, 1).unwrap());
+        assert_eq!(
+            activate_connector_broker(&mut resident, &mut empty),
+            Ok(current)
+        );
+        assert_eq!(
+            empty.as_ref().and_then(ConnectorBroker::current),
+            Some(current)
+        );
     }
 }

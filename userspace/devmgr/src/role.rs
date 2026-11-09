@@ -1608,7 +1608,7 @@ fn selector32_driver_ready<P: DevmgrPlatform>(
 }
 
 #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
-fn activate_connector_broker(
+pub(crate) fn activate_connector_broker(
     resident: &mut crate::ResidentController,
     broker: &mut Option<ConnectorBroker>,
 ) -> Result<PublishedDriver, u32> {
