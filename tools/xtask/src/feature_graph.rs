@@ -153,4 +153,29 @@ mod tests {
             }
         }
     }
+
+    /// Row 273. No devmgr feature turns on both the D product's staged
+    /// launch and the historical selector-29 actor, and the retained WYR1-A
+    /// stubs, which build that actor, have no D-production feature at all.
+    #[test]
+    fn d_production_never_selects_the_historical_selector29_actor() {
+        let features = WorkspaceFeatures::load();
+        assert!(
+            !features
+                .closure("wyrmroot-devmgr", "wyr1d-production")
+                .contains("wyr1c6-selector29")
+        );
+        for feature in features.declared("wyrmroot-devmgr") {
+            let enabled = features.closure("wyrmroot-devmgr", feature);
+            assert!(
+                !(enabled.contains("wyr1d-production") && enabled.contains("wyr1c6-selector29")),
+                "devmgr's {feature} enables both D production and selector 29"
+            );
+        }
+        assert!(
+            !features
+                .declared("wyrmroot-wyr1-retained-stubs")
+                .contains("wyr1d-production")
+        );
+    }
 }

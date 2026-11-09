@@ -23,8 +23,6 @@ const DEVMGR: &str = concat!(
     include_str!("../../devmgr/src/main.rs"),
     include_str!("../../devmgr/src/role.rs")
 );
-const DEVMGR_MANIFEST: &str = include_str!("../../devmgr/Cargo.toml");
-const RETAINED_MANIFEST: &str = include_str!("../../wyr1-retained-stubs/Cargo.toml");
 
 /// Source text until S3: the role runs over the platform seam, but no
 /// RecordingPlatform script drives this path yet.
@@ -423,20 +421,6 @@ fn native_stream_commit_consumes_uart_prefix_in_optimized_builds() {
     let clear = body.find("self.pending_rx_len = 0").unwrap();
     assert!(discard < invariant && invariant < clear);
     assert!(!body.contains("debug_assert_eq!"));
-}
-
-#[test]
-fn d3_product_gate_cannot_select_the_historical_selector29_actor() {
-    assert!(DEVMGR_MANIFEST.contains("wyr1d-production = [\"wyr1c5-production\"]"));
-    assert!(DEVMGR_MANIFEST.contains("wyr1c6-selector29 = [\"wyr1c6-production\"]"));
-    assert!(!DEVMGR_MANIFEST.contains("wyr1c6-selector29 = [\"wyr1d-production\"]"));
-    assert!(
-        DEVMGR.contains("#[cfg(feature = \"wyr1d-production\")]\n    return launch_driver_staged")
-    );
-    assert!(DEVMGR.contains(
-        "#[cfg(all(feature = \"wyr1c5-production\", not(feature = \"wyr1d-production\")))]\nfn launch_driver_with_historical_bundle"
-    ));
-    assert!(!RETAINED_MANIFEST.contains("wyr1d-production"));
 }
 
 /// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.3 item 1. Losing the control peer
