@@ -23,7 +23,7 @@ members = [
     "userspace/uart16550d",
     "userspace/consoled",
     "userspace/wyrmsh",
-    "userspace/dw1b-preemption",
+    "userspace/cpu-hog",
 ]
 
 [workspace.package]

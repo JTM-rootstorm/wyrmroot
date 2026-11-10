@@ -5,7 +5,7 @@
 use core::panic::PanicInfo;
 
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwSignals};
-use wyrmroot_dw1b_preemption::{
+use wyrmroot_cpu_hog::{
     JobActorSystem, prepare_job_cpu_hog, run_cpu_hog_body, validate_job_cpu_hog_entry,
 };
 use wyrmroot_loader as _;

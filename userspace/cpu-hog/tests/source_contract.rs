@@ -3,7 +3,7 @@
 use std::{fs, path::PathBuf};
 
 use deepwyrm_syscall as _;
-use wyrmroot_dw1b_preemption as _;
+use wyrmroot_cpu_hog as _;
 use wyrmroot_loader as _;
 use wyrmroot_runtime as _;
 

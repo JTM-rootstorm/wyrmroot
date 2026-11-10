@@ -1,9 +1,9 @@
 [package]
-name = "wyrmroot-dw1b-preemption"
+name = "wyrmroot-cpu-hog"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Selector-26 normal-preemption payloads and fixed challenge protocol"
+description = "The bin/cpu-hog job: a no-yield CPU hog started as a JobV2 payload"
 license = "GPL-3.0-or-later"
 
 [lib]

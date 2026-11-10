@@ -110,7 +110,7 @@ pub(crate) const NATIVES: [NativeSpec; 8] = [
     ),
     native(
         "cpu-hog",
-        "wyrmroot-dw1b-preemption",
+        "wyrmroot-cpu-hog",
         "wyrmroot-job-cpu-hog",
         "native-job-cpu-hog",
         "wyrmroot-job-cpu-hog",
