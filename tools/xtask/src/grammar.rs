@@ -48,8 +48,7 @@ pub(crate) fn dump() -> Result<String, Failure> {
     let rendered = render(&scratch);
     let cleanup = fs::remove_dir_all(&scratch);
     let body = rendered?;
-    cleanup
-        .map_err(|error| Failure::task(format!("could not remove grammar scratch: {error}")))?;
+    cleanup.map_err(|error| Failure::task(format!("could not remove grammar scratch: {error}")))?;
     Ok(body)
 }
 
@@ -292,12 +291,24 @@ mod tests {
         )));
         for product_kind in PRODUCTS {
             let expected_result = json_array_of_strings(wyr1f::result_keys(product_kind).iter());
-            assert!(body.contains(&expected_result), "{}", product_kind.cli_value());
+            assert!(
+                body.contains(&expected_result),
+                "{}",
+                product_kind.cli_value()
+            );
             let expected_request = json_array_of_strings(wyr1f::request_keys(product_kind).iter());
-            assert!(body.contains(&expected_request), "{}", product_kind.cli_value());
+            assert!(
+                body.contains(&expected_request),
+                "{}",
+                product_kind.cli_value()
+            );
             let expected_fixed =
                 json_object_of_string_pairs(wyr1f::fixed_fields(product_kind).iter().copied());
-            assert!(body.contains(&expected_fixed), "{}", product_kind.cli_value());
+            assert!(
+                body.contains(&expected_fixed),
+                "{}",
+                product_kind.cli_value()
+            );
         }
     }
 
@@ -321,7 +332,11 @@ mod tests {
     #[test]
     fn dump_names_every_product_by_its_request_value() {
         let body = dump().expect("grammar dump");
-        for product in ["wyr1-f-normal", "wyr1-f-normal-instrumented", "wyr1-f-degraded"] {
+        for product in [
+            "wyr1-f-normal",
+            "wyr1-f-normal-instrumented",
+            "wyr1-f-degraded",
+        ] {
             assert!(body.contains(&json_string(product)), "{product}");
         }
     }

@@ -67,8 +67,13 @@ pub fn run<P: RegistryPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
         wyrmroot_loader::launch::SELF_ROOT_RIGHTS,
     )
     .map_err(|_| 0xB101_0006_u32)?;
-    validate_received(platform, handles[1], DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS)
-        .map_err(|_| 0xB101_0007_u32)?;
+    validate_received(
+        platform,
+        handles[1],
+        DW_OBJECT_TYPE_CHANNEL,
+        CHILD_CHANNEL_RIGHTS,
+    )
+    .map_err(|_| 0xB101_0007_u32)?;
     let self_root = handles[0].handle;
     let control = handles[1].handle;
     let mut ready = [0u8; WRLP_HEADER_BYTES];
@@ -81,7 +86,9 @@ pub fn run<P: RegistryPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
     platform
         .send_channel(bootstrap, &ready[..ready_len], &[])
         .map_err(|_| 0xB101_0009_u32)?;
-    platform.close_handle(bootstrap).map_err(|_| 0xB101_000A_u32)?;
+    platform
+        .close_handle(bootstrap)
+        .map_err(|_| 0xB101_000A_u32)?;
     platform
         .close_handle(self_root)
         .map_err(|_| 0xB101_000B_u32)?;
@@ -285,7 +292,9 @@ fn validate_received<P: HandlePlatform + ?Sized>(
     if info.object_type != object_type || info.rights != rights {
         return Err(());
     }
-    let fresh = platform.query_capability_info(info.handle).map_err(|_| ())?;
+    let fresh = platform
+        .query_capability_info(info.handle)
+        .map_err(|_| ())?;
     if fresh.object_type != object_type || fresh.rights != rights {
         return Err(());
     }

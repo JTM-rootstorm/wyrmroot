@@ -961,7 +961,7 @@ pub(crate) fn prepare(
 ) -> Result<String, Failure> {
     use crate::wyr1c6::{
         MAX_ARTIFACT_BYTES, canonical_deep_repository, canonical_new_output, clean_revision,
-        matching_abi_tree, system_firmware, reject_selector_environment, validate_revision,
+        matching_abi_tree, reject_selector_environment, system_firmware, validate_revision,
         verify_clean_revision, write_new,
     };
 
@@ -1056,12 +1056,8 @@ pub(crate) fn prepare(
         kernel,
         bootstrap,
         boot_device_table: crate::wyr1c6::boot_device_table(),
-        ovmf_code: system_firmware(
-            crate::wyr1c6::OVMF_CODE_PATH, "OVMF code",
-        )?,
-        ovmf_vars: system_firmware(
-            crate::wyr1c6::OVMF_VARS_PATH, "OVMF vars",
-        )?,
+        ovmf_code: system_firmware(crate::wyr1c6::OVMF_CODE_PATH, "OVMF code")?,
+        ovmf_vars: system_firmware(crate::wyr1c6::OVMF_VARS_PATH, "OVMF vars")?,
     };
 
     toolchain.accepted().verify_unchanged()?;

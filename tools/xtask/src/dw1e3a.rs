@@ -322,12 +322,8 @@ fn build_produced_artifacts_with_snapshot(
     let snapshot = build_snapshot()?;
     let kernel = build_kernel(deep_repository, nonce, kernel_mode)?;
     let boot_device_table = wyr1c6::boot_device_table();
-    let ovmf_code = wyr1c6::system_firmware(
-        wyr1c6::OVMF_CODE_PATH, "OVMF code",
-    )?;
-    let ovmf_vars = wyr1c6::system_firmware(
-        wyr1c6::OVMF_VARS_PATH, "OVMF vars",
-    )?;
+    let ovmf_code = wyr1c6::system_firmware(wyr1c6::OVMF_CODE_PATH, "OVMF code")?;
+    let ovmf_vars = wyr1c6::system_firmware(wyr1c6::OVMF_VARS_PATH, "OVMF vars")?;
     let artifacts = staging.join("artifacts");
     fs::create_dir(&artifacts)
         .map_err(|error| Failure::task(format!("could not create DW1-E3A artifacts: {error}")))?;

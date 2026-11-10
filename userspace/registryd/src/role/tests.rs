@@ -68,9 +68,8 @@ fn valid_init() -> Vec<u8> {
 
 #[test]
 fn failed_bootstrap_query_stops_after_one_call() {
-    let mut platform = RecordingPlatform::scripted([Reply::CapabilityInfo(Err(status(
-        DW_STATUS_PEER_CLOSED,
-    )))]);
+    let mut platform =
+        RecordingPlatform::scripted([Reply::CapabilityInfo(Err(status(DW_STATUS_PEER_CLOSED)))]);
     assert_eq!(run(&mut platform, BOOTSTRAP), Err(failure(1)));
     assert_eq!(
         platform.calls(),

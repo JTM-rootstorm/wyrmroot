@@ -2878,17 +2878,18 @@ fn child_status(code: Option<i32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BINARY_ONLY_PACKAGES, HOST_BUILDABLE_ROLE_PACKAGES, BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS,
+        BINARY_ONLY_PACKAGES, BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS,
         CargoRun, DW1C_INIT0_TEST_ARGUMENTS, DW1D6_ACTOR_TEST_ARGUMENTS,
         DW1D6_BOOTSTRAP_TEST_ARGUMENTS, DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS,
-        INSPECTION_PATH, INSPECTION_SHELL, IsolatedUefiBuild, LoaderLinkMode, NAMED_HOST_FILTERS,
-        NATIVE_COVERED_BY, Route, Step, UefiCargoProfile, blocked_toolchain_failure,
-        canonical_build_directory, canonical_project_root, component_package, default_steps,
-        encoded_uefi_rustflags, encoded_uefi_rustflags_for_target, explicit_test_filter,
-        feature_combinations, host_test_arguments, host_test_commands, is_listed_combination,
-        lint_ratchet_shapes,
+        HOST_BUILDABLE_ROLE_PACKAGES, INSPECTION_PATH, INSPECTION_SHELL, IsolatedUefiBuild,
+        LoaderLinkMode, NAMED_HOST_FILTERS, NATIVE_COVERED_BY, Route, Step, UefiCargoProfile,
+        blocked_toolchain_failure, canonical_build_directory, canonical_project_root,
+        component_package, default_steps, encoded_uefi_rustflags,
+        encoded_uefi_rustflags_for_target, explicit_test_filter, feature_combinations,
+        host_test_arguments, host_test_commands, is_listed_combination, lint_ratchet_shapes,
         named_host_filter, named_host_runs, names_a_test, native_steps, prepare_uefi_target_roots,
-        r1_clippy_command, role_binary_check_commands, role_binary_lint_command, r1_status_command, render_uefi_inspection_report, run_verified_report,
+        r1_clippy_command, r1_status_command, render_uefi_inspection_report,
+        role_binary_check_commands, role_binary_lint_command, run_verified_report,
         selector_library_commands, selector32_library_commands, tests_passed,
         validate_regular_artifact, validate_uefi_inspection_report,
         wyr1e8_producer_fixture_command,
@@ -3551,8 +3552,14 @@ mod tests {
             assert!(!shapes[..index].contains(shape));
         }
         assert_eq!(named_host_filter("lint-ratchet"), Some(Route::LintRatchet));
-        assert_eq!(named_host_filter("root-tests"), Some(Route::RootTests(false)));
-        assert_eq!(named_host_filter("root-products"), Some(Route::RootTests(true)));
+        assert_eq!(
+            named_host_filter("root-tests"),
+            Some(Route::RootTests(false))
+        );
+        assert_eq!(
+            named_host_filter("root-products"),
+            Some(Route::RootTests(true))
+        );
     }
 
     /// S1.2: the gates that name a test are exactly the ones that must see

@@ -520,12 +520,8 @@ fn build_produced(
     let bootfs_pages = product.bootfs.len().div_ceil(4096);
     let kernel = build_kernel(deep_repository, product_kind, gate_config, bootfs_pages)?;
     let boot_device_table = wyr1c6::boot_device_table();
-    let ovmf_code = wyr1c6::system_firmware(
-        wyr1c6::OVMF_CODE_PATH, "OVMF code",
-    )?;
-    let ovmf_vars = wyr1c6::system_firmware(
-        wyr1c6::OVMF_VARS_PATH, "OVMF vars",
-    )?;
+    let ovmf_code = wyr1c6::system_firmware(wyr1c6::OVMF_CODE_PATH, "OVMF code")?;
+    let ovmf_vars = wyr1c6::system_firmware(wyr1c6::OVMF_VARS_PATH, "OVMF vars")?;
     let artifacts = staging.join("artifacts");
     fs::create_dir(&artifacts)
         .map_err(|e| Failure::task(format!("could not create WYR1-F artifacts: {e}")))?;
@@ -747,7 +743,9 @@ fn kernel_build_command(
 /// Thirteen of them do vary by product, and those thirteen are the whole
 /// declared production-versus-instrumented and normal-versus-degraded
 /// difference as the request records it.
-pub(crate) fn fixed_fields(product_kind: wyr1c::Wyr1fProduct) -> [(&'static str, &'static str); 40] {
+pub(crate) fn fixed_fields(
+    product_kind: wyr1c::Wyr1fProduct,
+) -> [(&'static str, &'static str); 40] {
     use wyr1c::Wyr1fProduct;
     let instrumented = product_kind.is_instrumented();
     [

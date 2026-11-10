@@ -739,7 +739,9 @@ fn dispatch_r1(arguments: &[String]) -> Result<Action, Failure> {
 fn dispatch_grammar(arguments: &[String]) -> Result<Action, Failure> {
     match arguments {
         [command] if command == "dump" => Ok(Action::GrammarDump),
-        _ => Err(Failure::usage("grammar requires dump; it has no other command")),
+        _ => Err(Failure::usage(
+            "grammar requires dump; it has no other command",
+        )),
     }
 }
 

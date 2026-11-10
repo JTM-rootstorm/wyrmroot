@@ -5,7 +5,10 @@ use {
     wyrmroot_registryd as _, wyrmroot_runtime as _,
 };
 
-const NATIVE: &str = concat!(include_str!("../src/main.rs"), include_str!("../src/role.rs"));
+const NATIVE: &str = concat!(
+    include_str!("../src/main.rs"),
+    include_str!("../src/role.rs")
+);
 const SERVICE: &str = include_str!("../src/service.rs");
 
 /// Source text because `main.rs` plus `role.rs` is the guest binary's whole
