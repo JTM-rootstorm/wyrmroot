@@ -19,8 +19,5 @@ pub mod wyr1;
 
 pub use limits::{BootfsLimits, WYR0_LIMITS};
 
-/// Wyrmroot's first deterministic boot archive policy revision.
-pub const FORMAT_VERSION: u32 = 1;
-
 /// The only CPIO header magic accepted and emitted by WYR0-C.
 pub const NEWC_MAGIC: &[u8; 6] = b"070701";

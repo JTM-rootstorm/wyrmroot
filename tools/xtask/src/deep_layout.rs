@@ -1120,11 +1120,6 @@ impl LayoutPolicy {
             "\n// Conservative half-open kernel ELF window. u64::MAX is excluded.\n\
 pub const DEEPWYRM_ELF_WINDOW_START: u64 = DEEPWYRM_LINK_BASE;\n\
 pub const DEEPWYRM_ELF_WINDOW_END_EXCLUSIVE: u64 = u64::MAX;\n\
-pub const fn deepwyrm_lowest_pt_load_matches_layout(\n\
-    lowest_page_rounded_pt_load: u64,\n\
-) -> bool {\n\
-    lowest_page_rounded_pt_load == DEEPWYRM_ELF_WINDOW_START\n\
-}\n\
 \n\
 // The accepted target build compiles these assertions against the actual pinned ABI crate.\n\
 pub const fn deepwyrm_transition_table_policy_is_self_consistent() -> bool {\n\

@@ -900,70 +900,6 @@ mod firmware {
             Ok(())
         }
 
-        /// Borrows the whole zeroed allocation as exact x86_64 page-table
-        /// pages. The allocation remains owned by `self` throughout the
-        /// callback and therefore cannot be freed or outlive the handoff.
-        #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
-        pub fn with_page_table_pages<R>(
-            &mut self,
-            callback: impl FnOnce(&mut [crate::uefi_page_table::PageTablePage]) -> R,
-        ) -> Result<R, FirmwarePreparationError> {
-            verify_generated_base_page_size()?;
-            let page_bytes = size_of::<crate::uefi_page_table::PageTablePage>();
-            if self.allocation_byte_len == 0 || self.allocation_byte_len % page_bytes != 0 {
-                return Err(FirmwarePreparationError::TypedViewInvalid);
-            }
-            let count = self.allocation_byte_len / page_bytes;
-            // SAFETY: the named page-table view validates alignment, checked
-            // extent, and unique ownership below; it cannot escape this borrow.
-            let pages =
-                unsafe { self.typed_slice_mut::<crate::uefi_page_table::PageTablePage>(count)? };
-            Ok(callback(pages))
-        }
-
-        /// Borrows one generated BootInfo object from preallocated storage.
-        #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
-        pub fn with_boot_info<R>(
-            &mut self,
-            callback: impl FnOnce(&mut DwBootInfoV1) -> R,
-        ) -> Result<R, FirmwarePreparationError> {
-            verify_generated_base_page_size()?;
-            // SAFETY: this named view retains unique ownership and checks the
-            // generated type's alignment and exact one-element extent.
-            let values = unsafe { self.typed_slice_mut::<DwBootInfoV1>(1)? };
-            Ok(callback(&mut values[0]))
-        }
-
-        /// Borrows exactly `count` generated memory-map records from retained
-        /// storage; count comes from final post-EBS map normalization.
-        #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
-        pub fn with_memory_map_records<R>(
-            &mut self,
-            count: usize,
-            callback: impl FnOnce(&mut [DwBootMemoryRangeV1]) -> R,
-        ) -> Result<R, FirmwarePreparationError> {
-            verify_generated_base_page_size()?;
-            // SAFETY: this named view retains unique ownership and validates
-            // count/extent before exposing generated ABI records.
-            let values = unsafe { self.typed_slice_mut::<DwBootMemoryRangeV1>(count)? };
-            Ok(callback(values))
-        }
-
-        /// Borrows exactly `count` generated module records from retained
-        /// storage; canonical module ordering remains owned by `modules`.
-        #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
-        pub fn with_module_records<R>(
-            &mut self,
-            count: usize,
-            callback: impl FnOnce(&mut [DwBootModuleV1]) -> R,
-        ) -> Result<R, FirmwarePreparationError> {
-            verify_generated_base_page_size()?;
-            // SAFETY: this named view retains unique ownership and validates
-            // count/extent before exposing generated ABI records.
-            let values = unsafe { self.typed_slice_mut::<DwBootModuleV1>(count)? };
-            Ok(callback(values))
-        }
-
         /// The only raw conversion point. It is private so no caller can cast
         /// retained pages into an arbitrary public type.
         #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
@@ -1057,19 +993,6 @@ mod firmware {
             // The slot was populated immediately above and stays uniquely
             // borrowed through `self`, so its retained-page metadata is valid.
             Ok(slot.storage.as_mut().expect("just populated pre-exit slot"))
-        }
-
-        /// Releases every page on a failure path before boot services exit.
-        pub fn abort_before_exit(self) {
-            for slot in &mut *self.slots {
-                if let Some(storage) = slot.storage.take() {
-                    // SAFETY: transaction abort is exclusively pre-EBS and no
-                    // reference into a failed transaction may escape.
-                    unsafe { storage.release() };
-                }
-                slot.purpose = None;
-            }
-            self.prepared.release_before_exit();
         }
 
         /// Exposes the original retained artifact state only to the final
@@ -2783,13 +2706,6 @@ mod firmware {
             CollectedEntropy::Unavailable => Ok(FirmwareEntropy::Unavailable),
             CollectedEntropy::Failed => Ok(FirmwareEntropy::Failed),
         }
-    }
-
-    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
-    fn verify_generated_base_page_size() -> Result<(), FirmwarePreparationError> {
-        (usize::try_from(deepwyrm_abi::DW_BOOT_BASE_PAGE_SIZE).ok() == Some(super::UEFI_PAGE_BYTES))
-            .then_some(())
-            .ok_or(FirmwarePreparationError::GeneratedPageGranuleMismatch)
     }
 
     /// Reads the architectural MAXPHYADDR fact from CPUID. The returned value

@@ -1,6 +1,4 @@
 //! Selector-27-only gate configuration and controller-originated WRB1 evidence.
-
-pub const GATE_PATH: &str = "system/bootstrap/wyr1-b-gate-v1";
 pub const RECORD_BYTES: usize = 96;
 pub const EVIDENCE_RECORDS: usize = 14;
 

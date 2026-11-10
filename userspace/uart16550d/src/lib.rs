@@ -259,15 +259,6 @@ impl StreamAttachment {
         }
     }
 
-    pub const fn active_generations(&self) -> Option<(u64, u64)> {
-        match self.active {
-            Some((_, stream_generation, publication_generation, _)) => {
-                Some((stream_generation, publication_generation))
-            }
-            None => None,
-        }
-    }
-
     /// Accepts only the exact current ATTACH_STREAM and one moved Channel.
     /// D3C does not read or write WRST bytes; D3D owns that event loop.
     pub fn attach(
@@ -726,10 +717,6 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
         self.stream.active_endpoint()
     }
 
-    pub const fn stream_generations(&self) -> Option<(u64, u64)> {
-        self.stream.active_generations()
-    }
-
     pub fn tx_free(&self) -> usize {
         RING_CAPACITY - self.uart.tx_len()
     }
@@ -825,20 +812,6 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
             self.counters.stream_detaches = self.counters.stream_detaches.saturating_add(1);
         }
         detached
-    }
-
-    /// Selector-private stage-1 retirement: IER is zero and only the raw
-    /// stream endpoint is detached. The caller deliberately retains the
-    /// Interrupt/resource/control handles for controller-authorized stage 2.
-    pub fn begin_selector_retire(&mut self) {
-        self.begin_graceful_retire();
-    }
-
-    /// Exact stage-1 IER readback. The caller must fail closed rather than
-    /// advertise retirement readiness if the hardware still exposes any
-    /// enabled source.
-    pub fn selector_interrupts_disabled(&mut self) -> bool {
-        self.graceful_retire_interrupts_disabled()
     }
 
     /// Final production-retirement quiesce after receive, software TX, and
@@ -969,10 +942,6 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
             count += 1;
         }
         count
-    }
-
-    pub fn into_uart(self) -> Uart16550<I> {
-        self.uart
     }
 
     #[cfg(test)]

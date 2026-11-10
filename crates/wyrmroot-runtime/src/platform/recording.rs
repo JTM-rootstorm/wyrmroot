@@ -252,11 +252,6 @@ impl RecordingPlatform {
         }
     }
 
-    /// Appends one reply to the end of the script.
-    pub fn push_reply(&mut self, reply: Reply) {
-        self.script.push_back(reply);
-    }
-
     /// Every call so far, in order.
     pub fn calls(&self) -> &[Call] {
         &self.calls
@@ -265,11 +260,6 @@ impl RecordingPlatform {
     /// Removes and returns every call so far.
     pub fn take_calls(&mut self) -> Vec<Call> {
         core::mem::take(&mut self.calls)
-    }
-
-    /// Replies not yet consumed.
-    pub fn remaining_replies(&self) -> usize {
-        self.script.len()
     }
 
     /// Panics unless every scripted reply was consumed.

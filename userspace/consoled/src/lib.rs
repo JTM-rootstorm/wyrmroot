@@ -1150,23 +1150,6 @@ impl ConsoleModel {
         self.last_failure = Some(ModelError::ChildDisconnected);
         self.start_child_retirement(false, true, now)
     }
-    /// Cleanup evidence is accepted while a child is retiring, but remains
-    /// bound to the exact child session rather than treated as fresh DATA.
-    pub fn observe_child_peer_closed(
-        &mut self,
-        event: EventGeneration,
-        kind: StreamKind,
-        now: u64,
-    ) -> Result<(), ModelError> {
-        self.time(now)?;
-        if !matches!(
-            self.state,
-            ConnectionState::RetiringChild | ConnectionState::AwaitingReap
-        ) {
-            return Err(ModelError::WrongConnectionState);
-        }
-        self.mark_child_peer_closed(event, kind)
-    }
     /// Confirms local closure of the complete retained stream triple during
     /// teardown, before the JobV2 reap may be accepted.
     pub fn child_streams_closed(

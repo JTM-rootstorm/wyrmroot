@@ -103,15 +103,6 @@ pub fn digest(bytes: &[u8]) -> [u8; 32] {
     output
 }
 
-#[must_use]
-pub fn prefix_u64(digest: &[u8; 32]) -> u64 {
-    u64::from_be_bytes(
-        digest[..8]
-            .try_into()
-            .expect("SHA-256 prefix is eight bytes"),
-    )
-}
-
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut words = [0_u32; 64];
     for (index, source) in block.as_chunks::<4>().0.iter().enumerate() {

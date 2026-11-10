@@ -5,8 +5,6 @@
 
 #![allow(dead_code)]
 
-/// Canonical directory on the EFI System Partition.
-pub const ARTIFACT_ROOT: &str = "/EFI/Wyrmroot";
 pub const KERNEL_PATH: &str = "/EFI/Wyrmroot/deepwyrm.elf";
 pub const BOOTSTRAP_PATH: &str = "/EFI/Wyrmroot/bootstrap.elf";
 pub const BOOTFS_PATH: &str = "/EFI/Wyrmroot/bootfs.img";

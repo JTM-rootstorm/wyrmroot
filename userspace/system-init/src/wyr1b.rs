@@ -1253,37 +1253,6 @@ impl JobController {
     }
 }
 
-/// Performs policy validation and loader construction while retaining the
-/// reservation. The caller must either observe the exact READY then call
-/// [`commit_prepared_job`], or abort and clean up the loaded process.
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // D/E's serialized native dispatcher hookup consumes this next.
-pub(crate) fn prepare_authorized_job<'a, L: LoaderPlatform>(
-    jobs: &mut JobController,
-    policy: &PolicyView<'a>,
-    loader: &mut L,
-    authority: LoadAuthority,
-    task_group: u64,
-    reservation: Reservation,
-    request: wyrmroot_launch_proto::LaunchRequest<'a>,
-    streams: &'a [deepwyrm_syscall::DwHandle],
-) -> Result<PreparedJob, LaunchEngineError<L::Error>> {
-    let ticket = jobs
-        .begin_launch(reservation)
-        .map_err(LaunchEngineError::Job)?;
-    prepare_reserved_job(
-        jobs,
-        policy,
-        loader,
-        authority,
-        task_group,
-        reservation,
-        ticket,
-        request,
-        streams,
-    )
-}
-
 /// Continues a launch whose correlatable transaction was reserved before
 /// semantic message validation.
 #[allow(clippy::too_many_arguments)]

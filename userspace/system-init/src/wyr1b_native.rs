@@ -9,7 +9,7 @@ use crate::wyr1b::{
     LaunchEngineError, PolicyView, PreparedJob, RegistryTopology, RequestTicket,
     commit_prepared_job, correlation_environment, observe_prepared_ready, prepare_reserved_job,
 };
-use crate::wyr1b_gate::{EvidenceLog, GATE_PATH, GateConfig, GateEvent, parse_config};
+use crate::wyr1b_gate::{EvidenceLog, GateConfig, GateEvent};
 use crate::wyr1b_job::{JobDispatcher, LaunchSessionScope, SessionOwner};
 use deepwyrm_syscall::{
     DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ,
@@ -164,18 +164,6 @@ impl ShellControllerState {
         } else {
             Ok(())
         }
-    }
-
-    /// Reads the clock only when an episode is open, so a build with no
-    /// episode pays no syscall for the check.
-    pub(crate) fn require_recovery_live<S: Wyr1BPlatform>(
-        &self,
-        system: &mut S,
-    ) -> Result<(), InitError> {
-        if self.recovery_deadline.is_none() {
-            return Ok(());
-        }
-        self.require_recovery_live_at(system.now().map_err(InitError::Native)?)
     }
 
     pub(crate) const fn health(&self) -> ShellRegistryHealth {
@@ -444,52 +432,6 @@ pub(crate) struct ResidentState {
     pub jobs: JobDispatcher,
 }
 
-/// Validates the selector-27 retained product without weakening the selector-25
-/// profile parser.
-pub(crate) fn validate_retained_bootfs(
-    bytes: &[u8],
-) -> Result<(SystemInit, GateConfig), InitError> {
-    let archive = Archive::new(bytes).map_err(InitError::Bootfs)?;
-    let manifest_entry = archive
-        .lookup(MANIFEST_PATH.as_bytes())
-        .map_err(map_lookup)?;
-    let manifest_bytes = manifest_entry.data();
-    let encoded_generation: [u8; 32] = manifest_bytes
-        .get(48..80)
-        .ok_or(InitError::Manifest(ManifestParseError::TruncatedHeader))?
-        .try_into()
-        .expect("checked WRRM generation slice");
-    if encoded_generation == [0; 32] {
-        return Err(InitError::ZeroBootGeneration);
-    }
-    let manifest = Manifest::parse_structural(manifest_bytes, &encoded_generation)
-        .map_err(InitError::Manifest)?;
-    let controller = SystemInit::from_wyr1b_manifest(manifest)?;
-    for role in manifest.roles() {
-        let entry = archive.lookup(role.path().as_bytes()).map_err(map_lookup)?;
-        if !entry.is_executable() || entry.data().is_empty() {
-            return Err(InitError::NonExecutableRole);
-        }
-        if wyrmroot_runtime::sha256::digest(entry.data()) != *role.executable_identity() {
-            return Err(InitError::ArtifactIdentityMismatch(role.id()));
-        }
-    }
-    let init = archive
-        .lookup(SYSTEM_INIT_PATH.as_bytes())
-        .map_err(map_lookup)?;
-    if !init.is_executable() || init.data().is_empty() {
-        return Err(InitError::NonExecutableRole);
-    }
-    for edge in manifest.edges() {
-        if let Some(path) = edge.target_path() {
-            archive.lookup(path.as_bytes()).map_err(map_lookup)?;
-        }
-    }
-    let gate = archive.lookup(GATE_PATH.as_bytes()).map_err(map_lookup)?;
-    let gate = parse_config(gate.data()).map_err(InitError::Wyr1BGateConfig)?;
-    Ok((controller, gate))
-}
-
 /// Validates the C1 retained closure while preserving the selector-27 gate's
 /// separate marker/configuration contract.
 ///
@@ -539,198 +481,6 @@ pub(crate) fn validate_retained_bootfs_c1(
         }
     }
     Ok((controller, uart_identity))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn activate_in_place<'a, S, L, W>(
-    system: &mut S,
-    loader: &mut L,
-    waits: &mut W,
-    slot: &'a mut MaybeUninit<ResidentSystemInit>,
-    authority: LoadAuthority,
-    bootstrap_channel: DwHandle,
-    parent_transaction: u64,
-    bootfs: &[u8],
-) -> Result<&'a mut ResidentSystemInit, InitError>
-where
-    S: Wyr1BPlatform,
-    L: LoaderPlatform<Error = NativeError>,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let resident = initialize_resident_in_place(slot, authority, bootfs)?;
-    activate_resident(
-        system,
-        loader,
-        waits,
-        resident,
-        authority,
-        bootstrap_channel,
-        parent_transaction,
-        bootfs,
-    )?;
-    Ok(resident)
-}
-
-fn initialize_resident_in_place<'a>(
-    slot: &'a mut MaybeUninit<ResidentSystemInit>,
-    authority: LoadAuthority,
-    bootfs: &[u8],
-) -> Result<&'a mut ResidentSystemInit, InitError> {
-    let (controller, gate) = validate_retained_bootfs(bootfs)?;
-    Ok(slot.write(ResidentSystemInit {
-        controller,
-        authority,
-        result: RecoveryResult::Degraded,
-        active: [None; EARLY_ROLE_COUNT],
-        evidence_finalized: false,
-        session_complete: false,
-        last_tick_ns: 0,
-        wyr1b: Some(ResidentState {
-            registry_control: DwHandle(0),
-            topology: None,
-            gate,
-            jobs: JobDispatcher::new(),
-        }),
-        wyr1b_evidence: None,
-        wyr1c: None,
-    }))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn activate_resident<S, L, W>(
-    system: &mut S,
-    loader: &mut L,
-    waits: &mut W,
-    resident: &mut ResidentSystemInit,
-    authority: LoadAuthority,
-    bootstrap_channel: DwHandle,
-    parent_transaction: u64,
-    bootfs: &[u8],
-) -> Result<(), InitError>
-where
-    S: Wyr1BPlatform,
-    L: LoaderPlatform<Error = NativeError>,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let ResidentSystemInit {
-        controller,
-        result,
-        active,
-        wyr1b,
-        wyr1b_evidence,
-        ..
-    } = resident;
-    let state = wyr1b.as_mut().ok_or(InitError::Accounting)?;
-    let gate = state.gate;
-    controller.become_operational()?;
-    let mut ready = [0u8; HEADER_BYTES];
-    let ready_len =
-        encode_ready_for_profile(LaunchProfile::Supervisor, parent_transaction, &mut ready)
-            .map_err(InitError::Launch)?;
-    system
-        .send_channel(bootstrap_channel, &ready[..ready_len])
-        .map_err(InitError::Native)?;
-    let retire_deadline = system
-        .now()
-        .map_err(InitError::Native)?
-        .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
-        .ok_or(InitError::Accounting)?;
-    let retired = waits
-        .wait_many(
-            core::slice::from_ref(&DwWaitItemV1 {
-                handle: bootstrap_channel,
-                signals: DW_SIGNAL_PEER_CLOSED,
-            }),
-            DwDeadline(retire_deadline),
-        )
-        .map_err(|_| InitError::Supervision)?;
-    if retired.index != 0 || retired.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 {
-        return Err(InitError::Supervision);
-    }
-    controller.begin_registry(system.now().map_err(InitError::Native)?, 1, 0x1001)?;
-    let Some(registry) =
-        launch_registry_until_ready(system, loader, waits, controller, authority, bootfs)?
-    else {
-        return Ok(());
-    };
-    let (mut registry, mut topology) =
-        establish_registry_topology(system, waits, controller, registry)?;
-    let (devmgr, activation_result) = match activate_role_until_ready(
-        system,
-        controller,
-        loader,
-        waits,
-        authority,
-        bootfs,
-        RoleId::Devmgr,
-    )? {
-        RoleActivation::Ready(active) => (Some(active), RecoveryResult::Recovered),
-        RoleActivation::Degraded => (None, RecoveryResult::Degraded),
-    };
-    *result = activation_result;
-    loop {
-        match run_registry_gate(
-            system,
-            loader,
-            waits,
-            authority,
-            bootfs,
-            registry,
-            &mut topology,
-            gate,
-            &mut state.jobs,
-        ) {
-            Ok(evidence) => {
-                *active = [Some(registry.active), devmgr];
-                state.registry_control = registry.control_channel;
-                state.topology = Some(topology);
-                *wyr1b_evidence = Some(evidence);
-                return Ok(());
-            }
-            Err(GateRunError::PreInstall(_error)) => {
-                *result = RecoveryResult::Degraded;
-                *active = [Some(registry.active), devmgr];
-                state.registry_control = registry.control_channel;
-                state.topology = Some(topology);
-                return Ok(());
-            }
-            Err(GateRunError::CleanupFailed(_)) => {
-                let _ = poison_registry_generation(system, waits, controller, registry, true)?;
-                *result = RecoveryResult::Degraded;
-                *active = [None, devmgr];
-                state.topology = Some(topology);
-                return Ok(());
-            }
-            Err(GateRunError::InstallCommitted {
-                error: _,
-                cleanup_failed,
-            }) => {
-                if poison_registry_generation(system, waits, controller, registry, cleanup_failed)?
-                {
-                    *result = RecoveryResult::Degraded;
-                    *active = [None, devmgr];
-                    state.topology = Some(topology);
-                    return Ok(());
-                }
-                let Some(replacement) = launch_registry_until_ready(
-                    system, loader, waits, controller, authority, bootfs,
-                )?
-                else {
-                    *result = RecoveryResult::Degraded;
-                    *active = [None, devmgr];
-                    state.topology = Some(topology);
-                    return Ok(());
-                };
-                registry = restart_topology_or_poison(
-                    system,
-                    waits,
-                    controller,
-                    &mut topology,
-                    replacement,
-                )?;
-            }
-        }
-    }
 }
 
 fn gate_record(
@@ -12141,18 +11891,5 @@ mod tests {
         // rebind ever fails, the fall into `recover_devmgr_after_error` is
         // loud instead of letting devmgr recovery quietly stand in for the
         // registry recovery under test.
-    }
-
-    /// The resident is written straight into the caller's slot: a by-value
-    /// constructor here fails to build. Type-check only; see
-    /// `crate::in_place_activation_signatures`.
-    #[allow(dead_code)]
-    fn the_resident_is_initialized_in_the_callers_slot() {
-        type Initialize = for<'a> fn(
-            &'a mut MaybeUninit<ResidentSystemInit>,
-            LoadAuthority,
-            &[u8],
-        ) -> Result<&'a mut ResidentSystemInit, InitError>;
-        let _: Initialize = initialize_resident_in_place;
     }
 }

@@ -44,10 +44,6 @@ pub const WYR1_B_GATE_PATH: &str = "system/bootstrap/wyr1-b-gate-v1";
 pub const WYR1_C_MARKER_PATH: &str = "system/bootstrap/wyr1-c-gate-v1";
 /// Fixed immutable WRDM v1 entry consumed by the resident device coordinator.
 pub const WYR1_C_DEVICE_MANIFEST_PATH: &str = "system/bootstrap/wyr1-c-device-manifest-v1";
-/// Short aliases for callers that name the two C1 product-surface entries by
-/// their protocol/product role.
-pub const WYR1_C_GATE_PATH: &str = WYR1_C_MARKER_PATH;
-pub const WRDM_PATH: &str = WYR1_C_DEVICE_MANIFEST_PATH;
 /// Exact, fixed content of the WYR1-C1 product marker entry.
 pub const WYR1_C1_MARKER: &[u8] = b"WYR1-C1";
 pub const HELLO_PATH: &str = "bin/hello";
@@ -258,42 +254,7 @@ pub fn build_c1(product: ProductC1<'_>) -> Result<Vec<u8>, BuildError> {
     builder.build()
 }
 
-/// Exact WYR1-C6 archive extension.  It deliberately retains the C1 base
-/// entries and adds the selector-bound, read-only C6 gate as a distinct
-/// bootstrap input; C1 and C2 builders therefore remain byte-for-byte
-/// unchanged.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProductC6<'a> {
-    pub base: ProductC1<'a>,
-    pub gate: &'a [u8],
-}
-
 pub const WYR1_C6_GATE_PATH: &str = "system/bootstrap/wyr1-c6-gate-v1";
-
-pub fn build_c6(product: ProductC6<'_>) -> Result<Vec<u8>, BuildError> {
-    validate_c1_product(product.base)?;
-    if product.gate.is_empty() {
-        return Err(BuildError::EmptyArtifact);
-    }
-    let mut builder = Builder::new();
-    for artifact in product.base.artifacts() {
-        builder.add(
-            artifact.path.as_bytes(),
-            artifact.bytes,
-            if artifact.executable {
-                FileMode::Executable
-            } else {
-                FileMode::ReadOnly
-            },
-        )?;
-    }
-    builder.add(
-        WYR1_C6_GATE_PATH.as_bytes(),
-        product.gate,
-        FileMode::ReadOnly,
-    )?;
-    builder.build()
-}
 
 /// Selector-31 E3A extends the retained C1 production closure with one
 /// explicitly test-only RegistryClient actor. The actor is not a WRRM role
