@@ -1,6 +1,6 @@
 //! DW1-F/WYR1-F final normal product freeze and inspection (slice F1A.4).
 //!
-//! This is the *final production* producer. It differs from `wyr1e7`/`wyr1e8`,
+//! This is the *final production* producer. It differs from `wyr1e8`,
 //! which are its structural templates, in five deliberate ways:
 //!
 //! 1. **Nothing is inherited.** `wyr1e8::prepare` takes `--e6-product` and
@@ -593,7 +593,7 @@ fn build_produced(
 
 /// Builds the uninstrumented production kernel.
 ///
-/// Written here rather than reusing `wyr1e7::build_e8_kernel`, which cannot be
+/// Written here rather than reusing `wyr1e8::build_e8_kernel`, which cannot be
 /// reused honestly: that helper sets `DEEPWYRM_GUEST_TEST_SELECTOR`,
 /// `DEEPWYRM_WYR1E8_EVIDENCE` and a nonce, and passes `--features test-support`.
 /// The production build removes the selector variable and passes no features,

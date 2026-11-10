@@ -8,15 +8,17 @@ use std::{
     env, fs,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
     cli::G3ImageArguments, error::Failure, g3_image, secure_fs::Directory, sha256, tasks, wyr1c,
-    wyr1c6, wyr1e7,
+    wyr1c6,
 };
 
 pub(crate) const SELECTOR: &str = "interactive-wyrmsh";
+const KERNEL_TARGET: &str = "x86_64-unknown-none";
 pub(crate) const TEST_ID: &str = "33";
 pub(crate) const EVIDENCE_PROTOCOL: &str = "WRE1";
 pub(crate) const RESULT_KIND: &str = "wyrmroot-wyr1-e8-selector33-result";
@@ -363,7 +365,7 @@ fn build_produced(
             crate::dw1e3a::build_bootstrap(repository, &toolchain, layout, &cargo_home, anchor)
         })?;
     let snapshot = wyr1c::build_e8_snapshot(nonce, &e6.product)?;
-    let kernel = wyr1e7::build_e8_kernel(deep_repository, nonce)?;
+    let kernel = build_e8_kernel(deep_repository, nonce)?;
     let boot_device_table = wyr1c6::boot_device_table();
     let ovmf_code = wyr1c6::system_firmware(wyr1c6::OVMF_CODE_PATH, "OVMF code")?;
     let ovmf_vars = wyr1c6::system_firmware(wyr1c6::OVMF_VARS_PATH, "OVMF vars")?;
@@ -1644,6 +1646,95 @@ fn decode_scalar_string(inner: &str) -> Result<String, Failure> {
         }
     }
     Ok(value)
+}
+
+// Moved from the retired wyr1e7 module (2026-11-10); selector 33 still builds
+// its kernel this way.
+pub(crate) fn build_e8_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
+    let repository = Directory::open_exact(repository, "Deepwyrm source root")?;
+    let build = fresh_e8_kernel_target(&repository)?;
+    let target = build.create_child("target", 0o700, "WYR1-E8 Cargo target")?;
+    let stdout = build.create_file("cargo.stdout.log", 0o600, "WYR1-E8 kernel stdout")?;
+    let stderr = build.create_file("cargo.stderr.log", 0o600, "WYR1-E8 kernel stderr")?;
+    let status = e8_kernel_build_command(
+        &repository.path().join("tools/pinned-cargo"),
+        repository.path(),
+        target.path(),
+        nonce,
+    )
+    .stdout(Stdio::from(stdout))
+    .stderr(Stdio::from(stderr))
+    .status()
+    .map_err(|error| Failure::task(format!("could not build WYR1-E8 kernel: {error}")))?;
+    if !status.success() {
+        return Err(Failure::task(format!(
+            "WYR1-E8 selector-33 Deepwyrm kernel build failed; logs preserved in {}",
+            build.path().display()
+        )));
+    }
+    target.read_producer(
+        &PathBuf::from(KERNEL_TARGET).join("release/deepwyrm-kernel"),
+        wyr1c6::MAX_ARTIFACT_BYTES,
+        "WYR1-E8 selector-33 kernel",
+    )
+}
+
+fn fresh_e8_kernel_target(repository: &Directory) -> Result<Directory, Failure> {
+    let temporary = match repository.open_child(".tmp", "Deepwyrm temporary root") {
+        Ok(directory) => directory,
+        Err(_) => repository.create_child(".tmp", 0o700, "Deepwyrm temporary root")?,
+    };
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    temporary.create_child(
+        &format!("wyr1e8-kernel-{}-{unique}", std::process::id()),
+        0o700,
+        "WYR1-E8 kernel target",
+    )
+}
+
+fn e8_kernel_build_command(
+    pinned_cargo: &Path,
+    repository: &Path,
+    target: &Path,
+    nonce: &str,
+) -> Command {
+    let mut command = Command::new(pinned_cargo);
+    command
+        .arg("target")
+        .args([
+            "build",
+            "--locked",
+            "--offline",
+            "--release",
+            "--target",
+            KERNEL_TARGET,
+            "--package",
+            "deepwyrm-kernel",
+            "--bin",
+            "deepwyrm-kernel",
+            "--features",
+            "test-support",
+        ])
+        .env("DEEPWYRM_PINNED_TARGET_DIR", target)
+        .env("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR)
+        .env("DEEPWYRM_WYR1E8_EVIDENCE", "1")
+        .env("DEEPWYRM_WYR1E8_EVIDENCE_NONCE", nonce)
+        .env_remove("DEEPWYRM_WYR1E7_EVIDENCE_NONCE")
+        .env_remove("DEEPWYRM_WYR1D_EVIDENCE_NONCE")
+        .env_remove("DEEPWYRM_DW1E_EVIDENCE_NONCE")
+        .env_remove("DEEPWYRM_DW1E_E3B_FULL")
+        .env_remove("WYRMROOT_DW1E3_CHALLENGE_1_NONCE")
+        .env_remove("WYRMROOT_DW1E3_CHALLENGE_2_NONCE")
+        .env_remove("CARGO_HOME")
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .current_dir(repository)
+        .stdin(Stdio::null());
+    command
 }
 
 #[cfg(test)]

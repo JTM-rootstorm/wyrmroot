@@ -253,49 +253,6 @@ fn inspect_with_inputs(arguments: &G3ImageArguments, inputs: Inputs) -> Result<S
     inspect_loaded(&mut image, &inputs).map(|value| value.render())
 }
 
-pub(crate) fn build_open(
-    image: &mut File,
-    loader: &[u8],
-    kernel: &[u8],
-    bootstrap: &[u8],
-    bootfs: &[u8],
-) -> Result<Inspection, Failure> {
-    let inputs = Inputs {
-        loader: loader.to_vec(),
-        kernel: kernel.to_vec(),
-        bootstrap: bootstrap.to_vec(),
-        bootfs: bootfs.to_vec(),
-        boot_device_table: None,
-    };
-    let geometry = Geometry::fixed();
-    let used_clusters = 4_u32
-        .checked_add(inputs.total_clusters()?)
-        .ok_or_else(|| Failure::task("G3 image allocation overflowed"))?;
-    if used_clusters > geometry.cluster_count {
-        return Err(Failure::task("G3 artifacts do not fit the fixed FAT32 ESP"));
-    }
-    let layouts = layouts(&inputs)?;
-    build_loaded(image, geometry, used_clusters, &layouts)?;
-    inspect_loaded(image, &inputs)
-}
-
-pub(crate) fn inspect_open(
-    image: &mut File,
-    loader: &[u8],
-    kernel: &[u8],
-    bootstrap: &[u8],
-    bootfs: &[u8],
-) -> Result<Inspection, Failure> {
-    let inputs = Inputs {
-        loader: loader.to_vec(),
-        kernel: kernel.to_vec(),
-        bootstrap: bootstrap.to_vec(),
-        bootfs: bootfs.to_vec(),
-        boot_device_table: None,
-    };
-    inspect_loaded(image, &inputs)
-}
-
 fn build_loaded(
     output: &mut File,
     geometry: Geometry,

@@ -360,16 +360,6 @@ impl Directory {
         read_producer_at(self.file.as_raw_fd(), relative, maximum, label, || {})
     }
 
-    pub(crate) fn open_exact_file(
-        &self,
-        name: &str,
-        exact: u64,
-        label: &str,
-    ) -> Result<File, Failure> {
-        let (file, _) = self.open_bounded(name, exact, Some(exact), label)?;
-        Ok(file)
-    }
-
     pub(crate) fn open_retained_file(
         &self,
         name: &str,
@@ -378,13 +368,6 @@ impl Directory {
     ) -> Result<File, Failure> {
         let (file, _) = self.open_bounded(name, maximum, None, label)?;
         Ok(file)
-    }
-
-    pub(crate) fn verify_file(&self, name: &str, file: &File, label: &str) -> Result<(), Failure> {
-        let metadata = file
-            .metadata()
-            .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
-        self.verify_file_identity(name, &metadata, label)
     }
 
     pub(crate) fn verify_retained_file_exact(

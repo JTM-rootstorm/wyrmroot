@@ -66,31 +66,17 @@ Usage:
     tools/pinned-cargo xtask wyr1b inspect --request <wyr1-b-request.toml>
     tools/pinned-cargo xtask wyr1b run --request <wyr1-b-request.toml>
     tools/pinned-cargo xtask wyr1b evidence --request <wyr1-b-request.toml>
-    tools/pinned-cargo xtask r1 product --output <fresh-directory> --evidence-nonce <16-hex>
-    tools/pinned-cargo xtask r1 prepare --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --gdb-port <port>
     tools/pinned-cargo xtask wyr1c1 product --output <fresh-directory>
     tools/pinned-cargo xtask wyr1e6 product --output <fresh-directory>
     tools/pinned-cargo xtask wyr1e6 inspect --product <directory>
-    tools/pinned-cargo xtask wyr1e7 prepare --output <fresh-directory> --e6-product <directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex>
-    tools/pinned-cargo xtask wyr1e7 inspect --product <directory>
     tools/pinned-cargo xtask wyr1e8 prepare --output <fresh-directory> --e6-product <directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex>
     tools/pinned-cargo xtask wyr1e8 inspect --product <directory>
     tools/pinned-cargo xtask wyr1f prepare --scenario <normal|normal-instrumented|degraded> --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> [--evidence-nonce <16-uppercase-hex>]
     tools/pinned-cargo xtask wyr1f inspect --product <directory>
-    tools/pinned-cargo xtask wyr1c2 freeze --output <fresh-directory>
-    tools/pinned-cargo xtask wyr1c2 image --request <wyr1-c2-request.toml>
-    tools/pinned-cargo xtask wyr1c2 inspect --request <wyr1-c2-request.toml>
     tools/pinned-cargo xtask wyr1c6 prepare --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>
     tools/pinned-cargo xtask wyr1c6 inspect --request <wyr1-c6-request.toml>
     tools/pinned-cargo xtask wyr1c6 run --request <wyr1-c6-request.toml>
     tools/pinned-cargo xtask wyr1c6 evidence --request <wyr1-c6-request.toml>
-    cargo xtask dw1b image --request <dw1-b-request.toml>
-    cargo xtask dw1b image-rebuild --request <dw1-b-request.toml>
-    cargo xtask dw1b freeze --output <directory>
-    cargo xtask dw1b inspect --request <dw1-b-request.toml>
-    cargo xtask dw1b run --request <dw1-b-request.toml>
-    cargo xtask dw1b measure --init <elf> --hello <elf> --cpu-hog <elf> --progress <elf>
-    cargo xtask dw1b evidence --request <dw1-b-request.toml>
     cargo xtask dw1c preflight --output <fresh-directory> --progress-digest <16-hex>
     cargo xtask dw1c prepare --request <dw1-c-request.toml>
     cargo xtask dw1c freeze --output <directory>
@@ -268,29 +254,9 @@ pub(crate) enum Action {
     Wyr1BInspect(String),
     Wyr1BRun(String),
     Wyr1BEvidence(String),
-    R1Product {
-        output: String,
-        evidence_nonce: String,
-    },
-    R1Prepare {
-        output: String,
-        card: String,
-        deep_repository: String,
-        deep_revision: String,
-        evidence_nonce: String,
-        gdb_port: String,
-    },
     Wyr1C1Product(String),
     Wyr1E6Product(String),
     Wyr1E6Inspect(String),
-    Wyr1E7Prepare {
-        output: String,
-        e6_product: String,
-        deep_repository: String,
-        deep_revision: String,
-        evidence_nonce: String,
-    },
-    Wyr1E7Inspect(String),
     Wyr1E8Prepare {
         output: String,
         e6_product: String,
@@ -312,9 +278,6 @@ pub(crate) enum Action {
         smp: bool,
         deep_repository: Option<String>,
     },
-    Wyr1C2Freeze(String),
-    Wyr1C2Image(String),
-    Wyr1C2Inspect(String),
     Wyr1C6Prepare {
         output: String,
         deep_repository: String,
@@ -330,18 +293,6 @@ pub(crate) enum Action {
         smp: String,
         output: String,
     },
-    Dw1BImage(String),
-    Dw1BImageRebuild(String),
-    Dw1BFreeze(String),
-    Dw1BInspect(String),
-    Dw1BRun(String),
-    Dw1BMeasure {
-        init: String,
-        hello: String,
-        cpu_hog: String,
-        progress: String,
-    },
-    Dw1BEvidence(String),
     Dw1CPreflight {
         output: String,
         progress_digest: String,
@@ -445,15 +396,11 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "wyr0" => dispatch_wyr0(&arguments[1..]),
         "wyr1" => dispatch_wyr1(&arguments[1..]),
         "wyr1b" => dispatch_wyr1b(&arguments[1..]),
-        "r1" => dispatch_r1(&arguments[1..]),
         "wyr1c1" => dispatch_wyr1c1(&arguments[1..]),
         "wyr1e6" => dispatch_wyr1e6(&arguments[1..]),
-        "wyr1e7" => dispatch_wyr1e7(&arguments[1..]),
         "wyr1e8" => dispatch_wyr1e8(&arguments[1..]),
         "wyr1f" => dispatch_wyr1f(&arguments[1..]),
-        "wyr1c2" => dispatch_wyr1c2(&arguments[1..]),
         "wyr1c6" => dispatch_wyr1c6(&arguments[1..]),
-        "dw1b" => dispatch_dw1b(&arguments[1..]),
         "dw1c" => dispatch_dw1c(&arguments[1..]),
         "dw1d6" => dispatch_dw1d6(&arguments[1..]),
         "dw1-e3a-prepare" => dispatch_dw1e3a_prepare(&arguments[1..]),
@@ -593,23 +540,6 @@ fn dispatch_dw1d6(arguments: &[String]) -> Result<Action, Failure> {
     }
 }
 
-fn dispatch_wyr1c2(arguments: &[String]) -> Result<Action, Failure> {
-    match arguments {
-        [command, flag, value] if command == "freeze" && flag == "--output" => {
-            Ok(Action::Wyr1C2Freeze(value.clone()))
-        }
-        [command, flag, value] if command == "image" && flag == "--request" => {
-            Ok(Action::Wyr1C2Image(value.clone()))
-        }
-        [command, flag, value] if command == "inspect" && flag == "--request" => {
-            Ok(Action::Wyr1C2Inspect(value.clone()))
-        }
-        _ => Err(Failure::usage(
-            "wyr1c2 requires freeze --output <fresh-directory>, image --request <request>, or inspect --request <request>; it has selector=none and no run or evidence command",
-        )),
-    }
-}
-
 fn dispatch_wyr1c6(arguments: &[String]) -> Result<Action, Failure> {
     match arguments {
         [
@@ -674,65 +604,6 @@ fn dispatch_wyr1c6(arguments: &[String]) -> Result<Action, Failure> {
     }
 }
 
-fn dispatch_r1(arguments: &[String]) -> Result<Action, Failure> {
-    match arguments {
-        [command, output_flag, output, nonce_flag, evidence_nonce]
-            if command == "product"
-                && output_flag == "--output"
-                && nonce_flag == "--evidence-nonce" =>
-        {
-            Ok(Action::R1Product {
-                output: output.clone(),
-                evidence_nonce: evidence_nonce.clone(),
-            })
-        }
-        [
-            command,
-            output_flag,
-            output,
-            deep_flag,
-            deep_repository,
-            revision_flag,
-            deep_revision,
-            nonce_flag,
-            evidence_nonce,
-            port_flag,
-            gdb_port,
-            rest @ ..,
-        ] if command == "prepare"
-            && output_flag == "--output"
-            && deep_flag == "--deep-repository"
-            && revision_flag == "--deep-revision"
-            && nonce_flag == "--evidence-nonce"
-            && port_flag == "--gdb-port" =>
-        {
-            // The gate block a request carries is what a reader checks a run
-            // against, so the card is selectable. It defaults to R1C, which is
-            // the only card that ran before the flag existed.
-            let card = match rest {
-                [] => "R1C".to_string(),
-                [card_flag, card] if card_flag == "--card" => card.clone(),
-                _ => {
-                    return Err(Failure::usage(
-                        "r1 prepare accepts only --card <R1C|R4E> after --gdb-port",
-                    ));
-                }
-            };
-            Ok(Action::R1Prepare {
-                output: output.clone(),
-                card,
-                deep_repository: deep_repository.clone(),
-                deep_revision: deep_revision.clone(),
-                evidence_nonce: evidence_nonce.clone(),
-                gdb_port: gdb_port.clone(),
-            })
-        }
-        _ => Err(Failure::usage(
-            "r1 requires product --output <fresh-directory> --evidence-nonce <16-hex>, or prepare --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --gdb-port <port> [--card <R1C|R4E>]; the VM request itself is not produced",
-        )),
-    }
-}
-
 /// `xtask grammar dump`: the F request/receipt/handoff/pair/result grammar,
 /// as data (S2T). It takes no arguments; there is nothing to select, because
 /// it always emits the whole grammar.
@@ -766,44 +637,6 @@ fn dispatch_wyr1e6(arguments: &[String]) -> Result<Action, Failure> {
         }
         _ => Err(Failure::usage(
             "wyr1e6 requires product --output <fresh-directory> or inspect --product <directory>; it has no selector, image, run, or evidence command",
-        )),
-    }
-}
-
-fn dispatch_wyr1e7(arguments: &[String]) -> Result<Action, Failure> {
-    match arguments {
-        [
-            command,
-            output_flag,
-            output,
-            e6_flag,
-            e6_product,
-            deep_flag,
-            deep_repository,
-            revision_flag,
-            deep_revision,
-            nonce_flag,
-            evidence_nonce,
-        ] if command == "prepare"
-            && output_flag == "--output"
-            && e6_flag == "--e6-product"
-            && deep_flag == "--deep-repository"
-            && revision_flag == "--deep-revision"
-            && nonce_flag == "--evidence-nonce" =>
-        {
-            Ok(Action::Wyr1E7Prepare {
-                output: output.clone(),
-                e6_product: e6_product.clone(),
-                deep_repository: deep_repository.clone(),
-                deep_revision: deep_revision.clone(),
-                evidence_nonce: evidence_nonce.clone(),
-            })
-        }
-        [command, flag, product] if command == "inspect" && flag == "--product" => {
-            Ok(Action::Wyr1E7Inspect(product.clone()))
-        }
-        _ => Err(Failure::usage(
-            "wyr1e7 requires prepare --output <fresh-directory> --e6-product <directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> or inspect --product <directory>",
         )),
     }
 }
@@ -954,55 +787,6 @@ fn dispatch_dw1c(arguments: &[String]) -> Result<Action, Failure> {
         }
         _ => Err(Failure::usage(
             "dw1c requires preflight --output <fresh-dir> --progress-digest <16-hex>, freeze --output <fresh-dir> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --progress-digest <16-hex>, or image|image-rebuild|inspect|prepare --request <dw1-c-request.toml>",
-        )),
-    }
-}
-
-fn dispatch_dw1b(arguments: &[String]) -> Result<Action, Failure> {
-    match arguments {
-        [command, flag, output] if command == "freeze" && flag == "--output" => {
-            Ok(Action::Dw1BFreeze(output.clone()))
-        }
-        [command, flag, request] if command == "image" && flag == "--request" => {
-            Ok(Action::Dw1BImage(request.clone()))
-        }
-        [command, flag, request] if command == "image-rebuild" && flag == "--request" => {
-            Ok(Action::Dw1BImageRebuild(request.clone()))
-        }
-        [command, flag, request] if command == "inspect" && flag == "--request" => {
-            Ok(Action::Dw1BInspect(request.clone()))
-        }
-        [command, flag, request] if command == "run" && flag == "--request" => {
-            Ok(Action::Dw1BRun(request.clone()))
-        }
-        [
-            command,
-            init_flag,
-            init,
-            hello_flag,
-            hello,
-            hog_flag,
-            cpu_hog,
-            progress_flag,
-            progress,
-        ] if command == "measure"
-            && init_flag == "--init"
-            && hello_flag == "--hello"
-            && hog_flag == "--cpu-hog"
-            && progress_flag == "--progress" =>
-        {
-            Ok(Action::Dw1BMeasure {
-                init: init.clone(),
-                hello: hello.clone(),
-                cpu_hog: cpu_hog.clone(),
-                progress: progress.clone(),
-            })
-        }
-        [command, flag, request] if command == "evidence" && flag == "--request" => {
-            Ok(Action::Dw1BEvidence(request.clone()))
-        }
-        _ => Err(Failure::usage(
-            "dw1b requires freeze --output <directory>, image|image-rebuild|inspect|run|evidence --request <path>, or measure with four exact artifacts",
         )),
     }
 }
@@ -1423,29 +1207,6 @@ mod tests {
     }
 
     #[test]
-    fn dw1b_run_dispatches_to_the_observed_execution_path() {
-        assert_eq!(
-            dispatch(&arguments(&["dw1b", "run", "--request", "request.toml",])),
-            Ok(Action::Dw1BRun("request.toml".into()))
-        );
-        assert!(USAGE.contains("dw1b run --request"));
-        assert_eq!(
-            dispatch(&arguments(&["dw1b", "freeze", "--output", "freeze"])),
-            Ok(Action::Dw1BFreeze("freeze".into()))
-        );
-        assert!(USAGE.contains("dw1b freeze --output"));
-        assert_eq!(
-            dispatch(&arguments(&[
-                "dw1b",
-                "image-rebuild",
-                "--request",
-                "request.toml",
-            ])),
-            Ok(Action::Dw1BImageRebuild("request.toml".into()))
-        );
-    }
-
-    #[test]
     fn dw1c_product_commands_dispatch_to_request_bound_actions() {
         assert_eq!(
             dispatch(&arguments(&[
@@ -1640,113 +1401,6 @@ mod tests {
     }
 
     #[test]
-    fn r1_dispatch_accepts_product_and_prepare_and_nothing_looser() {
-        assert_eq!(
-            dispatch(&arguments(&[
-                "r1",
-                "product",
-                "--output",
-                "product",
-                "--evidence-nonce",
-                "8100000000000001",
-            ])),
-            Ok(Action::R1Product {
-                output: "product".into(),
-                evidence_nonce: "8100000000000001".into(),
-            })
-        );
-        assert_eq!(
-            dispatch(&arguments(&[
-                "r1",
-                "prepare",
-                "--output",
-                "run",
-                "--deep-repository",
-                "../deepwyrm",
-                "--deep-revision",
-                "0123456789abcdef0123456789abcdef01234567",
-                "--evidence-nonce",
-                "8100000000000001",
-                "--gdb-port",
-                "1240",
-            ])),
-            Ok(Action::R1Prepare {
-                output: "run".into(),
-                card: "R1C".into(),
-                deep_repository: "../deepwyrm".into(),
-                deep_revision: "0123456789abcdef0123456789abcdef01234567".into(),
-                evidence_nonce: "8100000000000001".into(),
-                gdb_port: "1240".into(),
-            })
-        );
-        fn prepare_with(extra: &[&str]) -> Vec<&'static str> {
-            let mut line: Vec<&'static str> = vec![
-                "r1",
-                "prepare",
-                "--output",
-                "run",
-                "--deep-repository",
-                "../deepwyrm",
-                "--deep-revision",
-                "0123456789abcdef0123456789abcdef01234567",
-                "--evidence-nonce",
-                "8100000000000001",
-                "--gdb-port",
-                "1240",
-            ];
-            for argument in extra {
-                line.push(match *argument {
-                    "--card" => "--card",
-                    "--profile" => "--profile",
-                    "R1C" => "R1C",
-                    "R4E" => "R4E",
-                    "smp" => "smp",
-                    other => panic!("unexpected fixture argument {other}"),
-                });
-            }
-            line
-        }
-        // Every flag is required and positional order is exact: a prepare missing
-        // its revision or port must not fall back to a default, because both are
-        // part of what the produced domains and receipt claim.
-        for looser in [
-            vec!["r1"],
-            vec!["r1", "product", "--output", "product"],
-            vec!["r1", "prepare", "--output", "run"],
-            vec![
-                "r1",
-                "prepare",
-                "--output",
-                "run",
-                "--deep-repository",
-                "../deepwyrm",
-                "--deep-revision",
-                "0123456789abcdef0123456789abcdef01234567",
-                "--evidence-nonce",
-                "8100000000000001",
-            ],
-            vec!["r1", "run", "--request", "request.toml"],
-            // A trailing flag that is not --card, and a --card with no value,
-            // are refused rather than ignored: silently preparing a request
-            // under the wrong card is the failure this flag exists to prevent.
-            prepare_with(&["--profile", "smp"]),
-            prepare_with(&["--card"]),
-            prepare_with(&["--card", "R4E", "--card", "R1C"]),
-        ] {
-            assert!(dispatch(&arguments(&looser)).is_err(), "{looser:?}");
-        }
-        let Ok(Action::R1Prepare { card, .. }) =
-            dispatch(&arguments(&prepare_with(&["--card", "R4E"])))
-        else {
-            panic!("an explicit card is accepted after --gdb-port");
-        };
-        assert_eq!(card, "R4E");
-        for command in ["product --output", "prepare --output"] {
-            assert!(USAGE.contains(&format!("tools/pinned-cargo xtask r1 {command}")));
-        }
-    }
-
-    #[test]
     fn grammar_dump_dispatches_and_takes_no_arguments() {
         assert_eq!(
             dispatch(&arguments(&["grammar", "dump"])),
@@ -1785,38 +1439,6 @@ mod tests {
         assert!(dispatch(&arguments(&["wyr1e6", "image", "--product", "product"])).is_err());
         assert!(USAGE.contains("tools/pinned-cargo xtask wyr1e6 product --output"));
         assert!(USAGE.contains("tools/pinned-cargo xtask wyr1e6 inspect --product"));
-    }
-
-    #[test]
-    fn wyr1e7_dispatch_keeps_product_preparation_separate_from_execution() {
-        assert_eq!(
-            dispatch(&arguments(&[
-                "wyr1e7",
-                "prepare",
-                "--output",
-                "e7",
-                "--e6-product",
-                "e6",
-                "--deep-repository",
-                "deep",
-                "--deep-revision",
-                "1",
-                "--evidence-nonce",
-                "A",
-            ])),
-            Ok(Action::Wyr1E7Prepare {
-                output: "e7".into(),
-                e6_product: "e6".into(),
-                deep_repository: "deep".into(),
-                deep_revision: "1".into(),
-                evidence_nonce: "A".into(),
-            })
-        );
-        assert_eq!(
-            dispatch(&arguments(&["wyr1e7", "inspect", "--product", "e7"])),
-            Ok(Action::Wyr1E7Inspect("e7".into()))
-        );
-        assert!(dispatch(&arguments(&["wyr1e7", "run", "--product", "e7"])).is_err());
     }
 
     #[test]

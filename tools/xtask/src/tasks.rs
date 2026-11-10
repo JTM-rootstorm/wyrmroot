@@ -1,4 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -875,148 +874,6 @@ fn render_uefi_inspection_values(
         debug_symbol_sha256,
         debug_symbol_size,
     )
-}
-
-pub(crate) fn validate_uefi_inspection_report(report: &[u8], loader: &[u8]) -> Result<(), Failure> {
-    let report = std::str::from_utf8(report)
-        .map_err(|_| Failure::task("UEFI inspection report is not UTF-8"))?;
-    if report.contains('\r') || !report.ends_with('\n') {
-        return Err(Failure::task(
-            "UEFI inspection report is not canonical text",
-        ));
-    }
-    let lines = report.lines().collect::<Vec<_>>();
-    if lines.first() != Some(&"{") || lines.last() != Some(&"}") || lines.len() < 3 {
-        return Err(Failure::task("UEFI inspection report framing is malformed"));
-    }
-    let field_lines = &lines[1..lines.len() - 1];
-    let mut fields = BTreeMap::new();
-    for (index, line) in field_lines.iter().enumerate() {
-        let comma = index + 1 != field_lines.len();
-        let line = if comma {
-            line.strip_suffix(',')
-                .ok_or_else(|| Failure::task("UEFI inspection report comma drifted"))?
-        } else if line.ends_with(',') {
-            return Err(Failure::task("UEFI inspection report has a trailing comma"));
-        } else {
-            line
-        };
-        let line = line
-            .strip_prefix("  \"")
-            .ok_or_else(|| Failure::task("UEFI inspection report indentation drifted"))?;
-        let (key, value) = line
-            .split_once("\": ")
-            .ok_or_else(|| Failure::task("UEFI inspection report field is malformed"))?;
-        if key.is_empty() || fields.insert(key, value).is_some() {
-            return Err(Failure::task(
-                "UEFI inspection report key is empty or duplicate",
-            ));
-        }
-    }
-    let expected_keys = [
-        "schema_version",
-        "report_kind",
-        "loader",
-        "debug_loader",
-        "debug_symbol_artifact",
-        "loader_sha256",
-        "loader_size",
-        "debug_loader_sha256",
-        "debug_loader_size",
-        "debug_symbol_sha256",
-        "debug_symbol_size",
-        "pe32_plus",
-        "amd64",
-        "efi_application",
-        "no_pe_imports",
-        "production_reproducible",
-        "production_codeview_absent",
-        "debug_pair_linked",
-        "pdb_has_symbols",
-        "verified",
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    if fields.keys().copied().collect::<BTreeSet<_>>() != expected_keys {
-        return Err(Failure::task("UEFI inspection report key set drifted"));
-    }
-    for (key, expected) in [
-        ("schema_version", "2"),
-        ("report_kind", "\"wyrmroot-wyr0-uefi-artifact-inspection\""),
-        ("loader", "\"loader.efi\""),
-        ("debug_loader", "\"loader.efi\""),
-        ("debug_symbol_artifact", "\"loader.pdb\""),
-        ("pe32_plus", "true"),
-        ("amd64", "true"),
-        ("efi_application", "true"),
-        ("no_pe_imports", "true"),
-        ("production_reproducible", "true"),
-        ("production_codeview_absent", "true"),
-        ("debug_pair_linked", "true"),
-        ("pdb_has_symbols", "true"),
-        ("verified", "true"),
-    ] {
-        if fields.get(key).copied() != Some(expected) {
-            return Err(Failure::task(format!(
-                "UEFI inspection report {key} drifted"
-            )));
-        }
-    }
-    let digest = |key: &str| -> Result<&str, Failure> {
-        let quoted = fields
-            .get(key)
-            .copied()
-            .ok_or_else(|| Failure::task("UEFI inspection digest is missing"))?;
-        let value = quoted
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-            .ok_or_else(|| Failure::task("UEFI inspection digest is not quoted"))?;
-        if value.len() != 64
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(Failure::task("UEFI inspection digest is malformed"));
-        }
-        Ok(value)
-    };
-    let size = |key: &str, maximum: usize| -> Result<usize, Failure> {
-        let raw = fields
-            .get(key)
-            .copied()
-            .ok_or_else(|| Failure::task("UEFI inspection size is missing"))?;
-        let value = raw
-            .parse::<usize>()
-            .map_err(|_| Failure::task("UEFI inspection size is malformed"))?;
-        if value == 0 || value > maximum || value.to_string() != raw {
-            return Err(Failure::task("UEFI inspection size is outside its bound"));
-        }
-        Ok(value)
-    };
-    let loader_hash = digest("loader_sha256")?;
-    let debug_loader_hash = digest("debug_loader_sha256")?;
-    let debug_symbol_hash = digest("debug_symbol_sha256")?;
-    let loader_size = size("loader_size", MAX_LOADER_BYTES as usize)?;
-    let debug_loader_size = size("debug_loader_size", MAX_LOADER_BYTES as usize)?;
-    let debug_symbol_size = size("debug_symbol_size", MAX_DEBUG_SYMBOL_BYTES as usize)?;
-    if loader_hash != bytes_digest(loader) || loader_size != loader.len() {
-        return Err(Failure::task(
-            "UEFI inspection report does not bind the published loader bytes",
-        ));
-    }
-    if report
-        != render_uefi_inspection_values(
-            loader_hash,
-            loader_size,
-            debug_loader_hash,
-            debug_loader_size,
-            debug_symbol_hash,
-            debug_symbol_size,
-        )
-    {
-        return Err(Failure::task("UEFI inspection report is not canonical"));
-    }
-    Ok(())
 }
 
 fn prepare_uefi_target_roots(
@@ -2891,8 +2748,7 @@ mod tests {
         r1_clippy_command, r1_status_command, render_uefi_inspection_report,
         role_binary_check_commands, role_binary_lint_command, run_verified_report,
         selector_library_commands, selector32_library_commands, tests_passed,
-        validate_regular_artifact, validate_uefi_inspection_report,
-        wyr1e8_producer_fixture_command,
+        validate_regular_artifact, wyr1e8_producer_fixture_command,
     };
     use crate::error::Failure;
     use crate::sha256::bytes_digest;
@@ -3694,8 +3550,6 @@ mod tests {
     #[test]
     fn uefi_inspection_report_binds_all_snapshot_hashes_and_sizes() {
         let first = render_uefi_inspection_report(b"loader", b"debug", b"symbols");
-        validate_uefi_inspection_report(first.as_bytes(), b"loader")
-            .expect("validate exact published loader binding");
         assert!(first.contains(&format!(
             "\"loader_sha256\": \"{}\"",
             bytes_digest(b"loader")
@@ -3712,22 +3566,6 @@ mod tests {
         assert_ne!(
             first,
             render_uefi_inspection_report(b"loadeR", b"debug", b"symbols")
-        );
-        assert!(validate_uefi_inspection_report(first.as_bytes(), b"loadeR").is_err());
-
-        let false_verified = first.replace("\"verified\": true", "\"verified\": false");
-        assert!(validate_uefi_inspection_report(false_verified.as_bytes(), b"loader").is_err());
-        let extra_key = first.replace(
-            "  \"verified\": true\n",
-            "  \"verified\": true,\n  \"extra\": true\n",
-        );
-        assert!(validate_uefi_inspection_report(extra_key.as_bytes(), b"loader").is_err());
-        let malformed_debug_hash = first.replace(
-            &bytes_digest(b"debug"),
-            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffG",
-        );
-        assert!(
-            validate_uefi_inspection_report(malformed_debug_hash.as_bytes(), b"loader").is_err()
         );
     }
 

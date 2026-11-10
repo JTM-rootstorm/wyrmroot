@@ -2,7 +2,6 @@ mod abi_pairing;
 mod cli;
 mod deep_layout;
 mod dev_boot;
-mod dw1b;
 mod dw1c;
 mod dw1d6;
 mod dw1e3a;
@@ -21,7 +20,6 @@ mod lint_ratchet;
 mod metadata;
 mod product_engine;
 mod provenance;
-mod r1;
 mod rrc_audit;
 mod secure_fs;
 mod sha256;
@@ -31,11 +29,9 @@ mod wyr1;
 mod wyr1_vm;
 mod wyr1b;
 mod wyr1c;
-mod wyr1c2;
 mod wyr1c6;
 mod wyr1d5;
 mod wyr1e;
-mod wyr1e7;
 mod wyr1e8;
 mod wyr1f;
 
@@ -159,52 +155,9 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         Action::Wyr1BInspect(request) => wyr1b::inspect(std::path::Path::new(&request)).map(Some),
         Action::Wyr1BRun(request) => wyr1b::run(std::path::Path::new(&request)).map(Some),
         Action::Wyr1BEvidence(request) => wyr1b::evidence(std::path::Path::new(&request)).map(Some),
-        Action::R1Product {
-            output,
-            evidence_nonce,
-        } => r1::product(std::path::Path::new(&output), &evidence_nonce).map(Some),
-        Action::R1Prepare {
-            output,
-            card,
-            deep_repository,
-            deep_revision,
-            evidence_nonce,
-            gdb_port,
-        } => {
-            let port = gdb_port.parse::<u16>().map_err(|_| {
-                error::Failure::usage("card R1 requires --gdb-port as a decimal TCP port")
-            })?;
-            let card = r1::RequestCard::parse(&card).ok_or_else(|| {
-                error::Failure::usage("card R1 prepare requires --card R1C or --card R4E")
-            })?;
-            r1::prepare(
-                std::path::Path::new(&output),
-                card,
-                std::path::Path::new(&deep_repository),
-                &deep_revision,
-                &evidence_nonce,
-                port,
-            )
-            .map(Some)
-        }
         Action::Wyr1C1Product(output) => wyr1c::product(std::path::Path::new(&output)).map(Some),
         Action::Wyr1E6Product(output) => wyr1e::product(std::path::Path::new(&output)).map(Some),
         Action::Wyr1E6Inspect(output) => wyr1e::inspect(std::path::Path::new(&output)).map(Some),
-        Action::Wyr1E7Prepare {
-            output,
-            e6_product,
-            deep_repository,
-            deep_revision,
-            evidence_nonce,
-        } => wyr1e7::prepare(
-            std::path::Path::new(&output),
-            std::path::Path::new(&e6_product),
-            std::path::Path::new(&deep_repository),
-            &deep_revision,
-            &evidence_nonce,
-        )
-        .map(Some),
-        Action::Wyr1E7Inspect(product) => wyr1e7::inspect(std::path::Path::new(&product)).map(Some),
         Action::Wyr1E8Prepare {
             output,
             e6_product,
@@ -246,9 +199,6 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             deep_repository,
         })
         .map(Some),
-        Action::Wyr1C2Freeze(output) => wyr1c2::freeze(std::path::Path::new(&output)).map(Some),
-        Action::Wyr1C2Image(request) => wyr1c2::image(std::path::Path::new(&request)).map(Some),
-        Action::Wyr1C2Inspect(request) => wyr1c2::inspect(std::path::Path::new(&request)).map(Some),
         Action::Wyr1C6Prepare {
             output,
             deep_repository,
@@ -277,26 +227,6 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             std::path::Path::new(&output),
         )
         .map(Some),
-        Action::Dw1BImage(request) => dw1b::build(std::path::Path::new(&request)).map(Some),
-        Action::Dw1BImageRebuild(request) => {
-            dw1b::rebuild(std::path::Path::new(&request)).map(Some)
-        }
-        Action::Dw1BFreeze(output) => dw1b::freeze(std::path::Path::new(&output)).map(Some),
-        Action::Dw1BInspect(request) => dw1b::inspect(std::path::Path::new(&request)).map(Some),
-        Action::Dw1BRun(request) => dw1b::run(std::path::Path::new(&request)).map(Some),
-        Action::Dw1BMeasure {
-            init,
-            hello,
-            cpu_hog,
-            progress,
-        } => dw1b::measure(
-            std::path::Path::new(&init),
-            std::path::Path::new(&hello),
-            std::path::Path::new(&cpu_hog),
-            std::path::Path::new(&progress),
-        )
-        .map(Some),
-        Action::Dw1BEvidence(request) => dw1b::evidence(std::path::Path::new(&request)).map(Some),
         Action::Dw1CPreflight {
             output,
             progress_digest,

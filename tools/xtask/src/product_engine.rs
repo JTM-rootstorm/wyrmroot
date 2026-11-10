@@ -101,10 +101,6 @@ impl NativeBuildOptions<'_> {
         }
     }
 
-    pub(crate) const fn exact_wyr1e7() -> Self {
-        Self::exact_with_evidence("WYRMROOT_WYR1E7_EVIDENCE_NONCE")
-    }
-
     pub(crate) const fn exact_wyr1e8() -> Self {
         Self::exact_with_evidence("WYRMROOT_WYR1E8_EVIDENCE_NONCE")
     }
