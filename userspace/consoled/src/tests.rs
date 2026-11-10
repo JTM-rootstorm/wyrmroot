@@ -10,7 +10,15 @@ use super::*;
 /// `role.rs`, so every count and position below keeps its meaning.
 #[test]
 fn a_withdrawn_publication_keeps_the_session_serving() {
-    const MAIN: &str = concat!(include_str!("main.rs"), include_str!("role.rs"));
+    const MAIN: &str = concat!(
+        include_str!("main.rs"),
+        include_str!("role/mod.rs"),
+        include_str!("role/serial.rs"),
+        include_str!("role/launch.rs"),
+        include_str!("role/event_loop.rs"),
+        include_str!("role/recovery.rs"),
+        include_str!("role/channels.rs")
+    );
     let main: std::string::String = MAIN.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(main.contains(
         "constfnpublication_withdrawn(service_generation:u64)->bool{service_generation==0}"
@@ -64,7 +72,15 @@ fn a_withdrawn_publication_keeps_the_session_serving() {
 /// its old order.
 #[test]
 fn an_orphaned_witness_is_dropped_and_the_session_keeps_serving() {
-    const MAIN: &str = concat!(include_str!("main.rs"), include_str!("role.rs"));
+    const MAIN: &str = concat!(
+        include_str!("main.rs"),
+        include_str!("role/mod.rs"),
+        include_str!("role/serial.rs"),
+        include_str!("role/launch.rs"),
+        include_str!("role/event_loop.rs"),
+        include_str!("role/recovery.rs"),
+        include_str!("role/channels.rs")
+    );
     let squeeze = |text: &str| -> std::string::String {
         text.chars().filter(|c| !c.is_whitespace()).collect()
     };
@@ -120,7 +136,15 @@ fn an_orphaned_witness_is_dropped_and_the_session_keeps_serving() {
 /// three.
 #[test]
 fn terminal_recovery_checks_for_a_session_shutdown_before_it_relaunches() {
-    const MAIN: &str = concat!(include_str!("main.rs"), include_str!("role.rs"));
+    const MAIN: &str = concat!(
+        include_str!("main.rs"),
+        include_str!("role/mod.rs"),
+        include_str!("role/serial.rs"),
+        include_str!("role/launch.rs"),
+        include_str!("role/event_loop.rs"),
+        include_str!("role/recovery.rs"),
+        include_str!("role/channels.rs")
+    );
     const SIGNATURE: &str = "fn recover_terminal_child<";
 
     let start = MAIN
@@ -128,7 +152,7 @@ fn terminal_recovery_checks_for_a_session_shutdown_before_it_relaunches() {
         .expect("recover_terminal_child is gone");
     let body = &MAIN[start + SIGNATURE.len()..];
     let end = body
-        .find("\nfn ")
+        .find("\npub(crate) fn ")
         .expect("recover_terminal_child never ends");
     let body = &body[..end];
 
