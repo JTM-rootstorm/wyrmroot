@@ -1044,10 +1044,24 @@ fn parse_stack_sizes_json(bytes: &[u8]) -> Result<BTreeMap<String, u64>, Failure
             .map_err(|_| Failure::task("WYR1-B LLVM stack frame size overflowed"))?;
         expect_json(bytes, &mut cursor, b"}}")?;
         for function in functions {
-            if sizes.insert(function, size).is_some() {
-                return Err(Failure::task(
-                    "WYR1-B LLVM stack report contains a duplicate function",
-                ));
+            // A generic instance can be emitted as a local copy in more than
+            // one codegen unit, so the same symbol may own several frames.
+            // Keeping the largest is conservative for the cap and the
+            // maximum. A designated frame must still be one frame.
+            match sizes.entry(function) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(size);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if is_designated_stack_frame(entry.key()) {
+                        return Err(Failure::task(
+                            "WYR1-B LLVM stack report contains a duplicate designated frame",
+                        ));
+                    }
+                    if size > *entry.get() {
+                        entry.insert(size);
+                    }
+                }
             }
         }
     }
@@ -1090,6 +1104,20 @@ fn parse_json_string(bytes: &[u8], cursor: &mut usize) -> Result<String, Failure
     ))
 }
 
+fn designated_frame_matches(symbol: &str, prefix: &str) -> bool {
+    if !prefix.ends_with("::<") {
+        symbol == prefix
+    } else {
+        symbol.starts_with(prefix)
+    }
+}
+
+fn is_designated_stack_frame(symbol: &str) -> bool {
+    DESIGNATED_STACK_FRAMES
+        .iter()
+        .any(|(_, prefix)| designated_frame_matches(symbol, prefix))
+}
+
 fn assess_stack_budget(sizes: &BTreeMap<String, u64>) -> Result<StackBudgetReport, Failure> {
     let mut frames = BTreeMap::new();
     let mut maximum = None;
@@ -1111,13 +1139,7 @@ fn assess_stack_budget(sizes: &BTreeMap<String, u64>) -> Result<StackBudgetRepor
     for (label, prefix) in DESIGNATED_STACK_FRAMES {
         let matches = sizes
             .iter()
-            .filter(|(symbol, _)| {
-                if !prefix.ends_with("::<") {
-                    symbol.as_str() == *prefix
-                } else {
-                    symbol.starts_with(prefix)
-                }
-            })
+            .filter(|(symbol, _)| designated_frame_matches(symbol, prefix))
             .collect::<Vec<_>>();
         if matches.len() != 1 {
             return Err(Failure::task(format!(
@@ -3820,6 +3842,20 @@ mod tests {
         assert_eq!(sizes.get("__wyrmroot_native_main"), Some(&4096));
         assert_eq!(sizes.get("alias"), Some(&8));
         assert_eq!(sizes.get("other"), Some(&8));
+    }
+
+    #[test]
+    fn stack_metadata_keeps_the_largest_frame_of_a_repeated_local_symbol() {
+        // init27 at wyrmroot e6b8b72 lists `<() as core::fmt::Debug>::fmt`
+        // twice: one mangled symbol, two codegen-unit copies.
+        let json = br#"[{"FileSummary":{"Format":"elf64-x86-64","Arch":"x86_64"},"StackSizes":[{"Entry":{"Functions":["<() as core::fmt::Debug>::fmt"],"Size":8}},{"Entry":{"Functions":["<() as core::fmt::Debug>::fmt"],"Size":24}},{"Entry":{"Functions":["<() as core::fmt::Debug>::fmt"],"Size":16}}]}]"#;
+        let sizes = parse_stack_sizes_json(json).unwrap();
+        assert_eq!(sizes.get("<() as core::fmt::Debug>::fmt"), Some(&24));
+
+        let designated = br#"[{"FileSummary":{"Format":"elf64-x86-64","Arch":"x86_64"},"StackSizes":[{"Entry":{"Functions":["__wyrmroot_native_main"],"Size":8}},{"Entry":{"Functions":["__wyrmroot_native_main"],"Size":8}}]}]"#;
+        assert!(parse_stack_sizes_json(designated).is_err());
+        let generic = br#"[{"FileSummary":{"Format":"elf64-x86-64","Arch":"x86_64"},"StackSizes":[{"Entry":{"Functions":["wyrmroot_system_init::wyr1b_native::activate_in_place::<NativeSystem>"],"Size":8}},{"Entry":{"Functions":["wyrmroot_system_init::wyr1b_native::activate_in_place::<NativeSystem>"],"Size":8}}]}]"#;
+        assert!(parse_stack_sizes_json(generic).is_err());
     }
 
     #[test]
