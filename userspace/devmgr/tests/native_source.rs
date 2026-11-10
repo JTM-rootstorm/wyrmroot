@@ -56,46 +56,6 @@ fn native_path_keeps_the_c3_launch_surface_hardware_free() {
 /// Source text until S3: the role runs over the platform seam, but no
 /// RecordingPlatform script drives this path yet.
 #[test]
-fn c4_claim_path_is_feature_gated_exact_and_stops_before_interrupt_creation() {
-    assert!(NATIVE.contains("#[cfg(feature = \"wyr1c4-production\")]"));
-    assert!(NATIVE.contains("parse_device_coordinator_resource_init"));
-    assert!(NATIVE.contains("RESOURCE_DOMAIN_CLAIM_RIGHTS"));
-    assert!(NATIVE.contains("require_device_resource_interrupt_feature"));
-    assert!(NATIVE.contains("claim_device_resource("));
-    assert!(NATIVE.contains("DEVICE_RESOURCE_CUSTODY_RIGHTS"));
-    assert!(NATIVE.contains("device_resource_info(resource)"));
-    assert!(NATIVE.contains("admit_device_resource(info)"));
-    assert!(NATIVE.contains("send_publication_acknowledgement(platform, bootstrap, &resident)"));
-    let c4 = &NATIVE[NATIVE
-        .find("if action == ControllerAction::InitialPublicationBound")
-        .expect("C4 initial binding")..];
-    let feature = c4
-        .find("require_device_resource_interrupt_feature")
-        .expect("ABI feature gate");
-    let claim = c4.find("claim_device_resource(").expect("resource claim");
-    let owned = c4
-        .find("_device_resource = Some(resource)")
-        .expect("tracked ownership");
-    let metadata = c4
-        .find("device_resource_info(resource)")
-        .expect("typed resource metadata");
-    let retire_domain = c4
-        .find("if platform.close_handle(domain).is_err()")
-        .expect("domain retirement");
-    let status = c4
-        .find("send_publication_acknowledgement(platform, bootstrap, &resident)")
-        .expect("resource-owned status");
-    assert!(feature < claim && claim < owned && owned < metadata);
-    assert!(metadata < retire_domain && retire_domain < status);
-    assert!(c4.contains("close_optional(platform, _device_resource.take())"));
-    assert!(NATIVE.contains("#[cfg(not(any("));
-    let c4_branch = &NATIVE[..NATIVE.find("fn launch_driver_with_bundle<").unwrap()];
-    assert!(!c4_branch.contains("create_interrupt("));
-}
-
-/// Source text until S3: the role runs over the platform seam, but no
-/// RecordingPlatform script drives this path yet.
-#[test]
 fn c5_moves_exact_reduced_bundle_then_requires_ready_before_publish() {
     let historical = NATIVE
         .find("fn launch_driver_with_historical_bundle<")

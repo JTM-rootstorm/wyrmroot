@@ -6,50 +6,9 @@ use core::panic::PanicInfo;
 
 use deepwyrm_syscall::{DwHandle, DwReceivedHandleInfoV1};
 use wyrmroot_bootfs as _;
-#[cfg(any(
-    feature = "i0-negative-malformed-elf",
-    feature = "i0-negative-malformed-startup",
-    feature = "i0-negative-capability-count",
-    feature = "i0-negative-capability-type",
-    feature = "i0-negative-capability-rights"
-))]
-use wyrmroot_bootstrap::i0_negative_terminal_detail;
-#[cfg(any(
-    feature = "primordial-user-exception",
-    feature = "primordial-invalid-return"
-))]
-use wyrmroot_bootstrap::run_bootstrap;
-#[cfg(feature = "primordial-blocking-cleanup")]
-use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
-#[cfg(not(any(
-    feature = "primordial-blocking-cleanup",
-    feature = "native-loader-smoke-integration",
-    feature = "primordial-user-exception",
-    feature = "primordial-invalid-return",
-    feature = "i0-negative-malformed-elf",
-    feature = "i0-negative-malformed-startup",
-    feature = "i0-negative-capability-count",
-    feature = "i0-negative-capability-type",
-    feature = "i0-negative-capability-rights"
-)))]
-#[cfg(not(feature = "i-capability-integration"))]
-#[cfg(feature = "wyr0-init0-integration")]
-use wyrmroot_bootstrap::run_init0_bootstrap;
-#[cfg(any(
-    feature = "i0-negative-malformed-elf",
-    feature = "i0-negative-malformed-startup",
-    feature = "i0-negative-capability-count",
-    feature = "i0-negative-capability-type",
-    feature = "i0-negative-capability-rights"
-))]
-use wyrmroot_bootstrap::run_init0_bootstrap_with_fault;
-#[cfg(feature = "i-capability-integration")]
-use wyrmroot_bootstrap::run_init0_capability_bootstrap;
-#[cfg(feature = "native-loader-smoke-integration")]
-use wyrmroot_bootstrap::run_loader_smoke_bootstrap;
-#[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
+#[cfg(not(feature = "wyr1c5-production"))]
 use wyrmroot_bootstrap::run_supervisor_bootstrap;
-#[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+#[cfg(feature = "wyr1c5-production")]
 use wyrmroot_bootstrap::run_supervisor_resource_domain_bootstrap;
 use wyrmroot_bootstrap::{BootstrapError, BootstrapSystem};
 use wyrmroot_bootstrap_proto as _;
@@ -59,35 +18,9 @@ use wyrmroot_runtime::{
     map_bootfs_read_only, panic_abort, query_capability_info, query_memory_object_size,
     receive_channel, send_channel, unmap_bootfs,
 };
-#[cfg(any(
-    feature = "native-loader-smoke-integration",
-    feature = "i0-negative-malformed-elf",
-    feature = "i0-negative-malformed-startup",
-    feature = "i0-negative-capability-count",
-    feature = "i0-negative-capability-type",
-    feature = "i0-negative-capability-rights",
-    not(any(
-        feature = "primordial-blocking-cleanup",
-        feature = "primordial-user-exception",
-        feature = "primordial-invalid-return"
-    ))
-))]
 use wyrmroot_runtime::{NativeLoaderPlatform, NativeSupervisionPlatform, monotonic_deadline_after};
 
-#[cfg(any(
-    feature = "native-loader-smoke-integration",
-    feature = "i0-negative-malformed-elf",
-    feature = "i0-negative-malformed-startup",
-    feature = "i0-negative-capability-count",
-    feature = "i0-negative-capability-type",
-    feature = "i0-negative-capability-rights",
-    not(any(
-        feature = "primordial-blocking-cleanup",
-        feature = "primordial-user-exception",
-        feature = "primordial-invalid-return"
-    ))
-))]
-const BOOTSTRAP_SUPERVISION_TIMEOUT_NS: u64 = if cfg!(feature = "i2-bootstrap-supervision") {
+const BOOTSTRAP_SUPERVISION_TIMEOUT_NS: u64 = if false {
     // Selector 22 sends init0 READY only after the whole I2
     // controller, whose stage-7 concurrent-unmap rounds run for seconds.
     // init0 bounds that controller by its 120-second I2 deadline; this outer
@@ -231,20 +164,7 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     panic_abort()
 }
 
-#[cfg(not(any(
-    feature = "primordial-blocking-cleanup",
-    feature = "primordial-user-exception",
-    feature = "primordial-invalid-return",
-    feature = "native-loader-smoke-integration",
-    feature = "i0-negative-malformed-elf",
-    feature = "i0-negative-malformed-startup",
-    feature = "i0-negative-capability-count",
-    feature = "i0-negative-capability-type",
-    feature = "i0-negative-capability-rights",
-    any(feature = "wyr1c4-production", feature = "wyr1c5-production"),
-    feature = "i-capability-integration",
-    feature = "wyr0-init0-integration"
-)))]
+#[cfg(not(feature = "wyr1c5-production"))]
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
         Ok(deadline) => deadline,
@@ -265,7 +185,7 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     }
 }
 
-#[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+#[cfg(feature = "wyr1c5-production")]
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
         Ok(deadline) => deadline,
@@ -284,142 +204,6 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
         Ok(()) => 0,
         Err(error) => system.exit_code(&error),
     }
-}
-
-#[cfg(feature = "wyr0-init0-integration")]
-fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
-    let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
-        Ok(deadline) => deadline,
-        Err(error) => return 0xB300_0000 | wyrmroot_runtime::native_error_code(error),
-    };
-    let mut system = NativeSystem::new();
-    match run_init0_bootstrap(
-        &mut system,
-        &mut NativeLoaderPlatform,
-        &mut NativeSupervisionPlatform,
-        startup.bootstrap_channel().as_abi(),
-        deadline,
-    ) {
-        Ok(()) => 0,
-        Err(error) => system.exit_code(&error),
-    }
-}
-
-#[cfg(feature = "i-capability-integration")]
-fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
-    let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
-        Ok(deadline) => deadline,
-        Err(error) => return 0xB300_0000 | wyrmroot_runtime::native_error_code(error),
-    };
-    let mut system = NativeSystem::new();
-    let mut loader = NativeLoaderPlatform;
-    let mut supervisor = NativeSupervisionPlatform;
-    match run_init0_capability_bootstrap(
-        &mut system,
-        &mut loader,
-        &mut supervisor,
-        startup.bootstrap_channel().as_abi(),
-        deadline,
-    ) {
-        Ok(()) => 0,
-        Err(error) => system.exit_code(&error),
-    }
-}
-
-#[cfg(any(
-    feature = "i0-negative-malformed-elf",
-    feature = "i0-negative-malformed-startup",
-    feature = "i0-negative-capability-count",
-    feature = "i0-negative-capability-type",
-    feature = "i0-negative-capability-rights"
-))]
-fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
-    use wyrmroot_loader::process::LoadFault;
-
-    let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
-        Ok(deadline) => deadline,
-        Err(_) => return 1,
-    };
-    let fault = if cfg!(feature = "i0-negative-malformed-elf") {
-        LoadFault::MalformedElf
-    } else if cfg!(feature = "i0-negative-malformed-startup") {
-        LoadFault::MalformedStartup
-    } else if cfg!(feature = "i0-negative-capability-count") {
-        LoadFault::InitCapabilityCount
-    } else if cfg!(feature = "i0-negative-capability-type") {
-        LoadFault::InitCapabilityType
-    } else {
-        LoadFault::InitCapabilityRights
-    };
-    let mut system = NativeSystem::new();
-    let mut loader = NativeLoaderPlatform;
-    let mut supervisor = NativeSupervisionPlatform;
-    match run_init0_bootstrap_with_fault(
-        &mut system,
-        &mut loader,
-        &mut supervisor,
-        startup.bootstrap_channel().as_abi(),
-        deadline,
-        fault,
-    ) {
-        Ok(()) => 0,
-        Err(error) => {
-            i0_negative_terminal_detail(fault, &error).unwrap_or_else(|| system.exit_code(&error))
-        }
-    }
-}
-
-#[cfg(feature = "native-loader-smoke-integration")]
-fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
-    let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
-        Ok(deadline) => deadline,
-        Err(_) => return 1,
-    };
-    let mut system = NativeSystem::new();
-    let mut loader = NativeLoaderPlatform;
-    let mut supervisor = NativeSupervisionPlatform;
-    u32::from(
-        run_loader_smoke_bootstrap(
-            &mut system,
-            &mut loader,
-            &mut supervisor,
-            startup.bootstrap_channel().as_abi(),
-            deadline,
-        )
-        .is_err(),
-    )
-}
-
-#[cfg(feature = "primordial-blocking-cleanup")]
-fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
-    let mut system = NativeSystem::new();
-    let result = run_bootstrap_with_before_ready(
-        &mut system,
-        startup.bootstrap_channel().as_abi(),
-        |channel| {
-            wyrmroot_runtime::primordial_blocking_cleanup(channel)
-                .map_err(wyrmroot_bootstrap::BootstrapError::TestSupport)
-        },
-    );
-    u32::from(result.is_err())
-}
-
-#[cfg(feature = "primordial-user-exception")]
-fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
-    let mut system = NativeSystem::new();
-    if run_bootstrap(&mut system, startup.bootstrap_channel().as_abi()).is_err() {
-        return 1;
-    }
-    wyrmroot_runtime::trigger_user_exception()
-}
-
-#[cfg(feature = "primordial-invalid-return")]
-fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
-    let mut system = NativeSystem;
-    if run_bootstrap(&mut system, startup.bootstrap_channel().as_abi()).is_err() {
-        return 1;
-    }
-    wyrmroot_runtime::trigger_invalid_syscall_return()
 }
 
 wyrmroot_runtime::native_entry!(crate::bootstrap_main);

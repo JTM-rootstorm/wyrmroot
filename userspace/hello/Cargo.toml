@@ -10,20 +10,6 @@ license = "GPL-3.0-or-later"
 path = "src/lib.rs"
 
 [[bin]]
-name = "wyrmroot-hello"
-path = "src/main.rs"
-test = false
-bench = false
-required-features = ["native-hello"]
-
-[[bin]]
-name = "wyrmroot-job-hello"
-path = "src/job_main.rs"
-test = false
-bench = false
-required-features = ["native-job-hello"]
-
-[[bin]]
 name = "wyrmroot-stream-hello"
 path = "src/stream_main.rs"
 test = false
@@ -32,8 +18,6 @@ required-features = ["native-stream-hello"]
 
 [features]
 default = []
-native-hello = []
-native-job-hello = []
 native-stream-hello = []
 
 [dependencies]

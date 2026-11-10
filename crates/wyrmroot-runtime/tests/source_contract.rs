@@ -25,8 +25,6 @@ const LOADER_NATIVE_SOURCE: &str =
 const STARTUP_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/startup.rs"));
 const ENTRY_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/entry.rs"));
 const MEMORY_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/memory.rs"));
-const TEST_SUPPORT_SOURCE: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test_support.rs"));
 const SUPERVISION_SOURCE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/supervision.rs"));
 const RESTART_SUPERVISION_SOURCE: &str = include_str!(concat!(
@@ -264,23 +262,4 @@ fn shared_native_entry_owns_startup_assembly_but_not_syscall_assembly() {
     assert!(ENTRY_SOURCE.contains("with_native_startup"));
     assert!(!ENTRY_SOURCE.contains("syscall"));
     assert!(!ENTRY_SOURCE.contains("DW_SYSCALL_"));
-}
-
-#[test]
-fn primordial_test_support_uses_generated_ids_and_is_feature_isolated() {
-    assert!(MANIFEST.contains("primordial-test-support = []"));
-    for generated_id in [
-        "DW_SYSCALL_CLOCK_GET",
-        "DW_SYSCALL_WAIT_ONE",
-        "DW_SYSCALL_ATOMIC_WAIT32",
-    ] {
-        assert!(TEST_SUPPORT_SOURCE.contains(generated_id));
-    }
-    assert!(TEST_SUPPORT_SOURCE.contains("fn dw_syscall6("));
-    assert!(TEST_SUPPORT_SOURCE.contains("DwSyscallId(u32::MAX)"));
-    assert!(TEST_SUPPORT_SOURCE.contains("\"xor rsp, rsp\""));
-    assert!(TEST_SUPPORT_SOURCE.contains("\"syscall\""));
-    assert!(!TEST_SUPPORT_SOURCE.contains("0x000400"));
-    assert!(!TEST_SUPPORT_SOURCE.contains("libc"));
-    assert!(!TEST_SUPPORT_SOURCE.contains("std::"));
 }

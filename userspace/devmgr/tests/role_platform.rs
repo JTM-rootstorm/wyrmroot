@@ -26,13 +26,13 @@ mod bootstrap {
         0xC101_0000 | stage
     }
 
-    #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
+    #[cfg(not(feature = "wyr1c5-production"))]
     const INIT_BYTES: usize = wyrmroot_loader::launch::DEVICE_COORDINATOR_BYTES;
-    #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+    #[cfg(feature = "wyr1c5-production")]
     const INIT_BYTES: usize = wyrmroot_loader::launch::DEVICE_COORDINATOR_RESOURCE_BYTES;
-    #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
+    #[cfg(not(feature = "wyr1c5-production"))]
     const INIT_HANDLES: usize = 3;
-    #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+    #[cfg(feature = "wyr1c5-production")]
     const INIT_HANDLES: usize = 4;
 
     fn valid_bootstrap() -> Reply {

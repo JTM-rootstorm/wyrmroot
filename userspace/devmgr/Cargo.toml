@@ -23,7 +23,6 @@ native-devmgr = [
     "dep:wyrmroot-registry-proto",
     "dep:wyrmroot-runtime",
 ]
-wyr1c4-production = ["native-devmgr"]
 wyr1c5-production = ["native-devmgr"]
 wyr1c6-production = ["wyr1c5-production"]
 wyr1d-production = ["wyr1c5-production"]

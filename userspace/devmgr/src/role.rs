@@ -27,17 +27,14 @@ use deepwyrm_syscall::{
     DW_RIGHT_TRANSFER, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwHandle,
     DwHandleTransferV1, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwWaitItemV1,
 };
-#[cfg(any(
-    not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")),
-    feature = "wyr1c5-production"
-))]
+#[cfg(any(not(feature = "wyr1c5-production"), feature = "wyr1c5-production"))]
 use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_WAIT};
 #[cfg(feature = "wyr1c5-production")]
 use deepwyrm_syscall::{
     DW_INTERRUPT_INFO_V1_SIZE, DW_INTERRUPT_INFO_V1_VERSION, DW_INTERRUPT_STATE_ARMED,
     DW_OBJECT_TYPE_INTERRUPT,
 };
-#[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+#[cfg(feature = "wyr1c5-production")]
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_MODIFY,
 };
@@ -83,7 +80,7 @@ use wyrmroot_device_proto::{
         LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES, encode_request, parse_constructed,
     },
 };
-#[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
+#[cfg(not(feature = "wyr1c5-production"))]
 use wyrmroot_device_proto::{
     DirectControlRights,
     control::{CONTROL_READY_BYTES, parse as parse_control},
@@ -97,9 +94,9 @@ use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, DEVICE_MANIFEST_RIGHTS, HEADER_BYTES, LaunchProfile, SELF_ROOT_RIGHTS,
     encode_ready_for_profile,
 };
-#[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
+#[cfg(not(feature = "wyr1c5-production"))]
 use wyrmroot_loader::launch::{DEVICE_COORDINATOR_BYTES, parse_device_coordinator_init};
-#[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+#[cfg(feature = "wyr1c5-production")]
 use wyrmroot_loader::launch::{
     DEVICE_COORDINATOR_RESOURCE_BYTES, RESOURCE_DOMAIN_CLAIM_RIGHTS,
     parse_device_coordinator_resource_init,
@@ -114,10 +111,7 @@ use wyrmroot_registry_proto::{
 use wyrmroot_registry_proto::{Lookup, ProtocolVersion};
 #[cfg(feature = "wyr1c6-production")]
 use wyrmroot_runtime::NativeError;
-#[cfg(any(
-    not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")),
-    feature = "wyr1c5-production"
-))]
+#[cfg(any(not(feature = "wyr1c5-production"), feature = "wyr1c5-production"))]
 use wyrmroot_runtime::WYR0_I_SUPERVISION_POLICY;
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, ChannelPlatform, ClockPlatform, DevicePlatform,
@@ -158,10 +152,7 @@ struct ProductionClientWitness {
     handle: DwHandle,
     attach: AttachCorrelation,
 }
-#[cfg(any(
-    not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")),
-    feature = "wyr1c5-production"
-))]
+#[cfg(any(not(feature = "wyr1c5-production"), feature = "wyr1c5-production"))]
 const DIRECT_CONTROL_RIGHTS: DwRights = DwRights(
     DW_RIGHT_READ.0
         | DW_RIGHT_WRITE.0
@@ -170,7 +161,7 @@ const DIRECT_CONTROL_RIGHTS: DwRights = DwRights(
         | DW_RIGHT_DUPLICATE.0
         | DW_RIGHT_TRANSFER.0,
 );
-#[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+#[cfg(feature = "wyr1c5-production")]
 const DEVICE_RESOURCE_CUSTODY_RIGHTS: DwRights = DwRights(
     DW_RIGHT_READ.0
         | DW_RIGHT_WRITE.0
@@ -206,13 +197,13 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
     validate_bootstrap_channel(bootstrap_info, BOOTSTRAP_CHANNEL_EXPECTATION)
         .map_err(|_| failure(2))?;
 
-    #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
+    #[cfg(not(feature = "wyr1c5-production"))]
     let mut init = [0u8; DEVICE_COORDINATOR_BYTES];
-    #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+    #[cfg(feature = "wyr1c5-production")]
     let mut init = [0u8; DEVICE_COORDINATOR_RESOURCE_BYTES];
-    #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
+    #[cfg(not(feature = "wyr1c5-production"))]
     let mut handles = [DwReceivedHandleInfoV1::default(); 3];
-    #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+    #[cfg(feature = "wyr1c5-production")]
     let mut handles = [DwReceivedHandleInfoV1::default(); 4];
     let counts = platform
         .receive_channel(bootstrap, &mut init, &mut handles)
@@ -221,9 +212,9 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
         close_received(platform, &handles, counts.handles);
         return Err(failure(4));
     }
-    #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
+    #[cfg(not(feature = "wyr1c5-production"))]
     let parsed_result = parse_device_coordinator_init(&init[..counts.bytes], &handles);
-    #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+    #[cfg(feature = "wyr1c5-production")]
     let parsed_result = parse_device_coordinator_resource_init(&init[..counts.bytes], &handles);
     let parsed = match parsed_result {
         Ok(parsed) => parsed,
@@ -253,7 +244,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
             DEVICE_MANIFEST_RIGHTS,
         )
         .is_err();
-    #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+    #[cfg(feature = "wyr1c5-production")]
     let invalid = invalid
         || validate_fresh(
             platform,
@@ -270,7 +261,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
     let self_root = handles[0].handle;
     let publication = handles[1].handle;
     let manifest = handles[2].handle;
-    #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+    #[cfg(feature = "wyr1c5-production")]
     let mut resource_domain = Some(handles[3].handle);
     let size = platform
         .query_memory_object_size(manifest)
@@ -296,9 +287,9 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
     platform.close_handle(self_root).map_err(|_| failure(13))?;
 
     let mut ready = [0u8; HEADER_BYTES];
-    #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
+    #[cfg(not(feature = "wyr1c5-production"))]
     let launch_profile = LaunchProfile::DeviceCoordinator;
-    #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+    #[cfg(feature = "wyr1c5-production")]
     let launch_profile = LaunchProfile::DeviceCoordinatorResourceDomain;
     let ready_len = encode_ready_for_profile(launch_profile, parsed.transaction_id, &mut ready)
         .map_err(|_| failure(14))?;
@@ -318,8 +309,6 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
     let mut e8_retire_requested = false;
     #[cfg(all(not(feature = "wyr1e8-production"), feature = "wyr1c6-production"))]
     let e8_retire_requested = false;
-    #[cfg(feature = "wyr1c4-production")]
-    let mut _device_resource = None;
     #[cfg(feature = "wyr1c5-production")]
     let mut device_resource = None;
     loop {
@@ -505,7 +494,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     }
                 }
             }
-            #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
+            #[cfg(feature = "wyr1c5-production")]
             if action == ControllerAction::InitialPublicationBound {
                 let domain = resource_domain.take().ok_or(failure(46))?;
                 if platform
@@ -526,12 +515,6 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                         return Err(failure(48));
                     }
                 };
-                // Establish local ownership before any validation, admission,
-                // status, or custodian-retirement step can fail.
-                #[cfg(feature = "wyr1c4-production")]
-                {
-                    _device_resource = Some(resource);
-                }
                 #[cfg(feature = "wyr1c5-production")]
                 {
                     device_resource = Some(resource);
@@ -553,8 +536,6 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     Ok::<_, u32>(())
                 })();
                 if let Err(code) = claim {
-                    #[cfg(feature = "wyr1c4-production")]
-                    close_optional(platform, _device_resource.take());
                     #[cfg(feature = "wyr1c5-production")]
                     close_optional(platform, device_resource.take());
                     let _ = platform.close_handle(domain);
@@ -564,8 +545,6 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     return Err(code);
                 }
                 if platform.close_handle(domain).is_err() {
-                    #[cfg(feature = "wyr1c4-production")]
-                    close_optional(platform, _device_resource.take());
                     #[cfg(feature = "wyr1c5-production")]
                     close_optional(platform, device_resource.take());
                     close_optional(platform, publication);
@@ -577,14 +556,12 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
             if let Err(code) = send_publication_acknowledgement(platform, bootstrap, &resident) {
                 close_optional(platform, publication);
                 close_optional(platform, driver_control);
-                #[cfg(feature = "wyr1c4-production")]
-                close_optional(platform, _device_resource.take());
                 #[cfg(feature = "wyr1c5-production")]
                 close_optional(platform, device_resource.take());
                 let _ = platform.close_handle(bootstrap);
                 return Err(code);
             }
-            #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
+            #[cfg(not(feature = "wyr1c5-production"))]
             if action == ControllerAction::InitialPublicationBound {
                 if driver_control.is_some() {
                     return Err(failure(38));
@@ -1540,7 +1517,7 @@ fn send_driver_retired<P: DevmgrPlatform>(
     send_bootstrap_channel(platform, bootstrap, &bytes, &[], 121)
 }
 
-#[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
+#[cfg(not(feature = "wyr1c5-production"))]
 fn launch_driver<P: DevmgrPlatform>(
     platform: &mut P,
     bootstrap: DwHandle,
@@ -2316,10 +2293,7 @@ fn send_driver_retire<P: DevmgrPlatform>(
         .map_err(|_| failure(95))
 }
 
-#[cfg(any(
-    not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")),
-    feature = "wyr1c5-production"
-))]
+#[cfg(any(not(feature = "wyr1c5-production"), feature = "wyr1c5-production"))]
 fn wait_readable<P: DevmgrPlatform>(
     platform: &mut P,
     handle: DwHandle,

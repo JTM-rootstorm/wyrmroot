@@ -34,12 +34,6 @@ pub mod sha256;
 mod startup;
 mod stream;
 mod supervision;
-#[cfg(feature = "primordial-test-support")]
-#[allow(
-    unsafe_code,
-    reason = "explicitly selected primordial kernel-test variants own their isolated generated-veneer and terminal-fault boundaries"
-)]
-mod test_support;
 
 pub use bootstrap::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityExpectation, CapabilityInfo,
@@ -94,9 +88,4 @@ pub use supervision::{
     await_child_ready_profile_observed, supervise_child, supervise_child_profile,
     supervise_native_child, supervise_native_child_profile, supervise_ready_child_profile,
     validate_successful_exit,
-};
-#[cfg(feature = "primordial-test-support")]
-pub use test_support::{
-    PrimordialTestError, primordial_blocking_cleanup, trigger_invalid_syscall_return,
-    trigger_user_exception,
 };

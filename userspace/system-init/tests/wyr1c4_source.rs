@@ -15,50 +15,11 @@ use wyrmroot_uart16550d as _;
 use wyrmroot_wyr1b_gate_proto as _;
 
 const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
-const LIB_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
 const MAIN_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
 const NATIVE_SOURCE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/wyr1c_native.rs"));
 const RETAINED_SOURCE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/wyr1b_native.rs"));
-
-/// The C4 product receives four capabilities under the resource-domain
-/// profile and keeps the fourth as the domain's custody; the historical
-/// product stays on the three-capability profile.
-///
-/// Source text because both product entries start with the bootstrap
-/// receive and capability checks, and no host fake passes them (`MockNative`
-/// fails the first query). Scoped to each activation fn's body.
-#[test]
-fn c4_product_selects_only_the_four_capability_resource_profile() {
-    assert!(MANIFEST.contains("wyr1c4-production = [\"native-init\"]"));
-    assert!(MAIN_SOURCE.contains("continue_system_init_resource_product"));
-    let receive = lib_fn("receive_and_activate_resource_product_in_place<");
-    assert!(receive.contains("let mut handles = [DwReceivedHandleInfoV1::default(); 4]"));
-    let resource = lib_fn("activate_received_resource_product_in_place<");
-    assert!(
-        resource
-            .contains("parse_init(LaunchProfile::SupervisorResourceDomain, init_bytes, handles)")
-    );
-    assert!(resource.contains("let custody = ResourceDomainCustody::new(handles[3].handle);"));
-    assert!(
-        resource.contains(
-            "Some(custody),\n                    LaunchProfile::SupervisorResourceDomain,"
-        )
-    );
-    let historical = lib_fn("activate_received_product_in_place<");
-    assert!(historical.contains("parse_init(LaunchProfile::Supervisor, init_bytes, handles)"));
-    assert!(!historical.contains("SupervisorResourceDomain"));
-}
-
-/// The text of lib.rs's `fn name`, up to its closing brace at column 0.
-fn lib_fn(name: &str) -> &'static str {
-    let start = LIB_SOURCE
-        .find(&format!("fn {name}"))
-        .unwrap_or_else(|| panic!("missing fn {name}"));
-    let end = LIB_SOURCE[start..].find("\n}\n").unwrap() + start;
-    &LIB_SOURCE[start..end]
-}
 
 #[test]
 fn native_wait_until_accepts_only_a_clock_verified_timeout_fallback() {

@@ -3,146 +3,6 @@
 
 //! Primordial Wyrmroot bootstrap transaction shared by the native entry and host fixtures.
 
-#[cfg(any(
-    all(
-        feature = "primordial-blocking-cleanup",
-        feature = "primordial-user-exception"
-    ),
-    all(
-        feature = "primordial-blocking-cleanup",
-        feature = "primordial-invalid-return"
-    ),
-    all(
-        feature = "primordial-user-exception",
-        feature = "primordial-invalid-return"
-    )
-))]
-compile_error!("primordial bootstrap behavior variants are mutually exclusive");
-
-#[cfg(any(
-    all(
-        feature = "i0-negative-malformed-elf",
-        any(
-            feature = "primordial-blocking-cleanup",
-            feature = "primordial-user-exception",
-            feature = "primordial-invalid-return",
-            feature = "i0-negative-malformed-startup",
-            feature = "i0-negative-capability-count",
-            feature = "i0-negative-capability-type",
-            feature = "i0-negative-capability-rights"
-        )
-    ),
-    all(
-        feature = "i0-negative-malformed-startup",
-        any(
-            feature = "primordial-blocking-cleanup",
-            feature = "primordial-user-exception",
-            feature = "primordial-invalid-return",
-            feature = "i0-negative-capability-count",
-            feature = "i0-negative-capability-type",
-            feature = "i0-negative-capability-rights"
-        )
-    ),
-    all(
-        feature = "i0-negative-capability-count",
-        any(
-            feature = "primordial-blocking-cleanup",
-            feature = "primordial-user-exception",
-            feature = "primordial-invalid-return",
-            feature = "i0-negative-capability-type",
-            feature = "i0-negative-capability-rights"
-        )
-    ),
-    all(
-        feature = "i0-negative-capability-type",
-        any(
-            feature = "primordial-blocking-cleanup",
-            feature = "primordial-user-exception",
-            feature = "primordial-invalid-return",
-            feature = "i0-negative-capability-rights"
-        )
-    ),
-    all(
-        feature = "i0-negative-capability-rights",
-        any(
-            feature = "primordial-blocking-cleanup",
-            feature = "primordial-user-exception",
-            feature = "primordial-invalid-return"
-        )
-    )
-))]
-compile_error!(
-    "I0 negative bootstrap variants are mutually exclusive with other bootstrap behavior variants"
-);
-
-#[cfg(all(
-    feature = "loader-smoke-integration",
-    any(
-        feature = "i0-negative-malformed-elf",
-        feature = "i0-negative-malformed-startup",
-        feature = "i0-negative-capability-count",
-        feature = "i0-negative-capability-type",
-        feature = "i0-negative-capability-rights"
-    )
-))]
-compile_error!(
-    "the WYR0-E loader-smoke integration is mutually exclusive with I0 negative variants"
-);
-
-#[cfg(any(
-    all(
-        feature = "loader-smoke-integration",
-        feature = "primordial-blocking-cleanup"
-    ),
-    all(
-        feature = "loader-smoke-integration",
-        feature = "primordial-user-exception"
-    ),
-    all(
-        feature = "loader-smoke-integration",
-        feature = "primordial-invalid-return"
-    )
-))]
-compile_error!(
-    "the WYR0-E loader-smoke integration is mutually exclusive with primordial behavior variants"
-);
-
-#[cfg(all(
-    feature = "i-capability-integration",
-    any(
-        feature = "loader-smoke-integration",
-        feature = "primordial-blocking-cleanup",
-        feature = "primordial-user-exception",
-        feature = "primordial-invalid-return",
-        feature = "i0-negative-malformed-elf",
-        feature = "i0-negative-malformed-startup",
-        feature = "i0-negative-capability-count",
-        feature = "i0-negative-capability-type",
-        feature = "i0-negative-capability-rights"
-    )
-))]
-compile_error!("the WYR0-I capability relay is mutually exclusive with other bootstrap variants");
-
-#[cfg(all(
-    feature = "wyr1c4-production",
-    any(
-        feature = "wyr0-init0-integration",
-        feature = "native-loader-smoke-integration",
-        feature = "primordial-blocking-cleanup",
-        feature = "primordial-user-exception",
-        feature = "primordial-invalid-return",
-        feature = "i0-negative-malformed-elf",
-        feature = "i0-negative-malformed-startup",
-        feature = "i0-negative-capability-count",
-        feature = "i0-negative-capability-type",
-        feature = "i0-negative-capability-rights",
-        feature = "i-capability-integration"
-    )
-))]
-compile_error!(
-    "the WYR1-C4 production bootstrap is mutually exclusive with historical and test variants"
-);
-
 mod wyr0_compat;
 
 pub use wyr0_compat::{
@@ -156,13 +16,6 @@ pub use wyr0_compat::{
 pub const SYSTEM_INIT_PATH: &[u8] = b"system/init";
 /// Primordial-owned nonzero transaction for the permanent supervisor handoff.
 pub const SYSTEM_INIT_TRANSACTION_ID: u64 = 0x5759_5231_0000_0001;
-#[cfg(feature = "loader-smoke-integration")]
-pub use wyr0_compat::{LOADER_SMOKE_PATH, LOADER_SMOKE_TRANSACTION_ID, run_loader_smoke_bootstrap};
-#[cfg(feature = "i-capability-relay")]
-pub use wyr0_compat::{
-    WRCAP1_KINDS, WRCAP1_RECORD_COUNT, WRCAP1_RECORD_SIZE, Wrcap1RelayError,
-    run_init0_capability_bootstrap,
-};
 
 use deepwyrm_syscall::{
     DW_TASK_STATE_EXITED, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
@@ -179,8 +32,6 @@ use wyrmroot_loader::process::{
     LoadAuthority, LoadError, LoadRequest, LoadStage, LoadedProcess, LoaderPlatform,
     ResourceDomainLoadRequest, load_resource_domain_process,
 };
-#[cfg(feature = "primordial-test-support")]
-use wyrmroot_runtime::PrimordialTestError;
 use wyrmroot_runtime::await_child_ready_profile_observed;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
@@ -470,9 +321,6 @@ pub enum BootstrapError {
     MissingRequiredEntry,
     /// A required bootfs entry was not immutable executable content.
     RequiredEntryNotExecutable,
-    /// An explicitly selected primordial kernel-test behavior failed closed.
-    #[cfg(feature = "primordial-test-support")]
-    TestSupport(PrimordialTestError),
     /// The E-only loader transaction failed before it published the temporary child.
     Loader(LoadError<NativeError>),
     /// Temporary WYR0-E child readiness or completion did not satisfy the exact contract.
@@ -483,9 +331,6 @@ pub enum BootstrapError {
     Cleanup(ChildCleanupError),
     /// A successful bootfs callback failed to retain the child it created.
     MissingLoadedProcess,
-    /// The selector-gated WYR0-I controller evidence relay rejected an init0 datagram.
-    #[cfg(feature = "i-capability-relay")]
-    CapabilityRelay(Wrcap1RelayError),
 }
 
 impl BootstrapError {
@@ -514,10 +359,6 @@ impl BootstrapError {
             Self::Bootfs(_) => PREFIX | 0x09,
             Self::MissingRequiredEntry => PREFIX | 0x0A,
             Self::RequiredEntryNotExecutable => PREFIX | 0x0B,
-            #[cfg(feature = "i-capability-relay")]
-            Self::CapabilityRelay(error) => PREFIX | 0x0D00 | wrcap1_relay_error_code(error),
-            #[cfg(feature = "primordial-test-support")]
-            Self::TestSupport(_) => PREFIX | 0x0C,
             Self::Loader(LoadError::Platform {
                 stage,
                 cause,
@@ -759,23 +600,6 @@ const fn bounded_index(index: usize) -> u32 {
     if index > 0xFF { 0xFF } else { index as u32 }
 }
 
-#[cfg(feature = "i-capability-relay")]
-const fn wrcap1_relay_error_code(error: &Wrcap1RelayError) -> u32 {
-    match error {
-        Wrcap1RelayError::UnboundedDeadline => 1,
-        Wrcap1RelayError::TimedOut => 2,
-        Wrcap1RelayError::PeerClosed => 3,
-        Wrcap1RelayError::InvalidWaitResult => 4,
-        Wrcap1RelayError::ReceiveWouldBlock => 5,
-        Wrcap1RelayError::SendWouldBlock => 6,
-        Wrcap1RelayError::CapabilityBearing => 7,
-        Wrcap1RelayError::MalformedFraming => 8,
-        Wrcap1RelayError::UnexpectedSequence => 9,
-        Wrcap1RelayError::UnexpectedKind => 10,
-        Wrcap1RelayError::Checksum => 11,
-    }
-}
-
 /// The exact operation that failed while reclaiming a published child.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChildCleanupStage {
@@ -876,16 +700,6 @@ pub fn run_bootstrap<System: BootstrapSystem>(
     bootstrap_channel: DwHandle,
 ) -> Result<(), BootstrapError> {
     run_bootstrap_inner(system, bootstrap_channel, |_| Ok(()))
-}
-
-/// Executes the bootstrap transaction with one explicit test-only hook before READY and close.
-#[cfg(feature = "primordial-test-support")]
-pub fn run_bootstrap_with_before_ready<System: BootstrapSystem>(
-    system: &mut System,
-    bootstrap_channel: DwHandle,
-    before_ready: impl FnOnce(DwHandle) -> Result<(), BootstrapError>,
-) -> Result<(), BootstrapError> {
-    run_bootstrap_inner(system, bootstrap_channel, before_ready)
 }
 
 fn run_bootstrap_inner<System: BootstrapSystem>(
