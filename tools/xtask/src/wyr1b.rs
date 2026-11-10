@@ -69,7 +69,10 @@ const DESIGNATED_STACK_FRAMES: &[(&str, &str)] = &[
         "control_tick",
         "wyrmroot_system_init::wyr1b_native::control_tick::<",
     ),
-    ("continue_resident", "system_init::continue_resident"),
+    (
+        "continue_resident",
+        "wyrmroot_system_init::resident_loop::continue_resident::<",
+    ),
 ];
 const OVMF_CODE_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
 const OVMF_VARS_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";

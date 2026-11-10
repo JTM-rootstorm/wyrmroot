@@ -76,7 +76,10 @@ const _: () = assert!(
 ///
 /// It returns only to end permanent init's process: `0` when the interactive
 /// session is complete, and a failure status otherwise.
-#[inline(always)]
+///
+/// It keeps its own frame, as it had in `main.rs` before S3 moved it here:
+/// the WYR1-B init27 stack preflight measures it as a designated frame.
+#[inline(never)]
 pub fn continue_resident<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
