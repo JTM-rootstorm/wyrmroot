@@ -238,10 +238,7 @@ pub(crate) mod abandoned {
     // place is what makes the reason byte readable, so the set is allowed to
     // be wider than any single build's callers rather than split across cfgs
     // that would drift out of step with them.
-    #[allow(dead_code)]
     pub(crate) mod trigger {
-        /// Not loss-driven: startup, a fallback, or a host fixture.
-        pub(crate) const NONE: u8 = 0x00;
         /// `ResidentPollEvent::RegistryControlLost`.
         pub(crate) const CONTROL_LOST: u8 = 0x01;
         /// `ResidentPollEvent::RegistryExited`.
@@ -250,8 +247,6 @@ pub(crate) mod abandoned {
         pub(crate) const DEVMGR_WAITING: u8 = 0x03;
         /// `wyr1e::PollOutcome::RecoverRegistry`.
         pub(crate) const WYR1E_POLL: u8 = 0x04;
-        /// `wyr1e::PollOutcome::RecoverRegistryForE8`.
-        pub(crate) const WYR1E_POLL_E8: u8 = 0x05;
         /// `start_wyr1e_or_recover_registry`'s fallback after a failed start.
         pub(crate) const WYR1E_START_FALLBACK: u8 = 0x06;
     }
@@ -262,7 +257,6 @@ pub(crate) mod abandoned {
     /// functions, which is most of the poll, so on its own it named a file
     /// rather than a cause. These name the site. `NONE` is every trigger that
     /// is not the wyr1e poll.
-    #[allow(dead_code)]
     pub(crate) mod phase {
         /// Not a wyr1e-poll trigger.
         pub(crate) const NONE: u8 = 0x00;
@@ -364,8 +358,6 @@ where
         evidence_finalized: false,
         session_complete: false,
         last_tick_ns: 0,
-        wyr1b: None,
-        wyr1b_evidence: None,
         wyr1c: None,
     });
     resident.controller.become_operational()?;
@@ -584,9 +576,7 @@ where
         ..authority
     };
     let loaded_result = if let Some(custody) = resource_domain {
-        let reduced = custody
-            .devmgr_claim_authority(ResourceDomainMembership::DevmgrGenerationDescendant)
-            .map_err(|_| InitError::WrongActivationOrder)?;
+        let reduced = custody.devmgr_claim_authority();
         load_device_coordinator_resource_process(
             loader,
             generation_authority,
@@ -2290,8 +2280,6 @@ fn recovery_fixture_resident(
         degraded_transitions: 0,
         activated: [false; EARLY_ROLE_COUNT],
         accounting: AttemptLedger::new(),
-        gate: None,
-        evidence: None,
         registry_startup_profile: StartupProfile::BootstrapRegistry,
         devmgr_startup_profile: StartupProfile::DeviceCoordinator,
     };
@@ -2354,8 +2342,6 @@ fn recovery_fixture_resident(
         evidence_finalized: false,
         session_complete: false,
         last_tick_ns: 0,
-        wyr1b: None,
-        wyr1b_evidence: None,
         wyr1c: Some(ResidentState {
             e6: Some(e6),
             resource_domain: Some(ResourceDomainCustody::new(DwHandle(0xE8B5_0043))),
@@ -2379,58 +2365,6 @@ fn recovery_fixture_resident(
     };
 
     Ok((resident, devmgr, driver))
-}
-
-/// Drives the product's ordinary registry recovery with no episode open.
-///
-/// Reset card R7E. A probe over the whole host suite found that
-/// `recover_registry`, `recover_devmgr` and `recover_devmgr_after_error` were
-/// reached by exactly one test -- the E8 producer fixture -- and only through a
-/// ShellJobs launch carrying a magic path and nonce. The *product's* recovery,
-/// the one R7B-1 made ordinary by giving the episode a budget instead of a
-/// selector, had no coverage at all.
-///
-/// This is that path: no trigger, no held WAIT, no shell. `recovery_deadline`
-/// answers `None`, so the episode arithmetic the selector opens is simply not
-/// entered, and what runs is registry retirement, relaunch, topology restart
-/// and publication rebinding.
-#[cfg(test)]
-pub(crate) fn exercise_ordinary_registry_recovery<S, L, W>(
-    system: &mut S,
-    loader: &mut L,
-    waits: &mut W,
-    bootfs: &[u8],
-    registry_identity: [u8; 32],
-    registry_generation: u64,
-) -> Result<(RecoveryResult, u64, Option<RestartState>), InitError>
-where
-    S: Wyr1BPlatform,
-    L: LoaderPlatform<Error = NativeError>,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let (mut resident, _devmgr, _driver) = recovery_fixture_resident(
-        registry_identity,
-        registry_generation,
-        wyr1e::State::new(registry_generation)?,
-        RegistryTopology::new(registry_generation).map_err(InitError::Wyr1BModel)?,
-        None,
-    )?;
-    recover_registry(
-        &mut resident,
-        system,
-        loader,
-        waits,
-        bootfs,
-        false,
-        false,
-        abandoned::reason(abandoned::trigger::NONE, abandoned::phase::NONE),
-    )?;
-    let role = resident.controller.role_state(RoleId::Registryd);
-    let state = resident
-        .wyr1c
-        .as_ref()
-        .ok_or(InitError::AbsentState(0x56))?;
-    Ok((resident.result, state.topology.generation(), role))
 }
 
 fn start_wyr1e_or_recover_registry<S, L, W>(
@@ -2971,7 +2905,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deepwyrm_syscall::{DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwStatus};
+    use deepwyrm_syscall::{
+        DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_TERMINATION_NORMAL_EXIT,
+        DwStatus,
+    };
     use wyrmroot_device_proto::manifest::{
         HEADER_BYTES as WRDM_HEADER_BYTES, MAGIC as WRDM_MAGIC, MAJOR as WRDM_MAJOR,
         MINOR as WRDM_MINOR, PROFILE_Q35, PROFILE_Q35_VERSION, RECORD_BYTES as WRDM_RECORD_BYTES,

@@ -301,7 +301,6 @@ dependencies = [
  "wyrmroot-rrc-manifest",
  "wyrmroot-runtime",
  "wyrmroot-uart16550d",
- "wyrmroot-wyr1b-gate-proto",
 ]
 
 [[package]]
@@ -320,10 +319,6 @@ dependencies = [
  "wyrmroot-stream-proto",
  "wyrmroot-uart16550-core",
 ]
-
-[[package]]
-name = "wyrmroot-wyr1b-gate-proto"
-version = "0.0.0"
 
 [[package]]
 name = "wyrmroot-wyrmsh"

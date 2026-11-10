@@ -1,25 +1,9 @@
-//! Permanent init's resident loop: tick, drain each selector's evidence, wait.
-//!
-//! Structural refactor S3. This was `continue_resident` in `main.rs`, whose
-//! host build only type-checks the guest entry, so nothing on the host could
-//! run it. It now takes its platform as a parameter like the rest of the
-//! crate; `main.rs` supplies `NativeSystem`, whose evidence submissions are the
-//! runtime's syscall wrappers.
+//! Permanent init's resident loop: tick, then wait for the next tick.
 
 use super::*;
 
-/// Selector 34's evidence sink, which every platform trivially provides in a
-/// build that relays no R1 records.
-pub trait ResidentR1Sink {}
-
-impl<T: ?Sized> ResidentR1Sink for T {}
-
-/// The resident loop's platform: the WYR1-B operations, plus the evidence
-/// submission each selector's drain makes.
-pub trait ResidentLoopPlatform: Wyr1BPlatform + ResidentR1Sink {}
-
 /// The period of the resident loop's tick.
-pub const RESIDENT_TICK_NS: u64 = WYR0_I_SUPERVISION_POLICY.backoff_ns;
+pub(crate) const RESIDENT_TICK_NS: u64 = WYR0_I_SUPERVISION_POLICY.backoff_ns;
 
 /// Permanent init's resident loop, entered once the product has activated.
 ///
@@ -36,7 +20,7 @@ pub fn continue_resident<S, L, W>(
     waits: &mut W,
 ) -> u32
 where
-    S: ResidentLoopPlatform,
+    S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {

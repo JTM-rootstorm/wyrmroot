@@ -10,35 +10,29 @@ use core::mem::MaybeUninit;
 
 use wyrmroot_consoled as _;
 #[cfg(test)]
-use {wyrmroot_devmgr as _, wyrmroot_uart16550d as _};
+use {wyrmroot_devmgr as _, wyrmroot_registryd as _, wyrmroot_uart16550d as _};
 
-pub mod evidence;
-pub mod gate;
 mod launch_transaction;
 pub mod resident_loop;
-pub mod wyr1b;
-pub mod wyr1b_gate;
+pub(crate) mod wyr1b;
 mod wyr1b_job;
-pub mod wyr1b_native;
-pub mod wyr1c_native;
+pub(crate) mod wyr1b_native;
+pub(crate) mod wyr1c_native;
 
-use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
-use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
 use deepwyrm_syscall::{
     DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_STATUS_TIMED_OUT,
-    DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT,
-    DW_TERMINATION_TASK_GROUP_TEARDOWN, DwDeadline, DwHandle, DwHandleTransferV1, DwObjectType,
+    DW_TASK_STATE_EXITED, DwDeadline, DwHandle, DwHandleTransferV1, DwObjectType,
     DwReceivedHandleInfoV1, DwRights, DwTaskTerminationInfoV1, DwWaitItemV1, DwWaitResultV1,
 };
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
     launch::{
-        HEADER_BYTES, LaunchProfile, RESOURCE_DOMAIN_CLAIM_RIGHTS, RESOURCE_DOMAIN_CUSTODY_RIGHTS,
-        SUPERVISOR_BYTES, encode_ready_for_profile, parse_init,
+        HEADER_BYTES, LaunchProfile, RESOURCE_DOMAIN_CLAIM_RIGHTS, SUPERVISOR_BYTES,
+        encode_ready_for_profile, parse_init,
     },
     process::{
-        LoadAuthority, LoadError, LoadRequest, LoadedProcess, LoaderPlatform, ServiceLoadRequest,
-        load_process, load_service_process,
+        LoadAuthority, LoadError, LoadedProcess, LoaderPlatform, ServiceLoadRequest,
+        load_service_process,
     },
 };
 use wyrmroot_rrc_manifest::{
@@ -47,19 +41,18 @@ use wyrmroot_rrc_manifest::{
 };
 use wyrmroot_runtime::{
     AttemptFailure, CleanupDisposition, RestartState, RestartSupervisor, RestartTransitionError,
-    TerminalDisposition, WYR0_I_SUPERVISION_POLICY,
+    WYR0_I_SUPERVISION_POLICY,
 };
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
     InitCapability, LOADER_TASK_GROUP_EXPECTATION, MappingPlan, MappingPlanError, NativeError,
-    ObservedSupervisionError, RESOURCE_DOMAIN_TASK_GROUP_EXPECTATION, ReceiveCounts,
-    SELF_ROOT_EXPECTATION, SupervisionError, SupervisionPlatform,
-    await_child_ready_profile_observed, supervise_ready_child_profile, validate_bootstrap_channel,
-    validate_init_capabilities_v2, validate_init_capabilities_v3,
+    RESOURCE_DOMAIN_TASK_GROUP_EXPECTATION, ReceiveCounts, SELF_ROOT_EXPECTATION,
+    SupervisionPlatform, await_child_ready_profile_observed, validate_bootstrap_channel,
+    validate_init_capabilities_v3,
 };
 
-pub const SYSTEM_INIT_PATH: &str = "system/init";
-pub const EARLY_ROLE_COUNT: usize = 2;
+pub(crate) const SYSTEM_INIT_PATH: &str = "system/init";
+pub(crate) const EARLY_ROLE_COUNT: usize = 2;
 const EXPECTED_ROLE_PATHS: [(RoleId, &str); 5] = [
     (RoleId::Registryd, "system/registryd"),
     (RoleId::Devmgr, "system/devmgr"),
@@ -69,7 +62,7 @@ const EXPECTED_ROLE_PATHS: [(RoleId, &str); 5] = [
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SystemMode {
+pub(crate) enum SystemMode {
     Bootstrap,
     SupervisorOperational,
     ActivatingEarlyRoles,
@@ -79,7 +72,7 @@ pub enum SystemMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RecoveryResult {
+pub(crate) enum RecoveryResult {
     Recovered,
     Degraded,
     Fatal,
@@ -215,7 +208,6 @@ const fn failure_instance(error: &InitError) -> u16 {
         InitError::AbsentState(site) => *site as u16,
         InitError::RegistryAbandoned(reason) => *reason as u16,
         InitError::SessionShutdown(steps) => *steps as u16,
-        InitError::LaunchProtocol(error) => *error as u16,
         // An attributed failure already carries the innermost instance.
         InitError::RecoveryTransition { payload, .. } => *payload,
         _ => 0,
@@ -241,16 +233,14 @@ const fn failure_kind(error: &InitError) -> u8 {
         // The retirement wait kept `Supervision`'s meaning when it gained a
         // payload, so selector 33's kind is unchanged by that split. E8 must stay
         // byte-identical to the A27 baseline, and this is what keeps it so.
-        InitError::Supervision | InitError::BootstrapRetirement(_) => 0x03,
+        InitError::Supervision => 0x03,
         InitError::Cleanup => 0x04,
         InitError::Native(_) => 0x05,
         InitError::WrongManifestProfile
         | InitError::ResourceIdentityMismatch
         | InitError::InvalidResourceHandle
         | InitError::Capability(_)
-        | InitError::RegistryProtocol(_)
-        | InitError::Wyr1BGateProtocol(_)
-        | InitError::Wyr1BGateMismatch => 0x06,
+        | InitError::RegistryProtocol(_) => 0x06,
         InitError::UnlaunchableRole
         | InitError::Bootfs(_)
         | InitError::MissingRetainedMaterial
@@ -260,13 +250,6 @@ const fn failure_kind(error: &InitError) -> u8 {
         | InitError::Mapping(_)
         | InitError::Launch(_)
         | InitError::Loader(_) => 0x07,
-        // A refused launch message is a protocol refusal, which is what 0x06
-        // already names for the registry and gate protocols.
-        InitError::LaunchProtocol(_) => 0x06,
-        InitError::GateConfig(_)
-        | InitError::Evidence(_)
-        | InitError::Wyr1BGateConfig(_)
-        | InitError::Wyr1BEvidence(_) => 0x08,
         InitError::RecoveryTransition {
             initiating_kind,
             emergency_cleanup,
@@ -344,7 +327,7 @@ pub(crate) fn dispatch_failure(error: InitError, emergency_cleanup: EmergencyCle
 /// Selector 34 keeps its own category encoding: `test_failure_category` is a
 /// 32-value space that R1's evidence is written against, not this 8-kind one.
 #[must_use]
-pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 {
+pub(crate) const fn resident_tick_failure_application_status(error: &InitError) -> u32 {
     {
         // Not a wildcard over `InitError` in the sense §3.4 forbids: every
         // variant but this one is named by `failure_kind`, whose match is
@@ -416,79 +399,9 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
             0x0a => 0xAF21_0000 | (operation as u32) << 8 | (instance & 0xff),
             // A session shutdown, with the mask of steps that failed.
             0x0b => 0xAF22_0000 | (operation as u32) << 8 | (instance & 0xff),
-            // Kind 0x06 is shared by three protocols, so the tag says which
-            // one and the low byte carries the refusal. Only the launch
-            // protocol carries an instance here; the other two reach the
-            // reader as 0xAF18 and their class, unchanged.
-            0x06 if matches!(error, InitError::LaunchProtocol(_)) => {
-                0xAF20_0000 | (operation as u32) << 8 | (instance & 0xff)
-            }
             _ => 0xAF18_0000 | (operation as u32) << 8 | kind as u32,
         }
     }
-}
-
-/// Decodes a tick-failure status back into operation, kind and instance.
-///
-/// In source and under test because the layout is a contract, not a comment:
-/// four tags share one function and a reader holding a transcript needs to
-/// know which one they are looking at.
-///
-/// Returns `None` for a word this encoder never produces.
-#[must_use]
-pub const fn decode_tick_failure(status: u32) -> Option<TickFailure> {
-    match status >> 16 {
-        0xAF18 => Some(TickFailure {
-            operation: ((status >> 8) & 0xff) as u8,
-            kind: (status & 0x0f) as u8,
-            instance: 0,
-            saturated: false,
-        }),
-        0xAF1E => Some(TickFailure {
-            operation: ((status >> 8) & 0xff) as u8,
-            kind: 0x05,
-            instance: (status & 0x7f) as u16 | if status & 0x80 != 0 { 0x8000 } else { 0 },
-            saturated: status & 0x7f == 0x7f,
-        }),
-        0xAF1F => Some(TickFailure {
-            operation: ((status >> 8) & 0xff) as u8,
-            kind: 0x09,
-            instance: (status & 0xff) as u16,
-            saturated: false,
-        }),
-        0xAF20 => Some(TickFailure {
-            operation: ((status >> 8) & 0xff) as u8,
-            kind: 0x06,
-            instance: (status & 0xff) as u16,
-            saturated: false,
-        }),
-        0xAF21 => Some(TickFailure {
-            operation: ((status >> 8) & 0xff) as u8,
-            kind: 0x0a,
-            instance: (status & 0xff) as u16,
-            saturated: false,
-        }),
-        0xAF22 => Some(TickFailure {
-            operation: ((status >> 8) & 0xff) as u8,
-            kind: 0x0b,
-            instance: (status & 0xff) as u16,
-            saturated: false,
-        }),
-        _ => None,
-    }
-}
-
-/// One decoded tick-failure status.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TickFailure {
-    /// `RecoveryOperation`, or `0x0f` when nothing claimed the failure.
-    pub operation: u8,
-    /// `failure_kind`'s four-bit class.
-    pub kind: u8,
-    /// The cause's own value, or zero where the kind carries none.
-    pub instance: u16,
-    /// Whether `instance` reached its encoding's limit and may be larger.
-    pub saturated: bool,
 }
 
 /// Boot-lifetime owner of the fixed supervisor state and primordial authority.
@@ -510,8 +423,6 @@ pub struct ResidentSystemInit {
     /// and this is how that reaches the loop.
     session_complete: bool,
     last_tick_ns: u64,
-    wyr1b: Option<wyr1b_native::ResidentState>,
-    wyr1b_evidence: Option<wyr1b_gate::EvidenceLog>,
     wyr1c: Option<wyr1c_native::ResidentState>,
 }
 
@@ -519,71 +430,40 @@ pub struct ResidentSystemInit {
 /// of [`LoadAuthority`]: ordinary process construction must not manufacture
 /// or absorb device-claim authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResourceDomainCustody {
+pub(crate) struct ResourceDomainCustody {
     resource_domain: DwHandle,
 }
 
 impl ResourceDomainCustody {
-    pub const fn new(resource_domain: DwHandle) -> Self {
+    pub(crate) const fn new(resource_domain: DwHandle) -> Self {
         Self { resource_domain }
     }
 
-    pub const fn handle(self) -> DwHandle {
+    pub(crate) const fn handle(self) -> DwHandle {
         self.resource_domain
     }
 
-    /// Models the only D5 reduction init may make for a devmgr-generation
-    /// descendant. Membership is kernel-authoritative; this seam refuses to
-    /// represent a claim capability for init itself or another outsider.
-    pub fn devmgr_claim_authority(
-        self,
-        membership: ResourceDomainMembership,
-    ) -> Result<ReducedResourceDomainAuthority, ResourceDomainCustodyError> {
-        match membership {
-            ResourceDomainMembership::InitOutsideDomain | ResourceDomainMembership::Unrelated => {
-                Err(ResourceDomainCustodyError::OutsideResourceDomain)
-            }
-            ResourceDomainMembership::DevmgrGenerationDescendant => {
-                Ok(ReducedResourceDomainAuthority {
-                    resource_domain: self.resource_domain,
-                    rights: RESOURCE_DOMAIN_CLAIM_RIGHTS,
-                })
-            }
+    /// The one reduction init makes: claim authority for a devmgr-generation
+    /// descendant. Membership is kernel-authoritative.
+    pub(crate) const fn devmgr_claim_authority(self) -> ReducedResourceDomainAuthority {
+        ReducedResourceDomainAuthority {
+            resource_domain: self.resource_domain,
+            rights: RESOURCE_DOMAIN_CLAIM_RIGHTS,
         }
     }
 }
 
-/// D5 model membership relation. It records the kernel custody predicate but
-/// does not implement a userspace claim syscall.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResourceDomainMembership {
-    InitOutsideDomain,
-    Unrelated,
-    DevmgrGenerationDescendant,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReducedResourceDomainAuthority {
+pub(crate) struct ReducedResourceDomainAuthority {
     resource_domain: DwHandle,
     rights: DwRights,
 }
 
 impl ReducedResourceDomainAuthority {
-    pub const fn handle(self) -> DwHandle {
+    pub(crate) const fn handle(self) -> DwHandle {
         self.resource_domain
     }
-    pub const fn rights(self) -> DwRights {
-        self.rights
-    }
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResourceDomainCustodyError {
-    OutsideResourceDomain,
-}
-
-/// Explicit broad-rights identity used by focused D5 model tests.
-pub const RESOURCE_DOMAIN_CUSTODY_PROFILE_RIGHTS: DwRights = RESOURCE_DOMAIN_CUSTODY_RIGHTS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveNativeRole {
@@ -594,39 +474,11 @@ struct ActiveNativeRole {
     task_group: DwHandle,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct ActivationState {
-    controller: SystemInit,
-    result: RecoveryResult,
-    active: [Option<ActiveNativeRole>; EARLY_ROLE_COUNT],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RoleActivation {
-    Ready(ActiveNativeRole),
-    Degraded,
-}
-
 impl ResidentSystemInit {
-    #[must_use]
-    pub const fn result(&self) -> RecoveryResult {
-        self.result
-    }
-
-    #[must_use]
-    pub const fn controller(&self) -> &SystemInit {
-        &self.controller
-    }
-
-    #[must_use]
-    pub const fn authority(&self) -> LoadAuthority {
-        self.authority
-    }
-
     #[must_use]
     /// Whether the interactive session ended. Once true it stays true: there
     /// is no console generation after the one that ended the session.
-    pub const fn session_complete(&self) -> bool {
+    pub(crate) const fn session_complete(&self) -> bool {
         self.session_complete
     }
 
@@ -634,169 +486,11 @@ impl ResidentSystemInit {
         self.session_complete = true;
     }
 
-    pub const fn evidence_finalized(&self) -> bool {
-        self.evidence_finalized
-    }
-
-    /// Returns one completed selector-27 evidence record. Selector 25 and
-    /// incomplete selector-27 attempts expose no WRB1 record.
-    #[must_use]
-    pub fn wyr1b_evidence_record(&self, index: usize) -> Option<&[u8; wyr1b_gate::RECORD_BYTES]> {
-        self.wyr1b_evidence.as_ref()?.record_at(index)
-    }
-
-    /// Advances the permanent fixed-role control loop without inventing service
-    /// manager policy. A zero-time probe keeps idle ticks nonblocking; once a
-    /// role signal is pending, the exact terminal protocol is drained under the
-    /// bounded cleanup deadline before the generation-owned transition occurs.
-    pub fn control_tick<S, L, W>(
-        &mut self,
-        system: &mut S,
-        loader: &mut L,
-        waits: &mut W,
-        now_ns: u64,
-    ) -> Result<SystemMode, InitError>
-    where
-        S: InitPlatform,
-        L: LoaderPlatform<Error = NativeError>,
-        W: SupervisionPlatform<Error = NativeError>,
-    {
-        if now_ns < self.last_tick_ns {
-            self.controller.fatal();
-            self.result = RecoveryResult::Fatal;
-            return Err(InitError::WrongActivationOrder);
-        }
-        self.last_tick_ns = now_ns;
-
-        for index in 0..self.active.len() {
-            let Some(active) = self.active[index] else {
-                continue;
-            };
-            let poll_items = [
-                DwWaitItemV1 {
-                    handle: active.loaded.launch_channel,
-                    signals: deepwyrm_syscall::DwSignals(
-                        DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0,
-                    ),
-                },
-                DwWaitItemV1 {
-                    handle: active.loaded.process,
-                    signals: DW_SIGNAL_EXITED,
-                },
-            ];
-            let observed = match waits.wait_many(&poll_items, DwDeadline(now_ns)) {
-                Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => continue,
-                Err(error) => Err(ObservedSupervisionError::Supervision(
-                    SupervisionError::Platform(error),
-                )),
-                Ok(_) => {
-                    let observation_deadline = now_ns
-                        .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
-                        .ok_or(InitError::Restart(
-                            RestartTransitionError::ArithmeticOverflow,
-                        ))?;
-                    supervise_ready_child_profile(
-                        waits,
-                        active.loaded.process,
-                        active.loaded.launch_channel,
-                        LaunchProfile::EarlyBootStub,
-                        active.transaction_id,
-                        DwDeadline(observation_deadline),
-                    )
-                }
-            };
-
-            let (transition, terminate) = match observed {
-                Ok(info) => (
-                    AfterReadyTransition::Terminal(terminal_disposition(&info)),
-                    false,
-                ),
-                Err(error) => (
-                    classify_after_ready_observation(&error),
-                    !error.process_exit_observed(),
-                ),
-            };
-            let transitioned = match transition {
-                AfterReadyTransition::Terminal(disposition) => self.controller.terminal(
-                    active.role,
-                    active.generation,
-                    active.transaction_id,
-                    now_ns,
-                    disposition,
-                ),
-                AfterReadyTransition::Failure(failure) => self.controller.fail(
-                    active.role,
-                    active.generation,
-                    active.transaction_id,
-                    now_ns,
-                    failure,
-                ),
-            };
-            if let Err(error) = transitioned {
-                return Err(cleanup_after_transition_error(
-                    system,
-                    waits,
-                    &mut self.controller,
-                    active.loaded,
-                    active.task_group,
-                    active.role,
-                    error,
-                ));
-            }
-            complete_native_cleanup(
-                system,
-                waits,
-                &mut self.controller,
-                active.loaded,
-                active.task_group,
-                terminate,
-                active.role,
-                active.generation,
-                active.transaction_id,
-                now_ns,
-            )?;
-            self.active[index] = None;
-
-            if transition == AfterReadyTransition::Terminal(TerminalDisposition::NormalExit(0)) {
-                continue;
-            }
-            if advance_or_degrade(
-                system,
-                &mut self.controller,
-                active.role,
-                active.transaction_id,
-            )? {
-                self.result = RecoveryResult::Degraded;
-                continue;
-            }
-            match remap_and_activate_role(
-                system,
-                loader,
-                waits,
-                self.authority,
-                &mut self.controller,
-                active.role,
-            )? {
-                RoleActivation::Ready(replacement) => self.active[index] = Some(replacement),
-                RoleActivation::Degraded => self.result = RecoveryResult::Degraded,
-            }
-        }
-
-        if self.controller.mode() == SystemMode::Degraded {
-            self.result = RecoveryResult::Degraded;
-        }
-        if !self.evidence_finalized && self.active.iter().all(Option::is_none) {
-            self.controller.finalize_evidence(self.result)?;
-            self.evidence_finalized = true;
-        }
-        Ok(self.controller.mode())
-    }
-
     /// Product-dispatched resident loop. Selector 25 immediately delegates to
     /// the unchanged legacy loop and therefore performs zero WYR1-B platform
     /// operations.
     #[inline(always)]
-    pub fn control_tick_product<S, L, W>(
+    pub(crate) fn control_tick_product<S, L, W>(
         &mut self,
         system: &mut S,
         loader: &mut L,
@@ -812,35 +506,29 @@ impl ResidentSystemInit {
         // distinguishable from one during startup. `attribute_failure` keeps
         // an inner attribution, so a recovery transition that already named
         // itself is not overwritten by this outer one.
-        let observed = if self.wyr1c.is_some() {
-            wyr1c_native::control_tick(self, system, loader, waits, now_ns)
-        } else if self.wyr1b.is_none() {
-            self.control_tick(system, loader, waits, now_ns)
-        } else {
-            wyr1b_native::control_tick(self, system, loader, waits, now_ns)
-        };
+        let observed = wyr1c_native::control_tick(self, system, loader, waits, now_ns);
         attribute_failure(RecoveryOperation::ResidentTick, observed)
     }
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct AttemptResources {
-    pub role: RoleId,
-    pub generation: u64,
-    pub transaction_id: u64,
-    pub executable_identity: [u8; 32],
-    pub startup_profile: StartupProfile,
-    pub task_group: DwHandle,
-    pub process: DwHandle,
-    pub launch_channel: DwHandle,
-    pub mappings: u8,
-    pub reservation: AttemptReservation,
+pub(crate) struct AttemptResources {
+    pub(crate) role: RoleId,
+    pub(crate) generation: u64,
+    pub(crate) transaction_id: u64,
+    pub(crate) executable_identity: [u8; 32],
+    pub(crate) startup_profile: StartupProfile,
+    pub(crate) task_group: DwHandle,
+    pub(crate) process: DwHandle,
+    pub(crate) launch_channel: DwHandle,
+    pub(crate) mappings: u8,
+    pub(crate) reservation: AttemptReservation,
 }
 
 /// Affine token proving one fixed-role generation was reserved before child
 /// publication. It is intentionally neither `Copy` nor `Clone`.
 #[derive(Debug, Eq, PartialEq)]
-pub struct AttemptReservation {
+pub(crate) struct AttemptReservation {
     role: RoleId,
     generation: u64,
     transaction_id: u64,
@@ -941,10 +629,6 @@ impl AttemptLedger {
         slot.nonce = 0;
         Ok(())
     }
-
-    const fn outstanding(&self) -> usize {
-        self.slots[0].outstanding as usize + self.slots[1].outstanding as usize
-    }
 }
 
 fn validate_reservation(
@@ -991,27 +675,12 @@ pub enum InitError {
     Capability(CapabilityValidationError),
     Mapping(MappingPlanError),
     Launch(wyrmroot_loader::launch::LaunchError),
-    /// A launch-protocol message refused parsing, with the reason it refused.
-    ///
-    /// Both sites that parse one used to report `InitError::Accounting`, which
-    /// was not merely a collapse under
-    /// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.1 but the wrong class: a
-    /// malformed request is a protocol refusal, and kind 0x02 sent a reader
-    /// looking at resource accounting. Twenty-three distinct reasons reached
-    /// that one value.
-    LaunchProtocol(wyrmroot_launch_proto::Error),
     Loader(LoadError<NativeError>),
     Supervision,
     Cleanup,
     Accounting,
-    GateConfig(GateConfigError),
-    Evidence(EvidenceError),
-    Wyr1BGateConfig(wyr1b_gate::GateError),
     RegistryProtocol(wyrmroot_registry_proto::Error),
-    Wyr1BGateProtocol(wyrmroot_wyr1b_gate_proto::Error),
-    Wyr1BGateMismatch,
     Wyr1BModel(wyr1b::JobError),
-    Wyr1BEvidence(wyr1b_gate::GateError),
     /// A bounded recovery transition failed, naming the operation it failed in.
     /// An expected state slot was absent, at the numbered site that found it.
     ///
@@ -1100,27 +769,6 @@ pub enum InitError {
         payload: u16,
         emergency_cleanup: EmergencyCleanup,
     },
-    BootstrapRetirement(BootstrapRetirementFailure),
-}
-
-/// Why permanent init could not retire its bootstrap launch channel.
-///
-/// The retirement wait is reached by every selector through `run_system_init`,
-/// and both of its failures reported a bare `InitError::Supervision` -- one value
-/// shared with a hundred and five other sites across this crate. Card R1's run 5
-/// reported exactly that (`0xAF340014`) and the site was not even among the two I
-/// had identified; the cause-preservation gate found it. Each case here carries
-/// what it knows, so the failure names itself.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BootstrapRetirementFailure {
-    /// The wait for the bootstrap peer's close failed or timed out. The native
-    /// status distinguishes those, and every neighbouring call in this function
-    /// already preserves it.
-    Wait(NativeError),
-    /// The wait succeeded but selected the wrong input or lacked `PEER_CLOSED`,
-    /// which is a different failure from the wait refusing: the kernel answered,
-    /// and answered unexpectedly.
-    WrongResult { index: u32, observed: u64 },
 }
 
 impl From<RestartTransitionError> for InitError {
@@ -1183,46 +831,17 @@ impl RoleController {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct SystemInit {
+pub(crate) struct SystemInit {
     mode: SystemMode,
     roles: [RoleController; EARLY_ROLE_COUNT],
     degraded_transitions: u8,
     activated: [bool; EARLY_ROLE_COUNT],
     accounting: AttemptLedger,
-    gate: Option<GateConfig>,
-    evidence: Option<EvidenceLog>,
     registry_startup_profile: StartupProfile,
     devmgr_startup_profile: StartupProfile,
 }
 
 impl SystemInit {
-    /// Consumes an already product-validated WRRM manifest and binds exact
-    /// executable identities to the two WYR1-A launchable roles.
-    pub fn from_manifest(manifest: Manifest<'_>) -> Result<Self, InitError> {
-        Self::from_manifest_with_profiles(
-            manifest,
-            StartupProfile::EarlyBootStub,
-            StartupProfile::EarlyBootStub,
-            StartupProfile::Retained,
-        )
-    }
-
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "retained for explicit historical-profile isolation in the E6 binary build"
-        )
-    )]
-    pub(crate) fn from_wyr1c_manifest(manifest: Manifest<'_>) -> Result<Self, InitError> {
-        Self::from_manifest_with_profiles(
-            manifest,
-            StartupProfile::BootstrapRegistry,
-            StartupProfile::DeviceCoordinator,
-            StartupProfile::Retained,
-        )
-    }
-
     pub(crate) fn from_wyr1e_manifest(manifest: Manifest<'_>) -> Result<Self, InitError> {
         Self::from_manifest_with_profiles(
             manifest,
@@ -1299,42 +918,27 @@ impl SystemInit {
             degraded_transitions: 0,
             activated: [false; EARLY_ROLE_COUNT],
             accounting: AttemptLedger::new(),
-            gate: None,
-            evidence: None,
             registry_startup_profile,
             devmgr_startup_profile,
         })
     }
 
     #[must_use]
-    pub const fn mode(&self) -> SystemMode {
+    pub(crate) const fn mode(&self) -> SystemMode {
         self.mode
     }
     #[must_use]
-    pub const fn result(&self) -> Option<RecoveryResult> {
-        match self.mode {
-            SystemMode::Normal => Some(RecoveryResult::Recovered),
-            SystemMode::Degraded => Some(RecoveryResult::Degraded),
-            SystemMode::Fatal => Some(RecoveryResult::Fatal),
-            _ => None,
-        }
-    }
-    #[must_use]
-    pub const fn degraded_transitions(&self) -> u8 {
-        self.degraded_transitions
-    }
-    #[must_use]
-    pub fn role_state(&self, role: RoleId) -> Option<RestartState> {
+    pub(crate) fn role_state(&self, role: RoleId) -> Option<RestartState> {
         self.index(role).map(|i| self.roles[i].restart.state())
     }
 
     #[must_use]
-    pub fn resources(&self, role: RoleId) -> Option<&AttemptResources> {
+    pub(crate) fn resources(&self, role: RoleId) -> Option<&AttemptResources> {
         self.index(role)
             .and_then(|i| self.roles[i].resources.as_ref())
     }
 
-    pub fn reserve_attempt(
+    pub(crate) fn reserve_attempt(
         &mut self,
         role: RoleId,
         generation: u64,
@@ -1345,26 +949,16 @@ impl SystemInit {
             .reserve(index, role, generation, transaction)
     }
 
-    pub fn abort_reservation(
+    pub(crate) fn abort_reservation(
         &mut self,
         mut reservation: AttemptReservation,
     ) -> Result<(), InitError> {
         self.accounting.release(&mut reservation)
     }
 
-    #[must_use]
-    pub const fn outstanding_reservations(&self) -> usize {
-        self.accounting.outstanding()
-    }
-
-    #[must_use]
-    pub const fn gate_config(&self) -> Option<GateConfig> {
-        self.gate
-    }
-
     /// Marks manifest/closure/controller initialization complete. This is the
     /// exact state acknowledged by the supervisor READY to primordial.
-    pub fn become_operational(&mut self) -> Result<(), InitError> {
+    pub(crate) fn become_operational(&mut self) -> Result<(), InitError> {
         if self.mode != SystemMode::Bootstrap {
             return Err(InitError::WrongActivationOrder);
         }
@@ -1372,7 +966,7 @@ impl SystemInit {
         Ok(())
     }
 
-    pub fn begin_registry(
+    pub(crate) fn begin_registry(
         &mut self,
         now: u64,
         generation: u64,
@@ -1386,7 +980,10 @@ impl SystemInit {
         Ok(())
     }
 
-    pub fn install_attempt(&mut self, mut resources: AttemptResources) -> Result<(), InitError> {
+    pub(crate) fn install_attempt(
+        &mut self,
+        mut resources: AttemptResources,
+    ) -> Result<(), InitError> {
         let index = self
             .index(resources.role)
             .ok_or(InitError::UnlaunchableRole)?;
@@ -1436,7 +1033,7 @@ impl SystemInit {
         Ok(())
     }
 
-    pub fn child_started(
+    pub(crate) fn child_started(
         &mut self,
         role: RoleId,
         generation: u64,
@@ -1458,7 +1055,7 @@ impl SystemInit {
         Ok(())
     }
 
-    pub fn ready(
+    pub(crate) fn ready(
         &mut self,
         role: RoleId,
         generation: u64,
@@ -1469,7 +1066,6 @@ impl SystemInit {
         self.roles[index]
             .restart
             .ready(generation, transaction, now)?;
-        self.record_evidence(EvidenceEvent::Ready, role, generation, transaction, 0)?;
         self.activated[index] = true;
         match role {
             RoleId::Registryd if !self.activated[1] => {
@@ -1495,7 +1091,7 @@ impl SystemInit {
         Ok(())
     }
 
-    pub fn fail(
+    pub(crate) fn fail(
         &mut self,
         role: RoleId,
         generation: u64,
@@ -1526,7 +1122,7 @@ impl SystemInit {
         self.roles[index].admit_recovery(&self.accounting, generation, transaction, now)
     }
 
-    pub fn ready_wait_failed(
+    pub(crate) fn ready_wait_failed(
         &mut self,
         role: RoleId,
         generation: u64,
@@ -1549,24 +1145,7 @@ impl SystemInit {
         Ok(())
     }
 
-    pub fn terminal(
-        &mut self,
-        role: RoleId,
-        generation: u64,
-        transaction: u64,
-        now: u64,
-        disposition: TerminalDisposition,
-    ) -> Result<(), InitError> {
-        self.controller_mut(role)?
-            .restart
-            .terminal(generation, transaction, now, disposition)?;
-        if self.mode == SystemMode::Normal && disposition != TerminalDisposition::NormalExit(0) {
-            self.mode = SystemMode::ActivatingEarlyRoles;
-        }
-        Ok(())
-    }
-
-    pub fn cleanup_complete(
+    pub(crate) fn cleanup_complete(
         &mut self,
         role: RoleId,
         generation: u64,
@@ -1575,7 +1154,6 @@ impl SystemInit {
     ) -> Result<(), InitError> {
         let index = self.index(role).ok_or(InitError::UnlaunchableRole)?;
         let controller = &mut self.roles[index];
-        let had_resources = controller.resources.is_some();
         let unpublished = matches!(
             controller.restart.state(),
             RestartState::CleaningUp {
@@ -1592,22 +1170,11 @@ impl SystemInit {
         if let Some(mut resources) = controller.resources.take() {
             self.accounting.release(&mut resources.reservation)?;
         }
-        if had_resources {
-            let value = self.roles[index]
-                .restart
-                .history()
-                .as_slice()
-                .last()
-                .and_then(|record| *record)
-                .map(|record| reap_evidence_value(record.failure))
-                .ok_or(InitError::Accounting)?;
-            self.record_evidence(EvidenceEvent::Reap, role, generation, transaction, value)?;
-        }
         self.update_permanent_failure(role)?;
         Ok(())
     }
 
-    pub fn cleanup_failed(
+    pub(crate) fn cleanup_failed(
         &mut self,
         role: RoleId,
         generation: u64,
@@ -1626,7 +1193,7 @@ impl SystemInit {
     /// `CleaningUp` failed but the caller has already attempted native owner
     /// release. Complete cleanup releases the installed accounting reservation
     /// exactly once; failed cleanup remains retained and blocks replacement.
-    pub fn retire_active_fail_closed(
+    pub(crate) fn retire_active_fail_closed(
         &mut self,
         role: RoleId,
         generation: u64,
@@ -1652,46 +1219,26 @@ impl SystemInit {
                 .take()
                 .ok_or(InitError::MissingAttemptResources)?;
             self.accounting.release(&mut resources.reservation)?;
-            self.record_evidence(
-                EvidenceEvent::Reap,
-                role,
-                generation,
-                transaction,
-                reap_evidence_value(failure),
-            )?;
         }
         self.update_permanent_failure(role)?;
         Ok(())
     }
 
-    pub fn start_replacement(
+    pub(crate) fn start_replacement(
         &mut self,
         role: RoleId,
         now: u64,
         generation: u64,
         transaction: u64,
     ) -> Result<(), InitError> {
-        let previous = self
-            .index(role)
-            .and_then(|index| self.roles[index].restart.history().as_slice().last())
-            .and_then(|record| *record)
-            .map(|record| (record.generation, record.transaction_id))
-            .ok_or(InitError::Accounting)?;
         self.controller_mut(role)?
             .restart
             .start_replacement(now, generation, transaction)?;
-        self.record_evidence(
-            EvidenceEvent::Restart,
-            role,
-            previous.0,
-            previous.1,
-            generation,
-        )?;
         self.update_permanent_failure(role)?;
         Ok(())
     }
 
-    pub fn fatal(&mut self) {
+    pub(crate) fn fatal(&mut self) {
         self.mode = SystemMode::Fatal;
     }
 
@@ -1712,51 +1259,10 @@ impl SystemInit {
         {
             self.mode = SystemMode::Degraded;
             self.degraded_transitions = self.degraded_transitions.saturating_add(1);
-            let identity = self
-                .index(role)
-                .and_then(|index| self.roles[index].restart.history().as_slice().last())
-                .and_then(|record| *record)
-                .map(|record| (record.generation, record.transaction_id));
-            if let Some((last_generation, last_transaction_id)) = identity {
-                self.record_evidence(
-                    EvidenceEvent::PermanentFailure,
-                    role,
-                    last_generation,
-                    last_transaction_id,
-                    1,
-                )?;
-            }
-        }
-        Ok(())
-    }
-    fn record_evidence(
-        &mut self,
-        event: EvidenceEvent,
-        role: RoleId,
-        generation: u64,
-        transaction: u64,
-        value: u64,
-    ) -> Result<(), InitError> {
-        if let Some(evidence) = &mut self.evidence {
-            evidence
-                .record(event, role as u32, generation, transaction, value)
-                .map_err(InitError::Evidence)?;
         }
         Ok(())
     }
 
-    fn finalize_evidence(&mut self, result: RecoveryResult) -> Result<(), InitError> {
-        if let Some(evidence) = &mut self.evidence {
-            match result {
-                RecoveryResult::Recovered | RecoveryResult::Degraded => {}
-                RecoveryResult::Fatal => return Ok(()),
-            }
-            evidence
-                .record(EvidenceEvent::Terminal, 0, 0, 0, 0)
-                .map_err(InitError::Evidence)?;
-        }
-        Ok(())
-    }
     fn index(&self, role: RoleId) -> Option<usize> {
         match role {
             RoleId::Registryd => Some(0),
@@ -1773,66 +1279,6 @@ impl SystemInit {
         let index = self.index(role).ok_or(InitError::UnlaunchableRole)?;
         Ok(self.roles[index].executable_identity)
     }
-}
-
-/// Validates the runtime half of the selected-generation trust boundary.
-///
-/// Build tooling externally authenticates the bootfs/manifest receipts. Init
-/// has no fourth startup authority with which to re-authenticate those
-/// receipts; it validates the retained bytes it actually received, including
-/// canonical WRRM form, the fixed product graph, and every role artifact hash.
-pub fn validate_retained_bootfs(bytes: &[u8]) -> Result<SystemInit, InitError> {
-    let archive = Archive::new(bytes).map_err(InitError::Bootfs)?;
-    let manifest_entry = archive
-        .lookup(MANIFEST_PATH.as_bytes())
-        .map_err(map_lookup)?;
-    let manifest_bytes = manifest_entry.data();
-    let encoded_generation: [u8; 32] = manifest_bytes
-        .get(48..80)
-        .ok_or(InitError::Manifest(ManifestParseError::TruncatedHeader))?
-        .try_into()
-        .expect("checked WRRM generation slice");
-    if encoded_generation == [0; 32] {
-        return Err(InitError::ZeroBootGeneration);
-    }
-    let manifest = Manifest::parse_structural(manifest_bytes, &encoded_generation)
-        .map_err(InitError::Manifest)?;
-    let mut controller = SystemInit::from_manifest(manifest)?;
-    for role in manifest.roles() {
-        let entry = archive.lookup(role.path().as_bytes()).map_err(map_lookup)?;
-        if !entry.is_executable() || entry.data().is_empty() {
-            return Err(InitError::NonExecutableRole);
-        }
-        if wyrmroot_runtime::sha256::digest(entry.data()) != *role.executable_identity() {
-            return Err(InitError::ArtifactIdentityMismatch(role.id()));
-        }
-    }
-    // Init itself and all declared immutable dependencies must resolve from
-    // the same retained archive. Their expected identities remain bound by
-    // the external selected-generation receipt; hashing them again here would
-    // produce an unauthenticated value with no independent comparison source.
-    let init = archive
-        .lookup(SYSTEM_INIT_PATH.as_bytes())
-        .map_err(map_lookup)?;
-    if !init.is_executable() || init.data().is_empty() {
-        return Err(InitError::NonExecutableRole);
-    }
-    for edge in manifest.edges() {
-        if let Some(path) = edge.target_path() {
-            archive.lookup(path.as_bytes()).map_err(map_lookup)?;
-        }
-    }
-    controller.gate = match archive.lookup(GATE_CONFIG_PATH.as_bytes()) {
-        Ok(entry) => Some(parse_gate_config(entry.data()).map_err(InitError::GateConfig)?),
-        Err(LookupError::NotFound) => None,
-        Err(error) => return Err(map_lookup(error)),
-    };
-    controller.evidence = controller
-        .gate
-        .map(|config| EvidenceLog::new(config.nonce, config.scenario))
-        .transpose()
-        .map_err(InitError::Evidence)?;
-    Ok(controller)
 }
 
 fn map_lookup(_: LookupError) -> InitError {
@@ -1927,48 +1373,6 @@ pub trait Wyr1BPlatform: InitPlatform {
         bytes: &[u8],
         rights: DwRights,
     ) -> Result<DwHandle, NativeError>;
-}
-
-/// Runs the native selected-generation activation through NORMAL or DEGRADED.
-/// The caller remains alive afterward as the permanent supervisor loop.
-pub fn run_system_init<S, L, W>(
-    system: &mut S,
-    loader: &mut L,
-    waits: &mut W,
-    bootstrap_channel: DwHandle,
-) -> Result<ResidentSystemInit, InitError>
-where
-    S: InitPlatform,
-    L: LoaderPlatform<Error = NativeError>,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let (authority, activation) = receive_and_activate(
-        system,
-        bootstrap_channel,
-        |system, authority, transaction_id, bootfs| {
-            activate_retained_bootfs(
-                system,
-                loader,
-                waits,
-                authority,
-                bootstrap_channel,
-                transaction_id,
-                bootfs,
-            )
-        },
-    )?;
-    Ok(ResidentSystemInit {
-        controller: activation.controller,
-        authority,
-        result: activation.result,
-        active: activation.active,
-        evidence_finalized: false,
-        session_complete: false,
-        last_tick_ns: system.now().map_err(InitError::Native)?,
-        wyr1b: None,
-        wyr1b_evidence: None,
-        wyr1c: None,
-    })
 }
 
 /// Selects only the WYR1-C4 WRLP 1.7 four-capability supervisor product.
@@ -2122,81 +1526,6 @@ where
         .map_err(InitError::Native)?
 }
 
-fn receive_and_activate<S, T>(
-    system: &mut S,
-    bootstrap_channel: DwHandle,
-    activate: impl FnOnce(&mut S, LoadAuthority, u64, &[u8]) -> Result<T, InitError>,
-) -> Result<(LoadAuthority, T), InitError>
-where
-    S: InitPlatform,
-{
-    let channel = system
-        .query_capability_info(bootstrap_channel)
-        .map_err(InitError::Native)?;
-    validate_bootstrap_channel(channel, BOOTSTRAP_CHANNEL_EXPECTATION)
-        .map_err(InitError::Capability)?;
-    let mut init_bytes = [0; SUPERVISOR_BYTES];
-    let mut handles = [DwReceivedHandleInfoV1::default(); 3];
-    let counts = system
-        .receive_channel(bootstrap_channel, &mut init_bytes, &mut handles)
-        .map_err(InitError::Native)?;
-    if counts
-        != (ReceiveCounts {
-            bytes: SUPERVISOR_BYTES,
-            handles: 3,
-        })
-    {
-        let error = InitError::Launch(wyrmroot_loader::launch::LaunchError::HandleCount);
-        close_malformed_startup(system, &handles, counts.handles, bootstrap_channel)?;
-        return Err(error);
-    }
-    let startup = (|| {
-        let parsed = parse_init(LaunchProfile::Supervisor, &init_bytes, &handles)
-            .map_err(InitError::Launch)?;
-        let capabilities = [
-            fresh_capability(system, handles[0])?,
-            fresh_capability(system, handles[1])?,
-            fresh_capability(system, handles[2])?,
-        ];
-        validate_init_capabilities_v2(
-            &capabilities,
-            SELF_ROOT_EXPECTATION,
-            BOOTFS_EXPECTATION,
-            LOADER_TASK_GROUP_EXPECTATION,
-        )
-        .map_err(InitError::Capability)?;
-        let authority = LoadAuthority {
-            parent_root: handles[0].handle,
-            bootfs: handles[1].handle,
-            task_group: handles[2].handle,
-        };
-        let size = system
-            .query_memory_object_size(authority.bootfs)
-            .map_err(InitError::Native)?;
-        let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
-        let activation = system
-            .with_bootfs_bytes(
-                authority.parent_root,
-                authority.bootfs,
-                plan,
-                |system, bootfs| activate(system, authority, parsed.transaction_id, bootfs),
-            )
-            .map_err(InitError::Native)??;
-        Ok::<_, InitError>((authority, activation))
-    })();
-    let (authority, activation) = match startup {
-        Ok(value) => value,
-        Err(error) => {
-            close_startup_failure(system, &handles, bootstrap_channel)?;
-            return Err(error);
-        }
-    };
-    system
-        .close_handle(bootstrap_channel)
-        .map_err(InitError::Native)?;
-    Ok((authority, activation))
-}
-
 fn close_startup_failure<S: InitPlatform>(
     system: &mut S,
     handles: &[DwReceivedHandleInfoV1],
@@ -2226,360 +1555,6 @@ fn close_malformed_startup<S: InitPlatform>(
     close_startup_failure(system, &handles[..initialized], bootstrap_channel)
 }
 
-fn activate_retained_bootfs<S, L, W>(
-    system: &mut S,
-    loader: &mut L,
-    waits: &mut W,
-    authority: LoadAuthority,
-    bootstrap_channel: DwHandle,
-    parent_transaction: u64,
-    bootfs: &[u8],
-) -> Result<ActivationState, InitError>
-where
-    S: InitPlatform,
-    L: LoaderPlatform<Error = NativeError>,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let mut controller = validate_retained_bootfs(bootfs)?;
-    let mut active = [None; EARLY_ROLE_COUNT];
-    let result = activate_retained_bootfs_state(
-        system,
-        loader,
-        waits,
-        authority,
-        bootstrap_channel,
-        parent_transaction,
-        bootfs,
-        &mut controller,
-        &mut active,
-    )?;
-    Ok(ActivationState {
-        controller,
-        result,
-        active,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn activate_retained_bootfs_state<S, L, W>(
-    system: &mut S,
-    loader: &mut L,
-    waits: &mut W,
-    authority: LoadAuthority,
-    bootstrap_channel: DwHandle,
-    parent_transaction: u64,
-    bootfs: &[u8],
-    controller: &mut SystemInit,
-    active: &mut [Option<ActiveNativeRole>; EARLY_ROLE_COUNT],
-) -> Result<RecoveryResult, InitError>
-where
-    S: InitPlatform,
-    L: LoaderPlatform<Error = NativeError>,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    controller.become_operational()?;
-    let mut ready = [0; HEADER_BYTES];
-    let ready_len =
-        encode_ready_for_profile(LaunchProfile::Supervisor, parent_transaction, &mut ready)
-            .map_err(InitError::Launch)?;
-    system
-        .send_channel(bootstrap_channel, &ready[..ready_len])
-        .map_err(InitError::Native)?;
-    let retire_now = system.now().map_err(InitError::Native)?;
-    let retire_deadline = retire_now
-        .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
-        .ok_or(InitError::Restart(
-            RestartTransitionError::ArithmeticOverflow,
-        ))?;
-    let retire_item = DwWaitItemV1 {
-        handle: bootstrap_channel,
-        signals: DW_SIGNAL_PEER_CLOSED,
-    };
-    let retired = waits
-        .wait_many(
-            core::slice::from_ref(&retire_item),
-            DwDeadline(retire_deadline),
-        )
-        .map_err(|error| InitError::BootstrapRetirement(BootstrapRetirementFailure::Wait(error)))?;
-    if retired.index != 0 || retired.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 {
-        return Err(InitError::BootstrapRetirement(
-            BootstrapRetirementFailure::WrongResult {
-                index: retired.index,
-                observed: retired.observed.0,
-            },
-        ));
-    }
-    let now = system.now().map_err(InitError::Native)?;
-    controller.begin_registry(now, 1, 0x1001)?;
-    for role in [RoleId::Registryd, RoleId::Devmgr] {
-        match activate_role_until_ready(system, controller, loader, waits, authority, bootfs, role)?
-        {
-            RoleActivation::Ready(attempt) => active[role_index(role)?] = Some(attempt),
-            RoleActivation::Degraded => return Ok(RecoveryResult::Degraded),
-        }
-    }
-    Ok(RecoveryResult::Recovered)
-}
-
-fn remap_and_activate_role<S, L, W>(
-    system: &mut S,
-    loader: &mut L,
-    waits: &mut W,
-    authority: LoadAuthority,
-    controller: &mut SystemInit,
-    role: RoleId,
-) -> Result<RoleActivation, InitError>
-where
-    S: InitPlatform,
-    L: LoaderPlatform<Error = NativeError>,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let size = system
-        .query_memory_object_size(authority.bootfs)
-        .map_err(InitError::Native)?;
-    let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
-    system
-        .with_bootfs_bytes(
-            authority.parent_root,
-            authority.bootfs,
-            plan,
-            |system, bootfs| {
-                activate_role_until_ready(
-                    system, controller, loader, waits, authority, bootfs, role,
-                )
-            },
-        )
-        .map_err(InitError::Native)?
-}
-
-#[allow(clippy::too_many_arguments)]
-fn activate_role_until_ready<S, L, W>(
-    system: &mut S,
-    controller: &mut SystemInit,
-    loader: &mut L,
-    waits: &mut W,
-    authority: LoadAuthority,
-    bootfs: &[u8],
-    role: RoleId,
-) -> Result<RoleActivation, InitError>
-where
-    S: InitPlatform,
-    L: LoaderPlatform<Error = NativeError>,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    loop {
-        let RestartState::Starting {
-            generation,
-            transaction_id,
-            ..
-        } = controller
-            .role_state(role)
-            .ok_or(InitError::AbsentState(0x01))?
-        else {
-            return Err(InitError::WrongActivationOrder);
-        };
-        let executable_identity = controller.executable_identity(role)?;
-        let task_group = system
-            .create_attempt_task_group(authority.task_group)
-            .map_err(InitError::Native)?;
-        let reservation = controller.reserve_attempt(role, generation, transaction_id)?;
-        let role_authority = LoadAuthority {
-            task_group,
-            ..authority
-        };
-        let loaded = match load_role(
-            loader,
-            role_authority,
-            bootfs,
-            role,
-            executable_identity,
-            transaction_id,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                let now = match system.now().map_err(InitError::Native) {
-                    Ok(now) => now,
-                    Err(clock_error) => {
-                        let close_failed = system.close_handle(task_group).is_err();
-                        let release_failed = controller.abort_reservation(reservation).is_err();
-                        controller.fatal();
-                        return Err(if close_failed || release_failed {
-                            InitError::Cleanup
-                        } else {
-                            clock_error
-                        });
-                    }
-                };
-                if let Err(transition_error) = controller.fail(
-                    role,
-                    generation,
-                    transaction_id,
-                    now,
-                    AttemptFailure::CreationFailed,
-                ) {
-                    let close_failed = system.close_handle(task_group).is_err();
-                    let release_failed = controller.abort_reservation(reservation).is_err();
-                    controller.fatal();
-                    return Err(if close_failed || release_failed {
-                        InitError::Cleanup
-                    } else {
-                        transition_error
-                    });
-                }
-                let rollback_failed = matches!(
-                    error,
-                    InitError::Loader(LoadError::Platform {
-                        rollback_failed: true,
-                        ..
-                    })
-                );
-                let close_failed = system.close_handle(task_group).is_err();
-                if rollback_failed || close_failed {
-                    let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
-                    controller.cleanup_failed(role, generation, transaction_id, retired_at)?;
-                    controller.fatal();
-                    return Err(error);
-                }
-                controller.abort_reservation(reservation)?;
-                let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
-                controller.cleanup_complete(role, generation, transaction_id, retired_at)?;
-                if advance_or_degrade(system, controller, role, transaction_id)? {
-                    return Ok(RoleActivation::Degraded);
-                }
-                continue;
-            }
-        };
-        let install = controller.install_attempt(AttemptResources {
-            role,
-            generation,
-            transaction_id,
-            executable_identity,
-            startup_profile: StartupProfile::EarlyBootStub,
-            task_group,
-            process: loaded.process,
-            launch_channel: loaded.launch_channel,
-            mappings: 0,
-            reservation,
-        });
-        if let Err(error) = install {
-            controller.fatal();
-            return match cleanup_loaded(system, waits, loaded, task_group, true) {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(cleanup),
-            };
-        }
-        let now = match system.now().map_err(InitError::Native) {
-            Ok(now) => now,
-            Err(error) => {
-                return Err(cleanup_after_transition_error(
-                    system, waits, controller, loaded, task_group, role, error,
-                ));
-            }
-        };
-        if let Err(error) = controller.child_started(role, generation, transaction_id, now) {
-            return Err(cleanup_after_transition_error(
-                system, waits, controller, loaded, task_group, role, error,
-            ));
-        }
-        let deadline = match now.checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns) {
-            Some(deadline) => DwDeadline(deadline),
-            None => {
-                return Err(cleanup_after_transition_error(
-                    system,
-                    waits,
-                    controller,
-                    loaded,
-                    task_group,
-                    role,
-                    InitError::Restart(RestartTransitionError::ArithmeticOverflow),
-                ));
-            }
-        };
-        match await_child_ready_profile_observed(
-            waits,
-            loaded.process,
-            loaded.launch_channel,
-            LaunchProfile::EarlyBootStub,
-            transaction_id,
-            deadline,
-        ) {
-            Ok(()) => {
-                let now = match system.now().map_err(InitError::Native) {
-                    Ok(now) => now,
-                    Err(error) => {
-                        return Err(cleanup_after_transition_error(
-                            system, waits, controller, loaded, task_group, role, error,
-                        ));
-                    }
-                };
-                if let Err(error) = controller.ready(role, generation, transaction_id, now) {
-                    return Err(cleanup_after_transition_error(
-                        system, waits, controller, loaded, task_group, role, error,
-                    ));
-                }
-                return Ok(RoleActivation::Ready(ActiveNativeRole {
-                    role,
-                    generation,
-                    transaction_id,
-                    loaded,
-                    task_group,
-                }));
-            }
-            Err(error) => {
-                let observed_transition = classify_after_ready_observation(&error);
-                let now = match system.now().map_err(InitError::Native) {
-                    Ok(now) => now,
-                    Err(clock_error) => {
-                        return Err(cleanup_after_transition_error(
-                            system,
-                            waits,
-                            controller,
-                            loaded,
-                            task_group,
-                            role,
-                            clock_error,
-                        ));
-                    }
-                };
-                let transition = match observed_transition {
-                    AfterReadyTransition::Terminal(disposition) => {
-                        controller.terminal(role, generation, transaction_id, now, disposition)
-                    }
-                    AfterReadyTransition::Failure(failure) => {
-                        controller.ready_wait_failed(role, generation, transaction_id, now, failure)
-                    }
-                };
-                if let Err(transition_error) = transition {
-                    return Err(cleanup_after_transition_error(
-                        system,
-                        waits,
-                        controller,
-                        loaded,
-                        task_group,
-                        role,
-                        transition_error,
-                    ));
-                }
-                complete_native_cleanup(
-                    system,
-                    waits,
-                    controller,
-                    loaded,
-                    task_group,
-                    !error.process_exit_observed(),
-                    role,
-                    generation,
-                    transaction_id,
-                    now,
-                )?;
-                if advance_or_degrade(system, controller, role, transaction_id)? {
-                    return Ok(RoleActivation::Degraded);
-                }
-            }
-        }
-    }
-}
-
 fn fresh_capability<S: InitPlatform>(
     system: &mut S,
     info: DwReceivedHandleInfoV1,
@@ -2593,36 +1568,6 @@ fn fresh_capability<S: InitPlatform>(
             .query_capability_info(info.handle)
             .map_err(InitError::Native)?,
     })
-}
-fn load_role<L: LoaderPlatform<Error = NativeError>>(
-    loader: &mut L,
-    authority: LoadAuthority,
-    bytes: &[u8],
-    role: RoleId,
-    expected_identity: [u8; 32],
-    transaction_id: u64,
-) -> Result<LoadedProcess, InitError> {
-    let archive = Archive::new(bytes).map_err(InitError::Bootfs)?;
-    let path = match role {
-        RoleId::Registryd => "system/registryd",
-        RoleId::Devmgr => "system/devmgr",
-        _ => return Err(InitError::UnlaunchableRole),
-    };
-    let e = archive.lookup(path.as_bytes()).map_err(map_lookup)?;
-    if wyrmroot_runtime::sha256::digest(e.data()) != expected_identity {
-        return Err(InitError::ArtifactIdentityMismatch(role));
-    }
-    load_process(
-        loader,
-        authority,
-        LoadRequest {
-            image: e.data(),
-            display_path: path,
-            profile: LaunchProfile::EarlyBootStub,
-            transaction_id,
-        },
-    )
-    .map_err(InitError::Loader)
 }
 pub(crate) fn cleanup_loaded<S: InitPlatform, W: SupervisionPlatform<Error = NativeError>>(
     system: &mut S,
@@ -2698,126 +1643,6 @@ pub(crate) fn cleanup_loaded_before<
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cleanup_after_transition_error<S: InitPlatform, W: SupervisionPlatform<Error = NativeError>>(
-    system: &mut S,
-    waits: &mut W,
-    controller: &mut SystemInit,
-    loaded: LoadedProcess,
-    task_group: DwHandle,
-    role: RoleId,
-    transition_error: InitError,
-) -> InitError {
-    if cleanup_loaded(system, waits, loaded, task_group, true).is_err() {
-        controller.fatal();
-        return InitError::Cleanup;
-    }
-    match controller.retire_attempt_after_fatal(role) {
-        Ok(()) => transition_error,
-        Err(error) => {
-            controller.fatal();
-            error
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn complete_native_cleanup<S: InitPlatform, W: SupervisionPlatform<Error = NativeError>>(
-    system: &mut S,
-    waits: &mut W,
-    controller: &mut SystemInit,
-    loaded: LoadedProcess,
-    task_group: DwHandle,
-    terminate: bool,
-    role: RoleId,
-    generation: u64,
-    transaction: u64,
-    classified_at: u64,
-) -> Result<u64, InitError> {
-    match cleanup_loaded(system, waits, loaded, task_group, terminate) {
-        Ok(()) => {
-            let retired_at = classified_at.checked_add(1).ok_or(InitError::Accounting)?;
-            match controller.cleanup_complete(role, generation, transaction, retired_at) {
-                Ok(()) => Ok(retired_at),
-                Err(error) => {
-                    let retirement = controller.retire_attempt_after_fatal(role);
-                    match retirement {
-                        Ok(()) => Err(error),
-                        Err(retirement_error) => Err(retirement_error),
-                    }
-                }
-            }
-        }
-        Err(error) => {
-            let classified = classified_at.checked_add(1).ok_or(InitError::Accounting)?;
-            let transition = controller.cleanup_failed(role, generation, transaction, classified);
-            controller.fatal();
-            match transition {
-                Ok(()) => Err(error),
-                Err(_) => Err(InitError::Cleanup),
-            }
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AfterReadyTransition {
-    Terminal(TerminalDisposition),
-    Failure(AttemptFailure),
-}
-
-fn classify_after_ready_observation(
-    error: &ObservedSupervisionError<NativeError>,
-) -> AfterReadyTransition {
-    match error {
-        ObservedSupervisionError::ExitedBeforeReady(info)
-        | ObservedSupervisionError::PeerClosedBeforeReady(info)
-        | ObservedSupervisionError::Exit(_, info) => {
-            AfterReadyTransition::Terminal(terminal_disposition(info))
-        }
-        ObservedSupervisionError::ExitObservedReadiness(_, _) => {
-            AfterReadyTransition::Failure(AttemptFailure::ReadinessFailedAfterExit)
-        }
-        ObservedSupervisionError::Supervision(error) => {
-            let failure = match error {
-                SupervisionError::Ready(_)
-                | SupervisionError::InvalidReadyReceive(_)
-                | SupervisionError::DuplicateReady => AttemptFailure::DuplicateReady,
-                SupervisionError::ExitObservedReadiness(_) => {
-                    AttemptFailure::ReadinessFailedAfterExit
-                }
-                SupervisionError::ExitQuery(_) | SupervisionError::Exit(_) => {
-                    AttemptFailure::ExitQueryFailed
-                }
-                _ => AttemptFailure::WaitFailed,
-            };
-            AfterReadyTransition::Failure(failure)
-        }
-    }
-}
-
-fn terminal_disposition(info: &DwTaskTerminationInfoV1) -> TerminalDisposition {
-    if info.reason == DW_TERMINATION_NORMAL_EXIT
-        && info.exception_type.0 == 0
-        && info.detail == 0
-        && info.fault_address == 0
-    {
-        TerminalDisposition::NormalExit(info.application_code)
-    } else if info.reason == DW_TERMINATION_TASK_GROUP_TEARDOWN
-        && info.exception_type.0 == 0
-        && info.detail == 0
-        && info.fault_address == 0
-    {
-        TerminalDisposition::TaskGroupTeardown
-    } else if info.reason == DW_TERMINATION_AUTHORIZED
-        && info.exception_type.0 == 0
-        && info.detail == 0
-        && info.fault_address == 0
-    {
-        TerminalDisposition::AuthorizedTermination
-    } else {
-        TerminalDisposition::UnhandledException
-    }
-}
 fn advance_or_degrade<S: InitPlatform>(
     system: &mut S,
     controller: &mut SystemInit,
@@ -2863,69 +1688,6 @@ fn next_transaction(transaction: u64) -> Result<u64, InitError> {
     transaction.checked_add(1).ok_or(InitError::Restart(
         RestartTransitionError::ArithmeticOverflow,
     ))
-}
-
-/// Distinguishes process existence from profile-aware READY validation.
-pub fn observe_ready(
-    bytes: &[u8],
-    handles: usize,
-    expected_transaction: u64,
-) -> Result<(), AttemptFailure> {
-    if handles != 0 || bytes.len() != wyrmroot_loader::launch::HEADER_BYTES {
-        return Err(AttemptFailure::MalformedReady);
-    }
-    match wyrmroot_loader::launch::parse_ready_for_profile(
-        wyrmroot_loader::launch::LaunchProfile::EarlyBootStub,
-        bytes,
-        expected_transaction,
-    ) {
-        Ok(()) => Ok(()),
-        Err(wyrmroot_loader::launch::LaunchError::TransactionMismatch) => {
-            Err(AttemptFailure::WrongTransactionReady)
-        }
-        Err(_) => Err(AttemptFailure::MalformedReady),
-    }
-}
-
-/// Converts an exact Process result into the restart engine's typed terminal disposition.
-#[must_use]
-pub const fn normal_exit(code: u32) -> TerminalDisposition {
-    TerminalDisposition::NormalExit(code)
-}
-
-pub const REAP_CLASS_NORMAL_EXIT: u32 = 1;
-pub const REAP_CLASS_AUTHORIZED_TERMINATION: u32 = 2;
-pub const REAP_CLASS_TASK_GROUP_TEARDOWN: u32 = 3;
-pub const REAP_CLASS_UNHANDLED_EXCEPTION: u32 = 4;
-
-#[must_use]
-pub const fn reap_evidence_value(failure: AttemptFailure) -> u64 {
-    let disposition = match failure {
-        AttemptFailure::ExitBeforeReady(disposition)
-        | AttemptFailure::ExitAfterReady(disposition) => disposition,
-        AttemptFailure::MalformedReady
-        | AttemptFailure::DuplicateReady
-        | AttemptFailure::ReadinessFailedAfterExit
-        | AttemptFailure::WrongTransactionReady
-        | AttemptFailure::PeerClosedBeforeReady
-        | AttemptFailure::WaitFailed
-        | AttemptFailure::ReadyTimeout
-        | AttemptFailure::Cancelled => TerminalDisposition::TaskGroupTeardown,
-        AttemptFailure::ExitQueryFailed => TerminalDisposition::UnhandledException,
-        AttemptFailure::CreationFailed | AttemptFailure::StartFailed => {
-            TerminalDisposition::AuthorizedTermination
-        }
-    };
-    match disposition {
-        TerminalDisposition::NormalExit(code) => {
-            ((REAP_CLASS_NORMAL_EXIT as u64) << 32) | code as u64
-        }
-        TerminalDisposition::AuthorizedTermination => {
-            (REAP_CLASS_AUTHORIZED_TERMINATION as u64) << 32
-        }
-        TerminalDisposition::TaskGroupTeardown => (REAP_CLASS_TASK_GROUP_TEARDOWN as u64) << 32,
-        TerminalDisposition::UnhandledException => (REAP_CLASS_UNHANDLED_EXCEPTION as u64) << 32,
-    }
 }
 
 #[cfg(test)]
@@ -2992,115 +1754,8 @@ mod native_cleanup_tests {
         );
     }
 
-    #[test]
-    fn e6_manifest_constructor_admits_only_the_production_shell_profile() {
-        use wyrmroot_rrc_manifest::builder::{Builder, DependencySpec, RoleSpec};
-
-        // The same five-role closure with the shell's startup profile varied.
-        // The E6 constructor is additive: it admits only `Wyrmsh`, and the
-        // historical WYR1-C constructor keeps admitting only `Retained`.
-        let boot_generation = [0x42; 32];
-        let build = |shell_profile: StartupProfile| {
-            let mut builder = Builder::new(boot_generation);
-            for (id, path, activation, profile) in [
-                (
-                    RoleId::Registryd,
-                    "system/registryd",
-                    Activation::Early,
-                    StartupProfile::BootstrapRegistry,
-                ),
-                (
-                    RoleId::Devmgr,
-                    "system/devmgr",
-                    Activation::Early,
-                    StartupProfile::DeviceCoordinator,
-                ),
-                (
-                    RoleId::Uart16550d,
-                    "system/uart16550d",
-                    Activation::DeviceBound,
-                    StartupProfile::Retained,
-                ),
-                (
-                    RoleId::Consoled,
-                    "system/consoled",
-                    Activation::ConsoleBound,
-                    StartupProfile::Retained,
-                ),
-                (
-                    RoleId::Wyrmsh,
-                    "system/wyrmsh",
-                    Activation::ConsoleBound,
-                    shell_profile,
-                ),
-            ] {
-                builder
-                    .add_role(RoleSpec {
-                        id,
-                        required: true,
-                        requires_ready: true,
-                        activation,
-                        startup_profile: profile,
-                        path,
-                        justification: "fixed retained recovery closure",
-                        executable_identity: [id as u8; 32],
-                    })
-                    .unwrap();
-            }
-            for (owner, target) in [
-                (RoleId::Devmgr, RoleId::Registryd),
-                (RoleId::Uart16550d, RoleId::Devmgr),
-                (RoleId::Consoled, RoleId::Uart16550d),
-                (RoleId::Wyrmsh, RoleId::Consoled),
-            ] {
-                builder
-                    .add_dependency(DependencySpec {
-                        owner,
-                        kind: DependencyKind::RoleReady,
-                        target_role: Some(target),
-                        target_path: None,
-                    })
-                    .unwrap();
-            }
-            builder.build_structural().unwrap()
-        };
-        let production = build(StartupProfile::Wyrmsh);
-        let manifest = Manifest::parse_structural(&production, &boot_generation).unwrap();
-        assert!(SystemInit::from_wyr1e_manifest(manifest).is_ok());
-        assert_eq!(
-            SystemInit::from_wyr1c_manifest(manifest),
-            Err(InitError::WrongManifestProfile)
-        );
-        let historical = build(StartupProfile::Retained);
-        let manifest = Manifest::parse_structural(&historical, &boot_generation).unwrap();
-        assert!(SystemInit::from_wyr1c_manifest(manifest).is_ok());
-        assert_eq!(
-            SystemInit::from_wyr1e_manifest(manifest),
-            Err(InitError::WrongManifestProfile)
-        );
-    }
-
-    #[test]
-    fn resource_domain_custody_reduces_only_for_a_devmgr_descendant() {
-        let custody = ResourceDomainCustody::new(DwHandle(44));
-        assert_eq!(
-            custody.devmgr_claim_authority(ResourceDomainMembership::InitOutsideDomain),
-            Err(ResourceDomainCustodyError::OutsideResourceDomain)
-        );
-        assert_eq!(
-            custody.devmgr_claim_authority(ResourceDomainMembership::Unrelated),
-            Err(ResourceDomainCustodyError::OutsideResourceDomain)
-        );
-        let reduced = custody
-            .devmgr_claim_authority(ResourceDomainMembership::DevmgrGenerationDescendant)
-            .expect("devmgr descendant receives reduced claim authority");
-        assert_eq!(reduced.handle(), DwHandle(44));
-        assert_eq!(reduced.rights(), RESOURCE_DOMAIN_CLAIM_RIGHTS);
-        assert_ne!(reduced.rights(), RESOURCE_DOMAIN_CUSTODY_PROFILE_RIGHTS);
-    }
     use deepwyrm_syscall::{
-        DW_TASK_STATE_EXITED, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_WAIT_RESULT_V1_SIZE, DwStatus,
-        DwTaskState, DwTaskTerminationInfoV1, DwWaitResultV1,
+        DW_TASK_STATE_EXITED, DwStatus, DwTaskState, DwTaskTerminationInfoV1, DwWaitResultV1,
     };
     use wyrmroot_runtime::NativeOutputError;
 
@@ -3299,66 +1954,6 @@ mod native_cleanup_tests {
         }
     }
 
-    struct ResidentWaits {
-        wait_count: u8,
-    }
-
-    impl SupervisionPlatform for ResidentWaits {
-        type Error = NativeError;
-
-        fn wait_many(
-            &mut self,
-            items: &[DwWaitItemV1],
-            _deadline: DwDeadline,
-        ) -> Result<DwWaitResultV1, Self::Error> {
-            let result = match self.wait_count {
-                0 | 1 => DwWaitResultV1 {
-                    size: DW_WAIT_RESULT_V1_SIZE,
-                    version: 1,
-                    index: 0,
-                    observed: DW_SIGNAL_PEER_CLOSED,
-                    ..DwWaitResultV1::default()
-                },
-                2 => DwWaitResultV1 {
-                    size: DW_WAIT_RESULT_V1_SIZE,
-                    version: 1,
-                    index: 0,
-                    observed: DW_SIGNAL_EXITED,
-                    ..DwWaitResultV1::default()
-                },
-                3 => return Err(NativeError::Status(DW_STATUS_TIMED_OUT)),
-                _ => panic!("unexpected resident wait"),
-            };
-            if self.wait_count == 2 {
-                assert_eq!(items.len(), 1);
-            }
-            self.wait_count += 1;
-            Ok(result)
-        }
-
-        fn receive_channel(
-            &mut self,
-            _channel: DwHandle,
-            _bytes: &mut [u8],
-            _handles: &mut [DwReceivedHandleInfoV1],
-        ) -> Result<ReceiveCounts, Self::Error> {
-            Err(FAILURE)
-        }
-
-        fn query_task_termination(
-            &mut self,
-            _process: DwHandle,
-        ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
-            Ok(DwTaskTerminationInfoV1 {
-                size: DW_TASK_TERMINATION_INFO_V1_SIZE,
-                version: 1,
-                state: DW_TASK_STATE_EXITED,
-                reason: DW_TERMINATION_NORMAL_EXIT,
-                ..DwTaskTerminationInfoV1::default()
-            })
-        }
-    }
-
     impl SupervisionPlatform for MockWaits {
         type Error = NativeError;
 
@@ -3408,299 +2003,9 @@ mod native_cleanup_tests {
         launch_channel: DwHandle(30),
     };
 
-    fn install_ready_attempt(
-        controller: &mut SystemInit,
-        role: RoleId,
-        generation: u64,
-        transaction_id: u64,
-        handles: (u64, u64, u64),
-        now: u64,
-    ) -> ActiveNativeRole {
-        let reservation = controller
-            .reserve_attempt(role, generation, transaction_id)
-            .unwrap();
-        let loaded = LoadedProcess {
-            process: DwHandle(handles.1),
-            launch_channel: DwHandle(handles.2),
-        };
-        let task_group = DwHandle(handles.0);
-        let executable_identity = controller.executable_identity(role).unwrap();
-        controller
-            .install_attempt(AttemptResources {
-                role,
-                generation,
-                transaction_id,
-                executable_identity,
-                startup_profile: StartupProfile::EarlyBootStub,
-                task_group,
-                process: loaded.process,
-                launch_channel: loaded.launch_channel,
-                mappings: 0,
-                reservation,
-            })
-            .unwrap();
-        controller
-            .child_started(role, generation, transaction_id, now)
-            .unwrap();
-        controller
-            .ready(role, generation, transaction_id, now + 1)
-            .unwrap();
-        ActiveNativeRole {
-            role,
-            generation,
-            transaction_id,
-            loaded,
-            task_group,
-        }
-    }
-
-    fn ready_registry_controller() -> SystemInit {
-        let mut controller = SystemInit {
-            mode: SystemMode::Bootstrap,
-            roles: [
-                RoleController::new(RoleId::Registryd, [1; 32]).unwrap(),
-                RoleController::new(RoleId::Devmgr, [2; 32]).unwrap(),
-            ],
-            degraded_transitions: 0,
-            activated: [false; EARLY_ROLE_COUNT],
-            accounting: AttemptLedger::new(),
-            gate: None,
-            evidence: None,
-            registry_startup_profile: StartupProfile::EarlyBootStub,
-            devmgr_startup_profile: StartupProfile::EarlyBootStub,
-        };
-        controller.become_operational().unwrap();
-        controller.begin_registry(0, 1, 0x1001).unwrap();
-        install_ready_attempt(
-            &mut controller,
-            RoleId::Registryd,
-            1,
-            0x1001,
-            (10, 20, 30),
-            1,
-        );
-        controller
-    }
-
-    #[test]
-    fn fail_closed_complete_retirement_releases_accounting_and_degrades() {
-        let mut controller = ready_registry_controller();
-        assert_eq!(controller.outstanding_reservations(), 1);
-
-        controller
-            .retire_active_fail_closed(
-                RoleId::Registryd,
-                1,
-                0x1001,
-                u64::MAX,
-                AttemptFailure::WaitFailed,
-                CleanupDisposition::Complete,
-            )
-            .unwrap();
-
-        assert!(controller.resources(RoleId::Registryd).is_none());
-        assert_eq!(controller.outstanding_reservations(), 0);
-        assert_eq!(controller.mode(), SystemMode::Degraded);
-        assert_eq!(
-            controller.role_state(RoleId::Registryd),
-            Some(RestartState::PermanentFailure {
-                final_failure: AttemptFailure::WaitFailed,
-                cleanup: CleanupDisposition::Complete,
-            })
-        );
-    }
-
-    #[test]
-    fn fail_closed_retirement_is_identity_exact_and_failed_cleanup_stays_owned() {
-        let mut controller = ready_registry_controller();
-        let ready = controller.role_state(RoleId::Registryd);
-
-        assert_eq!(
-            controller.retire_active_fail_closed(
-                RoleId::Registryd,
-                1,
-                0x1002,
-                3,
-                AttemptFailure::WaitFailed,
-                CleanupDisposition::Complete,
-            ),
-            Err(InitError::Restart(
-                RestartTransitionError::TransactionMismatch
-            ))
-        );
-        assert_eq!(controller.role_state(RoleId::Registryd), ready);
-        assert_eq!(controller.outstanding_reservations(), 1);
-
-        controller
-            .retire_active_fail_closed(
-                RoleId::Registryd,
-                1,
-                0x1001,
-                3,
-                AttemptFailure::WaitFailed,
-                CleanupDisposition::Failed,
-            )
-            .unwrap();
-        assert!(controller.resources(RoleId::Registryd).is_some());
-        assert_eq!(controller.outstanding_reservations(), 1);
-        assert_eq!(controller.mode(), SystemMode::Degraded);
-        assert!(matches!(
-            controller.role_state(RoleId::Registryd),
-            Some(RestartState::PermanentFailure {
-                cleanup: CleanupDisposition::Failed,
-                ..
-            })
-        ));
-    }
-
-    /// Two ready early roles under one resident. With `ResidentWaits`, the
-    /// first legacy tick reaps the registry's peer close and succeeds.
-    pub(crate) fn two_role_resident() -> (ResidentSystemInit, ActiveNativeRole, ActiveNativeRole) {
-        let mut controller = SystemInit {
-            mode: SystemMode::Bootstrap,
-            roles: [
-                RoleController::new(RoleId::Registryd, [1; 32]).unwrap(),
-                RoleController::new(RoleId::Devmgr, [2; 32]).unwrap(),
-            ],
-            degraded_transitions: 0,
-            activated: [false; EARLY_ROLE_COUNT],
-            accounting: AttemptLedger::new(),
-            gate: None,
-            evidence: None,
-            registry_startup_profile: StartupProfile::EarlyBootStub,
-            devmgr_startup_profile: StartupProfile::EarlyBootStub,
-        };
-        controller.become_operational().unwrap();
-        controller.begin_registry(0, 1, 0x1001).unwrap();
-        let registry = install_ready_attempt(
-            &mut controller,
-            RoleId::Registryd,
-            1,
-            0x1001,
-            (10, 20, 30),
-            1,
-        );
-        let devmgr =
-            install_ready_attempt(&mut controller, RoleId::Devmgr, 1, 0x1002, (11, 21, 31), 3);
-        let resident = ResidentSystemInit {
-            controller,
-            authority: LoadAuthority {
-                parent_root: DwHandle(100),
-                bootfs: DwHandle(101),
-                task_group: DwHandle(102),
-            },
-            result: RecoveryResult::Recovered,
-            active: [Some(registry), Some(devmgr)],
-            evidence_finalized: false,
-            session_complete: false,
-            last_tick_ns: 9,
-            wyr1b: None,
-            wyr1b_evidence: None,
-            wyr1c: None,
-        };
-        (resident, registry, devmgr)
-    }
-
-    #[test]
-    fn resident_drains_peer_close_to_clean_exit_without_dropping_other_role() {
-        let (mut resident, registry, devmgr) = two_role_resident();
-        let mut native = MockNative::new();
-        let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
-        let mut waits = ResidentWaits { wait_count: 0 };
-
-        assert_eq!(
-            resident.control_tick_product(&mut native, &mut loader, &mut waits, 10),
-            Ok(SystemMode::Normal)
-        );
-        assert_eq!(native.wyr1b_calls, 0);
-        assert_eq!(resident.wyr1b_evidence_record(0), None);
-        assert_eq!(resident.active, [None, Some(devmgr)]);
-        assert_eq!(
-            resident.controller.role_state(RoleId::Registryd),
-            Some(RestartState::Stopped)
-        );
-        assert!(matches!(
-            resident.controller.role_state(RoleId::Devmgr),
-            Some(RestartState::Ready { .. })
-        ));
-        assert!(!resident.evidence_finalized());
-        assert_eq!(
-            &native.closed[..3],
-            &[
-                registry.loaded.launch_channel,
-                registry.loaded.process,
-                registry.task_group
-            ]
-        );
-        assert_eq!(waits.wait_count, 3);
-    }
-
     /// The resident loop's own platform for `MockNative`. Selectors 29 and 34
     /// drive their own scenario from the loop on every tick, which this fixture
     /// does not carry, so the loop tests below run in every other shape.
-    impl resident_loop::ResidentLoopPlatform for MockNative {}
-
-    /// F3A.7g, the last step: a completed session ends permanent init's
-    /// process with success, on the tick that observed it.
-    ///
-    /// The tick runs first (the registry is reaped), and the check comes
-    /// before the wait: `MockNative` fails any wait, so a loop that slept
-    /// before checking, or checked only after a later tick, would report
-    /// 0xAF01_0005 instead.
-    #[test]
-    fn permanent_init_leaves_its_loop_when_the_session_is_complete() {
-        let (mut resident, _, _) = two_role_resident();
-        resident.session_complete = true;
-        let mut native = MockNative::new();
-        let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
-        let mut waits = ResidentWaits { wait_count: 0 };
-
-        assert_eq!(
-            resident_loop::continue_resident(&mut resident, &mut native, &mut loader, &mut waits),
-            0
-        );
-        assert_eq!(waits.wait_count, 3, "the tick ran before the loop returned");
-    }
-
-    /// The control for the test above: the same resident with its session
-    /// still open does not leave the loop, and reaches the tick wait.
-    #[test]
-    fn an_open_session_keeps_permanent_init_in_its_loop() {
-        let (mut resident, _, _) = two_role_resident();
-        let mut native = MockNative::new();
-        let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
-        let mut waits = ResidentWaits { wait_count: 0 };
-
-        assert_eq!(
-            resident_loop::continue_resident(&mut resident, &mut native, &mut loader, &mut waits),
-            0xAF01_0005
-        );
-        assert_eq!(waits.wait_count, 3);
-    }
-
-    /// The loop sleeps one tick period past the tick's own instant. Products
-    /// with resident handshakes (selectors 29, 31, 32 and production) tick at
-    /// the supervision backoff, the rest once a second; the selectors' half
-    /// is a build-time assertion beside `RESIDENT_TICK_NS`.
-    #[test]
-    fn the_resident_loop_waits_one_tick_period_past_the_tick() {
-        let expected = if true {
-            WYR0_I_SUPERVISION_POLICY.backoff_ns
-        } else {
-            1_000_000_000
-        };
-        assert_eq!(resident_loop::RESIDENT_TICK_NS, expected);
-
-        let (mut resident, _, _) = two_role_resident();
-        let mut native = MockNative::new();
-        let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
-        let mut waits = ResidentWaits { wait_count: 0 };
-        assert_eq!(
-            resident_loop::continue_resident(&mut resident, &mut native, &mut loader, &mut waits),
-            0xAF01_0005
-        );
-        assert_eq!(native.wait_deadline, Some(native.now + expected));
-    }
 
     #[test]
     fn task_group_termination_race_reconciles_with_fresh_terminal_query() {
@@ -3863,161 +2168,6 @@ mod native_cleanup_tests {
     }
 
     #[test]
-    fn exact_terminal_records_map_to_all_reap_classes() {
-        let mut info = DwTaskTerminationInfoV1 {
-            reason: DW_TERMINATION_NORMAL_EXIT,
-            application_code: 0xA101_F001,
-            ..DwTaskTerminationInfoV1::default()
-        };
-        assert_eq!(
-            terminal_disposition(&info),
-            TerminalDisposition::NormalExit(0xA101_F001)
-        );
-        info.reason = DW_TERMINATION_AUTHORIZED;
-        info.application_code = 0;
-        assert_eq!(
-            terminal_disposition(&info),
-            TerminalDisposition::AuthorizedTermination
-        );
-        info.reason = deepwyrm_syscall::DW_TERMINATION_UNHANDLED_EXCEPTION;
-        info.exception_type = deepwyrm_syscall::DW_EXCEPTION_ILLEGAL_INSTRUCTION;
-        assert_eq!(
-            terminal_disposition(&info),
-            TerminalDisposition::UnhandledException
-        );
-        info.reason = DW_TERMINATION_TASK_GROUP_TEARDOWN;
-        info.exception_type = deepwyrm_syscall::DwExceptionType(0);
-        assert_eq!(
-            terminal_disposition(&info),
-            TerminalDisposition::TaskGroupTeardown
-        );
-        assert_eq!(
-            reap_evidence_value(AttemptFailure::ExitAfterReady(terminal_disposition(&info))),
-            (REAP_CLASS_TASK_GROUP_TEARDOWN as u64) << 32
-        );
-        assert_eq!(
-            reap_evidence_value(AttemptFailure::DuplicateReady),
-            (REAP_CLASS_TASK_GROUP_TEARDOWN as u64) << 32
-        );
-    }
-
-    #[test]
-    fn after_ready_observation_uses_terminal_and_failure_owners_exactly() {
-        let info = DwTaskTerminationInfoV1 {
-            reason: DW_TERMINATION_NORMAL_EXIT,
-            application_code: 7,
-            ..DwTaskTerminationInfoV1::default()
-        };
-        let terminal: ObservedSupervisionError<NativeError> =
-            ObservedSupervisionError::ExitedBeforeReady(info);
-        assert_eq!(
-            classify_after_ready_observation(&terminal),
-            AfterReadyTransition::Terminal(TerminalDisposition::NormalExit(7))
-        );
-
-        let post_exit: ObservedSupervisionError<NativeError> =
-            ObservedSupervisionError::ExitObservedReadiness(
-                wyrmroot_runtime::ExitObservedReadinessError::DuplicateReady,
-                info,
-            );
-        assert_eq!(
-            classify_after_ready_observation(&post_exit),
-            AfterReadyTransition::Failure(AttemptFailure::ReadinessFailedAfterExit)
-        );
-
-        let duplicate: ObservedSupervisionError<NativeError> =
-            ObservedSupervisionError::Supervision(SupervisionError::DuplicateReady);
-        assert_eq!(
-            classify_after_ready_observation(&duplicate),
-            AfterReadyTransition::Failure(AttemptFailure::DuplicateReady)
-        );
-    }
-
-    #[test]
-    fn initial_ready_exit_race_uses_the_terminal_transition() {
-        let info = DwTaskTerminationInfoV1 {
-            reason: DW_TERMINATION_NORMAL_EXIT,
-            application_code: 0xA101_F001,
-            ..DwTaskTerminationInfoV1::default()
-        };
-        let observed: ObservedSupervisionError<NativeError> =
-            ObservedSupervisionError::ExitedBeforeReady(info);
-        let AfterReadyTransition::Terminal(disposition) =
-            classify_after_ready_observation(&observed)
-        else {
-            panic!("early terminal observation lost its terminal owner")
-        };
-
-        let mut supervisor = RestartSupervisor::new(WYR0_I_SUPERVISION_POLICY).unwrap();
-        supervisor.begin(1, 1, 1).unwrap();
-        supervisor.child_started(1, 1, 2).unwrap();
-        supervisor.terminal(1, 1, 3, disposition).unwrap();
-        assert!(matches!(
-            supervisor.state(),
-            RestartState::CleaningUp {
-                failure: AttemptFailure::ExitBeforeReady(TerminalDisposition::NormalExit(
-                    0xA101_F001
-                )),
-                action: wyrmroot_runtime::CleanupAction::CloseTerminal,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn after_ready_exit_race_enters_the_admitted_restart_transition() {
-        let mut supervisor = RestartSupervisor::new(WYR0_I_SUPERVISION_POLICY).unwrap();
-        supervisor.begin(1, 1, 1).unwrap();
-        supervisor.child_started(1, 1, 2).unwrap();
-        supervisor.ready(1, 1, 3).unwrap();
-        let info = DwTaskTerminationInfoV1 {
-            reason: DW_TERMINATION_NORMAL_EXIT,
-            ..DwTaskTerminationInfoV1::default()
-        };
-        let observed: ObservedSupervisionError<NativeError> =
-            ObservedSupervisionError::ExitedBeforeReady(info);
-        let AfterReadyTransition::Terminal(disposition) =
-            classify_after_ready_observation(&observed)
-        else {
-            panic!("terminal observation lost its terminal owner")
-        };
-        supervisor.terminal(1, 1, 4, disposition).unwrap();
-        assert!(matches!(
-            supervisor.state(),
-            RestartState::CleaningUp {
-                failure: AttemptFailure::ExitAfterReady(TerminalDisposition::NormalExit(0)),
-                action: wyrmroot_runtime::CleanupAction::CloseTerminal,
-                ..
-            }
-        ));
-        supervisor.cleanup_complete(1, 1, 5).unwrap();
-        assert_eq!(supervisor.state(), RestartState::Stopped);
-
-        let mut drain_failure = RestartSupervisor::new(WYR0_I_SUPERVISION_POLICY).unwrap();
-        drain_failure.begin(1, 1, 1).unwrap();
-        drain_failure.child_started(1, 1, 2).unwrap();
-        drain_failure.ready(1, 1, 3).unwrap();
-        let observed: ObservedSupervisionError<NativeError> =
-            ObservedSupervisionError::ExitObservedReadiness(
-                wyrmroot_runtime::ExitObservedReadinessError::DuplicateReady,
-                info,
-            );
-        let AfterReadyTransition::Failure(failure) = classify_after_ready_observation(&observed)
-        else {
-            panic!("post-exit readiness failure lost its failure owner")
-        };
-        drain_failure.fail_attempt(1, 1, 4, failure).unwrap();
-        assert!(matches!(
-            drain_failure.state(),
-            RestartState::CleaningUp {
-                failure: AttemptFailure::ReadinessFailedAfterExit,
-                action: wyrmroot_runtime::CleanupAction::CloseTerminal,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn rollback_failure_maps_to_exact_fatal_reboot_status() {
         let error = InitError::Loader(LoadError::Platform {
             stage: wyrmroot_loader::process::LoadStage::ProcessCreate,
@@ -4029,286 +2179,6 @@ mod native_cleanup_tests {
             InitApplicationStatus::FatalRebootRequired
         );
         assert_eq!(fatal_application_status(&error) as u32, 0xAF01_0002);
-    }
-
-    /// F3A.6c: a native failure must say which native failure it was.
-    ///
-    /// The F3A campaign's transcripts reported `0xAF18_0F05` -- unattributed,
-    /// kind 5, `InitError::Native(_)` -- and could not say which syscall
-    /// returned what. `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.3 requires
-    /// the instance to survive a diagnostic boundary, so it now does: through
-    /// attribution, into its own tag, and back out of the decoder.
-    #[test]
-    fn a_native_tick_failure_carries_its_own_status_through_attribution() {
-        use deepwyrm_syscall::DwStatus;
-        use wyrmroot_runtime::{NativeError, NativeOutputError};
-
-        let native = InitError::Native(NativeError::Status(DwStatus(-7)));
-        let decoded = decode_tick_failure(resident_tick_failure_application_status(&native))
-            .expect("a native tick failure decodes");
-        assert_eq!(
-            (decoded.operation, decoded.kind, decoded.instance),
-            (0x0f, 0x05, 7)
-        );
-        assert!(!decoded.saturated);
-
-        // Attribution keeps the instance and replaces only the operation.
-        // This is the collapse F3A.6c closed: `attribute_failure` used to
-        // discard the error it wrapped and keep four bits of it.
-        let attributed: Result<(), InitError> =
-            attribute_failure(RecoveryOperation::StartConsole, Err(native));
-        let decoded = decode_tick_failure(resident_tick_failure_application_status(
-            &attributed.unwrap_err(),
-        ))
-        .expect("an attributed native tick failure decodes");
-        assert_eq!(
-            (decoded.operation, decoded.kind, decoded.instance),
-            (0x0e, 0x05, 7)
-        );
-
-        // An output-contract failure stays distinguishable from a kernel
-        // status, which is what the family bit is for.
-        let output = InitError::Native(NativeError::Output(NativeOutputError::InvalidWaitResult));
-        let decoded = decode_tick_failure(resident_tick_failure_application_status(&output))
-            .expect("an output-contract failure decodes");
-        assert_eq!(decoded.instance, 0x8006);
-
-        // A magnitude beyond the field saturates and says so, rather than
-        // aliasing a different small status: contract §5. Nothing in
-        // `status.toml` reaches 0x7f -- it tops out at 16 -- so this is a
-        // guard against a future status, not a live loss.
-        let big = InitError::Native(NativeError::Status(DwStatus(-4096)));
-        let decoded = decode_tick_failure(resident_tick_failure_application_status(&big))
-            .expect("a large native status decodes");
-        assert!(decoded.saturated);
-        assert_eq!(decoded.instance, 0x7f);
-    }
-
-    /// F3A.6e: a startup step must be nameable, and every old value must not move.
-    ///
-    /// F3A.6d located its failure's site and its status and could not say
-    /// which step it happened in, because `0x01..=0x0e` were all recovery
-    /// transitions and `0x0f` is the sentinel. The field was always eight bits
-    /// wide; only the clamp was four.
-    #[test]
-    fn an_abandoned_registry_names_the_exit_that_abandoned_it() {
-        // F3A.6f's whole point: the two exits used to be indistinguishable
-        // because both returned `Ok`. They must not collapse to one status.
-        let budget: Result<(), InitError> = attribute_failure(
-            RecoveryOperation::RetireRegistry,
-            Err(InitError::RegistryAbandoned(0x01)),
-        );
-        let declined: Result<(), InitError> = attribute_failure(
-            RecoveryOperation::LaunchRegistry,
-            Err(InitError::RegistryAbandoned(0x02)),
-        );
-        let budget = resident_tick_failure_application_status(&budget.unwrap_err());
-        let declined = resident_tick_failure_application_status(&declined.unwrap_err());
-        assert_ne!(budget, declined);
-        assert_eq!(budget >> 16, 0xAF21);
-        assert_eq!(declined >> 16, 0xAF21);
-
-        let decoded = decode_tick_failure(budget).expect("an abandoned registry decodes");
-        assert_eq!(decoded.operation, RecoveryOperation::RetireRegistry as u8);
-        assert_eq!(decoded.kind, 0x0a);
-        assert_eq!(decoded.instance, 0x01);
-        assert!(!decoded.saturated);
-        let decoded = decode_tick_failure(declined).expect("an abandoned registry decodes");
-        assert_eq!(decoded.operation, RecoveryOperation::LaunchRegistry as u8);
-        assert_eq!(decoded.instance, 0x02);
-
-        // Unattributed, the reason still survives: the tag is what carries it,
-        // not the operation.
-        let bare = resident_tick_failure_application_status(&InitError::RegistryAbandoned(0x02));
-        assert_eq!(bare, 0xAF21_0F02);
-
-        // F3A.6h. The same exit reached from two different triggers must not
-        // read as one status, and a whole reason byte survives the encoder.
-        use crate::wyr1c_native::abandoned;
-        let control = InitError::RegistryAbandoned(abandoned::reason(
-            abandoned::trigger::CONTROL_LOST,
-            abandoned::phase::NONE,
-        ));
-        let exited = InitError::RegistryAbandoned(abandoned::reason(
-            abandoned::trigger::EXITED,
-            abandoned::phase::NONE,
-        ));
-        let control = resident_tick_failure_application_status(&control);
-        let exited = resident_tick_failure_application_status(&exited);
-        assert_ne!(control, exited);
-        assert_eq!(control, 0xAF21_0F10);
-        assert_eq!(exited, 0xAF21_0F20);
-
-        // F3A.6j. One trigger and two phases must not read as one status
-        // either: the phase is what distinguishes twenty poll sites.
-        let deadline = InitError::RegistryAbandoned(abandoned::reason(
-            abandoned::trigger::WYR1E_POLL,
-            abandoned::phase::READY_DEADLINE_BEFORE_WAIT,
-        ));
-        let unmatched = InitError::RegistryAbandoned(abandoned::reason(
-            abandoned::trigger::WYR1E_POLL,
-            abandoned::phase::CONSOLE_EVENT_UNMATCHED,
-        ));
-        let deadline = resident_tick_failure_application_status(&deadline);
-        let unmatched = resident_tick_failure_application_status(&unmatched);
-        assert_ne!(deadline, unmatched);
-        assert_eq!(deadline, 0xAF21_0F44);
-        assert_eq!(unmatched, 0xAF21_0F4C);
-        assert_eq!(
-            decode_tick_failure(unmatched)
-                .expect("an abandoned registry decodes")
-                .instance,
-            0x4c
-        );
-
-        // And the new kind does not disturb the tag every other error uses.
-        assert_eq!(
-            resident_tick_failure_application_status(&InitError::Cleanup) >> 16,
-            0xAF18
-        );
-    }
-
-    /// F3A.7i. The mask is the point: the shutdown runs all five steps, so a
-    /// status that said only "a cleanup failed" -- which is what the first
-    /// F3A.7g run reported, as `0xAF18_1704` -- covers thirty-one different
-    /// outcomes and names none of them.
-    #[test]
-    fn a_session_shutdown_reports_every_step_that_failed_and_not_merely_that_one_did() {
-        let status =
-            |steps| resident_tick_failure_application_status(&InitError::SessionShutdown(steps));
-
-        // Each step alone is its own status. Literals, not `1 << n`: the bit
-        // positions are what a transcript is read with, and a test written in
-        // terms of the shift would follow the shift if it moved.
-        assert_eq!(status(0x01), 0xAF22_0F01);
-        assert_eq!(status(0x02), 0xAF22_0F02);
-        assert_eq!(status(0x04), 0xAF22_0F04);
-        assert_eq!(status(0x08), 0xAF22_0F08);
-        assert_eq!(status(0x10), 0xAF22_0F10);
-
-        // And combinations stay distinguishable from their members, which is
-        // the property a first-failure-only report does not have.
-        assert_eq!(status(0x03), 0xAF22_0F03);
-        assert_eq!(status(0x1f), 0xAF22_0F1F);
-        assert_ne!(status(0x03), status(0x01));
-        assert_ne!(status(0x03), status(0x02));
-
-        // The tag is its own, so no other kind's reader can claim it.
-        for other in [
-            resident_tick_failure_application_status(&InitError::Cleanup),
-            resident_tick_failure_application_status(&InitError::AbsentState(0x01)),
-            resident_tick_failure_application_status(&InitError::RegistryAbandoned(0x01)),
-        ] {
-            assert_ne!(other >> 16, 0xAF22);
-        }
-
-        let decoded = decode_tick_failure(status(0x1f)).expect("a session shutdown decodes");
-        assert_eq!(decoded.kind, 0x0b);
-        assert_eq!(decoded.instance, 0x1f);
-        assert!(!decoded.saturated);
-        assert_eq!(decoded.operation, UNATTRIBUTED_OPERATION);
-    }
-
-    #[test]
-    fn a_startup_operation_is_nameable_without_moving_any_recovery_value() {
-        // Every startup operation round-trips above the sentinel.
-        for operation in [
-            RecoveryOperation::ReceiveProduct,
-            RecoveryOperation::MapRetainedBootfs,
-            RecoveryOperation::ActivateRegistry,
-            RecoveryOperation::ActivateDevmgr,
-            RecoveryOperation::ActivateUart,
-            RecoveryOperation::ActivateConsole,
-            RecoveryOperation::ActivateShell,
-            RecoveryOperation::ResidentTick,
-            RecoveryOperation::DispatchHistoricalJob,
-            RecoveryOperation::DispatchConsoleJob,
-            RecoveryOperation::DispatchShellJob,
-        ] {
-            assert!(operation as u8 > UNATTRIBUTED_OPERATION);
-            let attributed: Result<(), InitError> =
-                attribute_failure(operation, Err(InitError::AbsentState(0x8d)));
-            let decoded = decode_tick_failure(resident_tick_failure_application_status(
-                &attributed.unwrap_err(),
-            ))
-            .expect("a startup-attributed failure decodes");
-            assert_eq!(decoded.operation, operation as u8);
-            assert_eq!(decoded.instance, 0x8d);
-        }
-
-        // A recovery operation still encodes where it always did, and the
-        // sentinel still means unattributed.
-        let recovery: Result<(), InitError> =
-            attribute_failure(RecoveryOperation::StartConsole, Err(InitError::Cleanup));
-        assert_eq!(
-            resident_tick_failure_application_status(&recovery.unwrap_err()),
-            0xAF18_0E04
-        );
-        assert_eq!(
-            resident_tick_failure_application_status(&InitError::Cleanup),
-            0xAF18_0F04
-        );
-    }
-
-    /// F3A.6c: a refused launch message must say why it was refused.
-    ///
-    /// Both sites that parse one reported `InitError::Accounting`, which was
-    /// the wrong class as well as a collapse: twenty-three reasons arrived as
-    /// kind 0x02, pointing a reader at resource accounting.
-    #[test]
-    fn a_refused_launch_message_carries_its_reason_and_the_right_class() {
-        use wyrmroot_launch_proto::Error as LaunchProtocolError;
-
-        let refused = InitError::LaunchProtocol(LaunchProtocolError::WrongHandleCount);
-        let decoded = decode_tick_failure(resident_tick_failure_application_status(&refused))
-            .expect("a refused launch message decodes");
-        // 0x06 is the protocol-refusal class, not 0x02's accounting.
-        assert_eq!(decoded.kind, 0x06);
-        assert_eq!(
-            decoded.instance,
-            LaunchProtocolError::WrongHandleCount as u16
-        );
-
-        // Distinct reasons must not encode alike.
-        let other = InitError::LaunchProtocol(LaunchProtocolError::InvalidUtf8);
-        assert_ne!(
-            resident_tick_failure_application_status(&refused),
-            resident_tick_failure_application_status(&other)
-        );
-
-        // The other two protocols at kind 0x06 keep the unchanged encoding,
-        // because neither carries an instance this word has room for.
-        let registry = resident_tick_failure_application_status(&InitError::Wyr1BGateMismatch);
-        assert_eq!(registry, 0xAF18_0F06);
-    }
-
-    /// F3A.6c: an absent state slot must say which slot.
-    #[test]
-    fn an_absent_state_tick_failure_carries_its_site() {
-        let absent = InitError::AbsentState(0x42);
-        let decoded = decode_tick_failure(resident_tick_failure_application_status(&absent))
-            .expect("an absent-state tick failure decodes");
-        assert_eq!(
-            (decoded.operation, decoded.kind, decoded.instance),
-            (0x0f, 0x09, 0x42)
-        );
-
-        let attributed: Result<(), InitError> =
-            attribute_failure(RecoveryOperation::LaunchRegistry, Err(absent));
-        let decoded = decode_tick_failure(resident_tick_failure_application_status(
-            &attributed.unwrap_err(),
-        ))
-        .expect("an attributed absent-state failure decodes");
-        assert_eq!(
-            (decoded.operation, decoded.kind, decoded.instance),
-            (0x0c, 0x09, 0x42)
-        );
-
-        // Two different sites must not encode alike, which is the whole point.
-        assert_ne!(
-            resident_tick_failure_application_status(&InitError::AbsentState(0x10)),
-            resident_tick_failure_application_status(&InitError::AbsentState(0x11))
-        );
     }
 
     #[test]

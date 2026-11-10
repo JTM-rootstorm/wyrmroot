@@ -92,13 +92,6 @@
 //! `JobController`, so the arena must not outnumber the live-job table: 16
 //! sessions against `MAX_LIVE_JOBS` 32, asserted below.
 
-#![allow(
-    dead_code,
-    reason = "R6B-2 uses most of this; `fail`, `failure` and `job_transaction` \
-              are the disposition and cancel surface R6C drives from ordinary \
-              dispatch, and are kept rather than removed and rewritten"
-)]
-
 use deepwyrm_syscall::{DwDeadline, DwHandle};
 use wyrmroot_launch_proto::{MAX_LIVE_JOBS, Reservation};
 use wyrmroot_loader::launch::LaunchProfile;
@@ -154,6 +147,7 @@ use crate::wyr1b_job::{LaunchSessionScope, MAX_SESSIONS};
 /// features, so the tier with 144 bytes of headroom carries none of them.
 pub(crate) const LAUNCH_TRANSACTION_SLOTS: usize = 5;
 
+#[cfg(test)]
 /// What the arena's ungated part may cost on the tightest resident tier.
 ///
 /// Measured, not assumed: `resident_fits_locked_native_stack_partition` locks
@@ -231,10 +225,6 @@ pub(crate) struct LaunchFailure {
     pub(crate) cleanup_failed: bool,
 }
 
-/// §9.5's `ERROR` codes run 1 through 10.
-const MIN_ERROR_CODE: u32 = 1;
-const MAX_ERROR_CODE: u32 = 10;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LaunchTransactionError {
     /// Every slot is occupied.
@@ -251,8 +241,6 @@ pub(crate) enum LaunchTransactionError {
     ResourceIdentity,
     /// The transaction has not reached `Complete`.
     Incomplete,
-    /// Not a §9.5 `ERROR` code.
-    ErrorCode,
     /// A slot's generation is exhausted; it retires rather than reuses,
     /// because a reused generation cannot be told from a stale token.
     GenerationExhausted,
@@ -269,6 +257,7 @@ impl LaunchToken {
     pub(crate) const fn slot(self) -> usize {
         self.slot
     }
+    #[cfg(test)]
     pub(crate) const fn generation(self) -> u64 {
         self.generation
     }
@@ -387,13 +376,6 @@ impl LaunchTransactions {
         self.slot(token).map(|slot| slot.stage)
     }
 
-    pub(crate) fn scope(
-        &self,
-        token: LaunchToken,
-    ) -> Result<LaunchSessionScope, LaunchTransactionError> {
-        self.slot(token).map(|slot| slot.scope)
-    }
-
     /// The envelope a deferred response must echo: the session Channel to send
     /// on, and the request's exact connection/generation/transaction triple.
     pub(crate) fn response_envelope(
@@ -508,36 +490,6 @@ impl LaunchTransactions {
         self.slot(token).map(|slot| slot.ready_deadline)
     }
 
-    /// Fixes the disposition. The first failure wins: a cleanup error that
-    /// happens while reporting a loader error must not relabel the reply.
-    pub(crate) fn fail(
-        &mut self,
-        token: LaunchToken,
-        failure: LaunchFailure,
-    ) -> Result<LaunchFailure, LaunchTransactionError> {
-        if !(MIN_ERROR_CODE..=MAX_ERROR_CODE).contains(&failure.code) {
-            return Err(LaunchTransactionError::ErrorCode);
-        }
-        let slot = self.slot_mut(token)?;
-        match slot.failure.as_mut() {
-            Some(existing) => {
-                existing.cleanup_failed |= failure.cleanup_failed;
-                Ok(*existing)
-            }
-            None => {
-                slot.failure = Some(failure);
-                Ok(failure)
-            }
-        }
-    }
-
-    pub(crate) fn failure(
-        &self,
-        token: LaunchToken,
-    ) -> Result<Option<LaunchFailure>, LaunchTransactionError> {
-        self.slot(token).map(|slot| slot.failure)
-    }
-
     /// The open transaction for one session, if it has one.
     pub(crate) fn session_transaction(&self, grant: EndpointGrant) -> Option<LaunchToken> {
         self.slots
@@ -573,6 +525,7 @@ impl LaunchTransactions {
         })
     }
 
+    #[cfg(test)]
     /// The open transaction that owns one job, if any still does.
     pub(crate) fn job_transaction(&self, job_id: u64) -> Option<LaunchToken> {
         if job_id == 0 {
@@ -590,6 +543,7 @@ impl LaunchTransactions {
             })
     }
 
+    #[cfg(test)]
     pub(crate) fn open_count(&self) -> usize {
         self.slots.iter().flatten().filter(|slot| slot.open).count()
     }

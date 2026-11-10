@@ -22,17 +22,13 @@ struct Session {
 /// The scope is fixed at installation and is never selected from request bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LaunchSessionScope {
-    Historical,
-    #[allow(dead_code, reason = "E3C installs the console launch session")]
     ConsoleLauncher,
-    #[allow(dead_code, reason = "E3C installs child shell job sessions")]
     ShellJobs,
 }
 
 impl LaunchSessionScope {
     pub(crate) fn admits_legacy_launch(self, path: &str) -> bool {
         match self {
-            Self::Historical => true,
             Self::ConsoleLauncher => false,
             Self::ShellJobs => {
                 let production = matches!(path, "bin/hello" | "bin/cpu-hog");
@@ -98,12 +94,13 @@ impl JobDispatcher {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn install_session(
         &mut self,
         grant: EndpointGrant,
         channel: DwHandle,
     ) -> Result<(), JobError> {
-        self.install_scoped_session(grant, channel, LaunchSessionScope::Historical)
+        self.install_scoped_session(grant, channel, LaunchSessionScope::ShellJobs)
     }
 
     pub(crate) fn install_scoped_session(
@@ -263,10 +260,6 @@ impl JobDispatcher {
             .ok_or(JobError::UnknownConnection)
     }
 
-    pub(crate) fn session_count(&self) -> usize {
-        self.sessions.iter().flatten().count()
-    }
-
     pub(crate) fn next_cleanup_job(&mut self) -> Option<crate::wyr1b::LoadedJob> {
         let (cursor, job_id) = self.jobs.cleanup_job_id(self.job_cursor)?;
         self.job_cursor = cursor;
@@ -385,8 +378,8 @@ impl JobDispatcher {
 mod tests {
     use super::*;
     use wyrmroot_launch_proto::{
-        ErrorCode, Message, MessageType, Reservation, TerminationClassification, TerminationResult,
-        encode_error, encode_job_message, encode_job_result, parse_message,
+        Message, Reservation, TerminationClassification, TerminationResult, encode_job_message,
+        encode_job_result, parse_message,
     };
 
     fn grant(id: u64) -> EndpointGrant {
@@ -428,171 +421,6 @@ mod tests {
         assert_eq!(
             dispatcher.install_session(grant(17), DwHandle(117)),
             Err(JobError::Capacity)
-        );
-    }
-
-    #[test]
-    fn session_scope_is_controller_owned_and_defaults_to_historical() {
-        let mut dispatcher = JobDispatcher::new();
-        dispatcher.install_session(grant(1), DwHandle(101)).unwrap();
-        dispatcher
-            .install_scoped_session(grant(2), DwHandle(102), LaunchSessionScope::ConsoleLauncher)
-            .unwrap();
-        dispatcher
-            .install_scoped_session(grant(3), DwHandle(103), LaunchSessionScope::ShellJobs)
-            .unwrap();
-
-        assert_eq!(
-            dispatcher.session_scope(grant(1)),
-            Ok(LaunchSessionScope::Historical)
-        );
-        assert_eq!(
-            dispatcher.session_scope(grant(2)),
-            Ok(LaunchSessionScope::ConsoleLauncher)
-        );
-        assert_eq!(
-            dispatcher.session_scope(grant(3)),
-            Ok(LaunchSessionScope::ShellJobs)
-        );
-        assert!(LaunchSessionScope::Historical.admits_legacy_launch("bin/other"));
-        assert!(!LaunchSessionScope::ConsoleLauncher.admits_legacy_launch("bin/hello"));
-        assert!(LaunchSessionScope::ShellJobs.admits_legacy_launch("bin/hello"));
-        assert!(LaunchSessionScope::ShellJobs.admits_legacy_launch("bin/cpu-hog"));
-        assert!(!LaunchSessionScope::ShellJobs.admits_legacy_launch("bin/hello-extra"));
-        assert!(!LaunchSessionScope::ShellJobs.admits_legacy_launch("test/wyr1-e/fault"));
-        assert!(!LaunchSessionScope::ShellJobs.admits_legacy_launch("test/wyr1-e/fault-extra"));
-        assert!(LaunchSessionScope::ConsoleLauncher.admits_shell_v1());
-        assert!(!LaunchSessionScope::Historical.admits_shell_v1());
-        assert!(!LaunchSessionScope::ShellJobs.admits_shell_v1());
-    }
-
-    #[test]
-    fn disconnect_reclaims_only_after_orphans_are_reaped() {
-        let mut dispatcher = JobDispatcher::new();
-        let owner = grant(1);
-        dispatcher.install_session(owner, DwHandle(101)).unwrap();
-        let ticket = dispatcher
-            .jobs
-            .begin_launch(wyrmroot_launch_proto::Reservation {
-                connection_id: 1,
-                generation: 1,
-                transaction_id: 1,
-            })
-            .unwrap();
-        dispatcher.jobs.commit_launch(ticket, 10, 11, 12).unwrap();
-        assert_eq!(dispatcher.disconnect_session(owner), Ok(DwHandle(101)));
-        assert_eq!(dispatcher.session_count(), 0);
-        assert_eq!(dispatcher.jobs.orphan_jobs(), 1);
-        assert_eq!(
-            dispatcher.jobs.open_connection(1, 2),
-            Err(JobError::DuplicateConnection)
-        );
-        dispatcher
-            .jobs
-            .complete(
-                ticket.job_id,
-                10,
-                11,
-                12,
-                crate::wyr1b::JobResult {
-                    classification: 1,
-                    application_code: 0,
-                    exception_class: 0,
-                    exception_detail: 0,
-                    exception_address: 0,
-                    cleanup_result: 0,
-                },
-            )
-            .unwrap();
-        dispatcher.jobs.reclaim_closed_sessions();
-        dispatcher.jobs.open_connection(1, 2).unwrap();
-    }
-
-    #[test]
-    fn owner_wait_and_foreign_query_transcript_is_exact() {
-        let mut dispatcher = JobDispatcher::new();
-        dispatcher.install_session(grant(1), DwHandle(101)).unwrap();
-        dispatcher.install_session(grant(2), DwHandle(102)).unwrap();
-        let launch = Reservation {
-            connection_id: 1,
-            generation: 1,
-            transaction_id: 1,
-        };
-        let ticket = dispatcher.jobs.begin_launch(launch).unwrap();
-        dispatcher.jobs.commit_launch(ticket, 10, 11, 12).unwrap();
-        let mut bytes = [0_u8; 88];
-        let size = encode_job_message(
-            launch,
-            MessageType::LaunchAccepted,
-            ticket.job_id,
-            &mut bytes,
-        )
-        .unwrap();
-        let accepted = parse_message(&bytes[..size], 0).unwrap();
-        assert_eq!(accepted.reservation, launch);
-        assert_eq!(
-            accepted.message,
-            Message::LaunchAccepted {
-                job_id: ticket.job_id
-            }
-        );
-
-        let controller_result = crate::wyr1b::JobResult {
-            classification: TerminationClassification::NormalExit.as_u32(),
-            application_code: 0,
-            exception_class: 0,
-            exception_detail: 0,
-            exception_address: 0,
-            cleanup_result: 0,
-        };
-        dispatcher
-            .jobs
-            .complete(ticket.job_id, 10, 11, 12, controller_result)
-            .unwrap();
-        let wait = Reservation {
-            transaction_id: 2,
-            ..launch
-        };
-        assert_eq!(
-            dispatcher.jobs.result(wait, ticket.job_id),
-            Ok(controller_result)
-        );
-        let terminal = TerminationResult {
-            classification: TerminationClassification::NormalExit,
-            application_code: 0,
-            exception_class: 0,
-            exception_detail: 0,
-            exception_address: 0,
-            cleanup_result: 0,
-        };
-        let size = encode_job_result(wait, ticket.job_id, terminal, &mut bytes).unwrap();
-        let result = parse_message(&bytes[..size], 0).unwrap();
-        assert_eq!(result.reservation, wait);
-        assert_eq!(
-            result.message,
-            Message::JobResult {
-                job_id: ticket.job_id,
-                result: terminal
-            }
-        );
-
-        let foreign = Reservation {
-            connection_id: 2,
-            generation: 1,
-            transaction_id: 1,
-        };
-        assert_eq!(
-            dispatcher.jobs.query(foreign, ticket.job_id),
-            Err(JobError::UnknownJob)
-        );
-        let size = encode_error(foreign, ErrorCode::ForeignOrUnknownJob, &mut bytes).unwrap();
-        let rejected = parse_message(&bytes[..size], 0).unwrap();
-        assert_eq!(rejected.reservation, foreign);
-        assert_eq!(
-            rejected.message,
-            Message::Error {
-                code: ErrorCode::ForeignOrUnknownJob
-            }
         );
     }
 

@@ -66,7 +66,7 @@ fn an_accepted_launch_runs_reserved_to_complete_and_frees_its_slot() {
         .open(
             grant(1),
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99),
         )
         .expect("first transaction");
@@ -94,7 +94,7 @@ fn a_slot_holding_the_childs_handles_refuses_to_close() {
         .open(
             grant(1),
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99),
         )
         .expect("transaction");
@@ -119,7 +119,7 @@ fn a_transaction_that_has_not_completed_refuses_to_close() {
         .open(
             grant(1),
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99),
         )
         .expect("transaction");
@@ -139,7 +139,7 @@ fn construction_cannot_skip_the_ready_observation() {
         .open(
             grant(1),
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99),
         )
         .expect("transaction");
@@ -160,7 +160,7 @@ fn a_stage_cannot_go_backwards_or_leave_a_terminal_stage() {
         .open(
             grant(1),
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99),
         )
         .expect("transaction");
@@ -227,7 +227,7 @@ fn one_session_cannot_hold_two_launches_in_flight() {
         .open(
             first,
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99),
         )
         .expect("first transaction");
@@ -235,7 +235,7 @@ fn one_session_cannot_hold_two_launches_in_flight() {
         arena.open(
             first,
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x9a)
         ),
         Err(LaunchTransactionError::SessionBusy)
@@ -246,7 +246,7 @@ fn one_session_cannot_hold_two_launches_in_flight() {
         .open(
             second,
             DwHandle(0x11),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x9b),
         )
         .expect("second session");
@@ -260,7 +260,7 @@ fn one_session_cannot_hold_two_launches_in_flight() {
         .open(
             first,
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x9c),
         )
         .expect("first session again");
@@ -278,7 +278,7 @@ fn the_arena_refuses_a_transaction_beyond_its_bound() {
             .open(
                 grant,
                 DwHandle(0x10 + index as u64),
-                LaunchSessionScope::Historical,
+                LaunchSessionScope::ShellJobs,
                 reservation(0x99),
             )
             .expect("slot within the bound");
@@ -291,7 +291,7 @@ fn the_arena_refuses_a_transaction_beyond_its_bound() {
         arena.open(
             overflow,
             DwHandle(0xff),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99)
         ),
         Err(LaunchTransactionError::Capacity)
@@ -306,7 +306,7 @@ fn the_response_envelope_survives_the_whole_transaction() {
     let session = DwHandle(0x10);
     let request = reservation(0x4321);
     let token = arena
-        .open(grant(1), session, LaunchSessionScope::Historical, request)
+        .open(grant(1), session, LaunchSessionScope::ShellJobs, request)
         .expect("transaction");
     drive_to_published(&mut arena, token).expect("accepted path");
     assert_eq!(arena.response_envelope(token), Ok((session, request)));
@@ -319,76 +319,13 @@ fn the_response_envelope_survives_the_whole_transaction() {
 }
 
 #[test]
-fn the_first_failure_fixes_the_reported_code() {
-    let mut arena = LaunchTransactions::new();
-    let token = arena
-        .open(
-            grant(1),
-            DwHandle(0x10),
-            LaunchSessionScope::Historical,
-            reservation(0x99),
-        )
-        .expect("transaction");
-    let loader = LaunchFailure {
-        code: 8,
-        cleanup_failed: false,
-    };
-    assert_eq!(arena.fail(token, loader), Ok(loader));
-    // A later cleanup failure records itself without relabelling the reply.
-    let cleanup = LaunchFailure {
-        code: 9,
-        cleanup_failed: true,
-    };
-    assert_eq!(
-        arena.fail(token, cleanup),
-        Ok(LaunchFailure {
-            code: 8,
-            cleanup_failed: true
-        })
-    );
-    assert_eq!(
-        arena.failure(token),
-        Ok(Some(LaunchFailure {
-            code: 8,
-            cleanup_failed: true
-        }))
-    );
-}
-
-#[test]
-fn a_disposition_outside_the_contracts_error_codes_is_refused() {
-    let mut arena = LaunchTransactions::new();
-    let token = arena
-        .open(
-            grant(1),
-            DwHandle(0x10),
-            LaunchSessionScope::Historical,
-            reservation(0x99),
-        )
-        .expect("transaction");
-    for code in [0, 11, u32::MAX] {
-        assert_eq!(
-            arena.fail(
-                token,
-                LaunchFailure {
-                    code,
-                    cleanup_failed: false
-                }
-            ),
-            Err(LaunchTransactionError::ErrorCode)
-        );
-    }
-    assert_eq!(arena.failure(token), Ok(None));
-}
-
-#[test]
 fn attaching_resources_twice_is_refused_rather_than_overwriting() {
     let mut arena = LaunchTransactions::new();
     let token = arena
         .open(
             grant(1),
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99),
         )
         .expect("transaction");
@@ -414,7 +351,7 @@ fn zero_identities_are_refused_everywhere_they_can_appear() {
         arena.open(
             grant(1),
             DwHandle(0),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99)
         ),
         Err(LaunchTransactionError::ResourceIdentity)
@@ -440,7 +377,7 @@ fn zero_identities_are_refused_everywhere_they_can_appear() {
             arena.open(
                 grant(1),
                 DwHandle(0x10),
-                LaunchSessionScope::Historical,
+                LaunchSessionScope::ShellJobs,
                 zeroed
             ),
             Err(LaunchTransactionError::ResourceIdentity)
@@ -450,7 +387,7 @@ fn zero_identities_are_refused_everywhere_they_can_appear() {
         .open(
             grant(1),
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99),
         )
         .expect("transaction");
@@ -492,7 +429,7 @@ fn a_token_kept_across_a_close_cannot_address_the_reused_slot() {
         .open(
             first,
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99),
         )
         .expect("first transaction");
@@ -506,7 +443,7 @@ fn a_token_kept_across_a_close_cannot_address_the_reused_slot() {
         .open(
             second,
             DwHandle(0x11),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x9a),
         )
         .expect("second transaction");
@@ -531,7 +468,7 @@ fn an_exhausted_slot_retires_rather_than_reusing_its_generation() {
         .open(
             first,
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99),
         )
         .expect("last generation");
@@ -547,7 +484,7 @@ fn an_exhausted_slot_retires_rather_than_reusing_its_generation() {
         .open(
             second,
             DwHandle(0x11),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x9a),
         )
         .expect("a different slot");
@@ -562,7 +499,7 @@ fn a_session_and_a_job_each_find_their_own_open_transaction() {
         .open(
             first,
             DwHandle(0x10),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x99),
         )
         .expect("first transaction");
@@ -570,7 +507,7 @@ fn a_session_and_a_job_each_find_their_own_open_transaction() {
         .open(
             second,
             DwHandle(0x11),
-            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
             reservation(0x9a),
         )
         .expect("second transaction");

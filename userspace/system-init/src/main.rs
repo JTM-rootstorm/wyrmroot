@@ -24,7 +24,6 @@ use wyrmroot_system_init::continue_system_init_resource_product;
 use wyrmroot_system_init::fatal_application_status;
 use wyrmroot_system_init::validate_wait_until_completion;
 use wyrmroot_system_init::{InitPlatform, Wyr1BPlatform, resident_loop};
-use wyrmroot_wyr1b_gate_proto as _;
 
 struct NativeSystem;
 
@@ -141,8 +140,6 @@ impl Wyr1BPlatform for NativeSystem {
         wyrmroot_runtime::materialize_read_only_memory(root, bytes, rights)
     }
 }
-
-impl resident_loop::ResidentLoopPlatform for NativeSystem {}
 
 fn native_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;

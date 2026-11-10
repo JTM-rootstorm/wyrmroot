@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false
-description = "Permanent WYR1 bootfs supervisor"
+description = "Permanent init: the bootfs supervisor"
 
 [lib]
 path = "src/lib.rs"
@@ -30,7 +30,6 @@ wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }
 wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
 wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
-wyrmroot-wyr1b-gate-proto = { path = "../../crates/wyrmroot-wyr1b-gate-proto" }
 
 [dev-dependencies]
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }
