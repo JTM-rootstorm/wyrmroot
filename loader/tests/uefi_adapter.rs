@@ -254,7 +254,12 @@ fn every_post_exit_gate_error_reaches_only_the_fatal_sink_once() {
 
 #[test]
 fn post_exit_ownership_surface_has_no_firmware_release_authority() {
-    let source = include_str!("../src/uefi_app/firmware.rs");
+    let source = concat!(
+        include_str!("../src/uefi_app/firmware.rs"),
+        include_str!("../src/uefi_app/firmware/handoff.rs"),
+        include_str!("../src/uefi_app/firmware/post_exit.rs"),
+        include_str!("../src/uefi_app/firmware/intake.rs"),
+    );
     assert_eq!(source.matches("boot::exit_boot_services(").count(), 1);
     assert!(!source.contains("PreparedPostExit"));
     let post_exit_pages = source
