@@ -7,7 +7,6 @@ use {
 
 const NATIVE: &str = include_str!("../src/wyr1c_native.rs");
 const E6: &str = include_str!("../src/wyr1e_native.rs");
-const SELECTOR32: &str = include_str!("../src/wyr1d_native.rs");
 const JOBS: &str = include_str!("../src/wyr1b_native.rs");
 
 /// Source assertions on call shape must survive rustfmt wrapping an argument

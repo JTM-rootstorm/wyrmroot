@@ -6,11 +6,9 @@ use {
 };
 
 const MAIN: &str = include_str!("../src/main.rs");
-const LOOP: &str = include_str!("../src/resident_loop.rs");
 const LIB: &str = include_str!("../src/lib.rs");
 const WYR1B_MODEL: &str = include_str!("../src/wyr1b.rs");
 const NATIVE: &str = include_str!("../src/wyr1b_native.rs");
-const MANIFEST: &str = include_str!("../Cargo.toml");
 
 /// The text of the item that starts at `start`, up to its closing brace at
 /// `indent`.

@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{error::Failure, h_integration, tasks, wyr1f};
+use crate::{error::Failure, h_integration, product, tasks};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DevBoot {
@@ -49,7 +49,6 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
         .deep_repository
         .as_ref()
         .map_or_else(|| project.join("deepwyrm"), PathBuf::from);
-    let deep_revision = head(&deep)?;
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
@@ -61,7 +60,7 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
     fs::create_dir_all(&root)
         .map_err(|error| Failure::task(format!("could not create dev-boot root: {error}")))?;
     let product = root.join("product");
-    wyr1f::prepare(&product, "normal", &deep, &deep_revision, None)?;
+    product::build(&product, &deep)?;
 
     // The product's firmware vars are sealed read-only; the run gets its own copy.
     let vars = root.join("OVMF_VARS.fd");
@@ -96,7 +95,7 @@ fn qemu_arguments(smp: bool, product: &Path, vars: &Path, com1: &Path) -> Vec<St
         MEMORY_MIB,
         &product.join("artifacts/OVMF_CODE.fd"),
         vars,
-        &product.join("artifacts/wyr1f-normal-esp.img"),
+        &product.join("artifacts").join(product::ESP_NAME),
         com1,
         None,
     );
@@ -195,22 +194,6 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
-}
-
-fn head(repository: &Path) -> Result<String, Failure> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repository)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .map_err(|error| Failure::task(format!("could not run git: {error}")))?;
-    if !output.status.success() {
-        return Err(Failure::task(format!(
-            "could not read the HEAD of {}",
-            repository.display()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 #[cfg(test)]

@@ -4831,7 +4831,6 @@ fn send_deferred_launch_error<S: Wyr1BPlatform>(
     session: DwHandle,
     reservation: LaunchReservation,
     code: LaunchErrorCode,
-    >,
 ) -> Result<(), InitError> {
     let mut response = [0_u8; 88];
     let size =

@@ -3555,11 +3555,8 @@ mod tests {
     fn current_product_builders_do_not_reselect_layout_from_the_abi_dependency() {
         for (name, source) in [
             ("selector27", include_str!("wyr1b.rs")),
-            ("selector28", include_str!("dw1c.rs")),
             ("selector29", include_str!("wyr1c6.rs")),
-            ("selector30", include_str!("dw1d6.rs")),
             ("selector31", include_str!("dw1e3a.rs")),
-            ("selector32", include_str!("wyr1d5.rs")),
             ("selector33-e8", include_str!("wyr1e8.rs")),
         ] {
             assert!(

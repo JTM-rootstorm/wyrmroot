@@ -19,10 +19,6 @@ const DRIVER_POLICY: &str = include_str!("../src/lib.rs");
 /// devmgr's role, in its original order: the binary's entry file, then
 /// `role.rs`, which holds everything devmgr's `main.rs` held before S2U step 3.
 /// Source text for the reason each test below gives.
-const DEVMGR: &str = concat!(
-    include_str!("../../devmgr/src/main.rs"),
-    include_str!("../../devmgr/src/role.rs")
-);
 
 /// Source text until S3: the role runs over the platform seam, but no
 /// RecordingPlatform script drives this path yet.

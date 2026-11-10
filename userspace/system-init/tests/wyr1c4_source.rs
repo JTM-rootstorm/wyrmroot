@@ -230,25 +230,3 @@ fn native_fn(name: &str) -> &'static str {
     &NATIVE_SOURCE[start..end]
 }
 
-/// The text of one match arm of `body`, from `start` to the next `end`.
-fn arm<'a>(body: &'a str, start: &str, end: &str) -> &'a str {
-    let from = body
-        .find(start)
-        .unwrap_or_else(|| panic!("missing arm {start}"));
-    let to = body[from..]
-        .find(end)
-        .unwrap_or_else(|| panic!("missing end {end}"))
-        + from;
-    &body[from..to]
-}
-
-fn in_order(text: &str, needles: &[&str]) {
-    let mut at = 0;
-    for needle in needles {
-        at += text[at..]
-            .find(needle)
-            .unwrap_or_else(|| panic!("missing {needle} in order"))
-            + needle.len();
-    }
-}
-
