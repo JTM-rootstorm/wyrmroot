@@ -1,9 +1,8 @@
-//! Canonical immutable WYR1-B launch policy.
+//! Canonical immutable launch policy.
 
 #![forbid(unsafe_code)]
 
 pub const LAUNCH_POLICY_PATH: &str = "system/bootstrap/launch-policy-v1";
-pub const WYR1_B_GATE_PATH: &str = "system/bootstrap/wyr1-b-gate-v1";
 pub const HEADER_BYTES: usize = 64;
 pub const RECORD_BYTES: usize = 64;
 pub const MAX_ENTRIES: usize = 32;

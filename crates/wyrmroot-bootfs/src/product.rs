@@ -2,7 +2,7 @@
 //!
 //! Callers supply the exact immutable bytes of every entry; the builder checks
 //! the device manifest and launch policy against the identities the producer
-//! computed, then emits the thirteen entries in the existing `cpio newc`
+//! computed, then emits the twelve entries in the existing `cpio newc`
 //! format. Content admission for arbitrary archives stays in
 //! [`crate::content`].
 
@@ -20,23 +20,7 @@ use crate::{
 };
 use wyrmroot_device_proto::{Manifest as DeviceManifest, manifest::ContentIdentity};
 
-/// Permanent supervisor executable.
-pub const INIT_PATH: &str = "system/init";
-pub const REGISTRYD_PATH: &str = "system/registryd";
-pub const DEVMGR_PATH: &str = "system/devmgr";
-pub const UART16550D_PATH: &str = "system/uart16550d";
-pub const CONSOLED_PATH: &str = "system/consoled";
-pub const WYRMSH_PATH: &str = "system/wyrmsh";
-pub const HELLO_PATH: &str = "bin/hello";
-pub const CPU_HOG_PATH: &str = "bin/cpu-hog";
-pub const RRC_MANIFEST_PATH: &str = "system/bootstrap/rrc-a-v1";
-pub const GATE_CONFIG_PATH: &str = "system/bootstrap/wyr1-a-gate-v1";
-pub const LAUNCH_POLICY_PATH: &str = "system/bootstrap/launch-policy-v1";
-/// The product marker `system-init` checks before it reads the device
-/// manifest.
-pub const MARKER_PATH: &str = "system/bootstrap/wyr1-c-gate-v1";
-pub const MARKER: &[u8] = b"WYR1-C1";
-pub const DEVICE_MANIFEST_PATH: &str = "system/bootstrap/wyr1-c-device-manifest-v1";
+pub use crate::paths::*;
 
 /// Every entry of the product archive, plus the identities the producer
 /// computed for the payloads the manifests name.
@@ -51,7 +35,6 @@ pub struct Product<'a> {
     pub hello: &'a [u8],
     pub cpu_hog: &'a [u8],
     pub rrc_manifest: &'a [u8],
-    pub gate_config: &'a [u8],
     pub device_manifest: &'a [u8],
     pub launch_policy: &'a [u8],
     /// Identity of `uart16550d`, which the device manifest's COM2 role must
@@ -64,7 +47,7 @@ pub struct Product<'a> {
 }
 
 impl Product<'_> {
-    fn entries(&self) -> [(&'static str, &[u8], FileMode); 13] {
+    fn entries(&self) -> [(&'static str, &[u8], FileMode); 12] {
         use FileMode::{Executable, ReadOnly};
         [
             (INIT_PATH, self.init, Executable),
@@ -76,7 +59,6 @@ impl Product<'_> {
             (HELLO_PATH, self.hello, Executable),
             (CPU_HOG_PATH, self.cpu_hog, Executable),
             (RRC_MANIFEST_PATH, self.rrc_manifest, ReadOnly),
-            (GATE_CONFIG_PATH, self.gate_config, ReadOnly),
             (MARKER_PATH, MARKER, ReadOnly),
             (DEVICE_MANIFEST_PATH, self.device_manifest, ReadOnly),
             (LAUNCH_POLICY_PATH, self.launch_policy, ReadOnly),
@@ -238,7 +220,6 @@ mod tests {
             hello: b"hello-elf",
             cpu_hog: b"cpu-hog-elf",
             rrc_manifest: b"WRRM",
-            gate_config: b"a",
             device_manifest,
             launch_policy,
             uart16550d_identity: UART,
@@ -249,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_the_thirteen_entry_product_deterministically() {
+    fn builds_the_twelve_entry_product_deterministically() {
         let manifest = wrdm(UART);
         let policy = policy(false, true);
         let product = product(&manifest, &policy);
@@ -262,11 +243,10 @@ mod tests {
             vec![
                 b"bin/cpu-hog".as_slice(),
                 b"bin/hello".as_slice(),
+                b"system/bootstrap/device-manifest-v1".as_slice(),
                 b"system/bootstrap/launch-policy-v1".as_slice(),
+                b"system/bootstrap/product-v1".as_slice(),
                 b"system/bootstrap/rrc-a-v1".as_slice(),
-                b"system/bootstrap/wyr1-a-gate-v1".as_slice(),
-                b"system/bootstrap/wyr1-c-device-manifest-v1".as_slice(),
-                b"system/bootstrap/wyr1-c-gate-v1".as_slice(),
                 b"system/consoled".as_slice(),
                 b"system/devmgr".as_slice(),
                 b"system/init".as_slice(),

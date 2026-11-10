@@ -4,8 +4,8 @@
 //! removed, not merely a test that exercises the happy path.
 
 use super::*;
-use crate::wyr1b::{EndpointKind, RegistryTopology};
-use crate::wyr1b_job::LaunchSessionScope;
+use crate::job_sessions::LaunchSessionScope;
+use crate::jobs::{EndpointKind, RegistryTopology};
 
 fn grant(role_generation: u64) -> EndpointGrant {
     RegistryTopology::new(7)

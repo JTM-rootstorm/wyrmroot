@@ -57,12 +57,6 @@ pub(crate) const ESP_NAME: &str = "esp.img";
 /// sections the native stack check reads.
 const WYRMSH_FLAGS: [&str; 2] = ["-Cjump-tables=no", "-Zemit-stack-sizes"];
 
-/// The bootstrap configuration `system-init` reads at `wyr1-a-gate-v1`. The
-/// bytes are what every production product has carried; the guest still
-/// parses them, so they change only together with `system-init`.
-const GATE_CONFIG: &[u8] =
-    b"schema = 1\nproduct = \"wyr1-f-normal\"\nselector = \"none\"\nevidence = \"not-produced\"\n";
-
 /// The product's native roles, in bootfs assembly order.
 pub(crate) const NATIVES: [NativeSpec; 8] = [
     native(
@@ -453,7 +447,6 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
         hello: &natives["hello"],
         cpu_hog: &natives["cpu-hog"],
         rrc_manifest: &rrc_manifest,
-        gate_config: GATE_CONFIG,
         device_manifest: &device_manifest,
         launch_policy: &launch_policy,
         uart16550d_identity: role_hashes[2],

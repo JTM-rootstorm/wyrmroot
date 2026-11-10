@@ -18,8 +18,8 @@ use wyrmroot_runtime::{
     ObservedSupervisionError, SupervisionPlatform, await_child_ready_profile_observed, sha256,
 };
 
-const MAX_CONNECTIONS: usize = 16;
-const REPLAY_RECORDS: usize = 32;
+pub(crate) const MAX_CONNECTIONS: usize = 16;
+pub(crate) const REPLAY_RECORDS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EndpointKind {
@@ -39,8 +39,8 @@ pub(crate) struct EndpointGrant {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegistryTopology {
-    registry_generation: u64,
-    next_endpoint_id: u64,
+    pub(crate) registry_generation: u64,
+    pub(crate) next_endpoint_id: u64,
 }
 
 impl RegistryTopology {
@@ -91,8 +91,8 @@ impl RegistryTopology {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PolicyView<'a> {
-    policy: LaunchPolicy<'a>,
-    archive: Archive<'a>,
+    pub(crate) policy: LaunchPolicy<'a>,
+    pub(crate) archive: Archive<'a>,
 }
 
 impl<'a> PolicyView<'a> {
@@ -211,10 +211,10 @@ pub(crate) struct JobResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LaunchTicket {
-    slot: usize,
+    pub(crate) slot: usize,
     pub(crate) job_id: u64,
-    owner: ConnectionIdentity,
-    transaction_id: u64,
+    pub(crate) owner: ConnectionIdentity,
+    pub(crate) transaction_id: u64,
 }
 
 impl LaunchTicket {
@@ -225,34 +225,34 @@ impl LaunchTicket {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RequestTicket {
-    owner: ConnectionIdentity,
-    transaction_id: u64,
+    pub(crate) owner: ConnectionIdentity,
+    pub(crate) transaction_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ConnectionIdentity {
-    id: u64,
-    generation: u64,
+pub(crate) struct ConnectionIdentity {
+    pub(crate) id: u64,
+    pub(crate) generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Replay {
-    values: [u64; REPLAY_RECORDS],
-    start: usize,
-    len: usize,
+pub(crate) struct Replay {
+    pub(crate) values: [u64; REPLAY_RECORDS],
+    pub(crate) start: usize,
+    pub(crate) len: usize,
 }
 impl Replay {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             values: [0; REPLAY_RECORDS],
             start: 0,
             len: 0,
         }
     }
-    fn contains(&self, value: u64) -> bool {
+    pub(crate) fn contains(&self, value: u64) -> bool {
         (0..self.len).any(|index| self.values[(self.start + index) % REPLAY_RECORDS] == value)
     }
-    fn push(&mut self, value: u64) {
+    pub(crate) fn push(&mut self, value: u64) {
         if self.len < REPLAY_RECORDS {
             self.values[(self.start + self.len) % REPLAY_RECORDS] = value;
             self.len += 1;
@@ -264,42 +264,42 @@ impl Replay {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Connection {
-    identity: ConnectionIdentity,
-    replay: Replay,
-    open: bool,
+pub(crate) struct Connection {
+    pub(crate) identity: ConnectionIdentity,
+    pub(crate) replay: Replay,
+    pub(crate) open: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Job {
-    id: u64,
-    owner: ConnectionIdentity,
-    phase: JobPhase,
-    orphaned: bool,
-    process: u64,
-    task_group: u64,
-    launch_channel: u64,
-    terminal: Option<JobResult>,
-    cleanup_result: u32,
-    published: bool,
+pub(crate) struct Job {
+    pub(crate) id: u64,
+    pub(crate) owner: ConnectionIdentity,
+    pub(crate) phase: JobPhase,
+    pub(crate) orphaned: bool,
+    pub(crate) process: u64,
+    pub(crate) task_group: u64,
+    pub(crate) launch_channel: u64,
+    pub(crate) terminal: Option<JobResult>,
+    pub(crate) cleanup_result: u32,
+    pub(crate) published: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Completed {
-    id: u64,
-    owner: ConnectionIdentity,
-    result: JobResult,
-    visible: bool,
+pub(crate) struct Completed {
+    pub(crate) id: u64,
+    pub(crate) owner: ConnectionIdentity,
+    pub(crate) result: JobResult,
+    pub(crate) visible: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct JobController {
-    connections: [Option<Connection>; MAX_CONNECTIONS],
-    jobs: [Option<Job>; MAX_LIVE_JOBS],
-    completed: [Option<Completed>; MAX_COMPLETED_JOBS],
-    completed_start: usize,
-    completed_len: usize,
-    next_job_id: u64,
+    pub(crate) connections: [Option<Connection>; MAX_CONNECTIONS],
+    pub(crate) jobs: [Option<Job>; MAX_LIVE_JOBS],
+    pub(crate) completed: [Option<Completed>; MAX_COMPLETED_JOBS],
+    pub(crate) completed_start: usize,
+    pub(crate) completed_len: usize,
+    pub(crate) next_job_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -338,9 +338,9 @@ pub(crate) struct LoadedJob {
 /// READY observation, so a READY-and-exited race cannot yield acceptance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedJob {
-    ticket: LaunchTicket,
-    profile: LaunchProfile,
-    transaction_id: u64,
+    pub(crate) ticket: LaunchTicket,
+    pub(crate) profile: LaunchProfile,
+    pub(crate) transaction_id: u64,
     pub(crate) loaded: LoadedProcess,
     pub(crate) task_group: u64,
 }
@@ -361,17 +361,17 @@ impl PreparedJob {
 /// profile/transaction READY record and separately excluded child exit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExactReadyObservation {
-    profile: LaunchProfile,
-    transaction_id: u64,
-    process: deepwyrm_syscall::DwHandle,
-    launch_channel: deepwyrm_syscall::DwHandle,
+    pub(crate) profile: LaunchProfile,
+    pub(crate) transaction_id: u64,
+    pub(crate) process: deepwyrm_syscall::DwHandle,
+    pub(crate) launch_channel: deepwyrm_syscall::DwHandle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LaunchChannelRelease {
-    slot: usize,
-    job_id: u64,
-    launch_channel: u64,
+    pub(crate) slot: usize,
+    pub(crate) job_id: u64,
+    pub(crate) launch_channel: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1063,7 +1063,7 @@ impl JobController {
         None
     }
 
-    fn reserve_transaction(
+    pub(crate) fn reserve_transaction(
         &mut self,
         request: Reservation,
     ) -> Result<ConnectionIdentity, JobError> {
@@ -1082,7 +1082,7 @@ impl JobController {
         Ok(identity)
     }
 
-    fn connection_mut(
+    pub(crate) fn connection_mut(
         &mut self,
         identity: ConnectionIdentity,
     ) -> Result<&mut Connection, JobError> {
@@ -1098,7 +1098,7 @@ impl JobController {
         Ok(connection)
     }
 
-    fn owned_job(&self, owner: ConnectionIdentity, id: u64) -> Result<&Job, JobError> {
+    pub(crate) fn owned_job(&self, owner: ConnectionIdentity, id: u64) -> Result<&Job, JobError> {
         let job = self
             .jobs
             .iter()
@@ -1113,7 +1113,11 @@ impl JobController {
         }
         Ok(job)
     }
-    fn owned_job_index(&self, owner: ConnectionIdentity, id: u64) -> Result<usize, JobError> {
+    pub(crate) fn owned_job_index(
+        &self,
+        owner: ConnectionIdentity,
+        id: u64,
+    ) -> Result<usize, JobError> {
         let index = self
             .jobs
             .iter()
@@ -1129,7 +1133,7 @@ impl JobController {
         }
         Ok(index)
     }
-    fn push_completed(&mut self, value: Completed) {
+    pub(crate) fn push_completed(&mut self, value: Completed) {
         if self.completed_len < MAX_COMPLETED_JOBS {
             let index = (self.completed_start + self.completed_len) % MAX_COMPLETED_JOBS;
             self.completed[index] = Some(value);
@@ -1258,7 +1262,7 @@ pub(crate) fn prepare_reserved_job<'a, L: LoaderPlatform>(
     })
 }
 
-fn close_streams_reverse<E>(
+pub(crate) fn close_streams_reverse<E>(
     streams: &[deepwyrm_syscall::DwHandle],
     mut close: impl FnMut(deepwyrm_syscall::DwHandle) -> Result<(), E>,
 ) -> bool {
@@ -1300,7 +1304,7 @@ impl Default for JobController {
         Self::new()
     }
 }
-fn identity(id: u64, generation: u64) -> Result<ConnectionIdentity, JobError> {
+pub(crate) fn identity(id: u64, generation: u64) -> Result<ConnectionIdentity, JobError> {
     if id == 0 || generation == 0 {
         Err(JobError::ZeroIdentity)
     } else {

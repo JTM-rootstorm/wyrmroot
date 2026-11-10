@@ -20,7 +20,7 @@ pub fn continue_resident<S, L, W>(
     waits: &mut W,
 ) -> u32
 where
-    S: Wyr1BPlatform,
+    S: ResidentPlatform,
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {

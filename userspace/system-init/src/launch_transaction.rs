@@ -96,8 +96,8 @@ use deepwyrm_syscall::{DwDeadline, DwHandle};
 use wyrmroot_launch_proto::{MAX_LIVE_JOBS, Reservation};
 use wyrmroot_loader::launch::LaunchProfile;
 
-use crate::wyr1b::EndpointGrant;
-use crate::wyr1b_job::{LaunchSessionScope, MAX_SESSIONS};
+use crate::job_sessions::{LaunchSessionScope, MAX_SESSIONS};
+use crate::jobs::EndpointGrant;
 
 /// Concurrent launch transactions the arena can hold.
 ///
@@ -249,8 +249,8 @@ pub(crate) enum LaunchTransactionError {
 /// Exact identity of one open transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LaunchToken {
-    slot: usize,
-    generation: u64,
+    pub(crate) slot: usize,
+    pub(crate) generation: u64,
 }
 
 impl LaunchToken {
@@ -264,26 +264,26 @@ impl LaunchToken {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LaunchSlot {
-    generation: u64,
-    open: bool,
-    grant: EndpointGrant,
-    session: DwHandle,
-    scope: LaunchSessionScope,
-    reservation: Reservation,
-    stage: LaunchStage,
-    job_id: u64,
-    profile: Option<LaunchProfile>,
-    resources: Option<LaunchResources>,
-    ready_deadline: Option<DwDeadline>,
-    failure: Option<LaunchFailure>,
+pub(crate) struct LaunchSlot {
+    pub(crate) generation: u64,
+    pub(crate) open: bool,
+    pub(crate) grant: EndpointGrant,
+    pub(crate) session: DwHandle,
+    pub(crate) scope: LaunchSessionScope,
+    pub(crate) reservation: Reservation,
+    pub(crate) stage: LaunchStage,
+    pub(crate) job_id: u64,
+    pub(crate) profile: Option<LaunchProfile>,
+    pub(crate) resources: Option<LaunchResources>,
+    pub(crate) ready_deadline: Option<DwDeadline>,
+    pub(crate) failure: Option<LaunchFailure>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct LaunchTransactions {
-    slots: [Option<LaunchSlot>; LAUNCH_TRANSACTION_SLOTS],
-    retired: [bool; LAUNCH_TRANSACTION_SLOTS],
-    generations: [u64; LAUNCH_TRANSACTION_SLOTS],
+    pub(crate) slots: [Option<LaunchSlot>; LAUNCH_TRANSACTION_SLOTS],
+    pub(crate) retired: [bool; LAUNCH_TRANSACTION_SLOTS],
+    pub(crate) generations: [u64; LAUNCH_TRANSACTION_SLOTS],
 }
 
 impl LaunchTransactions {
@@ -348,7 +348,7 @@ impl LaunchTransactions {
         })
     }
 
-    fn slot(&self, token: LaunchToken) -> Result<&LaunchSlot, LaunchTransactionError> {
+    pub(crate) fn slot(&self, token: LaunchToken) -> Result<&LaunchSlot, LaunchTransactionError> {
         let slot = self
             .slots
             .get(token.slot)
@@ -360,7 +360,10 @@ impl LaunchTransactions {
         Ok(slot)
     }
 
-    fn slot_mut(&mut self, token: LaunchToken) -> Result<&mut LaunchSlot, LaunchTransactionError> {
+    pub(crate) fn slot_mut(
+        &mut self,
+        token: LaunchToken,
+    ) -> Result<&mut LaunchSlot, LaunchTransactionError> {
         let slot = self
             .slots
             .get_mut(token.slot)

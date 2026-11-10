@@ -23,7 +23,7 @@ use wyrmroot_runtime::{
 use wyrmroot_system_init::continue_system_init_resource_product;
 use wyrmroot_system_init::fatal_application_status;
 use wyrmroot_system_init::validate_wait_until_completion;
-use wyrmroot_system_init::{InitPlatform, Wyr1BPlatform, resident_loop};
+use wyrmroot_system_init::{InitPlatform, ResidentPlatform, resident_loop};
 
 struct NativeSystem;
 
@@ -109,7 +109,7 @@ impl InitPlatform for NativeSystem {
     }
 }
 
-impl Wyr1BPlatform for NativeSystem {
+impl ResidentPlatform for NativeSystem {
     fn channel_create(&mut self, rights: DwRights) -> Result<(DwHandle, DwHandle), NativeError> {
         create_channel(rights)
     }

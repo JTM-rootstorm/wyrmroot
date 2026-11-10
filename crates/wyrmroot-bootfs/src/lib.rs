@@ -14,6 +14,7 @@ pub mod content;
 pub mod launch_policy;
 mod limits;
 pub mod path;
+pub mod paths;
 #[cfg(feature = "builder")]
 pub mod product;
 

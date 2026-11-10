@@ -2,19 +2,19 @@
 
 use deepwyrm_syscall::DwHandle;
 
+use crate::jobs::{EndpointGrant, EndpointKind, JobController, JobError};
 use crate::launch_transaction::LaunchTransactions;
-use crate::wyr1b::{EndpointGrant, EndpointKind, JobController, JobError};
 use wyrmroot_launch_proto::Reservation;
 
 pub(crate) const MAX_SESSIONS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Session {
-    grant: EndpointGrant,
-    channel: DwHandle,
-    owner: Option<SessionOwner>,
-    scope: LaunchSessionScope,
-    outer_job: Option<u64>,
+pub(crate) struct Session {
+    pub(crate) grant: EndpointGrant,
+    pub(crate) channel: DwHandle,
+    pub(crate) owner: Option<SessionOwner>,
+    pub(crate) scope: LaunchSessionScope,
+    pub(crate) outer_job: Option<u64>,
 }
 
 /// Controller-owned authority for one installed launch session.
@@ -73,11 +73,11 @@ pub(crate) struct JobDispatcher {
     /// Where the next deferred-launch sweep starts, so a child that never
     /// answers cannot starve the slot behind it.
     pub(crate) launch_cursor: usize,
-    sessions: [Option<Session>; MAX_SESSIONS],
-    poll_cursor: usize,
-    job_cursor: usize,
-    pending_waits: [Option<PendingWait>; MAX_SESSIONS],
-    wait_cursor: usize,
+    pub(crate) sessions: [Option<Session>; MAX_SESSIONS],
+    pub(crate) poll_cursor: usize,
+    pub(crate) job_cursor: usize,
+    pub(crate) pending_waits: [Option<PendingWait>; MAX_SESSIONS],
+    pub(crate) wait_cursor: usize,
 }
 
 impl JobDispatcher {
@@ -260,7 +260,7 @@ impl JobDispatcher {
             .ok_or(JobError::UnknownConnection)
     }
 
-    pub(crate) fn next_cleanup_job(&mut self) -> Option<crate::wyr1b::LoadedJob> {
+    pub(crate) fn next_cleanup_job(&mut self) -> Option<crate::jobs::LoadedJob> {
         let (cursor, job_id) = self.jobs.cleanup_job_id(self.job_cursor)?;
         self.job_cursor = cursor;
         self.jobs.loaded_job(job_id).ok()
@@ -343,7 +343,7 @@ impl JobDispatcher {
         Ok(())
     }
 
-    fn drop_session_waits(&mut self, grant: EndpointGrant) {
+    pub(crate) fn drop_session_waits(&mut self, grant: EndpointGrant) {
         for pending in &mut self.pending_waits {
             if pending.is_some_and(|pending| pending.grant == grant) {
                 *pending = None;
