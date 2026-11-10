@@ -104,7 +104,7 @@ impl<'a> Builder<'a> {
 /// Why a boot archive could not be constructed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BuildError {
-    /// A fixed WYR1 product entry had no immutable payload.
+    /// A product entry had no payload.
     EmptyArtifact,
     /// The supplied path was not a canonical archive-relative path.
     InvalidPath,
@@ -118,61 +118,17 @@ pub enum BuildError {
     ArchiveTooLarge,
     /// A host allocation failed before encoding could start.
     AllocationFailure,
-    /// The C1 product marker was not the exact fixed WYR1-C1 marker.
-    WrongC1Marker,
-    /// The supplied immutable WRDM v1 manifest was malformed or did not
-    /// describe the one fixed q35 COM2 role.
-    InvalidC1DeviceManifest,
-    /// The supplied expected UART identity was zero or did not match WRDM.
-    C1DriverIdentityMismatch,
-    /// The WYR1-E launch policy was malformed or did not contain exactly the
-    /// normal production shell and hello admission records.
-    InvalidE6LaunchPolicy,
-    /// The WYR1-E shell policy identity was zero or did not match the selected
-    /// production shell identity supplied by the product producer.
-    E6WyrmshIdentityMismatch,
-    /// The WYR1-E hello policy identity was zero or did not match the selected
-    /// hello identity supplied by the product producer.
-    E6HelloIdentityMismatch,
-    /// Reset card R1's launch policy was malformed, or did not admit exactly the
-    /// hog and progress payloads on exactly their expected stream shapes.
-    InvalidR1LaunchPolicy,
-    /// A card-R1 policy identity was zero or disagreed with the artifact
-    /// identity the product producer supplied for that payload.
-    R1PolicyIdentityMismatch,
-    /// The card-R1 WRR1 probe configuration was malformed.
-    InvalidR1GateConfiguration,
-    /// The WRR1 probe identity was zero or disagreed with the supplied probe
-    /// artifact identity.
-    R1ProbeIdentityMismatch,
-    /// The WRR1 topology was not one of the two plans reset plan §8.1 fixes.
-    R1UnacceptedTopology,
-    /// The selector-33 WRJP policy was malformed or did not contain exactly
-    /// the six frozen interactive-shell records.
-    InvalidE7LaunchPolicy,
-    /// A selector-33 fixture identity was zero or did not match its WRJP
+    /// The device manifest was malformed or did not describe the one fixed
+    /// q35 COM2 role.
+    InvalidDeviceManifest,
+    /// The UART identity was zero or did not match the device manifest.
+    DriverIdentityMismatch,
+    /// The launch policy was malformed, or did not admit exactly the shell,
+    /// hello and the CPU hog on their expected stream shapes.
+    InvalidLaunchPolicy,
+    /// An admitted payload's identity was zero or did not match its policy
     /// record.
-    E7ArtifactIdentityMismatch,
-    /// The selector-33 malformed-ELF fixture was not the frozen byte string.
-    InvalidE7MalformedElf,
-    /// The additive E8 launch policy was malformed or did not contain exactly
-    /// the eight admitted production and selector records.
-    InvalidE8LaunchPolicy,
-    /// An E8 inherited or current artifact identity did not match its policy
-    /// entry.
-    E8ArtifactIdentityMismatch,
-    /// The inherited malformed-ELF fixture changed in the additive E8 product.
-    InvalidE8MalformedElf,
-    /// The final WYR1-F launch policy was malformed, or did not admit exactly
-    /// the production shell, the hello payload and the CPU-hog job on exactly
-    /// their expected stream shapes.
-    InvalidFLaunchPolicy,
-    /// The WYR1-F shell policy identity was zero or did not match the selected
-    /// production shell identity supplied by the product producer.
-    FWyrmshIdentityMismatch,
-    /// A WYR1-F admitted-payload identity was zero or did not match the
-    /// artifact identity the product producer supplied for that path.
-    FPayloadIdentityMismatch,
+    PayloadIdentityMismatch,
 }
 
 /// The only regular-file metadata forms permitted in a WYR0 bootfs archive.

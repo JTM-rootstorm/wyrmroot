@@ -36,7 +36,7 @@ use wyrmroot_bootfs::{
     launch_policy::{
         JOB_V2_PROFILE_ID, LaunchPolicyEntry, WYRMSH_PATH, WYRMSH_PROFILE_ID, encode_wyrmsh,
     },
-    wyr1::{Product, ProductC1, ProductF, WYR1_C1_MARKER, build_f},
+    product::{Product, build as build_bootfs},
 };
 use wyrmroot_device_proto::manifest::{
     ContentIdentity, HEADER_BYTES as WRDM_HEADER_BYTES, RECORD_BYTES as WRDM_RECORD_BYTES,
@@ -443,28 +443,23 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
     .map_err(|error| Failure::task(format!("launch policy build failed: {error:?}")))?;
     let launch_policy = policy[..policy_size].to_vec();
 
-    let bootfs = build_f(ProductF {
-        base: ProductC1 {
-            base: Product {
-                init: &natives["system-init"],
-                registryd: &natives["registryd"],
-                devmgr: &natives["devmgr"],
-                uart16550d: &natives["uart16550d"],
-                consoled: &natives["consoled"],
-                wyrmsh: &natives["wyrmsh"],
-                rrc_manifest: &rrc_manifest,
-                gate_config: GATE_CONFIG,
-            },
-            marker: WYR1_C1_MARKER,
-            device_manifest: &device_manifest,
-            expected_uart16550d_identity: role_hashes[2],
-        },
-        launch_policy: &launch_policy,
+    let bootfs = build_bootfs(Product {
+        init: &natives["system-init"],
+        registryd: &natives["registryd"],
+        devmgr: &natives["devmgr"],
+        uart16550d: &natives["uart16550d"],
+        consoled: &natives["consoled"],
+        wyrmsh: &natives["wyrmsh"],
         hello: &natives["hello"],
         cpu_hog: &natives["cpu-hog"],
-        expected_wyrmsh_identity: role_hashes[4],
-        expected_hello_identity: hello,
-        expected_cpu_hog_identity: cpu_hog,
+        rrc_manifest: &rrc_manifest,
+        gate_config: GATE_CONFIG,
+        device_manifest: &device_manifest,
+        launch_policy: &launch_policy,
+        uart16550d_identity: role_hashes[2],
+        wyrmsh_identity: role_hashes[4],
+        hello_identity: hello,
+        cpu_hog_identity: cpu_hog,
     })
     .map_err(|error| Failure::task(format!("bootfs build failed: {error:?}")))?;
     if bootfs.len() > MAX_BOOTFS_BYTES {

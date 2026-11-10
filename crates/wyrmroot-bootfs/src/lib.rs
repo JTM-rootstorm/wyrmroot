@@ -15,7 +15,7 @@ pub mod launch_policy;
 mod limits;
 pub mod path;
 #[cfg(feature = "builder")]
-pub mod wyr1;
+pub mod product;
 
 pub use limits::{BootfsLimits, WYR0_LIMITS};
 
