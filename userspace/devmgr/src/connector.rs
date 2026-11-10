@@ -3,7 +3,6 @@
 //! Native code owns actual Channel handles. This module names every ownership
 //! transition so the native adapter never infers cleanup from event order.
 
-use wyrmroot_device_proto::D5DriverIdentity;
 use wyrmroot_device_proto::connector::{ConnectorErrorCode, ConnectorIdentity, ConnectorMessage};
 use wyrmroot_device_proto::control::FailureCode;
 use wyrmroot_device_proto::control_v1_1::{ControlIdentityV1_1, ControlMessageV1_1};
@@ -38,7 +37,7 @@ impl AttachCorrelation {
         }
     }
 
-    pub const fn attach_message(self) -> ControlMessageV1_1 {
+    pub(crate) const fn attach_message(self) -> ControlMessageV1_1 {
         ControlMessageV1_1::AttachStream {
             identity: ControlIdentityV1_1 {
                 transaction_id: self.attach_transaction_id,
@@ -72,18 +71,7 @@ impl AttachCorrelation {
     }
 }
 
-impl PublishedDriver {
-    pub const fn d5_identity(self) -> D5DriverIdentity {
-        D5DriverIdentity {
-            device_role_id: self.control.role_id.0,
-            bundle_generation: self.control.bundle_generation.0,
-            driver_attempt_generation: self.control.attempt_generation.0,
-            driver_control_endpoint_id: self.control.endpoint.id.0,
-            driver_control_endpoint_generation: self.control.endpoint.generation.0,
-            launch_transaction_id: self.control.transaction_id,
-        }
-    }
-}
+impl PublishedDriver {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EndpointOwner {
@@ -437,7 +425,7 @@ impl ConnectorBroker {
     }
 
     /// Failed pre-MOVE sends leave both endpoints in devmgr custody for close.
-    pub fn attach_send_failed(
+    pub(crate) fn attach_send_failed(
         &mut self,
         observed: AttachCorrelation,
     ) -> Result<ConnectorAction, ConnectorModelError> {

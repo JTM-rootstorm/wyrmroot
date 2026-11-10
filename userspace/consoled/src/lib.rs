@@ -316,7 +316,7 @@ pub struct ChildSession {
 }
 
 impl ChildSession {
-    pub const fn all_peers_live(self) -> bool {
+    pub(crate) const fn all_peers_live(self) -> bool {
         self.peers[0].live && self.peers[1].live && self.peers[2].live
     }
 }
@@ -404,7 +404,7 @@ impl LaunchTransaction {
         Ok(self.child_peers[index])
     }
 
-    pub const fn all_moved(&self) -> bool {
+    pub(crate) const fn all_moved(&self) -> bool {
         self.moved[0] && self.moved[1] && self.moved[2]
     }
 
@@ -1027,7 +1027,7 @@ impl ConsoleModel {
         Ok(cleanup)
     }
 
-    pub fn event_is_current(&self, event: EventGeneration) -> bool {
+    pub(crate) fn event_is_current(&self, event: EventGeneration) -> bool {
         self.state == ConnectionState::Active
             && self.child.map(|value| EventGeneration::from(value.ids)) == Some(event)
     }

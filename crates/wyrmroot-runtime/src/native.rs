@@ -358,7 +358,7 @@ pub fn exit_process(exit_code: u32) -> ! {
 }
 
 /// Terminates the calling thread normally. A rejected exit request fails closed by spinning.
-pub fn exit_thread(exit_code: u32) -> ! {
+pub(crate) fn exit_thread(exit_code: u32) -> ! {
     let _unexpected_status = deepwyrm_syscall::thread_exit(exit_code);
     fail_stop()
 }

@@ -6,7 +6,7 @@ mod unicode_format;
 ///
 /// This excludes Unicode general categories Cc, Cf, Zl, and Zp. The complete
 /// Unicode 17.0.0 Cf/Zl/Zp ranges live in the separately licensed data module.
-pub fn is_printable_scalar(ch: char) -> bool {
+pub(crate) fn is_printable_scalar(ch: char) -> bool {
     !ch.is_control() && !unicode_format::is_format_or_line_separator(ch)
 }
 

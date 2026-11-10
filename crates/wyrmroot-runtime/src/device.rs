@@ -13,7 +13,7 @@ use deepwyrm_syscall::{
 use crate::{NativeError, NativeOutputError, capability_native::generated_raw_call};
 
 /// Queries and validates the generated ABI discovery record.
-pub fn abi_info() -> Result<DwAbiInfoV1, NativeError> {
+pub(crate) fn abi_info() -> Result<DwAbiInfoV1, NativeError> {
     let mut info = DwAbiInfoV1::default();
     let mut required = 0_u64;
     require_success(generated_raw_call(

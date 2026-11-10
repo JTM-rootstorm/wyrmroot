@@ -878,18 +878,18 @@ pub fn parse_device_driver_init(
 }
 
 impl LaunchProfile {
-    pub const fn has_loader_authority_trio(self) -> bool {
+    pub(crate) const fn has_loader_authority_trio(self) -> bool {
         matches!(
             self,
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Supervisor
         )
     }
 
-    pub const fn has_loader_authority_quartet(self) -> bool {
+    pub(crate) const fn has_loader_authority_quartet(self) -> bool {
         matches!(self, Self::SupervisorResourceDomain)
     }
 
-    pub const fn needs_self_root(self) -> bool {
+    pub(crate) const fn needs_self_root(self) -> bool {
         self.has_loader_authority_trio()
             || self.has_loader_authority_quartet()
             || matches!(
@@ -906,7 +906,7 @@ impl LaunchProfile {
             )
     }
 
-    pub const fn channel_role(self) -> Option<u32> {
+    pub(crate) const fn channel_role(self) -> Option<u32> {
         match self {
             Self::BootstrapRegistry => Some(ROLE_SUPERVISOR_CONTROL),
             Self::BootstrapService => Some(ROLE_PUBLICATION_AUTHORITY),

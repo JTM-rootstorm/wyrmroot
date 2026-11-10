@@ -161,12 +161,6 @@ impl<'a> Coordinator<'a> {
     pub const fn publication_endpoint(&self) -> Option<RegistryEndpoint> {
         self.publication_endpoint
     }
-    pub const fn published_generation(&self) -> Option<PublishedServiceGeneration> {
-        self.published_generation
-    }
-    pub const fn attempts_started(&self) -> u8 {
-        self.attempts_started
-    }
 
     pub fn intake_manifest(
         &mut self,

@@ -242,7 +242,7 @@ where
 }
 
 /// Validates the native ABI and the exact canonical shell argv/environment.
-pub fn validate_startup(startup: StartupBlock<'_>) -> Result<(), ShellError> {
+pub(crate) fn validate_startup(startup: StartupBlock<'_>) -> Result<(), ShellError> {
     if startup.version() != STARTUP_ABI_V2
         || startup.argc() != 1
         || startup.envc() != 0

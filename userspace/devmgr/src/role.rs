@@ -41,9 +41,6 @@ use wyrmroot_device_proto::control_v1_1::{
     DEVICE_STAGE_BYTES as D3_DEVICE_STAGE_BYTES, INTERRUPT_STAGE_BYTES as D3_INTERRUPT_STAGE_BYTES,
     READY_BYTES as D3_READY_BYTES, encode as encode_control_v1_1, parse as parse_control_v1_1,
 };
-use wyrmroot_device_proto::d5_controller::{
-    D5ControllerMessage, RECORD_BYTES as D5_CONTROLLER_BYTES, parse as parse_d5_controller,
-};
 use wyrmroot_device_proto::driver_launch::{
     REAPED_RESPONSE_BYTES, encode_driver_retired, parse_reaped,
 };
@@ -241,7 +238,6 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
     let mut production_witness: Option<ProductionClientWitness> = None;
     let mut connector_cleanup_deadline: Option<u64> = None;
     let mut waiting_registry_status_sent = false;
-    let mut e8_retire_requested = false;
     let mut device_resource = None;
     loop {
         let mut waits = [DwWaitItemV1::default(); 4];
@@ -346,29 +342,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     return Err(code);
                 }
             };
-            let (replacement, action) = match input {
-                ControllerInput::D5(D5ControllerMessage::RequestRetire(identity)) => {
-                    let request = resident.active_driver_request().ok_or(failure(309))?;
-                    let control = driver_control.ok_or(failure(310))?;
-                    let broker = connector_broker.as_ref().ok_or(failure(311))?;
-                    let current = published_driver(&resident, request)?;
-                    if identity != current.d5_identity()
-                        || broker.current() != Some(current)
-                        || !matches!(
-                            broker.slot(),
-                            ConnectorSlot::Active { attach, .. } if attach.driver == current
-                        )
-                        || e8_retire_requested
-                    {
-                        return Err(failure(312));
-                    }
-                    send_driver_retire(platform, control, &mut resident)?;
-                    e8_retire_requested = true;
-                    continue;
-                }
-                ControllerInput::D5(_) => return Err(failure(313)),
-                ControllerInput::Controller(received) => received,
-            };
+            let (replacement, action) = input;
             if let Some(replacement) = replacement {
                 if let Some(old) = publication.replace(replacement) {
                     let _ = platform.close_handle(replacement);
@@ -533,7 +507,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     &mut resident,
                     observed.observed.0 & DW_SIGNAL_READABLE.0 != 0,
                     observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0,
-                    e8_retire_requested,
+                    false,
                 )?;
                 {
                     let broker = connector_broker.as_mut().ok_or(failure(294))?;
@@ -577,18 +551,13 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                 {
                     // The exact retired attempt is now terminal and fully
                     // reaped.  A later replacement failure is ordinary unless
-                    // init issues another exact RequestRetire.
-                    e8_retire_requested = false;
                 }
                 let rebind_deadline = platform
                     .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
                     .map_err(|_| failure(45))?;
                 wait_readable(platform, bootstrap, rebind_deadline, 46)?;
                 let received = receive_controller(platform, bootstrap, &mut resident)?;
-                let (replacement, action) = match received {
-                    ControllerInput::Controller(received) => received,
-                    ControllerInput::D5(_) => return Err(failure(314)),
-                };
+                let (replacement, action) = received;
                 if action != ControllerAction::PublicationRebound {
                     return Err(failure(47));
                 }
@@ -707,17 +676,14 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
     }
 }
 
-enum ControllerInput {
-    Controller((Option<DwHandle>, ControllerAction)),
-    D5(D5ControllerMessage),
-}
+type ControllerInput = (Option<DwHandle>, ControllerAction);
 
 fn receive_controller<P: DevmgrPlatform>(
     platform: &mut P,
     bootstrap: DwHandle,
     resident: &mut crate::ResidentController,
 ) -> Result<ControllerInput, u32> {
-    let mut bytes = [0u8; D5_CONTROLLER_BYTES];
+    let mut bytes = [0u8; wyrmroot_device_proto::controller_v1_1::RECORD_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
     let counts = platform
         .receive_channel(bootstrap, &mut bytes, &mut handles)
@@ -725,17 +691,6 @@ fn receive_controller<P: DevmgrPlatform>(
     if counts.bytes > bytes.len() || counts.handles > handles.len() {
         close_received(platform, &handles, counts.handles);
         return Err(failure(28));
-    }
-    if counts.bytes == D5_CONTROLLER_BYTES
-        && bytes[..4] == wyrmroot_device_proto::d5_controller::MAGIC
-    {
-        if counts.handles != 0 {
-            close_received(platform, &handles, counts.handles);
-            return Err(failure(233));
-        }
-        return parse_d5_controller(&bytes[..counts.bytes])
-            .map(ControllerInput::D5)
-            .map_err(|_| failure(233));
     }
     let publication = match wyrmroot_device_proto::controller_v1_1::parse(&bytes[..counts.bytes]) {
         Ok(publication) => publication,
@@ -789,7 +744,7 @@ fn receive_controller<P: DevmgrPlatform>(
             return Err(failure(34));
         }
     };
-    Ok(ControllerInput::Controller((replacement, action)))
+    Ok((replacement, action))
 }
 
 fn published_driver(

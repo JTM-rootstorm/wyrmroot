@@ -13,7 +13,6 @@ pub mod control_v1_1;
 pub mod controller;
 pub mod controller_v1_1;
 pub mod coordinator;
-pub mod d5_controller;
 pub mod driver_launch;
 pub mod manifest;
 
@@ -27,9 +26,6 @@ pub use controller::{
 };
 pub use coordinator::{
     Coordinator, CoordinatorError, CoordinatorState, RegistryBinding, RegistryEndpoint,
-};
-pub use d5_controller::{
-    D5ControllerMessage, D5ControllerParseError, D5DriverIdentity, D5StreamIdentity,
 };
 pub use driver_launch::{
     C6_FACT_BYTES, C6Fact, DEVICE_DRIVER_PATH, DRIVER_RETIRED_BYTES, DirectControlRights,

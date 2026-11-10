@@ -265,7 +265,7 @@ pub fn supervise_child<P: SupervisionPlatform>(
 
 /// Profile-aware READY/exit observation. Existing `supervise_child` callers
 /// remain bound byte-for-byte to WRLP 1.0 through its compatibility wrapper.
-pub fn supervise_child_profile<P: SupervisionPlatform>(
+pub(crate) fn supervise_child_profile<P: SupervisionPlatform>(
     platform: &mut P,
     process: DwHandle,
     launch_channel: DwHandle,
@@ -447,30 +447,6 @@ fn supervise_profile_state<P: SupervisionPlatform>(
     }
 }
 
-/// Observes one exact profile-bound READY without waiting for child exit.
-///
-/// This is the permanent-supervisor handoff boundary: successful return proves
-/// the child is operational and leaves its Process/Channel ownership with the
-/// caller. It never reinterprets process existence as READY.
-pub fn await_child_ready_profile<P: SupervisionPlatform>(
-    platform: &mut P,
-    process: DwHandle,
-    launch_channel: DwHandle,
-    profile: LaunchProfile,
-    transaction_id: u64,
-    deadline: DwDeadline,
-) -> Result<(), SupervisionError<P::Error>> {
-    await_child_ready_profile_observed(
-        platform,
-        process,
-        launch_channel,
-        profile,
-        transaction_id,
-        deadline,
-    )
-    .map_err(ObservedSupervisionError::into_legacy)
-}
-
 /// READY observation that preserves an exact terminal record on early exit.
 pub fn await_child_ready_profile_observed<P: SupervisionPlatform>(
     platform: &mut P,
@@ -611,40 +587,6 @@ fn drain_terminal_launch_channel<P: SupervisionPlatform>(
         // PEER_CLOSED is accepted only from this fresh wait with no READABLE bit.
         return Ok(ready);
     }
-}
-
-/// Production convenience entry point using the typed native syscall wrappers.
-pub fn supervise_native_child(
-    process: DwHandle,
-    launch_channel: DwHandle,
-    transaction_id: u64,
-    deadline: DwDeadline,
-) -> Result<(), SupervisionError<NativeError>> {
-    supervise_child(
-        &mut NativeSupervisionPlatform,
-        process,
-        launch_channel,
-        transaction_id,
-        deadline,
-    )
-}
-
-/// Native profile-aware READY/exit observation.
-pub fn supervise_native_child_profile(
-    process: DwHandle,
-    launch_channel: DwHandle,
-    profile: LaunchProfile,
-    transaction_id: u64,
-    deadline: DwDeadline,
-) -> Result<(), SupervisionError<NativeError>> {
-    supervise_child_profile(
-        &mut NativeSupervisionPlatform,
-        process,
-        launch_channel,
-        profile,
-        transaction_id,
-        deadline,
-    )
 }
 
 #[cfg(test)]

@@ -117,7 +117,7 @@ impl OwnedMemoryMapping {
     }
 
     /// Irreversibly removes writable authority from the live mapping.
-    pub fn protect_read_only(&mut self) -> Result<(), NativeError> {
+    pub(crate) fn protect_read_only(&mut self) -> Result<(), NativeError> {
         if self.writable {
             require_success(deepwyrm_syscall::address_region_protect(
                 self.root,
@@ -166,7 +166,7 @@ pub fn create_channel(rights: DwRights) -> Result<(DwHandle, DwHandle), NativeEr
     Ok((first, second))
 }
 
-pub fn create_memory_object(bytes: u64, rights: DwRights) -> Result<DwHandle, NativeError> {
+pub(crate) fn create_memory_object(bytes: u64, rights: DwRights) -> Result<DwHandle, NativeError> {
     let mut memory = DwHandle(0);
     require_success(deepwyrm_syscall::memory_object_create(
         DwSize(bytes),
@@ -239,7 +239,7 @@ pub fn materialize_read_only_memory(
     Ok(reduced)
 }
 
-pub fn map_memory_read_write(
+pub(crate) fn map_memory_read_write(
     root: DwHandle,
     memory: DwHandle,
     bytes: u64,
@@ -253,7 +253,7 @@ pub fn map_memory_read_write(
     )
 }
 
-pub fn map_memory_read_only(
+pub(crate) fn map_memory_read_only(
     root: DwHandle,
     memory: DwHandle,
     bytes: u64,
@@ -302,7 +302,7 @@ fn map_memory(
     })
 }
 
-pub fn unmap_memory(mapping: OwnedMemoryMapping) -> Result<(), NativeError> {
+pub(crate) fn unmap_memory(mapping: OwnedMemoryMapping) -> Result<(), NativeError> {
     require_success(deepwyrm_syscall::address_region_unmap(
         mapping.root,
         mapping.address,
@@ -365,7 +365,7 @@ pub fn terminate_task_group(
     ))
 }
 
-pub fn create_event(rights: DwRights) -> Result<DwHandle, NativeError> {
+pub(crate) fn create_event(rights: DwRights) -> Result<DwHandle, NativeError> {
     let mut event = DwHandle(0);
     require_success(raw::call(
         deepwyrm_syscall::DW_SYSCALL_EVENT_CREATE,
@@ -377,7 +377,11 @@ pub fn create_event(rights: DwRights) -> Result<DwHandle, NativeError> {
     Ok(event)
 }
 
-pub fn signal_event(event: DwHandle, clear: DwSignals, set: DwSignals) -> Result<(), NativeError> {
+pub(crate) fn signal_event(
+    event: DwHandle,
+    clear: DwSignals,
+    set: DwSignals,
+) -> Result<(), NativeError> {
     require_success(raw::call(
         deepwyrm_syscall::DW_SYSCALL_EVENT_SIGNAL,
         [event.0, clear.0, set.0, 0, 0, 0],
@@ -403,7 +407,7 @@ pub fn set_timer(timer: DwHandle, deadline: DwDeadline) -> Result<(), NativeErro
     ))
 }
 
-pub fn cancel_timer(timer: DwHandle) -> Result<(), NativeError> {
+pub(crate) fn cancel_timer(timer: DwHandle) -> Result<(), NativeError> {
     require_success(raw::call(
         deepwyrm_syscall::DW_SYSCALL_TIMER_CANCEL,
         [timer.0, 0, 0, 0, 0, 0],

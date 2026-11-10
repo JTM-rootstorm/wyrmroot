@@ -492,7 +492,7 @@ impl RegistryState {
         Ok(())
     }
 
-    pub fn prepare_publish(
+    pub(crate) fn prepare_publish(
         &mut self,
         endpoint: EndpointIdentity,
         transaction: u64,
@@ -515,7 +515,7 @@ impl RegistryState {
         })
     }
 
-    pub fn commit_publish(
+    pub(crate) fn commit_publish(
         &mut self,
         ticket: PublishTicket,
     ) -> Result<PublishOutcome, RegistryError> {

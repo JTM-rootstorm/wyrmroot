@@ -252,7 +252,7 @@ impl StreamAttachment {
         }
     }
 
-    pub const fn active_endpoint(&self) -> Option<ReceivedStreamEndpoint> {
+    pub(crate) const fn active_endpoint(&self) -> Option<ReceivedStreamEndpoint> {
         match self.active {
             Some((_, _, _, endpoint)) => Some(endpoint),
             None => None,
@@ -717,7 +717,7 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
         self.stream.active_endpoint()
     }
 
-    pub fn tx_free(&self) -> usize {
+    pub(crate) fn tx_free(&self) -> usize {
         RING_CAPACITY - self.uart.tx_len()
     }
 
@@ -875,7 +875,7 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
     }
 
     /// Commits a prepared record only after the Channel send succeeds.
-    pub fn commit_stream_send(&mut self) {
+    pub(crate) fn commit_stream_send(&mut self) {
         if self.pending_rx_len != 0 {
             let discarded = self.uart.discard_rx(self.pending_rx_len);
             assert_eq!(

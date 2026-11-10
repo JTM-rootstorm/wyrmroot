@@ -296,31 +296,11 @@ impl ResidentController {
         }
     }
 
-    pub const fn retired_binding(&self) -> Option<RegistryBinding> {
-        self.retired_binding
-    }
-
-    pub const fn retired_driver_attempt(&self) -> Option<u64> {
-        self.retired_driver_attempt
-    }
-
-    pub const fn last_transaction_id(&self) -> u64 {
-        self.last_transaction_id
-    }
-
     pub const fn bundle_generation(&self) -> Option<BundleGeneration> {
         self.bundle_generation
     }
 
-    pub const fn driver_lease_generation(&self) -> Option<u64> {
-        self.driver_lease_generation
-    }
-
-    pub const fn driver_irq_binding(&self) -> Option<u64> {
-        self.driver_irq_binding
-    }
-
-    pub fn set_driver_bindings(
+    pub(crate) fn set_driver_bindings(
         &mut self,
         lease_generation: u64,
         irq_binding: u64,
@@ -347,12 +327,8 @@ impl ResidentController {
         }
     }
 
-    pub const fn retry_until_ns(&self) -> Option<u64> {
+    pub(crate) const fn retry_until_ns(&self) -> Option<u64> {
         self.retry_until_ns
-    }
-
-    pub const fn driver_failures(&self) -> u8 {
-        self.driver_failures
     }
 
     /// Admits one exact queried COM2 resource for this devmgr generation.
@@ -501,7 +477,7 @@ impl ResidentController {
     /// Reserves the first direct-connector attach transaction and stream
     /// generation from resident-owned high-water marks. The broker owns later
     /// checked increments for the same live driver generation.
-    pub fn reserve_d3_connector_correlations(
+    pub(crate) fn reserve_d3_connector_correlations(
         &mut self,
         request: DriverLaunchRequest,
     ) -> Result<(u64, u64), DevmgrError> {

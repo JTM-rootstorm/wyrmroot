@@ -82,7 +82,7 @@ impl PioRange {
         self.base as u32 + self.length as u32
     }
 
-    pub const fn as_range(self) -> Range<u32> {
+    pub(crate) const fn as_range(self) -> Range<u32> {
         self.base as u32..self.end()
     }
 }
