@@ -382,6 +382,37 @@ mod tests {
         encode_job_result, parse_message,
     };
 
+    /// F4 WR-F4-L1 (with rereview D1): the scope table itself. Dispatch tests
+    /// cannot see a widened allowlist, because a refused scope and a missing
+    /// policy give the same reply; these assertions fail on any widened or
+    /// flipped arm.
+    #[test]
+    fn launch_scopes_admit_exactly_their_table() {
+        use LaunchSessionScope::{ConsoleLauncher, ShellJobs};
+        for path in ["bin/hello", "bin/cpu-hog"] {
+            assert!(ShellJobs.admits_legacy_launch(path), "{path}");
+            assert!(!ConsoleLauncher.admits_legacy_launch(path), "{path}");
+        }
+        for path in [
+            "system/consoled",
+            "system/init",
+            "system/wyrmsh",
+            "system/devmgr",
+            "system/registryd",
+            "system/uart16550d",
+            "bin/hello-extra",
+            "bin/cpu-hog2",
+            "bin/hello/",
+            "bin",
+            "",
+        ] {
+            assert!(!ShellJobs.admits_legacy_launch(path), "{path}");
+            assert!(!ConsoleLauncher.admits_legacy_launch(path), "{path}");
+        }
+        assert!(ConsoleLauncher.admits_shell_v1());
+        assert!(!ShellJobs.admits_shell_v1());
+    }
+
     fn grant(id: u64) -> EndpointGrant {
         EndpointGrant {
             registry_generation: 1,

@@ -704,8 +704,11 @@ mod bounded_read_tests {
     use super::*;
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("xtask-bounded-read-{}-{name}", std::process::id()));
+        // Inside the project's ignored `.tmp`, never the shared system temp.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.tmp/xtask-tests")
+            .join(format!("bounded-read-{}-{name}", std::process::id()));
+        fs::create_dir_all(dir.parent().unwrap()).unwrap();
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir(&dir).unwrap();
         dir

@@ -1241,8 +1241,10 @@ fn legacy_launch(path: &'static str, streams: bool) -> impl FnOnce(&mut [u8]) ->
     }
 }
 
-/// F4 WR-F4-L1: the console launcher may start only the shell. A legacy
-/// LAUNCH, even of an allowed job binary, is refused and its handles closed.
+/// F4 WR-F4-L1: a refused legacy LAUNCH on the console launcher closes every
+/// received handle and replies `PolicyRejected`. With no policy loaded this
+/// reply is also what a missing policy gives, so the scope table itself is
+/// pinned by `job_sessions::tests::launch_scopes_admit_exactly_their_table`.
 #[test]
 fn console_launcher_refuses_every_legacy_launch() {
     for (path, streams, handles) in [("bin/hello", false, 0), ("bin/cpu-hog", true, 3)] {
@@ -1258,8 +1260,10 @@ fn console_launcher_refuses_every_legacy_launch() {
     }
 }
 
-/// F4 WR-F4-L1: shell jobs may launch only `bin/hello` and `bin/cpu-hog`;
-/// system services, the shell itself and look-alike paths are refused.
+/// F4 WR-F4-L1: a refused ShellJobs LAUNCH of a system service or look-alike
+/// path closes every received handle and replies `PolicyRejected`. The scope
+/// table itself is pinned by
+/// `job_sessions::tests::launch_scopes_admit_exactly_their_table`.
 #[test]
 fn shell_jobs_refuse_system_services_and_unlisted_paths() {
     for path in [
