@@ -9,24 +9,11 @@ pub const MAX_ENTRIES: usize = 32;
 pub const MAX_PATH_BYTES: usize = 256;
 const MAGIC: [u8; 4] = *b"WRJP";
 const VERSION_MAJOR: u16 = 1;
-const VERSION_MINOR_HISTORICAL: u16 = 0;
-const VERSION_MINOR_WYRMSH: u16 = 1;
-/// Admits [`RECOVERY_TRIGGER_PROFILE_ID`]. Reset card R7B-4 class D1b.
-const VERSION_MINOR_RECOVERY_TRIGGER: u16 = 2;
+/// The only accepted minor. Minor 0 (JobV2 only) and minor 2 (the E8
+/// recovery-trigger profile) were closed with their phases.
+const VERSION_MINOR: u16 = 1;
 pub const JOB_V2_PROFILE_ID: u16 = 1;
 pub const WYRMSH_PROFILE_ID: u16 = 2;
-/// A launch this policy permits to open a recovery episode.
-///
-/// R7B-4 class D1b. The E8 recovery trigger used to be an ordinary
-/// `JOB_V2_PROFILE_ID` entry indistinguishable from every other test actor, so
-/// the only way the dispatcher could recognise it was to compare each ShellJobs
-/// launch against a magic path -- a sniff on the production dispatch path,
-/// which is what D1b names.
-///
-/// A profile id is the policy's existing way to say what a path is for, so the
-/// fact moves here. Deliberately not constrained to any path: the point is that
-/// nothing outside the builder that writes this policy knows which path it is.
-pub const RECOVERY_TRIGGER_PROFILE_ID: u16 = 3;
 pub const WYRMSH_PATH: &str = "system/wyrmsh";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,7 +32,6 @@ pub struct LaunchPolicy<'a> {
     count: usize,
     strings_offset: usize,
     boot_generation_sha256: [u8; 32],
-    minor: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,13 +60,7 @@ impl<'a> LaunchPolicy<'a> {
                 PolicyError::WrongMagic
             });
         }
-        let minor = get_u16(bytes, 6)?;
-        if get_u16(bytes, 4)? != VERSION_MAJOR
-            || !matches!(
-                minor,
-                VERSION_MINOR_HISTORICAL | VERSION_MINOR_WYRMSH | VERSION_MINOR_RECOVERY_TRIGGER
-            )
-        {
+        if get_u16(bytes, 4)? != VERSION_MAJOR || get_u16(bytes, 6)? != VERSION_MINOR {
             return Err(PolicyError::UnsupportedVersion);
         }
         if get_u16(bytes, 8)? as usize != HEADER_BYTES
@@ -123,7 +103,6 @@ impl<'a> LaunchPolicy<'a> {
             count,
             strings_offset,
             boot_generation_sha256,
-            minor,
         };
         let mut previous = None;
         let mut expected_offset = 0usize;
@@ -157,10 +136,6 @@ impl<'a> LaunchPolicy<'a> {
 
     pub const fn boot_generation_sha256(self) -> [u8; 32] {
         self.boot_generation_sha256
-    }
-
-    pub const fn version_minor(self) -> u16 {
-        self.minor
     }
 
     pub fn entry(self, index: usize) -> Option<Result<LaunchPolicyEntry<'a>, PolicyError>> {
@@ -202,26 +177,13 @@ impl<'a> LaunchPolicy<'a> {
         validate_path(path)?;
         let startup_abi = get_u16(record, 6)?;
         let profile_id = get_u16(record, 8)?;
-        if startup_abi != 2
-            || match (self.minor, profile_id) {
-                (VERSION_MINOR_HISTORICAL, JOB_V2_PROFILE_ID) => false,
-                (VERSION_MINOR_WYRMSH | VERSION_MINOR_RECOVERY_TRIGGER, JOB_V2_PROFILE_ID) => {
-                    path == WYRMSH_PATH
-                }
-                (VERSION_MINOR_WYRMSH | VERSION_MINOR_RECOVERY_TRIGGER, WYRMSH_PROFILE_ID) => {
-                    path != WYRMSH_PATH
-                }
-                (VERSION_MINOR_RECOVERY_TRIGGER, RECOVERY_TRIGGER_PROFILE_ID) => false,
-                _ => true,
-            }
-        {
+        if !profile_matches_path(startup_abi, profile_id, path) {
             return Err(PolicyError::InvalidStartupProfile);
         }
         let stream_modes = get_u16(record, 10)?;
         if stream_modes == 0
             || stream_modes & !0b11 != 0
-            || (matches!(profile_id, WYRMSH_PROFILE_ID | RECOVERY_TRIGGER_PROFILE_ID)
-                && stream_modes != 0b10)
+            || (profile_id == WYRMSH_PROFILE_ID && stream_modes != 0b10)
         {
             return Err(PolicyError::InvalidStreamModes);
         }
@@ -257,55 +219,18 @@ impl<'a> LaunchPolicy<'a> {
     }
 }
 
+/// Exactly one profile may name each path: the Wyrmsh profile only
+/// `system/wyrmsh`, and JobV2 every other path.
+fn profile_matches_path(startup_abi: u16, profile_id: u16, path: &str) -> bool {
+    startup_abi == 2
+        && match profile_id {
+            JOB_V2_PROFILE_ID => path != WYRMSH_PATH,
+            WYRMSH_PROFILE_ID => path == WYRMSH_PATH,
+            _ => false,
+        }
+}
+
 pub fn encode(
-    boot_generation_sha256: [u8; 32],
-    entries: &[LaunchPolicyEntry<'_>],
-    output: &mut [u8],
-) -> Result<usize, PolicyError> {
-    encode_version(
-        VERSION_MINOR_HISTORICAL,
-        boot_generation_sha256,
-        entries,
-        output,
-    )
-}
-
-/// Encodes the additive WRJP 1.2 policy, which may also carry
-/// [`RECOVERY_TRIGGER_PROFILE_ID`].
-///
-/// R7B-4 class D1b. Only a build that actually has a recovery trigger emits
-/// this minor; every other selector keeps the minor it already emits, so the
-/// profile exists exactly where it is used.
-pub fn encode_recovery_trigger(
-    boot_generation_sha256: [u8; 32],
-    entries: &[LaunchPolicyEntry<'_>],
-    output: &mut [u8],
-) -> Result<usize, PolicyError> {
-    encode_version(
-        VERSION_MINOR_RECOVERY_TRIGGER,
-        boot_generation_sha256,
-        entries,
-        output,
-    )
-}
-
-/// Encodes the additive WRJP 1.1 policy which may contain the exact Wyrmsh
-/// profile beside historical JobV2 entries.
-pub fn encode_wyrmsh(
-    boot_generation_sha256: [u8; 32],
-    entries: &[LaunchPolicyEntry<'_>],
-    output: &mut [u8],
-) -> Result<usize, PolicyError> {
-    encode_version(
-        VERSION_MINOR_WYRMSH,
-        boot_generation_sha256,
-        entries,
-        output,
-    )
-}
-
-fn encode_version(
-    minor: u16,
     boot_generation_sha256: [u8; 32],
     entries: &[LaunchPolicyEntry<'_>],
     output: &mut [u8],
@@ -330,7 +255,7 @@ fn encode_version(
     output[..total].fill(0);
     output[..4].copy_from_slice(&MAGIC);
     put_u16(output, 4, VERSION_MAJOR)?;
-    put_u16(output, 6, minor)?;
+    put_u16(output, 6, VERSION_MINOR)?;
     put_u16(output, 8, HEADER_BYTES as u16)?;
     put_u16(output, 10, RECORD_BYTES as u16)?;
     put_u16(output, 12, entries.len() as u16)?;
@@ -348,29 +273,12 @@ fn encode_version(
         if entry.content_sha256 == [0; 32] {
             return Err(PolicyError::InvalidDigest);
         }
-        if entry.startup_abi != 2
-            || match (minor, entry.profile_id) {
-                (VERSION_MINOR_HISTORICAL, JOB_V2_PROFILE_ID) => false,
-                (VERSION_MINOR_RECOVERY_TRIGGER, RECOVERY_TRIGGER_PROFILE_ID) => false,
-                (VERSION_MINOR_WYRMSH | VERSION_MINOR_RECOVERY_TRIGGER, JOB_V2_PROFILE_ID) => {
-                    entry.path == WYRMSH_PATH
-                }
-                (VERSION_MINOR_WYRMSH | VERSION_MINOR_RECOVERY_TRIGGER, WYRMSH_PROFILE_ID) => {
-                    entry.path != WYRMSH_PATH
-                }
-                _ => true,
-            }
-        {
+        if !profile_matches_path(entry.startup_abi, entry.profile_id, entry.path) {
             return Err(PolicyError::InvalidStartupProfile);
         }
         let stream_modes =
             u16::from(entry.allow_no_streams) | (u16::from(entry.allow_three_streams) << 1);
-        if stream_modes == 0
-            || (matches!(
-                entry.profile_id,
-                WYRMSH_PROFILE_ID | RECOVERY_TRIGGER_PROFILE_ID
-            ) && stream_modes != 0b10)
-        {
+        if stream_modes == 0 || (entry.profile_id == WYRMSH_PROFILE_ID && stream_modes != 0b10) {
             return Err(PolicyError::InvalidStreamModes);
         }
         let record = HEADER_BYTES + index * RECORD_BYTES;
@@ -450,142 +358,90 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), PolicyErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HELLO: LaunchPolicyEntry<'static> = LaunchPolicyEntry {
+        path: "bin/hello",
+        content_sha256: [0x22; 32],
+        startup_abi: 2,
+        profile_id: JOB_V2_PROFILE_ID,
+        allow_no_streams: true,
+        allow_three_streams: true,
+    };
+    const WYRMSH: LaunchPolicyEntry<'static> = LaunchPolicyEntry {
+        path: WYRMSH_PATH,
+        content_sha256: [0x33; 32],
+        startup_abi: 2,
+        profile_id: WYRMSH_PROFILE_ID,
+        allow_no_streams: false,
+        allow_three_streams: true,
+    };
+
     #[test]
-    fn deterministic_policy_round_trips_and_binds_hello() {
-        let entry = LaunchPolicyEntry {
-            path: "bin/hello",
-            content_sha256: [0x22; 32],
-            startup_abi: 2,
-            profile_id: 1,
-            allow_no_streams: true,
-            allow_three_streams: true,
-        };
-        let mut bytes = [0u8; 512];
-        let size = encode([0x11; 32], &[entry], &mut bytes).unwrap();
+    fn deterministic_policy_round_trips_and_binds_each_profile() {
+        let mut bytes = [0_u8; 512];
+        let size = encode([0x11; 32], &[HELLO, WYRMSH], &mut bytes).unwrap();
         let parsed = LaunchPolicy::parse(&bytes[..size]).unwrap();
         assert_eq!(parsed.boot_generation_sha256(), [0x11; 32]);
-        assert_eq!(parsed.find("bin/hello"), Some(entry));
+        assert_eq!(parsed.find("bin/hello"), Some(HELLO));
+        assert_eq!(parsed.find(WYRMSH_PATH), Some(WYRMSH));
         let mut malformed = bytes;
         malformed[56] = 1;
         assert!(LaunchPolicy::parse(&malformed[..size]).is_err());
     }
 
     #[test]
-    fn wyrmsh_policy_is_additive_and_version_selected() {
-        let historical = LaunchPolicyEntry {
-            path: "bin/hello",
-            content_sha256: [0x22; 32],
-            startup_abi: 2,
-            profile_id: JOB_V2_PROFILE_ID,
-            allow_no_streams: true,
-            allow_three_streams: true,
-        };
-        let wyrmsh = LaunchPolicyEntry {
-            path: WYRMSH_PATH,
-            content_sha256: [0x33; 32],
-            startup_abi: 2,
-            profile_id: WYRMSH_PROFILE_ID,
-            allow_no_streams: false,
-            allow_three_streams: true,
-        };
+    fn each_profile_is_bound_to_its_paths_and_stream_modes() {
         let mut bytes = [0_u8; 512];
-        let size = encode_wyrmsh([0x11; 32], &[historical, wyrmsh], &mut bytes).unwrap();
-        let parsed = LaunchPolicy::parse(&bytes[..size]).unwrap();
-        assert_eq!(parsed.version_minor(), VERSION_MINOR_WYRMSH);
-        assert_eq!(parsed.find("bin/hello"), Some(historical));
-        assert_eq!(parsed.find(WYRMSH_PATH), Some(wyrmsh));
-
-        assert_eq!(
-            encode([0x11; 32], &[wyrmsh], &mut bytes),
-            Err(PolicyError::InvalidStartupProfile)
-        );
-        let mut wrong_modes = wyrmsh;
+        let mut wrong_modes = WYRMSH;
         wrong_modes.allow_no_streams = true;
         assert_eq!(
-            encode_wyrmsh([0x11; 32], &[wrong_modes], &mut bytes),
+            encode([0x11; 32], &[wrong_modes], &mut bytes),
             Err(PolicyError::InvalidStreamModes)
         );
-        let mut wrong_path = wyrmsh;
+        let mut wrong_path = WYRMSH;
         wrong_path.path = "system/other";
         assert_eq!(
-            encode_wyrmsh([0x11; 32], &[wrong_path], &mut bytes),
+            encode([0x11; 32], &[wrong_path], &mut bytes),
             Err(PolicyError::InvalidStartupProfile)
         );
-        let mut wrong_profile = wyrmsh;
+        let mut wrong_profile = WYRMSH;
         wrong_profile.profile_id = JOB_V2_PROFILE_ID;
         assert_eq!(
-            encode_wyrmsh([0x11; 32], &[wrong_profile], &mut bytes),
+            encode([0x11; 32], &[wrong_profile], &mut bytes),
             Err(PolicyError::InvalidStartupProfile)
         );
     }
 
+    /// F4 WR-F4-L2: the closed minors 0 and 2 and the E8 recovery-trigger
+    /// profile 3 are refused by the production parser.
     #[test]
-    fn version_mutation_cannot_reinterpret_profile_two() {
-        let wyrmsh = LaunchPolicyEntry {
-            path: WYRMSH_PATH,
-            content_sha256: [0x33; 32],
-            startup_abi: 2,
-            profile_id: WYRMSH_PROFILE_ID,
-            allow_no_streams: false,
-            allow_three_streams: true,
-        };
+    fn closed_minors_and_unknown_profiles_are_refused() {
         let mut bytes = [0_u8; 512];
-        let size = encode_wyrmsh([0x11; 32], &[wyrmsh], &mut bytes).unwrap();
-        bytes[6..8].copy_from_slice(&VERSION_MINOR_HISTORICAL.to_le_bytes());
-        assert_eq!(
-            LaunchPolicy::parse(&bytes[..size]),
-            Err(PolicyError::InvalidStartupProfile)
-        );
-        // R7B-4 class D1b made minor 2 real, so this mutation now parses. What
-        // the test is for still holds and is asserted directly: a minor the
-        // attacker flips cannot promote an entry to the recovery-trigger
-        // profile, because the profile is a separate field the mutation does
-        // not touch, and the entry parses identically under both minors.
-        bytes[6..8].copy_from_slice(&VERSION_MINOR_RECOVERY_TRIGGER.to_le_bytes());
-        let promoted = LaunchPolicy::parse(&bytes[..size]).unwrap();
-        let entry = promoted.find(WYRMSH_PATH).unwrap();
-        assert_eq!(entry.profile_id, WYRMSH_PROFILE_ID);
-        assert_ne!(entry.profile_id, RECOVERY_TRIGGER_PROFILE_ID);
-        assert_eq!(entry, wyrmsh);
-
-        bytes[6..8].copy_from_slice(&3_u16.to_le_bytes());
-        assert_eq!(
-            LaunchPolicy::parse(&bytes[..size]),
-            Err(PolicyError::UnsupportedVersion)
-        );
-    }
-
-    #[test]
-    fn the_recovery_trigger_profile_needs_its_own_minor_and_three_streams() {
-        let trigger = LaunchPolicyEntry {
-            path: "test/wyr1-e/recovery-trigger",
-            content_sha256: [0x44; 32],
-            startup_abi: 2,
-            profile_id: RECOVERY_TRIGGER_PROFILE_ID,
-            allow_no_streams: false,
-            allow_three_streams: true,
-        };
-        let mut bytes = [0_u8; 512];
-        // The minor that does not admit it refuses to encode it at all.
-        assert_eq!(
-            encode_wyrmsh([0x11; 32], &[trigger], &mut bytes),
-            Err(PolicyError::InvalidStartupProfile)
-        );
-        let size = encode_recovery_trigger([0x11; 32], &[trigger], &mut bytes).unwrap();
-        let parsed = LaunchPolicy::parse(&bytes[..size]).unwrap();
-        assert_eq!(parsed.version_minor(), VERSION_MINOR_RECOVERY_TRIGGER);
-        assert_eq!(parsed.find(trigger.path).unwrap(), trigger);
-
-        // A no-stream trigger is not a trigger: the actor takes three streams,
-        // and the profile pins that the way the Wyrmsh profile pins its own.
-        let starved = LaunchPolicyEntry {
-            allow_no_streams: true,
-            allow_three_streams: false,
-            ..trigger
-        };
-        assert_eq!(
-            encode_recovery_trigger([0x11; 32], &[starved], &mut bytes),
-            Err(PolicyError::InvalidStreamModes)
-        );
+        let size = encode([0x11; 32], &[HELLO], &mut bytes).unwrap();
+        for minor in [0_u16, 2, 3] {
+            let mut mutated = bytes;
+            mutated[6..8].copy_from_slice(&minor.to_le_bytes());
+            assert_eq!(
+                LaunchPolicy::parse(&mutated[..size]),
+                Err(PolicyError::UnsupportedVersion)
+            );
+        }
+        for profile in [0_u16, 3, 4] {
+            let mut mutated = bytes;
+            mutated[HEADER_BYTES + 8..HEADER_BYTES + 10].copy_from_slice(&profile.to_le_bytes());
+            assert_eq!(
+                LaunchPolicy::parse(&mutated[..size]),
+                Err(PolicyError::InvalidStartupProfile)
+            );
+            let entry = LaunchPolicyEntry {
+                profile_id: profile,
+                ..HELLO
+            };
+            let mut scratch = [0_u8; 512];
+            assert_eq!(
+                encode([0x11; 32], &[entry], &mut scratch),
+                Err(PolicyError::InvalidStartupProfile)
+            );
+        }
     }
 }

@@ -1171,3 +1171,139 @@ fn staged_channel_cleanup_is_affine_and_reverse_ordered() {
         [DwHandle(21), DwHandle(20)]
     );
 }
+
+/// Sends one request on a session of `scope` and returns the error code of
+/// the reply, after checking every received handle was closed.
+fn rejected_on(
+    scope: LaunchSessionScope,
+    encode_request: impl FnOnce(&mut [u8]) -> usize,
+    handles: usize,
+    shell_v1_reply: bool,
+) -> LaunchErrorCode {
+    let mut platform = MockPlatform::new();
+    platform.fail_send = false;
+    let mut waits = TerminalWaits;
+    let mut loader = InitSendLoader::new();
+    let mut jobs = JobDispatcher::new();
+    let owner = grant(EndpointKind::LaunchSession, 1, 1);
+    jobs.install_scoped_session(owner, DwHandle(90), scope)
+        .unwrap();
+    platform.inbound_len = encode_request(&mut platform.inbound);
+    platform.inbound_handle_count = handles;
+    for (index, info) in platform.inbound_handles[..handles].iter_mut().enumerate() {
+        info.handle = DwHandle(41 + index as u64);
+    }
+    assert_eq!(
+        dispatch_one_job_request(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            None,
+            &mut jobs,
+            DwHandle(90),
+            owner,
+        ),
+        Ok(JobDispatchOutcome::Responded)
+    );
+    let mut closed = platform.closed[..platform.close_count].to_vec();
+    closed.sort_by_key(|handle| handle.0);
+    let expected: Vec<_> = (0..handles)
+        .map(|index| DwHandle(41 + index as u64))
+        .collect();
+    assert_eq!(closed, expected, "every received handle is closed");
+    assert_eq!(jobs.jobs.live_jobs(), 0);
+    let reply = &platform.sent[..platform.sent_len];
+    if shell_v1_reply {
+        match wyrmroot_launch_proto::parse_shell_v1_reply(reply, 0)
+            .unwrap()
+            .reply
+        {
+            wyrmroot_launch_proto::ShellV1Reply::Error { code } => code,
+            other => panic!("unexpected reply {other:?}"),
+        }
+    } else {
+        match parse_launch_message(reply, 0).unwrap().message {
+            LaunchMessage::Error { code } => code,
+            other => panic!("unexpected reply {other:?}"),
+        }
+    }
+}
+
+fn legacy_launch(path: &'static str, streams: bool) -> impl FnOnce(&mut [u8]) -> usize {
+    move |out| {
+        wyrmroot_launch_proto::encode_launch(reservation(1), path, &[path], &[], streams, out)
+            .unwrap()
+    }
+}
+
+/// F4 WR-F4-L1: the console launcher may start only the shell. A legacy
+/// LAUNCH, even of an allowed job binary, is refused and its handles closed.
+#[test]
+fn console_launcher_refuses_every_legacy_launch() {
+    for (path, streams, handles) in [("bin/hello", false, 0), ("bin/cpu-hog", true, 3)] {
+        assert_eq!(
+            rejected_on(
+                LaunchSessionScope::ConsoleLauncher,
+                legacy_launch(path, streams),
+                handles,
+                false,
+            ),
+            LaunchErrorCode::PolicyRejected
+        );
+    }
+}
+
+/// F4 WR-F4-L1: shell jobs may launch only `bin/hello` and `bin/cpu-hog`;
+/// system services, the shell itself and look-alike paths are refused.
+#[test]
+fn shell_jobs_refuse_system_services_and_unlisted_paths() {
+    for path in [
+        "system/consoled",
+        "system/init",
+        "system/wyrmsh",
+        "system/devmgr",
+        "bin/hello-extra",
+        "bin/cpu-hog2",
+    ] {
+        for (streams, handles) in [(false, 0), (true, 3)] {
+            assert_eq!(
+                rejected_on(
+                    LaunchSessionScope::ShellJobs,
+                    legacy_launch(path, streams),
+                    handles,
+                    false,
+                ),
+                LaunchErrorCode::PolicyRejected,
+                "{path}"
+            );
+        }
+    }
+}
+
+/// F4 WR-F4-L1: a shell cannot start another shell through its job session.
+#[test]
+fn shell_jobs_refuse_shell_v1() {
+    let code = rejected_on(
+        LaunchSessionScope::ShellJobs,
+        |out| {
+            wyrmroot_launch_proto::encode_shell_v1_request(
+                reservation(1),
+                wyrmroot_launch_proto::ShellV1Request {
+                    console_generation: 2,
+                    status_generation: 3,
+                    requested_child_generation: 4,
+                },
+                out,
+            )
+            .unwrap()
+        },
+        4,
+        true,
+    );
+    assert_eq!(code, LaunchErrorCode::PolicyRejected);
+}

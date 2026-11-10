@@ -34,7 +34,8 @@ use deepwyrm_abi::{
 };
 use wyrmroot_bootfs::{
     launch_policy::{
-        JOB_V2_PROFILE_ID, LaunchPolicyEntry, WYRMSH_PATH, WYRMSH_PROFILE_ID, encode_wyrmsh,
+        JOB_V2_PROFILE_ID, LaunchPolicyEntry, WYRMSH_PATH, WYRMSH_PROFILE_ID,
+        encode as encode_policy,
     },
     product::{Product, build as build_bootfs},
 };
@@ -402,7 +403,7 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
     let hello = identity("hello");
     let cpu_hog = identity("cpu-hog");
     let mut policy = [0u8; 512];
-    let policy_size = encode_wyrmsh(
+    let policy_size = encode_policy(
         generation,
         &[
             // A background job gets no stream roles, so the hog is admitted
@@ -640,10 +641,36 @@ pub(crate) fn read_regular_bounded(
     maximum: u64,
     label: &str,
 ) -> Result<Vec<u8>, Failure> {
-    let metadata = fs::symlink_metadata(path)
+    read_bounded_no_follow(path, maximum, true, label)
+}
+
+/// Reads a Cargo build output: a regular, non-empty file of at most `maximum`
+/// bytes. Cargo hard-links release binaries, so the link count is not checked.
+fn read_build_output(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, Failure> {
+    read_bounded_no_follow(path, maximum, false, label)
+}
+
+/// Opens `path` once without following a final symlink and without blocking
+/// on a FIFO, then checks and reads that same open file, so a path swapped
+/// after the check cannot be read in its place (F4 WR-F4-L3).
+fn read_bounded_no_follow(
+    path: &Path,
+    maximum: u64,
+    single_link: bool,
+    label: &str,
+) -> Result<Vec<u8>, Failure> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(crate::secure_fs::O_NOFOLLOW | crate::secure_fs::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| Failure::task(format!("could not open {label}: {error}")))?;
+    let metadata = file
+        .metadata()
         .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
     if !metadata.file_type().is_file()
-        || metadata.nlink() != 1
+        || (single_link && metadata.nlink() != 1)
         || metadata.len() == 0
         || metadata.len() > maximum
     {
@@ -651,20 +678,14 @@ pub(crate) fn read_regular_bounded(
             "{label} is not a bounded regular file"
         )));
     }
-    fs::read(path).map_err(|error| Failure::task(format!("could not read {label}: {error}")))
-}
-
-/// Reads a Cargo build output: a regular, non-empty file of at most `maximum`
-/// bytes. Cargo hard-links release binaries, so the link count is not checked.
-fn read_build_output(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, Failure> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
-    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > maximum {
-        return Err(Failure::task(format!(
-            "{label} is not a bounded regular file"
-        )));
+    let mut bytes = Vec::new();
+    file.take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| Failure::task(format!("could not read {label}: {error}")))?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err(Failure::task(format!("{label} changed while it was read")));
     }
-    fs::read(path).map_err(|error| Failure::task(format!("could not read {label}: {error}")))
+    Ok(bytes)
 }
 
 fn write_new(path: &Path, bytes: &[u8], label: &str) -> Result<(), Failure> {
@@ -676,4 +697,40 @@ fn write_new(path: &Path, bytes: &[u8], label: &str) -> Result<(), Failure> {
         .map_err(|error| Failure::task(format!("could not create {label}: {error}")))?;
     file.write_all(bytes)
         .map_err(|error| Failure::task(format!("could not write {label}: {error}")))
+}
+
+#[cfg(test)]
+mod bounded_read_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("xtask-bounded-read-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn reads_a_bounded_regular_file() {
+        let dir = scratch("regular");
+        let file = dir.join("out");
+        fs::write(&file, b"abc").unwrap();
+        assert_eq!(read_regular_bounded(&file, 3, "out").unwrap(), b"abc");
+        assert!(read_regular_bounded(&file, 2, "out").is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// F4 WR-F4-L3: a symlink in place of the output is refused, not followed.
+    #[test]
+    fn refuses_a_symlinked_output() {
+        let dir = scratch("symlink");
+        let target = dir.join("target");
+        fs::write(&target, b"abc").unwrap();
+        let link = dir.join("out");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_regular_bounded(&link, 16, "out").is_err());
+        assert!(read_build_output(&link, 16, "out").is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

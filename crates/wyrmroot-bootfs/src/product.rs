@@ -101,7 +101,7 @@ fn validate(product: &Product<'_>) -> Result<(), BuildError> {
     }
     let policy =
         LaunchPolicy::parse(product.launch_policy).map_err(|_| BuildError::InvalidLaunchPolicy)?;
-    if policy.version_minor() != 1 || policy.len() != 3 {
+    if policy.len() != 3 {
         return Err(BuildError::InvalidLaunchPolicy);
     }
     let entry = |path| policy.find(path).ok_or(BuildError::InvalidLaunchPolicy);
@@ -141,7 +141,7 @@ fn validate(product: &Product<'_>) -> Result<(), BuildError> {
 mod tests {
     use super::*;
     use crate::archive::Archive;
-    use crate::launch_policy::{LaunchPolicyEntry, encode_wyrmsh};
+    use crate::launch_policy::{LaunchPolicyEntry, encode};
     use alloc::vec;
 
     const UART: [u8; 32] = [0xa1; 32];
@@ -200,9 +200,9 @@ mod tests {
         };
         let mut output = vec![0; 512];
         let used = if include_hog {
-            encode_wyrmsh([0x42; 32], &[hog, hello, shell], &mut output)
+            encode([0x42; 32], &[hog, hello, shell], &mut output)
         } else {
-            encode_wyrmsh([0x42; 32], &[hello, shell], &mut output)
+            encode([0x42; 32], &[hello, shell], &mut output)
         }
         .unwrap();
         output.truncate(used);

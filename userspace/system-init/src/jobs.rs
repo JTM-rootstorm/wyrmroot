@@ -3,8 +3,8 @@
 use wyrmroot_bootfs::{
     archive::{Archive, LookupError},
     launch_policy::{
-        JOB_V2_PROFILE_ID, LAUNCH_POLICY_PATH, LaunchPolicy, PolicyError,
-        RECOVERY_TRIGGER_PROFILE_ID, WYRMSH_PATH, WYRMSH_PROFILE_ID,
+        JOB_V2_PROFILE_ID, LAUNCH_POLICY_PATH, LaunchPolicy, PolicyError, WYRMSH_PATH,
+        WYRMSH_PROFILE_ID,
     },
 };
 use wyrmroot_launch_proto::{MAX_COMPLETED_JOBS, MAX_LIVE_JOBS, Reservation};
@@ -127,17 +127,7 @@ impl<'a> PolicyView<'a> {
 
     pub(crate) fn authorize(&self, path: &str, streams: usize) -> Result<&'a [u8], JobError> {
         let entry = self.policy.find(path).ok_or(JobError::PolicyMissing)?;
-        // R7B-4 class D1b. The recovery-trigger profile is a JobV2 launch that
-        // the policy additionally permits to open a recovery episode, so it is
-        // launchable here on the same terms. Only an E8 policy carries it, and
-        // whether it opens an episode is asked separately, by
-        // `opens_recovery_episode`.
-        if entry.startup_abi != 2
-            || !matches!(
-                entry.profile_id,
-                JOB_V2_PROFILE_ID | RECOVERY_TRIGGER_PROFILE_ID
-            )
-        {
+        if entry.startup_abi != 2 || entry.profile_id != JOB_V2_PROFILE_ID {
             return Err(JobError::PolicyMissing);
         }
         match streams {
