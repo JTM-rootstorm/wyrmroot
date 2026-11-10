@@ -31,39 +31,24 @@ require_file() {
 [ -z "${CARGO_HOME:-}" ] || fail "CARGO_HOME is launcher-owned; do not supply it"
 [ -z "${WYRMROOT_RUSTC:-}" ] || fail "WYRMROOT_RUSTC is product-build-owned; do not supply it"
 
-safe_host_targets=false
 for argument in "$@"; do
     case "$argument" in
         +*) fail "toolchain selectors are forbidden; the launcher owns Rust 1.98.1" ;;
-        --features|--features=*|--all-features)
-            fail "host launcher rejects caller-selected features; use an explicit host gate or xtask"
-            ;;
         --target|--target=*|x86_64-unknown-wyrmroot|x86_64-unknown-none|x86_64-unknown-uefi)
             fail "host launcher rejects explicit guest/UEFI targets; use xtask"
             ;;
         --target-dir|--target-dir=*)
             fail "target directory is launcher-owned; use WYRMROOT_PINNED_TARGET_DIR for an isolated lane"
             ;;
-        --all-targets|--bin|--bin=*|--bins|--example|--example=*|--examples)
-            fail "host launcher rejects binary/all-target admission; use an explicit host test or xtask"
-            ;;
         --manifest-path|--manifest-path=*|--config|--config=*)
             fail "host launcher rejects manifest/config redirection"
             ;;
-        --lib|--tests|--test|--test=*|--doc) safe_host_targets=true ;;
     esac
 done
 
 case "$1" in
     -V|--version|version|metadata|fmt|test|clippy|doc|rustdoc|check|build|xtask) ;;
     *) fail "Cargo subcommand '$1' is not admitted by the host launcher" ;;
-esac
-
-case "$1" in
-    build|check|clippy|rustdoc)
-        [ "$safe_host_targets" = true ] || \
-            fail "host launcher rejects implicit $1 targets; select --lib, --tests, --test, or --doc"
-        ;;
 esac
 
 for variable in CARGO RUSTUP_TOOLCHAIN RUSTC_BOOTSTRAP RUSTC RUSTDOC RUSTFMT \

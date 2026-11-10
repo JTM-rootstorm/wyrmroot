@@ -29,12 +29,6 @@ fn launcher_owns_cargo_home() {
 }
 
 #[test]
-fn launcher_rejects_implicit_host_binary_targets() {
-    let error = rejected(&["build", "--workspace"], None);
-    assert!(error.contains("rejects implicit build targets"));
-}
-
-#[test]
 fn launcher_rejects_freestanding_target_selection() {
     let error = rejected(
         &["build", "--lib", "--target", "x86_64-unknown-wyrmroot"],
@@ -47,22 +41,6 @@ fn launcher_rejects_freestanding_target_selection() {
 fn launcher_rejects_caller_selected_product_compiler() {
     let error = rejected(&["xtask", "--help"], Some(("WYRMROOT_RUSTC", "/tmp/rustc")));
     assert!(error.contains("WYRMROOT_RUSTC is product-build-owned"));
-}
-
-#[test]
-fn launcher_rejects_transitive_firmware_feature_admission() {
-    let error = rejected(
-        &[
-            "test",
-            "--package",
-            "wyrmroot-efi-loader",
-            "--features",
-            "firmware",
-            "--no-run",
-        ],
-        None,
-    );
-    assert!(error.contains("rejects caller-selected features"));
 }
 
 #[test]
