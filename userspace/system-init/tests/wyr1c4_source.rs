@@ -1,6 +1,5 @@
 use deepwyrm_syscall as _;
 use wyrmroot_bootfs as _;
-#[cfg(feature = "wyr1e-production")]
 use wyrmroot_consoled as _;
 use wyrmroot_device_proto as _;
 use wyrmroot_devmgr as _;
@@ -14,7 +13,6 @@ use wyrmroot_system_init as _;
 use wyrmroot_uart16550d as _;
 use wyrmroot_wyr1b_gate_proto as _;
 
-const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
 const MAIN_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
 const NATIVE_SOURCE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/wyr1c_native.rs"));
@@ -85,41 +83,6 @@ fn c4_manifest_move_stages_transfer_without_delegating_it() {
     assert!(launch.contains("DwRights(DEVICE_MANIFEST_RIGHTS.0 | DW_RIGHT_TRANSFER.0)"));
     let process = include_str!("../../../crates/wyrmroot-loader/src/process.rs");
     assert!(process.contains("transfers[2] = transfer(manifest, launch::DEVICE_MANIFEST_RIGHTS);"));
-}
-
-/// Reversed by `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.3 item 2. The driver's
-/// attempt TaskGroup used to be a child of the devmgr generation that
-/// requested it, so tearing that generation down took the driver with it --
-/// which contradicts [B] §5.4's promise that the recovery console stays usable
-/// exactly when automatic reconstruction has failed. It is now parented under
-/// init's own authority, and only `reap_driver`'s explicit termination by
-/// handle stops it. It moves up one level, to the resource domain itself, not
-/// out to init's bootstrap group: `WYR1_C_DEVICE_HANDOFF_CONTRACT.md` §4 makes
-/// domain teardown terminal recovery for the boot, and a driver holding a
-/// DeviceResource outside the domain would survive it.
-///
-/// Source text because no host fake creates an attempt TaskGroup, so
-/// `construct_driver` never reaches its parentage on the host. Scoped to
-/// `construct_driver`'s body.
-#[test]
-fn c5_driver_attempt_is_parented_under_init_not_the_devmgr_generation() {
-    assert!(MANIFEST.contains("wyr1c5-production = [\"native-init\"]"));
-    let construct = native_fn("construct_driver<");
-    let parent = construct
-        .find(".and_then(|state| state.resource_domain)")
-        .unwrap();
-    let create = construct
-        .find("create_attempt_task_group(driver_parent)")
-        .unwrap();
-    let load = construct.find("load_device_driver_process(").unwrap();
-    assert!(parent < create && create < load);
-    // The domain's own handle, falling back to init's group only when the
-    // build has no domain.
-    assert!(
-        construct[parent..create]
-            .contains(".map_or(resident.authority.task_group, ResourceDomainCustody::handle);")
-    );
-    assert!(!construct[..create].contains("driver_parent = devmgr.task_group"));
 }
 
 /// The WRDM UART identity is joined to the one the retained WRRM validation

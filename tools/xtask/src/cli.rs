@@ -15,8 +15,7 @@ product builds the same product into a directory: artifacts/esp.img plus the
 loader, kernel, bootstrap, natives, bootfs and OVMF pair.
 
 test runs the host gate: formatting, warnings-denied Clippy and the workspace
-tests in the default and each production feature shape, then the root Python
-suites. The production natives are compiled by product and dev-boot.
+tests, then the root Python suites. The production natives are compiled by product and dev-boot.
 "#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -100,7 +100,7 @@ pub enum ChildPolicy {
 
 impl ChildPolicy {
     pub const fn selected() -> Self {
-        if cfg!(feature = "wyr1e-wyrmsh") {
+        if true {
             Self::Wyrmsh
         } else {
             Self::ConsoleEcho
@@ -1837,7 +1837,7 @@ mod tests {
         const MAIN: &str = concat!(include_str!("main.rs"), include_str!("role.rs"));
         let main: std::string::String = MAIN.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(main.contains(
-            "#[cfg(feature=\"wyr1e-wyrmsh\")]constfnpublication_withdrawn(service_generation:u64)->bool{service_generation==0}"
+            "constfnpublication_withdrawn(service_generation:u64)->bool{service_generation==0}"
         ));
         let guarded = "ifpublication_withdrawn(receive_publication_change(";
         assert_eq!(
@@ -1906,9 +1906,7 @@ mod tests {
         let mut sites = 0;
         for (at, _) in main.match_indices("ifwitness_index==Some(") {
             let branch = &main[at..at + 400];
-            let wyrmsh = branch
-                .find("#[cfg(feature=\"wyr1e-wyrmsh\")]{")
-                .expect("a witness branch has no wyrmsh arm");
+            let wyrmsh = branch.find("{").expect("a witness branch has no body");
             let arm = &branch[wyrmsh..];
             let arm = &arm[..arm.find("}").expect("the wyrmsh arm never closes")];
             let observe = arm
@@ -2167,12 +2165,6 @@ mod tests {
 
     #[test]
     fn selected_child_policy_preserves_historical_default() {
-        #[cfg(not(feature = "wyr1e-wyrmsh"))]
-        assert_eq!(
-            (ChildPolicy::selected(), ChildPolicy::selected().path()),
-            (ChildPolicy::ConsoleEcho, "bin/console-echo")
-        );
-        #[cfg(feature = "wyr1e-wyrmsh")]
         assert_eq!(
             (ChildPolicy::selected(), ChildPolicy::selected().path()),
             (ChildPolicy::Wyrmsh, "system/wyrmsh")

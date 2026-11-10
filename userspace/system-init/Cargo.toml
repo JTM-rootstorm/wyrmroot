@@ -19,16 +19,12 @@ required-features = ["native-init"]
 [features]
 default = []
 native-init = []
-wyr1c5-production = ["native-init"]
-wyr1c6-production = ["wyr1c5-production"]
-wyr1e-shell-controller = []
-wyr1e-production = ["wyr1c6-production", "wyr1e-shell-controller", "dep:wyrmroot-consoled", "wyrmroot-consoled/wyr1e-wyrmsh"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs" }
 wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto" }
-wyrmroot-consoled = { path = "../consoled", optional = true }
+wyrmroot-consoled = { path = "../consoled" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }
 wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
@@ -38,7 +34,7 @@ wyrmroot-wyr1b-gate-proto = { path = "../../crates/wyrmroot-wyr1b-gate-proto" }
 
 [dev-dependencies]
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }
-wyrmroot-devmgr = { path = "../devmgr", features = ["wyr1e8-production"] }
+wyrmroot-devmgr = { path = "../devmgr" }
 wyrmroot-registryd = { path = "../registryd" }
 wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest", features = ["builder"] }
 wyrmroot-uart16550d = { path = "../uart16550d" }

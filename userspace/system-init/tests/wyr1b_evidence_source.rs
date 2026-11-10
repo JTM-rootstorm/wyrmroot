@@ -1,4 +1,3 @@
-#[cfg(feature = "wyr1e-production")]
 use wyrmroot_consoled as _;
 use {
     deepwyrm_syscall as _, wyrmroot_bootfs as _, wyrmroot_device_proto as _, wyrmroot_devmgr as _,
@@ -7,8 +6,6 @@ use {
     wyrmroot_system_init as _, wyrmroot_uart16550d as _, wyrmroot_wyr1b_gate_proto as _,
 };
 
-const MAIN: &str = include_str!("../src/main.rs");
-const LIB: &str = include_str!("../src/lib.rs");
 const NATIVE: &str = include_str!("../src/wyr1b_native.rs");
 
 /// The text of the item that starts at `start`, up to its closing brace at
@@ -20,20 +17,6 @@ fn item<'a>(source: &'a str, start: &str, indent: &str) -> &'a str {
     let close = format!("\n{indent}}}\n");
     let to = source[from..].find(&close).unwrap() + from;
     &source[from..to]
-}
-
-#[test]
-fn native_product_activation_constructs_and_continues_one_resident_in_place() {
-    assert!(LIB.contains("pub fn continue_system_init_product"));
-    assert!(LIB.contains("let mut slot = MaybeUninit::uninit()"));
-    assert!(LIB.contains("slot.write(ResidentSystemInit"));
-    assert!(NATIVE.contains("slot.write(ResidentSystemInit"));
-    assert!(!LIB.contains("enum ProductActivation"));
-    assert!(!NATIVE.contains("struct Activation"));
-    assert!(!LIB.contains("pub fn run_system_init_product"));
-    assert!(MAIN.contains("continue_system_init_product("));
-    assert!(MAIN.contains("resident_loop::continue_resident,"));
-    assert!(!MAIN.contains("let mut resident = match"));
 }
 
 /// The selector-27 gate records its relational joins in contract order.

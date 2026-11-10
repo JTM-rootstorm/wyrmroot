@@ -8,7 +8,6 @@ use deepwyrm_syscall::{
     DwWaitResultV1,
 };
 use wyrmroot_bootfs as _;
-#[cfg(feature = "wyr1e-production")]
 use wyrmroot_consoled as _;
 use wyrmroot_device_proto as _;
 use wyrmroot_launch_proto as _;
@@ -21,9 +20,6 @@ use wyrmroot_runtime::{
     map_bootfs_read_only, monotonic_active_now, query_capability_info, query_memory_object_size,
     receive_channel, send_channel, set_timer, unmap_bootfs, wait_many, wait_one,
 };
-#[cfg(not(feature = "wyr1c5-production"))]
-use wyrmroot_system_init::continue_system_init_product;
-#[cfg(feature = "wyr1c5-production")]
 use wyrmroot_system_init::continue_system_init_resource_product;
 use wyrmroot_system_init::fatal_application_status;
 use wyrmroot_system_init::validate_wait_until_completion;
@@ -152,15 +148,6 @@ fn native_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
     let mut loader = NativeLoaderPlatform;
     let mut waits = NativeSupervisionPlatform;
-    #[cfg(not(feature = "wyr1c5-production"))]
-    let result = continue_system_init_product(
-        &mut system,
-        &mut loader,
-        &mut waits,
-        startup.bootstrap_channel().as_abi(),
-        resident_loop::continue_resident,
-    );
-    #[cfg(feature = "wyr1c5-production")]
     let result = continue_system_init_resource_product(
         &mut system,
         &mut loader,

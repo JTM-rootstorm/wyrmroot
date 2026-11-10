@@ -6,9 +6,6 @@ use core::panic::PanicInfo;
 
 use deepwyrm_syscall::{DwHandle, DwReceivedHandleInfoV1};
 use wyrmroot_bootfs as _;
-#[cfg(not(feature = "wyr1c5-production"))]
-use wyrmroot_bootstrap::run_supervisor_bootstrap;
-#[cfg(feature = "wyr1c5-production")]
 use wyrmroot_bootstrap::run_supervisor_resource_domain_bootstrap;
 use wyrmroot_bootstrap::{BootstrapError, BootstrapSystem};
 use wyrmroot_bootstrap_proto as _;
@@ -164,28 +161,6 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     panic_abort()
 }
 
-#[cfg(not(feature = "wyr1c5-production"))]
-fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
-    let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
-        Ok(deadline) => deadline,
-        Err(error) => return 0xB300_0000 | wyrmroot_runtime::native_error_code(error),
-    };
-    let mut system = NativeSystem::new();
-    let mut loader = NativeLoaderPlatform;
-    let mut supervisor = NativeSupervisionPlatform;
-    match run_supervisor_bootstrap(
-        &mut system,
-        &mut loader,
-        &mut supervisor,
-        startup.bootstrap_channel().as_abi(),
-        deadline,
-    ) {
-        Ok(()) => 0,
-        Err(error) => system.exit_code(&error),
-    }
-}
-
-#[cfg(feature = "wyr1c5-production")]
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
         Ok(deadline) => deadline,

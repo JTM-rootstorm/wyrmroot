@@ -19,8 +19,6 @@ required-features = ["native-bootstrap"]
 [features]
 default = []
 native-bootstrap = []
-wyr1c5-production = ["native-bootstrap"]
-wyr1c6-production = ["wyr1c5-production"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true

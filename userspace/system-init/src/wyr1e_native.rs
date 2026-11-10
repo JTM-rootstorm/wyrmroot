@@ -1089,7 +1089,6 @@ where
 /// is whatever the dispatcher itself still owns: sessions nothing reconnects
 /// to, and jobs whose owner is gone. `drain_job_dispatcher` is the same drain
 /// a fatal tick uses; the difference is only that nothing follows it.
-#[cfg(feature = "wyr1e-production")]
 pub(super) fn drain_jobs_for_shutdown<S, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,

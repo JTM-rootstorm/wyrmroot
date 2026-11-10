@@ -69,7 +69,7 @@ pub(crate) const NATIVES: [NativeSpec; 8] = [
         "system-init",
         "wyrmroot-system-init",
         "system-init",
-        "wyr1e-production",
+        "native-init",
         "system-init",
     ),
     native(
@@ -83,7 +83,7 @@ pub(crate) const NATIVES: [NativeSpec; 8] = [
         "devmgr",
         "wyrmroot-devmgr",
         "devmgr",
-        "wyr1e8-production",
+        "native-devmgr",
         "devmgr",
     ),
     native(
@@ -97,7 +97,7 @@ pub(crate) const NATIVES: [NativeSpec; 8] = [
         "consoled",
         "wyrmroot-consoled",
         "consoled",
-        "native-consoled,wyr1e-wyrmsh",
+        "native-consoled",
         "consoled",
     ),
     native(
@@ -127,7 +127,7 @@ const BOOTSTRAP: NativeSpec = native(
     "bootstrap",
     "wyrmroot-bootstrap",
     "wyrmroot-bootstrap",
-    "wyr1c5-production",
+    "native-bootstrap",
     "wyrmroot-bootstrap",
 );
 

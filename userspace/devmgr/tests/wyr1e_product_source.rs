@@ -1,9 +1,11 @@
+use wyrmroot_loader as _;
+use wyrmroot_registry_proto as _;
+use wyrmroot_runtime as _;
 #[cfg(feature = "native-devmgr")]
 use {wyrmroot_loader as _, wyrmroot_registry_proto as _, wyrmroot_runtime as _};
 
 use {deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_devmgr as _};
 
-const MANIFEST: &str = include_str!("../Cargo.toml");
 /// devmgr's role logic, in its original order: the binary's entry file, then
 /// `role.rs`, which holds everything `main.rs` held before S2U step 3. Source
 /// text because the role's decisions are not yet driven by host tests through
@@ -12,34 +14,6 @@ const NATIVE: &str = concat!(
     include_str!("../src/main.rs"),
     include_str!("../src/role.rs")
 );
-
-/// Source text until S3: the role runs over the platform seam, but no
-/// RecordingPlatform script drives this path yet.
-#[test]
-fn e8_accepts_only_the_exact_current_driver_retire_request() {
-    assert!(MANIFEST.contains("wyr1e8-production = [\"wyr1e-production\"]"));
-    let controller = &NATIVE[NATIVE
-        .find("let (replacement, action) = match input")
-        .unwrap()..NATIVE.find("fn receive_controller<").unwrap()];
-    let e8 = &controller[controller
-        .find("#[cfg(feature = \"wyr1e8-production\")]\n                ControllerInput::D5(D5ControllerMessage::RequestRetire(identity))")
-        .unwrap()..];
-    let validate = e8.find("identity != current.d5_identity()").unwrap();
-    let broker = e8.find("broker.current() != Some(current)").unwrap();
-    let attach = e8
-        .find("ConnectorSlot::Active { attach, .. } if attach.driver == current")
-        .unwrap();
-    let duplicate = e8.find("e8_retire_requested").unwrap();
-    let retire = e8
-        .find("send_driver_retire(platform, control, &mut resident)?")
-        .unwrap();
-    let one_shot = e8.find("e8_retire_requested = true").unwrap();
-    assert!(validate < broker && broker < attach && attach < duplicate);
-    assert!(duplicate < retire && retire < one_shot);
-    assert!(e8.contains(
-        "#[cfg(feature = \"wyr1e8-production\")]\n                ControllerInput::D5(_) => return Err(failure(313))"
-    ));
-}
 
 /// Source text until S3: the role runs over the platform seam, but no
 /// RecordingPlatform script drives this path yet.

@@ -4,6 +4,8 @@
 //! check the exact syscall sequence and the failure code it stops with. They
 //! cover the bootstrap stages, which need no manifest or driver.
 
+use wyrmroot_loader as _;
+use wyrmroot_registry_proto as _;
 use wyrmroot_runtime as _;
 use {deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_devmgr as _};
 #[cfg(feature = "native-devmgr")]
@@ -26,13 +28,7 @@ mod bootstrap {
         0xC101_0000 | stage
     }
 
-    #[cfg(not(feature = "wyr1c5-production"))]
-    const INIT_BYTES: usize = wyrmroot_loader::launch::DEVICE_COORDINATOR_BYTES;
-    #[cfg(feature = "wyr1c5-production")]
     const INIT_BYTES: usize = wyrmroot_loader::launch::DEVICE_COORDINATOR_RESOURCE_BYTES;
-    #[cfg(not(feature = "wyr1c5-production"))]
-    const INIT_HANDLES: usize = 3;
-    #[cfg(feature = "wyr1c5-production")]
     const INIT_HANDLES: usize = 4;
 
     fn valid_bootstrap() -> Reply {

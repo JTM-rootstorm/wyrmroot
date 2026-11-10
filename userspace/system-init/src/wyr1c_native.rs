@@ -5,11 +5,10 @@
 //! domain custody and delegates only its reduced claim authority.
 
 use super::*;
-#[cfg(feature = "wyr1e-production")]
 #[path = "wyr1e_native.rs"]
 mod wyr1e;
 use crate::wyr1b::{EndpointKind, RegistryTopology};
-#[cfg(all(test, feature = "wyr1e-production"))]
+#[cfg(test)]
 use crate::wyr1b_native::registry_native_attempt_for_fixture;
 use crate::wyr1b_native::{
     RegistryNativeAttempt, create_controller_channel_pair, establish_registry_topology,
@@ -18,19 +17,14 @@ use crate::wyr1b_native::{
     retire_registry_for_recovery_before,
 };
 use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DwHandleTransferV1};
-#[cfg(feature = "wyr1e-production")]
 use wyrmroot_device_proto::SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
-#[cfg(not(feature = "wyr1e-production"))]
-use wyrmroot_device_proto::SERIAL_CONSOLE_PUBLICATION_POLICY;
-#[cfg(any(test, not(feature = "wyr1e-production")))]
+#[cfg(test)]
 use wyrmroot_device_proto::controller::encode as encode_controller;
 use wyrmroot_device_proto::coordinator::{
     RegistryEndpoint, RegistryEndpointGeneration, RegistryEndpointId, RegistryGeneration,
     SupervisorGeneration,
 };
-#[cfg(feature = "wyr1c6-production")]
 use wyrmroot_device_proto::driver_launch::encode_reaped;
-#[cfg(feature = "wyr1c6-production")]
 use wyrmroot_device_proto::driver_launch::parse_driver_retired;
 use wyrmroot_device_proto::{
     DriverLaunchRequest,
@@ -41,9 +35,8 @@ use wyrmroot_device_proto::{
     },
     manifest::{COM2_ROLE_ID, ContentIdentity, Manifest as DeviceManifest},
 };
-#[cfg(any(test, not(feature = "wyr1c5-production")))]
+#[cfg(test)]
 use wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS;
-#[cfg(feature = "wyr1c5-production")]
 use wyrmroot_loader::launch::CHILD_CHANNEL_TRANSFER_RIGHTS;
 #[cfg(test)]
 use wyrmroot_loader::launch::DEVICE_MANIFEST_RIGHTS;
@@ -56,10 +49,7 @@ use wyrmroot_loader::{
     },
 };
 
-#[cfg(feature = "wyr1c5-production")]
 const DRIVER_CONTROL_INGRESS_RIGHTS: DwRights = CHILD_CHANNEL_TRANSFER_RIGHTS;
-#[cfg(not(feature = "wyr1c5-production"))]
-const DRIVER_CONTROL_INGRESS_RIGHTS: DwRights = CHILD_CHANNEL_RIGHTS;
 use wyrmroot_registry_proto::{
     Header as RegistryHeader, MessageType as RegistryMessageType, ProtocolVersion,
     encode_install_publication,
@@ -125,7 +115,6 @@ struct DriverNativeAttempt {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ResidentState {
-    #[cfg(feature = "wyr1e-production")]
     e6: Option<wyr1e::State>,
     resource_domain: Option<ResourceDomainCustody>,
     registry: Option<RegistryNativeAttempt>,
@@ -221,7 +210,6 @@ enum RegistryRecoveryStep {
 /// of these.
 // The reason is only *reported* under `wyr1e-production`, but every caller
 // names its trigger regardless, so the names exist in every build.
-#[cfg_attr(not(feature = "wyr1e-production"), allow(dead_code))]
 pub(crate) mod abandoned {
     // Which exit gave up is not in the reason byte: it is the operation field
     // of the same status. `registry_recovery_step`'s `Degraded` exit -- the
@@ -438,10 +426,8 @@ where
             return Err(poison.err().unwrap_or(error));
         }
     };
-    #[cfg(feature = "wyr1e-production")]
     let e6 = Some(wyr1e::State::new(topology.generation())?);
     let state = ResidentState {
-        #[cfg(feature = "wyr1e-production")]
         e6,
         resource_domain,
         registry: Some(registry),
@@ -897,17 +883,13 @@ where
     })
 }
 
-#[cfg(feature = "wyr1e-production")]
 const PUBLICATION_REQUEST_BYTES: usize = wyrmroot_device_proto::controller_v1_1::RECORD_BYTES;
-#[cfg(not(feature = "wyr1e-production"))]
-const PUBLICATION_REQUEST_BYTES: usize = wyrmroot_device_proto::controller::INSTALL_BYTES;
 
 fn encode_publication_request(
     controller: ControllerMessage,
     service_generation: u64,
 ) -> Result<[u8; PUBLICATION_REQUEST_BYTES], ()> {
     let mut bytes = [0u8; PUBLICATION_REQUEST_BYTES];
-    #[cfg(feature = "wyr1e-production")]
     wyrmroot_device_proto::controller_v1_1::encode(
         wyrmroot_device_proto::controller_v1_1::PublicationMessage {
             controller,
@@ -916,11 +898,6 @@ fn encode_publication_request(
         &mut bytes,
     )
     .map_err(|_| ())?;
-    #[cfg(not(feature = "wyr1e-production"))]
-    {
-        let _ = service_generation;
-        encode_controller(controller, &mut bytes).map_err(|_| ())?;
-    }
     Ok(bytes)
 }
 
@@ -932,10 +909,7 @@ fn install_publication<S: Wyr1BPlatform>(
     endpoint: DwHandle,
 ) -> Result<(), InitError> {
     let mut bytes = [0u8; 256];
-    #[cfg(feature = "wyr1e-production")]
     let policy = SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
-    #[cfg(not(feature = "wyr1e-production"))]
-    let policy = SERIAL_CONSOLE_PUBLICATION_POLICY;
     let size = encode_install_publication(
         RegistryHeader {
             message_type: RegistryMessageType::InstallPublication,
@@ -1279,10 +1253,7 @@ where
     // The recovery episode lives on the wyr1e console/shell supervisor, so
     // a build without that product has no episode rather than no concept of
     // one. The gate is the product, not a selector.
-    #[cfg(feature = "wyr1e-production")]
     let action_deadline = wyr1e::recovery_deadline(resident)?;
-    #[cfg(not(feature = "wyr1e-production"))]
-    let action_deadline = None;
     if action_deadline.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
         system
             .close_handle(child_endpoint)
@@ -1378,7 +1349,6 @@ where
         }
     };
 
-    #[cfg(feature = "wyr1e-production")]
     if let Err(error) =
         wyr1e::ensure_recovery_live(resident, system.now().map_err(InitError::Native)?)
     {
@@ -1494,7 +1464,6 @@ where
     Ok(request)
 }
 
-#[cfg(feature = "wyr1c6-production")]
 fn acknowledge_driver_reaped<S: InitPlatform>(
     system: &mut S,
     devmgr: ActiveNativeRole,
@@ -1577,7 +1546,6 @@ where
         return Err(InitError::WrongActivationOrder);
     }
     resident.last_tick_ns = now_ns;
-    #[cfg(feature = "wyr1e-production")]
     wyr1e::ensure_recovery_live(resident, now_ns)?;
     let state = resident
         .wyr1c
@@ -1591,10 +1559,7 @@ where
         // console exit, no session end and no terminal evidence. The console
         // stack still needs all of that; only the devmgr-driven half of the
         // tick has nothing to watch.
-        #[cfg(feature = "wyr1e-production")]
         return wyr1e_resident_step(resident, system, loader, waits, now_ns, false);
-        #[cfg(not(feature = "wyr1e-production"))]
-        return Ok(resident.controller.mode());
     };
     let mut items = [DwWaitItemV1::default(); 7];
     items[0] = DwWaitItemV1 {
@@ -1636,9 +1601,7 @@ where
             let size = system
                 .query_memory_object_size(resident.authority.bootfs)
                 .map_err(InitError::Native)?;
-            let plan = MappingPlan::for_bootfs(size).map_err(|error| {
-                ordinary_mapping_error(MappingDiagnosticSite::RegistryReplacement, error, size)
-            })?;
+            let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
             system
                 .with_bootfs_bytes(
                     resident.authority.parent_root,
@@ -1718,7 +1681,6 @@ where
                                             resident, system, loader, waits, bootfs, error,
                                         )
                                     } else {
-                                        #[cfg(feature = "wyr1e-production")]
                                         start_wyr1e_or_recover_registry(
                                             resident, system, loader, waits, bootfs,
                                         )?;
@@ -1726,38 +1688,30 @@ where
                                     }
                                 }
                                 Ok(DevmgrControlInput::DriverRetired { bytes }) => {
-                                    #[cfg(feature = "wyr1c6-production")]
-                                    {
-                                        let retired = (|| {
-                                            let state = resident
-                                                .wyr1c
-                                                .as_ref()
-                                                .ok_or(InitError::AbsentState(0x44))?;
-                                            let request = state
-                                                .last_reaped_driver
-                                                .ok_or(InitError::AbsentState(0x45))?;
-                                            parse_driver_retired(&bytes, request)
-                                                .map_err(|_| InitError::WrongManifestProfile)?;
-                                            {
-                                                let rebound = rebind_publication(
-                                                    resident,
-                                                    system,
-                                                    waits,
-                                                    PublicationRebindContext::DriverRetirement,
-                                                );
-                                                attribute_failure(
-                                                    RecoveryOperation::RebindPublication,
-                                                    rebound,
-                                                )
-                                            }
-                                        })();
-                                        attribute_failure(RecoveryOperation::DriverRetired, retired)
-                                    }
-                                    #[cfg(not(feature = "wyr1c6-production"))]
-                                    {
-                                        let _ = bytes;
-                                        Err(InitError::WrongManifestProfile)
-                                    }
+                                    let retired = (|| {
+                                        let state = resident
+                                            .wyr1c
+                                            .as_ref()
+                                            .ok_or(InitError::AbsentState(0x44))?;
+                                        let request = state
+                                            .last_reaped_driver
+                                            .ok_or(InitError::AbsentState(0x45))?;
+                                        parse_driver_retired(&bytes, request)
+                                            .map_err(|_| InitError::WrongManifestProfile)?;
+                                        {
+                                            let rebound = rebind_publication(
+                                                resident,
+                                                system,
+                                                waits,
+                                                PublicationRebindContext::DriverRetirement,
+                                            );
+                                            attribute_failure(
+                                                RecoveryOperation::RebindPublication,
+                                                rebound,
+                                            )
+                                        }
+                                    })();
+                                    attribute_failure(RecoveryOperation::DriverRetired, retired)
                                 }
                                 Err(error) => recover_devmgr_after_error(
                                     resident, system, loader, waits, bootfs, error,
@@ -1788,15 +1742,12 @@ where
                             abandoned::reason(abandoned::trigger::EXITED, abandoned::phase::NONE),
                         ),
                         ResidentPollEvent::DriverExited => {
-                            #[cfg(feature = "wyr1e-production")]
                             let dependent_retirement =
                                 wyr1e::retire_dependents(resident, system, waits, false);
-                            #[cfg(feature = "wyr1e-production")]
                             dependent_retirement?;
                             let _request = reap_driver(resident, system, waits, false);
                             let _request =
                                 attribute_failure(RecoveryOperation::ReapDriver, _request)?;
-                            #[cfg(feature = "wyr1e-production")]
                             {
                                 wyr1e::ensure_recovery_live(
                                     resident,
@@ -1822,30 +1773,13 @@ where
                                 )?;
                                 Ok(())
                             }
-                            #[cfg(not(feature = "wyr1e-production"))]
-                            {
-                                #[cfg(feature = "wyr1c6-production")]
-                                {
-                                    let state = resident
-                                        .wyr1c
-                                        .as_ref()
-                                        .ok_or(InitError::AbsentState(0x48))?;
-                                    let devmgr =
-                                        state.devmgr.ok_or(InitError::AbsentState(0x49))?;
-                                    acknowledge_driver_reaped(system, devmgr, _request)?;
-                                }
-                                Ok(())
-                            }
                         }
                     },
                 )
                 .map_err(InitError::Native)??;
         }
     }
-    #[cfg(feature = "wyr1e-production")]
-    return wyr1e_resident_step(resident, system, loader, waits, now_ns, true);
-    #[cfg(not(feature = "wyr1e-production"))]
-    Ok(resident.controller.mode())
+    wyr1e_resident_step(resident, system, loader, waits, now_ns, true)
 }
 
 /// The console/shell half of the resident tick.
@@ -1856,7 +1790,6 @@ where
 /// rebuild devmgr, the registry or a console out of a publication that died
 /// with devmgr, and is refused at its own site rather than attempted on half
 /// a topology.
-#[cfg(feature = "wyr1e-production")]
 fn wyr1e_resident_step<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -1896,9 +1829,7 @@ where
         let size = system
             .query_memory_object_size(resident.authority.bootfs)
             .map_err(InitError::Native)?;
-        let plan = MappingPlan::for_bootfs(size).map_err(|error| {
-            ordinary_mapping_error(MappingDiagnosticSite::RegistryReplacement, error, size)
-        })?;
+        let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
         return system
             .with_bootfs_bytes(
                 resident.authority.parent_root,
@@ -1961,7 +1892,6 @@ where
 /// and the registry answers to nobody. A role outliving something it depends
 /// on is the state every recovery path here exists to avoid, and a shutdown
 /// has no more right to create it than a restart does.
-#[cfg(feature = "wyr1e-production")]
 fn retire_for_session_shutdown<S, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -2040,7 +1970,6 @@ where
 /// One role, switched off. The channel is closed first so the role observes a
 /// peer close rather than only a termination, which is the ordinary way it
 /// learns its supervisor is gone.
-#[cfg(feature = "wyr1e-production")]
 fn retire_role_for_shutdown<S, W>(
     system: &mut S,
     waits: &mut W,
@@ -2077,18 +2006,10 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    // Only a build whose `poll` reads the registry slot reports the reason,
-    // so only that build consumes the trigger. Every caller still names one.
-    #[cfg(not(feature = "wyr1e-production"))]
-    let _ = reason;
     // The recovery episode lives on the wyr1e console/shell supervisor, so
     // a build without that product has no episode rather than no concept of
     // one. The gate is the product, not a selector.
-    #[cfg(feature = "wyr1e-production")]
     let action_deadline = wyr1e::recovery_deadline(resident)?;
-    #[cfg(not(feature = "wyr1e-production"))]
-    let action_deadline = None;
-    #[cfg(feature = "wyr1e-production")]
     if action_deadline.is_some() {
         wyr1e::ensure_recovery_live(resident, system.now().map_err(InitError::Native)?)?;
     }
@@ -2096,14 +2017,11 @@ where
     // the selector this was a bare `bool`, so a dependent retirement that
     // failed said so without saying why. One `Option<InitError>` now, under
     // the product gate that actually has dependents.
-    #[cfg(feature = "wyr1e-production")]
     let dependent_cleanup_error = attribute_failure(
         RecoveryOperation::RetireDependents,
         wyr1e::retire_dependents(resident, system, waits, true),
     )
     .err();
-    #[cfg(not(feature = "wyr1e-production"))]
-    let dependent_cleanup_error: Option<InitError> = None;
     let registry = resident
         .wyr1c
         .as_mut()
@@ -2160,17 +2078,13 @@ where
             // F3A.6f. `state.registry` and `state.binding` were emptied above
             // and nothing was installed, so a build whose `poll` reads that
             // slot cannot continue; see `InitError::RegistryAbandoned`.
-            #[cfg(feature = "wyr1e-production")]
             return attribute_failure(
                 RecoveryOperation::RetireRegistry,
                 Err(InitError::RegistryAbandoned(reason)),
             );
-            #[cfg(not(feature = "wyr1e-production"))]
-            return Ok(());
         }
         RegistryRecoveryStep::Restart | RegistryRecoveryStep::AwaitStatus => {}
     }
-    #[cfg(feature = "wyr1e-production")]
     if action_deadline.is_some() {
         wyr1e::ensure_recovery_live(resident, system.now().map_err(InitError::Native)?)?;
     }
@@ -2195,15 +2109,11 @@ where
         // F3A.6f, the second of the two exits. Same reasoning as the
         // `Degraded` step above: emptied, nothing installed, terminal where a
         // `poll` depends on it.
-        #[cfg(feature = "wyr1e-production")]
         return attribute_failure(
             RecoveryOperation::LaunchRegistry,
             Err(InitError::RegistryAbandoned(reason)),
         );
-        #[cfg(not(feature = "wyr1e-production"))]
-        return Ok(());
     };
-    #[cfg(feature = "wyr1e-production")]
     if action_deadline.is_some()
         && let Err(error) =
             wyr1e::ensure_recovery_live(resident, system.now().map_err(InitError::Native)?)
@@ -2225,7 +2135,6 @@ where
             Err(error)
         };
     }
-    #[cfg(feature = "wyr1e-production")]
     {
         let reserved = wyr1e::reserve_registry_replacement(resident, replacement.active.generation);
         let reserved = attribute_failure(RecoveryOperation::CommitRegistry, reserved);
@@ -2245,7 +2154,6 @@ where
     );
     let replacement = attribute_failure(RecoveryOperation::CommitRegistry, replacement);
     let replacement = replacement?;
-    #[cfg(feature = "wyr1e-production")]
     {
         let committed = wyr1e::commit_registry_replacement(resident, replacement.active.generation);
         let committed = attribute_failure(RecoveryOperation::CommitRegistry, committed);
@@ -2291,7 +2199,6 @@ where
     if let Err(error) = rebound {
         return recover_devmgr_after_error(resident, system, loader, waits, bootfs, error);
     }
-    #[cfg(feature = "wyr1e-production")]
     if resident
         .wyr1c
         .as_ref()
@@ -2304,12 +2211,12 @@ where
     Ok(())
 }
 
-#[cfg(all(test, feature = "wyr1e-production"))]
+#[cfg(test)]
 pub(crate) const E8_REGISTRY_FIXTURE_DEVMGR_CONTROL: DwHandle = DwHandle(0xE8B5_0021);
-#[cfg(all(test, feature = "wyr1e-production"))]
+#[cfg(test)]
 pub(crate) const E8_REGISTRY_FIXTURE_DRIVER_PROCESS: DwHandle = DwHandle(0xE8B5_0030);
 
-#[cfg(all(test, feature = "wyr1e-production"))]
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn install_e8_registry_fixture_role(
     controller: &mut SystemInit,
@@ -2355,7 +2262,7 @@ fn install_e8_registry_fixture_role(
 /// at all -- measured by probe, not assumed. The resident is ordinary; only
 /// the `e6` state its caller supplies decides whether an episode is open, so
 /// the product path can be driven without a shell, a trigger or a barrier.
-#[cfg(all(test, feature = "wyr1e-production"))]
+#[cfg(test)]
 fn recovery_fixture_resident(
     registry_identity: [u8; 32],
     registry_generation: u64,
@@ -2487,7 +2394,7 @@ fn recovery_fixture_resident(
 /// answers `None`, so the episode arithmetic the selector opens is simply not
 /// entered, and what runs is registry retirement, relaunch, topology restart
 /// and publication rebinding.
-#[cfg(all(test, feature = "wyr1e-production"))]
+#[cfg(test)]
 pub(crate) fn exercise_ordinary_registry_recovery<S, L, W>(
     system: &mut S,
     loader: &mut L,
@@ -2526,7 +2433,6 @@ where
     Ok((resident.result, state.topology.generation(), role))
 }
 
-#[cfg(feature = "wyr1e-production")]
 fn start_wyr1e_or_recover_registry<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -2575,10 +2481,7 @@ where
     // `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` 3.5: the parameter was taken and
     // then discarded outside the selector, which told every reader this
     // function carried a cause it did not. It is read in every build now.
-    #[cfg(feature = "wyr1e-production")]
     let episode_open = wyr1e::recovery_deadline(resident)?.is_some();
-    #[cfg(not(feature = "wyr1e-production"))]
-    let episode_open = false;
     if episode_open {
         return Err(error);
     }
@@ -2608,11 +2511,7 @@ where
     //
     // With no console product installed there is no consumer, the retention is
     // false, and everything below runs exactly as it always has.
-    #[cfg(feature = "wyr1e-production")]
     let retained_device_topology = wyr1e::console_depends_on_driver(resident);
-    #[cfg(not(feature = "wyr1e-production"))]
-    let retained_device_topology = false;
-    #[cfg(feature = "wyr1e-production")]
     if !retained_device_topology
         && wyr1e::retire_dependents(resident, system, waits, false).is_err()
     {
@@ -2714,7 +2613,6 @@ where
 /// an episode that never produces a replacement generation leaves the console
 /// stack untouched. It runs before the new generation is installed, so the
 /// replacement's first driver-launch request cannot race a live old driver.
-#[cfg(feature = "wyr1e-production")]
 fn retire_retained_device_topology<S, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -2794,7 +2692,6 @@ where
         };
         match attempt {
             Ok(attempt) => {
-                #[cfg(feature = "wyr1e-production")]
                 retire_retained_device_topology(resident, system, waits)?;
                 let state = resident
                     .wyr1c
@@ -2869,7 +2766,6 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublicationRebindContext {
     RegistryRecovery,
-    #[cfg(any(test, feature = "wyr1c6-production"))]
     DriverRetirement,
 }
 
@@ -2886,7 +2782,6 @@ impl PublicationRebindContext {
                 Ok(StatusCode::OperationalResourceOwned)
             }
             Self::RegistryRecovery => Ok(StatusCode::OperationalWaitingForDeviceBundle),
-            #[cfg(any(test, feature = "wyr1c6-production"))]
             Self::DriverRetirement => {
                 let reaped = _reaped.ok_or(InitError::AbsentState(0x6c))?;
                 if _driver.is_some() || reaped.supervisor_generation != _supervisor {
@@ -2911,10 +2806,7 @@ where
     // The recovery episode lives on the wyr1e console/shell supervisor, so
     // a build without that product has no episode rather than no concept of
     // one. The gate is the product, not a selector.
-    #[cfg(feature = "wyr1e-production")]
     let deadline_cap = wyr1e::recovery_deadline(resident)?;
-    #[cfg(not(feature = "wyr1e-production"))]
-    let deadline_cap = None;
     let state = resident
         .wyr1c
         .as_mut()
@@ -3257,7 +3149,6 @@ mod tests {
                 assert_eq!(self.send_count, 2);
                 assert_eq!(channel, devmgr().loaded.launch_channel);
                 assert_eq!(transfers[0].handle, DwHandle(51));
-                #[cfg(feature = "wyr1e-production")]
                 {
                     let parsed = wyrmroot_device_proto::controller_v1_1::parse(bytes).unwrap();
                     self.controller_request = Some(parsed.controller);
@@ -3266,10 +3157,6 @@ mod tests {
                         self.controller_service_generation,
                         self.registry_service_generation
                     );
-                }
-                #[cfg(not(feature = "wyr1e-production"))]
-                {
-                    self.controller_request = Some(parse_controller(bytes).unwrap());
                 }
             }
             if self.send_count == self.fail_send_at {
@@ -3681,10 +3568,7 @@ mod tests {
                 transaction_id: result.2,
             })
         );
-        #[cfg(feature = "wyr1e-production")]
         assert_eq!(platform.controller_service_generation, Some(result.1));
-        #[cfg(not(feature = "wyr1e-production"))]
-        assert_eq!(platform.controller_service_generation, None);
     }
 
     #[test]
@@ -3695,7 +3579,6 @@ mod tests {
             transaction_id: 9,
         };
         let bytes = encode_publication_request(request, 0xC1_0801).unwrap();
-        #[cfg(feature = "wyr1e-production")]
         {
             let parsed = wyrmroot_device_proto::controller_v1_1::parse(&bytes).unwrap();
             assert_eq!(parsed.controller, request);
@@ -3703,8 +3586,6 @@ mod tests {
             assert_ne!(parsed.service_generation, binding().generation.0);
             assert!(parse_controller(&bytes).is_err());
         }
-        #[cfg(not(feature = "wyr1e-production"))]
-        assert_eq!(parse_controller(&bytes), Ok(request));
     }
 
     #[test]
@@ -3995,7 +3876,6 @@ mod tests {
         assert_eq!(platform.closed, None);
     }
 
-    #[cfg(feature = "wyr1c5-production")]
     #[test]
     fn native_driver_request_requires_transfer_staging_before_actor_reduction() {
         assert_eq!(DRIVER_CONTROL_INGRESS_RIGHTS.0, 0x193);
@@ -4127,7 +4007,6 @@ mod tests {
     /// `active[1]` mirror the registry's and devmgr's handles; run 6 of
     /// F3A.7j retired both twice, once from the resident state and again from
     /// the early-role table, on handles already closed.
-    #[cfg(feature = "wyr1e-production")]
     mod session_shutdown {
         use super::*;
 

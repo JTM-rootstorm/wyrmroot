@@ -1,6 +1,5 @@
 use deepwyrm_syscall::DwHandle;
 use wyrmroot_bootfs::builder::{Builder as BootfsBuilder, FileMode};
-#[cfg(feature = "wyr1e-production")]
 use wyrmroot_consoled as _;
 use wyrmroot_device_proto as _;
 use wyrmroot_devmgr as _;

@@ -19,11 +19,7 @@ impl<T: ?Sized> ResidentR1Sink for T {}
 pub trait ResidentLoopPlatform: Wyr1BPlatform + ResidentR1Sink {}
 
 /// The period of the resident loop's tick.
-#[cfg(feature = "wyr1e-production")]
 pub const RESIDENT_TICK_NS: u64 = WYR0_I_SUPERVISION_POLICY.backoff_ns;
-/// The period of the resident loop's tick.
-#[cfg(not(feature = "wyr1e-production"))]
-pub const RESIDENT_TICK_NS: u64 = 1_000_000_000;
 
 /// Permanent init's resident loop, entered once the product has activated.
 ///

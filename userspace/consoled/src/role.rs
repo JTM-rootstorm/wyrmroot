@@ -20,7 +20,6 @@ use wyrmroot_consoled::{
     RecoveryAction, Reservation, STAGING_CAPACITY, SerialCorrelation, StreamKind,
     cleanup_after_event_loop_failure, release_raw_then_witness,
 };
-#[cfg(feature = "wyr1e-wyrmsh")]
 use wyrmroot_consoled::{ReleaseWitnessEvent, classify_release_witness};
 use wyrmroot_device_proto::connector::{ConnectorIdentity, ConnectorMessage, RECORD_BYTES};
 use wyrmroot_device_proto::{
@@ -54,7 +53,6 @@ use wyrmroot_runtime::{
 pub const FAILURE_BASE: u32 = 0xD400_0000;
 const EVENT_TICK_NS: u64 = 1_000_000_000;
 const STATUS_SEND_TIMEOUT_NS: u64 = 1_000_000_000;
-#[cfg(feature = "wyr1e-wyrmsh")]
 const TERMINAL_DRAIN_TIMEOUT_NS: u64 = 4_000_000_000;
 const NANOS_PER_MILLI: u64 = 1_000_000;
 const FATAL_ATTACH_BASE: u32 = 0x0000_0100;
@@ -91,7 +89,6 @@ struct SerialSession {
     identity: ConnectorIdentity,
     watch: Option<ActiveWatch>,
     raw_owned: bool,
-    #[cfg(feature = "wyr1e-wyrmsh")]
     release_witness: Option<DwHandle>,
     input: NativeInput,
     output: NativeOutput,
@@ -110,10 +107,7 @@ fn close_serial_session<P: ConsoledPlatform>(
     // The raw endpoint is always released first. The retained registry
     // CONNECT peer is the devmgr-observed certificate for this exact client
     // generation and therefore cannot be closed before raw custody ends.
-    #[cfg(feature = "wyr1e-wyrmsh")]
     let witness = serial.release_witness.take();
-    #[cfg(not(feature = "wyr1e-wyrmsh"))]
-    let witness: Option<DwHandle> = None;
     let raw = serial.raw_owned.then(|| serial.endpoint());
     // A failed close leaves ownership ambiguous. Consume it before the
     // attempt so outer fatal cleanup cannot retry a possibly released handle.
@@ -131,7 +125,6 @@ fn close_serial_session<P: ConsoledPlatform>(
     }
 }
 
-#[cfg(feature = "wyr1e-wyrmsh")]
 fn observe_release_witness<P: ConsoledPlatform>(
     platform: &mut P,
     serial: &SerialSession,
@@ -167,7 +160,6 @@ fn observe_release_witness<P: ConsoledPlatform>(
 /// degraded devmgr never makes. A real serial loss still arrives on the raw
 /// endpoint, and a replacement devmgr retires the retained console stack
 /// explicitly (`wyr1c_native::retire_retained_device_topology`).
-#[cfg(feature = "wyr1e-wyrmsh")]
 fn drop_orphaned_witness<P: ConsoledPlatform>(
     platform: &mut P,
     serial: &mut SerialSession,
@@ -194,14 +186,8 @@ fn drop_orphaned_witness<P: ConsoledPlatform>(
 /// the console in every degraded boot whose episode fired. A new generation
 /// is a real republication and still rebuilds the session. The watch is
 /// one-shot, so nothing further arrives on it.
-#[cfg(feature = "wyr1e-wyrmsh")]
 const fn publication_withdrawn(service_generation: u64) -> bool {
     service_generation == 0
-}
-
-#[cfg(not(feature = "wyr1e-wyrmsh"))]
-const fn publication_withdrawn(_service_generation: u64) -> bool {
-    false
 }
 
 #[derive(Clone, Copy)]
@@ -700,19 +686,10 @@ fn attach_serial<P: ConsoledPlatform>(
         finish_connect_abort(platform, model, connect_request, &handles)?;
         return Err(22);
     }
-    #[cfg(not(feature = "wyr1e-wyrmsh"))]
-    if platform.close_handle(direct).is_err() {
-        let _ = platform.close_handle(received[0].handle);
-        let _ = model.abort_connect(connect_request);
-        return Err(FATAL_ATTACH_BASE | 23);
-    }
     let attached_at = match now_millis(platform) {
         Ok(now) => now,
         Err(error) => {
-            #[cfg(feature = "wyr1e-wyrmsh")]
             let cleanup = [direct, received[0].handle];
-            #[cfg(not(feature = "wyr1e-wyrmsh"))]
-            let cleanup = [received[0].handle, DwHandle(0)];
             finish_connect_abort(platform, model, connect_request, &cleanup)?;
             return Err(error);
         }
@@ -725,10 +702,7 @@ fn attach_serial<P: ConsoledPlatform>(
     ) {
         Ok(watch) => watch,
         Err(error) => {
-            #[cfg(feature = "wyr1e-wyrmsh")]
             let cleanup = [direct, received[0].handle];
-            #[cfg(not(feature = "wyr1e-wyrmsh"))]
-            let cleanup = [received[0].handle, DwHandle(0)];
             finish_connect_abort(platform, model, connect_request, &cleanup)?;
             return Err(error);
         }
@@ -743,17 +717,11 @@ fn attach_serial<P: ConsoledPlatform>(
         )
         .is_err()
         {
-            #[cfg(feature = "wyr1e-wyrmsh")]
             let cleanup = [direct, received[0].handle];
-            #[cfg(not(feature = "wyr1e-wyrmsh"))]
-            let cleanup = [received[0].handle, DwHandle(0)];
             let _ = finish_connect_abort(platform, model, connect_request, &cleanup);
             return Err(FATAL_ATTACH_BASE | 24);
         }
-        #[cfg(feature = "wyr1e-wyrmsh")]
         let cleanup = [direct, received[0].handle];
-        #[cfg(not(feature = "wyr1e-wyrmsh"))]
-        let cleanup = [received[0].handle, DwHandle(0)];
         finish_connect_abort(platform, model, connect_request, &cleanup)?;
         return Err(24);
     }
@@ -761,7 +729,6 @@ fn attach_serial<P: ConsoledPlatform>(
         identity,
         watch: Some(active_watch),
         raw_owned: true,
-        #[cfg(feature = "wyr1e-wyrmsh")]
         release_witness: Some(direct),
         input: NativeInput::new(validated_stream_endpoint(received[0].handle).map_err(|_| 24u32)?),
         output: NativeOutput::new(
@@ -1435,7 +1402,6 @@ fn wait_launch_with_serial<P: ConsoledPlatform>(
             DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
         );
         let mut used = 3;
-        #[cfg(feature = "wyr1e-wyrmsh")]
         let witness_index = serial.release_witness.map(|witness| {
             let index = used;
             items[index] = wait_item(
@@ -1445,8 +1411,6 @@ fn wait_launch_with_serial<P: ConsoledPlatform>(
             used += 1;
             index
         });
-        #[cfg(not(feature = "wyr1e-wyrmsh"))]
-        let witness_index: Option<usize> = None;
         let status_index = if let Some(session) = status_session.as_deref() {
             if !session.is_open() || status_endpoint.0 == 0 {
                 return Err(45);
@@ -1466,14 +1430,9 @@ fn wait_launch_with_serial<P: ConsoledPlatform>(
             .map_err(|_| 45u32)?;
         let index = usize::try_from(observed.index).map_err(|_| 45u32)?;
         if witness_index == Some(index) {
-            #[cfg(feature = "wyr1e-wyrmsh")]
-            {
-                observe_release_witness(platform, serial, observed.observed)?;
-                drop_orphaned_witness(platform, serial)?;
-                continue;
-            }
-            #[cfg(not(feature = "wyr1e-wyrmsh"))]
-            return Ok(LaunchWaitOutcome::SerialLost);
+            observe_release_witness(platform, serial, observed.observed)?;
+            drop_orphaned_witness(platform, serial)?;
+            continue;
         }
         if status_index == Some(index) {
             if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
@@ -1558,11 +1517,7 @@ fn event_loop<P: ConsoledPlatform>(
         } else {
             6
         };
-        #[cfg(feature = "wyr1e-wyrmsh")]
         let mut data_base = initial_data_base;
-        #[cfg(not(feature = "wyr1e-wyrmsh"))]
-        let data_base = initial_data_base;
-        #[cfg(feature = "wyr1e-wyrmsh")]
         let witness_index = serial.release_witness.map(|witness| {
             let index = data_base;
             items[index] = wait_item(
@@ -1572,8 +1527,6 @@ fn event_loop<P: ConsoledPlatform>(
             data_base += 1;
             index
         });
-        #[cfg(not(feature = "wyr1e-wyrmsh"))]
-        let witness_index: Option<usize> = None;
         let recovery_index: Option<usize> = None;
 
         let raw_writable = if output_pending.is_empty() {
@@ -1639,30 +1592,10 @@ fn event_loop<P: ConsoledPlatform>(
         let observed_index = usize::try_from(observed.index).map_err(|_| 61u32)?;
 
         if witness_index == Some(observed_index) {
-            #[cfg(feature = "wyr1e-wyrmsh")]
-            {
-                observe_release_witness(platform, serial, observed.observed)?;
-                drop_orphaned_witness(platform, serial)?;
-                continue;
-            }
-            #[cfg(not(feature = "wyr1e-wyrmsh"))]
-            {
-                recover_serial(
-                    platform,
-                    authorities,
-                    transactions,
-                    model,
-                    serial,
-                    child,
-                    &mut input_pending,
-                    &mut output_pending,
-                )?;
-                next_data = DataClass::Raw;
-                continue;
-            }
+            observe_release_witness(platform, serial, observed.observed)?;
+            drop_orphaned_witness(platform, serial)?;
+            continue;
         }
-
-        if recovery_index == Some(observed_index) {}
 
         match observed.index {
             // Registry retirement and raw close invalidate the serial tuple
@@ -1706,7 +1639,6 @@ fn event_loop<P: ConsoledPlatform>(
                 if signals & DW_SIGNAL_READABLE.0 == 0 {
                     return Err(57);
                 }
-                #[cfg(feature = "wyr1e-wyrmsh")]
                 drain_clean_terminal_output(
                     platform,
                     authorities,
@@ -1732,7 +1664,6 @@ fn event_loop<P: ConsoledPlatform>(
                 continue;
             }
             3 => {
-                #[cfg(feature = "wyr1e-wyrmsh")]
                 if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 && child.wait.is_some() {
                     if recover_terminal_precursor(
                         platform,
@@ -1771,7 +1702,6 @@ fn event_loop<P: ConsoledPlatform>(
                 continue;
             }
             4 | 5 => {
-                #[cfg(feature = "wyr1e-wyrmsh")]
                 if child.wait.is_some() {
                     if recover_terminal_precursor(
                         platform,
@@ -1809,7 +1739,6 @@ fn event_loop<P: ConsoledPlatform>(
                 continue;
             }
             6 if child.status.is_some() => {
-                #[cfg(feature = "wyr1e-wyrmsh")]
                 if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 && child.wait.is_some() {
                     if recover_terminal_precursor(
                         platform,
@@ -2024,7 +1953,6 @@ fn event_loop<P: ConsoledPlatform>(
     }
 }
 
-#[cfg(feature = "wyr1e-wyrmsh")]
 fn drain_clean_terminal_output<P: ConsoledPlatform>(
     platform: &mut P,
     authorities: StartupAuthorities,
@@ -2142,7 +2070,6 @@ fn drain_clean_terminal_output<P: ConsoledPlatform>(
     Ok(())
 }
 
-#[cfg(feature = "wyr1e-wyrmsh")]
 #[allow(clippy::too_many_arguments)]
 fn recover_terminal_precursor<P: ConsoledPlatform>(
     platform: &mut P,
@@ -2184,17 +2111,6 @@ fn recover_terminal_child<P: ConsoledPlatform>(
     input_pending: &mut Pending,
     output_pending: &mut Pending,
 ) -> Result<TerminalOutcome, u32> {
-    #[cfg(not(feature = "wyr1e-wyrmsh"))]
-    {
-        let wait = child.wait.take().ok_or(61u32)?;
-        match receive_launch(platform, authorities.launch, wait)? {
-            LaunchReply::JobResult {
-                job_id,
-                session_shutdown,
-            } if job_id == child.job_id => child.session_shutdown = session_shutdown,
-            _ => return Err(61),
-        }
-    }
     if !matches!(model.child_terminal(child.event, now_millis(platform)?), Ok(RecoveryAction::ReapChild(job)) if job == child.job_id)
     {
         return Err(62);
@@ -2641,7 +2557,6 @@ fn receive_launch<P: ConsoledPlatform>(
 }
 
 // Only the Wyrmsh terminal drain waits for a launch result under a deadline.
-#[cfg(feature = "wyr1e-wyrmsh")]
 fn receive_launch_before<P: ConsoledPlatform>(
     platform: &mut P,
     channel: DwHandle,

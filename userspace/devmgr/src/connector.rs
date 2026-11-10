@@ -3,7 +3,6 @@
 //! Native code owns actual Channel handles. This module names every ownership
 //! transition so the native adapter never infers cleanup from event order.
 
-#[cfg(feature = "wyr1e8-production")]
 use wyrmroot_device_proto::D5DriverIdentity;
 use wyrmroot_device_proto::connector::{ConnectorErrorCode, ConnectorIdentity, ConnectorMessage};
 use wyrmroot_device_proto::control::FailureCode;
@@ -73,7 +72,6 @@ impl AttachCorrelation {
     }
 }
 
-#[cfg(feature = "wyr1e8-production")]
 impl PublishedDriver {
     pub const fn d5_identity(self) -> D5DriverIdentity {
         D5DriverIdentity {

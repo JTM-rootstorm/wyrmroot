@@ -1,8 +1,8 @@
 //! `xtask test`: the host gate.
 //!
-//! Formatting, warnings-denied Clippy and the workspace tests in the default
-//! feature shape, the same two in each production role's feature shape, and
-//! the root Python suites. The production natives themselves are compiled by
+//! Formatting, warnings-denied Clippy and the workspace tests, and the root
+//! Python suites. The roles' default host shape is their production code; the
+//! `native-*` features only add the guest binaries. The production natives themselves are compiled by
 //! `xtask product` (and so by `dev-boot`), which is the native half of the
 //! gate.
 
@@ -13,15 +13,6 @@ use std::{
 };
 
 use crate::{error::Failure, tasks};
-
-/// Production feature shapes of the roles that also build on the host. Their
-/// `native-*` features need the guest target and are covered by the product
-/// build instead.
-const PRODUCTION_SHAPES: [(&str, &str); 3] = [
-    ("wyrmroot-system-init", "wyr1e-production"),
-    ("wyrmroot-devmgr", "wyr1e8-production"),
-    ("wyrmroot-consoled", "wyr1e-wyrmsh"),
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Scope {
@@ -71,45 +62,12 @@ pub(crate) fn run(scope: Scope) -> Result<(), Failure> {
             ]
             .concat(),
         )?;
-        for (package, features) in PRODUCTION_SHAPES {
-            cargo(
-                &repository,
-                &[
-                    &[
-                        "clippy",
-                        "--locked",
-                        "--offline",
-                        "--all-targets",
-                        "--package",
-                        package,
-                        "--features",
-                        features,
-                    ][..],
-                    &lint,
-                ]
-                .concat(),
-            )?;
-        }
     }
     if all || scope == Scope::Unit {
         cargo(
             &repository,
             &["test", "--locked", "--offline", "--workspace"],
         )?;
-        for (package, features) in PRODUCTION_SHAPES {
-            cargo(
-                &repository,
-                &[
-                    "test",
-                    "--locked",
-                    "--offline",
-                    "--package",
-                    package,
-                    "--features",
-                    features,
-                ],
-            )?;
-        }
     }
     if all || scope == Scope::Root {
         root_tests(&repository)?;

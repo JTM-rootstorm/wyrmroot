@@ -298,7 +298,7 @@ pub(crate) struct RegistryNativeAttempt {
     ready_at: u64,
 }
 
-#[cfg(all(test, feature = "wyr1e-production"))]
+#[cfg(test)]
 pub(crate) const fn registry_native_attempt_for_fixture(
     active: ActiveNativeRole,
     control_channel: DwHandle,
@@ -517,10 +517,7 @@ pub(crate) fn validate_retained_bootfs_c1(
         .role(RoleId::Uart16550d)
         .ok_or(InitError::WrongManifestProfile)?
         .executable_identity();
-    #[cfg(feature = "wyr1e-production")]
     let controller = SystemInit::from_wyr1e_manifest(manifest)?;
-    #[cfg(not(feature = "wyr1e-production"))]
-    let controller = SystemInit::from_wyr1c_manifest(manifest)?;
     for role in manifest.roles() {
         let entry = archive.lookup(role.path().as_bytes()).map_err(map_lookup)?;
         if !entry.is_executable() || entry.data().is_empty() {
@@ -2511,11 +2508,7 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SentLaunchAccepted {}
 
-impl SentLaunchAccepted {
-    fn as_bytes(&self) -> &[u8] {
-        &[]
-    }
-}
+impl SentLaunchAccepted {}
 
 fn force_cleanup_job<S, W>(
     system: &mut S,
@@ -3218,10 +3211,7 @@ fn defer_reserved_launch<S, L, W>(
     request_ticket: RequestTicket,
     request: wyrmroot_launch_proto::LaunchRequest<'_>,
     moved: &[DwReceivedHandleInfoV1],
-    observed: &[DwReceivedHandleInfoV1],
     handle_count: usize,
-    request_bytes: &[u8],
-    mut state: Option<&mut ShellControllerState>,
 ) -> Result<JobDispatchOutcome, InitError>
 where
     S: Wyr1BPlatform,
@@ -3244,16 +3234,7 @@ where
     ) {
         Ok(constructed) => constructed,
         Err(error) => {
-            send_observed_job_error(
-                system,
-                session,
-                reservation,
-                launch_error_code(&error),
-                scope,
-                state.as_deref_mut(),
-                request_bytes,
-                observed,
-            )?;
+            send_observed_job_error(system, session, reservation, launch_error_code(&error))?;
             return if error == InitError::Cleanup {
                 Err(error)
             } else {
@@ -3264,16 +3245,7 @@ where
     if let Err(error) = park_constructed_launch(jobs, grant, scope, constructed) {
         let cleanup_failed =
             rollback_prepared_job(system, waits, jobs, constructed.prepared).is_err();
-        send_observed_job_error(
-            system,
-            session,
-            reservation,
-            launch_error_code(&error),
-            scope,
-            state,
-            request_bytes,
-            observed,
-        )?;
+        send_observed_job_error(system, session, reservation, launch_error_code(&error))?;
         return Err(if cleanup_failed {
             InitError::Cleanup
         } else {
@@ -3340,30 +3312,11 @@ fn launch_transaction_error(error: LaunchTransactionError) -> InitError {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn observe_e7_response<S: Wyr1BPlatform>(
-    system: &mut S,
-    scope: LaunchSessionScope,
-    state: Option<&mut ShellControllerState>,
-    request: &[u8],
-    response: &[u8],
-    handles: &[DwReceivedHandleInfoV1],
-) -> Result<(), InitError> {
-    {
-        let _ = (system, scope, state, request, response, handles);
-        Ok(())
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn send_observed_job_error<S: Wyr1BPlatform>(
     system: &mut S,
     session: DwHandle,
     reservation: LaunchReservation,
     code: LaunchErrorCode,
-    scope: LaunchSessionScope,
-    state: Option<&mut ShellControllerState>,
-    request: &[u8],
-    handles: &[DwReceivedHandleInfoV1],
 ) -> Result<(), InitError> {
     let mut response = [0_u8; 88];
     let size =
@@ -3371,7 +3324,7 @@ fn send_observed_job_error<S: Wyr1BPlatform>(
     system
         .send_channel(session, &response[..size])
         .map_err(InitError::Native)?;
-    observe_e7_response(system, scope, state, request, &response[..size], handles)
+    Ok(())
 }
 
 fn send_shell_v1_error<S: InitPlatform>(
@@ -3509,10 +3462,6 @@ where
                         session,
                         reservation,
                         job_error_code(error),
-                        scope,
-                        evidence.as_deref_mut(),
-                        request_bytes,
-                        &[],
                     );
                 }
             };
@@ -3528,10 +3477,6 @@ where
                     session,
                     reservation,
                     LaunchErrorCode::CleanupFailure,
-                    scope,
-                    evidence.as_deref_mut(),
-                    request_bytes,
-                    &[],
                 );
             }
             jobs.jobs
@@ -3580,10 +3525,6 @@ where
                     session,
                     reservation,
                     LaunchErrorCode::CancellationUnavailable,
-                    scope,
-                    evidence.as_deref_mut(),
-                    request_bytes,
-                    &[],
                 );
             }
             encode_job_message(
@@ -3602,26 +3543,10 @@ where
             system
                 .send_channel(session, &response[..size])
                 .map_err(InitError::Native)?;
-            observe_e7_response(
-                system,
-                scope,
-                evidence.as_deref_mut(),
-                request_bytes,
-                &response[..size],
-                &[],
-            )
+            Ok(())
         }
         Ok(None) => Ok(()),
-        Err(error) => send_observed_job_error(
-            system,
-            session,
-            reservation,
-            job_error_code(error),
-            scope,
-            evidence,
-            request_bytes,
-            &[],
-        ),
+        Err(error) => send_observed_job_error(system, session, reservation, job_error_code(error)),
     }
 }
 
@@ -4321,10 +4246,6 @@ where
                     session,
                     reservation,
                     LaunchErrorCode::PolicyRejected,
-                    scope,
-                    shell.as_deref_mut().map(|context| &mut *context.state),
-                    &bytes[..counts.bytes],
-                    &received[..counts.handles],
                 )?;
                 return Ok(JobDispatchOutcome::Responded);
             }
@@ -4337,10 +4258,6 @@ where
                     session,
                     reservation,
                     LaunchErrorCode::PolicyRejected,
-                    scope,
-                    shell.as_deref_mut().map(|context| &mut *context.state),
-                    &bytes[..counts.bytes],
-                    &received[..counts.handles],
                 )?;
                 return Ok(JobDispatchOutcome::Responded);
             };
@@ -4359,10 +4276,7 @@ where
                     request_ticket,
                     request,
                     &received[..legacy_handle_limit],
-                    &received[..counts.handles],
                     counts.handles,
-                    &bytes[..counts.bytes],
-                    shell.as_deref_mut().map(|context| &mut *context.state),
                 );
             }
             match accept_reserved_launch(
@@ -4379,27 +4293,13 @@ where
                 &received[..legacy_handle_limit],
                 counts.handles,
             ) {
-                Ok((loaded, response)) => {
-                    observe_e7_response(
-                        system,
-                        scope,
-                        shell.as_deref_mut().map(|context| &mut *context.state),
-                        &bytes[..counts.bytes],
-                        response.as_bytes(),
-                        &received[..counts.handles],
-                    )?;
-                    Ok(JobDispatchOutcome::Launched(loaded))
-                }
+                Ok((loaded, _)) => Ok(JobDispatchOutcome::Launched(loaded)),
                 Err(error) => {
                     send_observed_job_error(
                         system,
                         session,
                         reservation,
                         launch_error_code(&error),
-                        scope,
-                        shell.as_deref_mut().map(|context| &mut *context.state),
-                        &bytes[..counts.bytes],
-                        &received[..counts.handles],
                     )?;
                     if error == InitError::Cleanup {
                         Err(error)
@@ -4800,7 +4700,6 @@ where
 /// E3C adapter for the selected console controller. The caller supplies the
 /// current registry generation and poison state; request bytes cannot select
 /// either authority.
-#[cfg(feature = "wyr1e-shell-controller")]
 #[allow(
     dead_code,
     clippy::too_many_arguments,
@@ -4881,9 +4780,7 @@ where
                 let size = system
                     .query_memory_object_size(authority.bootfs)
                     .map_err(InitError::Native)?;
-                let plan = MappingPlan::for_bootfs(size).map_err(|error| {
-                    ordinary_mapping_error(MappingDiagnosticSite::JobDispatcher, error, size)
-                })?;
+                let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
                 let dispatched = system
                     .with_bootfs_bytes(
                         authority.parent_root,
@@ -5132,7 +5029,7 @@ where
         .session_handle(pending.grant)
         .map_err(InitError::Wyr1BModel)?;
     let terminal = controller_result_to_wire(result)?;
-    observe_session_shutdown_result(scope, evidence.as_deref_mut(), terminal);
+    observe_session_shutdown_result(scope, evidence, terminal);
     let mut response = [0_u8; 88];
     let size = encode_job_result(pending.reservation, pending.job_id, terminal, &mut response)
         .map_err(|_| InitError::Accounting)?;
@@ -5150,8 +5047,6 @@ where
             InitError::Native(error)
         });
     }
-    let request = &[];
-    observe_e7_response(system, scope, evidence, request, &response[..size], &[])?;
     jobs.finish_pending_wait(pending)
         .map_err(InitError::Wyr1BModel)
 }
@@ -5199,7 +5094,6 @@ where
 /// Retires one product consoled generation and its foreground shell while
 /// preserving already-published background jobs as invisible controller-owned
 /// orphans. The caller retains the dispatcher so those jobs can still reap.
-#[cfg(feature = "wyr1e-production")]
 pub(crate) fn retire_console_product<S, W>(
     system: &mut S,
     waits: &mut W,
@@ -5214,7 +5108,6 @@ where
     retire_console_product_inner(system, waits, jobs, peer, terminate, None).map(|_| ())
 }
 
-#[cfg(feature = "wyr1e-production")]
 fn retire_console_product_inner<S, W>(
     system: &mut S,
     waits: &mut W,
@@ -6168,9 +6061,7 @@ where
         let size = system
             .query_memory_object_size(authority.bootfs)
             .map_err(InitError::Native)?;
-        let plan = MappingPlan::for_bootfs(size).map_err(|error| {
-            ordinary_mapping_error(MappingDiagnosticSite::RegistryReplacement, error, size)
-        })?;
+        let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
         let replacement = system
             .with_bootfs_bytes(
                 authority.parent_root,
@@ -8736,7 +8627,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "wyr1e-shell-controller")]
     #[test]
     fn e3c_controller_feature_runs_the_transport_injected_poll_adapter() {
         let image = executable();
@@ -9249,7 +9139,6 @@ mod tests {
         assert_eq!(topology.generation(), generation);
     }
 
-    #[cfg(feature = "wyr1e-production")]
     #[test]
     fn e6_console_accounting_mismatch_still_closes_every_owned_resource() {
         let grant = grant(EndpointKind::LaunchSession, 1, 1);
@@ -9289,7 +9178,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "wyr1e-production")]
     #[test]
     fn e6_console_retirement_orphans_background_jobs_without_draining_them() {
         let console = grant(EndpointKind::LaunchSession, 1, 1);
@@ -9512,7 +9400,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "wyr1e-shell-controller")]
     #[test]
     fn e3c_console_peer_loss_reports_exact_closed_session_after_owner_cleanup() {
         let console = grant(EndpointKind::LaunchSession, 1, 1);
@@ -12133,7 +12020,6 @@ mod tests {
     /// arithmetic runs -- had no coverage in the tree. That is what blocked
     /// R7B-4's D1b: the sniff could not be removed while it was the only way
     /// any test reached recovery at all.
-    #[cfg(feature = "wyr1e-production")]
     #[test]
     fn ordinary_registry_recovery_needs_no_shell_no_trigger_and_no_barrier() {
         let image = executable();

@@ -6,21 +6,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-// The WYR1-E production product is the WYR1-C6 resource product plus the
-// shell controller; every selector built on it inherits both. The manifest's
-// feature lists say so, and these refuse a build in which one stopped doing so.
-#[cfg(all(
-    feature = "wyr1e-production",
-    not(all(feature = "wyr1c6-production", feature = "wyr1e-shell-controller"))
-))]
-compile_error!("wyr1e-production must compose wyr1c6-production and wyr1e-shell-controller");
-
-#[cfg(all(feature = "wyr1c6-production", not(feature = "wyr1c5-production")))]
-compile_error!("wyr1c6-production must compose the wyr1c5-production resource product");
-
 use core::mem::MaybeUninit;
 
-#[cfg(feature = "wyr1e-production")]
 use wyrmroot_consoled as _;
 #[cfg(test)]
 use {wyrmroot_devmgr as _, wyrmroot_uart16550d as _};
@@ -504,14 +491,6 @@ pub struct TickFailure {
     pub saturated: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub(crate) enum MappingDiagnosticSite {
-    RoleRemap = 1,
-    JobDispatcher = 2,
-    RegistryReplacement = 3,
-}
-
 /// Boot-lifetime owner of the fixed supervisor state and primordial authority.
 /// The immutable bootfs handle is retained and remapped narrowly for each load;
 /// no borrowed mapping escapes a transition.
@@ -651,7 +630,6 @@ impl ResidentSystemInit {
         self.session_complete
     }
 
-    #[cfg(feature = "wyr1e-production")]
     pub(crate) const fn observe_session_complete(&mut self) {
         self.session_complete = true;
     }
@@ -1260,7 +1238,7 @@ impl SystemInit {
     }
 
     #[cfg_attr(
-        all(feature = "wyr1e-production", not(test)),
+        not(test),
         allow(
             dead_code,
             reason = "retained for explicit historical-profile isolation in the E6 binary build"
@@ -1275,7 +1253,6 @@ impl SystemInit {
         )
     }
 
-    #[cfg(feature = "wyr1e-production")]
     pub(crate) fn from_wyr1e_manifest(manifest: Manifest<'_>) -> Result<Self, InitError> {
         Self::from_manifest_with_profiles(
             manifest,
@@ -2175,7 +2152,7 @@ where
     let size = system
         .query_memory_object_size(authority.bootfs)
         .map_err(InitError::Native)?;
-    let plan = MappingPlan::for_bootfs(size).map_err(|error| startup_mapping_error(error, size))?;
+    let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
     system
         .with_bootfs_bytes(
             authority.parent_root,
@@ -2297,7 +2274,7 @@ where
     let size = system
         .query_memory_object_size(authority.bootfs)
         .map_err(InitError::Native)?;
-    let plan = MappingPlan::for_bootfs(size).map_err(|error| startup_mapping_error(error, size))?;
+    let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
     system
         .with_bootfs_bytes(
             authority.parent_root,
@@ -2404,8 +2381,7 @@ where
         let size = system
             .query_memory_object_size(authority.bootfs)
             .map_err(InitError::Native)?;
-        let plan =
-            MappingPlan::for_bootfs(size).map_err(|error| startup_mapping_error(error, size))?;
+        let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
         let activation = system
             .with_bootfs_bytes(
                 authority.parent_root,
@@ -2427,24 +2403,6 @@ where
         .close_handle(bootstrap_channel)
         .map_err(InitError::Native)?;
     Ok((authority, activation))
-}
-
-fn startup_mapping_error(error: MappingPlanError, size: u64) -> InitError {
-    {
-        let _ = size;
-        InitError::Mapping(error)
-    }
-}
-
-pub(crate) fn ordinary_mapping_error(
-    site: MappingDiagnosticSite,
-    error: MappingPlanError,
-    size: u64,
-) -> InitError {
-    {
-        let _ = (site, size);
-        InitError::Mapping(error)
-    }
 }
 
 fn close_startup_failure<S: InitPlatform>(
@@ -2630,8 +2588,7 @@ where
     let size = system
         .query_memory_object_size(authority.bootfs)
         .map_err(InitError::Native)?;
-    let plan = MappingPlan::for_bootfs(size)
-        .map_err(|error| ordinary_mapping_error(MappingDiagnosticSite::RoleRemap, error, size))?;
+    let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
     system
         .with_bootfs_bytes(
             authority.parent_root,
@@ -3297,7 +3254,6 @@ mod native_cleanup_tests {
         );
     }
 
-    #[cfg(feature = "wyr1e-production")]
     #[test]
     fn e6_manifest_constructor_admits_only_the_production_shell_profile() {
         use wyrmroot_rrc_manifest::builder::{Builder, DependencySpec, RoleSpec};
@@ -3990,7 +3946,7 @@ mod native_cleanup_tests {
     /// is a build-time assertion beside `RESIDENT_TICK_NS`.
     #[test]
     fn the_resident_loop_waits_one_tick_period_past_the_tick() {
-        let expected = if cfg!(feature = "wyr1e-production") {
+        let expected = if true {
             WYR0_I_SUPERVISION_POLICY.backoff_ns
         } else {
             1_000_000_000
@@ -4682,11 +4638,7 @@ mod native_cleanup_tests {
         // device resident. Reserve 40 KiB of the existing 108 KiB execution
         // stack for residency; this partition is a userspace budget, not a
         // startup ABI limit.
-        let resident_budget = if cfg!(feature = "wyr1e-production") {
-            40
-        } else {
-            20
-        };
+        let resident_budget = if true { 40 } else { 20 };
         assert!(
             size_of::<ResidentSystemInit>() <= resident_budget * 1024,
             "resident bytes: {}",
