@@ -50,3 +50,19 @@ repository = "https://github.com/JTM-rootstorm/wyrmroot"
 deepwyrm-abi = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "347c092c954b15b7dfcd77bac1e2579a9014bf6f" }
 deepwyrm-syscall = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "347c092c954b15b7dfcd77bac1e2579a9014bf6f" }
 uefi = { version = "=0.39.0", default-features = false, features = ["alloc", "global_allocator", "panic_handler"] }
+
+# Host tooling hashes multi-GB toolchains and images. Unoptimized, xtask's
+# SHA-256 runs at ~33 MB/s and dominated every product freeze. Optimize the
+# host-side packages only; debug assertions and overflow checks stay on, and
+# guest products build with the release profile, which this does not touch.
+[profile.dev.package.xtask]
+opt-level = 3
+
+[profile.dev.package.wyrmroot-bootfs]
+opt-level = 3
+
+[profile.dev.package.wyrmroot-rrc-manifest]
+opt-level = 3
+
+[profile.dev.package.wyrmroot-loader]
+opt-level = 3
