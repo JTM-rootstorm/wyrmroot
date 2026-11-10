@@ -4,6 +4,7 @@ pub(crate) const USAGE: &str = r#"Wyrmroot development task dispatcher
 
 Usage:
     cargo xtask build [host|loader|bootfs]
+    tools/pinned-cargo xtask dev-boot [--smp] [--check] [--deep-repository <path>]
     cargo xtask image <loader.efi> <deepwyrm.elf> <bootstrap.elf> <bootfs.img> <esp.img>
     cargo xtask image --request <wyr0-h-request.toml>
     cargo xtask run <default|smp> --request <wyr0-h-request.toml>
@@ -306,6 +307,11 @@ pub(crate) enum Action {
         evidence_nonce: Option<String>,
     },
     Wyr1FInspect(String),
+    DevBoot {
+        check: bool,
+        smp: bool,
+        deep_repository: Option<String>,
+    },
     Wyr1C2Freeze(String),
     Wyr1C2Image(String),
     Wyr1C2Inspect(String),
@@ -454,10 +460,40 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "dw1-e3b-prepare" => dispatch_dw1e3b_prepare(&arguments[1..]),
         "wyr1-d5-prepare" => dispatch_wyr1d5_prepare(&arguments[1..]),
         "grammar" => dispatch_grammar(&arguments[1..]),
+        "dev-boot" => dispatch_dev_boot(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
     }
+}
+
+fn dispatch_dev_boot(arguments: &[String]) -> Result<Action, Failure> {
+    let mut check = false;
+    let mut smp = false;
+    let mut deep_repository = None;
+    let mut rest = arguments.iter();
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "--check" if !check => check = true,
+            "--smp" if !smp => smp = true,
+            "--deep-repository" if deep_repository.is_none() => {
+                deep_repository =
+                    Some(rest.next().cloned().ok_or_else(|| {
+                        Failure::usage("dev-boot --deep-repository requires a path")
+                    })?);
+            }
+            _ => {
+                return Err(Failure::usage(
+                    "dev-boot accepts [--smp] [--check] [--deep-repository <path>]",
+                ));
+            }
+        }
+    }
+    Ok(Action::DevBoot {
+        check,
+        smp,
+        deep_repository,
+    })
 }
 
 fn dispatch_wyr0(arguments: &[String]) -> Result<Action, Failure> {
@@ -1352,6 +1388,36 @@ mod tests {
         );
         assert!(USAGE.contains("tools/pinned-cargo xtask wyr1 prepare --request"));
         assert!(!USAGE.contains("\n    cargo xtask wyr1 "));
+    }
+
+    #[test]
+    fn dev_boot_takes_only_its_three_options_once_each() {
+        assert_eq!(
+            dispatch(&arguments(&["dev-boot"])),
+            Ok(Action::DevBoot {
+                check: false,
+                smp: false,
+                deep_repository: None,
+            })
+        );
+        assert_eq!(
+            dispatch(&arguments(&[
+                "dev-boot",
+                "--smp",
+                "--deep-repository",
+                "d",
+                "--check"
+            ])),
+            Ok(Action::DevBoot {
+                check: true,
+                smp: true,
+                deep_repository: Some("d".into()),
+            })
+        );
+        assert!(dispatch(&arguments(&["dev-boot", "--check", "--check"])).is_err());
+        assert!(dispatch(&arguments(&["dev-boot", "--deep-repository"])).is_err());
+        assert!(dispatch(&arguments(&["dev-boot", "extra"])).is_err());
+        assert!(USAGE.contains("xtask dev-boot [--smp] [--check]"));
     }
 
     #[test]

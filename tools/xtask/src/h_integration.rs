@@ -2890,7 +2890,7 @@ fn qemu_arguments(
     args
 }
 
-fn canonical_qemu_arguments(
+pub(crate) fn canonical_qemu_arguments(
     vcpus: u32,
     memory_mib: u32,
     ovmf_code: &Path,

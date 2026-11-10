@@ -1,6 +1,7 @@
 mod abi_pairing;
 mod cli;
 mod deep_layout;
+mod dev_boot;
 mod dw1b;
 mod dw1c;
 mod dw1d6;
@@ -235,6 +236,16 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         .map(Some),
         Action::Wyr1FInspect(product) => wyr1f::inspect(std::path::Path::new(&product)).map(Some),
         Action::GrammarDump => grammar::dump().map(Some),
+        Action::DevBoot {
+            check,
+            smp,
+            deep_repository,
+        } => dev_boot::run(&dev_boot::DevBoot {
+            check,
+            smp,
+            deep_repository,
+        })
+        .map(Some),
         Action::Wyr1C2Freeze(output) => wyr1c2::freeze(std::path::Path::new(&output)).map(Some),
         Action::Wyr1C2Image(request) => wyr1c2::image(std::path::Path::new(&request)).map(Some),
         Action::Wyr1C2Inspect(request) => wyr1c2::inspect(std::path::Path::new(&request)).map(Some),
