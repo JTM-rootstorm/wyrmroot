@@ -2,8 +2,6 @@ use deepwyrm_syscall as _;
 use wyrmroot_bootfs as _;
 use wyrmroot_bootstrap as _;
 use wyrmroot_bootstrap_proto as _;
-#[cfg(feature = "dw1d6-synthetic")]
-use wyrmroot_dw1d6_device_test as _;
 use wyrmroot_loader as _;
 use wyrmroot_runtime as _;
 
@@ -66,15 +64,6 @@ fn production_path_stays_separate_from_test_only_hook_and_terminal_behaviors() {
 }
 
 #[test]
-fn dw1c_bootstrap_watchdog_contains_the_selector_transaction() {
-    assert!(MANIFEST.contains("dw1c-bootstrap-supervision = [\"wyr0-init0-integration\"]"));
-    assert!(MAIN_SOURCE.contains("cfg!(feature = \"dw1c-bootstrap-supervision\")"));
-    assert!(MAIN_SOURCE.contains("270_000_000_000"));
-    assert!(MAIN_SOURCE.contains("240-second workload"));
-    assert!(MAIN_SOURCE.contains("5_000_000_000"));
-}
-
-#[test]
 fn i2_bootstrap_watchdog_contains_the_init0_i2_deadline() {
     assert!(MANIFEST.contains("i2-bootstrap-supervision = [\"wyr0-init0-integration\"]"));
     assert!(MAIN_SOURCE.contains("cfg!(feature = \"i2-bootstrap-supervision\")"));
@@ -90,8 +79,6 @@ fn i2_bootstrap_watchdog_contains_the_init0_i2_deadline() {
 
 #[test]
 fn d6_bootstrap_is_feature_gated_v3_and_keeps_actors_out_of_production_init() {
-    assert!(MANIFEST.contains("dw1d6-synthetic = [\"native-bootstrap\""));
-    assert!(MAIN_SOURCE.contains("#[cfg(feature = \"dw1d6-synthetic\")]"));
     assert!(LIB_SOURCE.contains("terminate_d6_replacement(system, replacement.process)"));
     assert!(LIB_SOURCE.contains("status == DW_STATUS_WOULD_BLOCK"));
     assert!(LIB_SOURCE.contains("D6_TERMINATE_REGISTRATION_RETRIES"));

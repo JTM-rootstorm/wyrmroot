@@ -4,8 +4,6 @@
 //! check the exact syscall sequence and the failure code it stops with. They
 //! cover the bootstrap stages, which need no manifest or driver.
 
-#[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_dw1e3_com2_test as _;
 use wyrmroot_runtime as _;
 use {deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_devmgr as _};
 #[cfg(feature = "native-devmgr")]

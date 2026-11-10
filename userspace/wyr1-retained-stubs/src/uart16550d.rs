@@ -12,12 +12,8 @@ use deepwyrm_syscall::{
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DwReceivedHandleInfoV1,
 };
-#[cfg(feature = "wyr1c6-selector29")]
-use wyrmroot_device_proto::control::{FAILURE_BYTES, TRIGGER_FAILURE_BYTES};
 #[cfg(feature = "wyr1c5-production")]
 use wyrmroot_device_proto::control::{READY_BYTES, RESOURCE_BUNDLE_BYTES, RETIRE_BYTES, parse};
-#[cfg(feature = "wyr1c6-selector29")]
-use wyrmroot_device_proto::selector29_should_fail;
 #[cfg(not(feature = "wyr1c5-production"))]
 use wyrmroot_device_proto::{ControlEndpoint, control::CONTROL_READY_BYTES};
 use wyrmroot_device_proto::{
@@ -204,189 +200,12 @@ fn run_c5_driver(
         return close_c5_intake(control, &handles, 22);
     }
 
-    #[cfg(feature = "wyr1c6-selector29")]
-    if selector29_should_fail(
-        wyrmroot_device_proto::coordinator::SupervisorGeneration(startup.supervisor_generation),
-        AttemptGeneration(startup.attempt_generation),
-    ) {
-        let result = hold_until_failure_trigger(control, ready);
-        let failure = ControlMessage::Failure {
-            role_id: bundle.0,
-            bundle_generation: bundle.1,
-            attempt_generation: bundle.2,
-            endpoint: bundle.3,
-            transaction_id: bundle.4,
-            code: wyrmroot_device_proto::FailureCode::IntentionalRestart,
-        };
-        let mut failure_bytes = [0u8; FAILURE_BYTES];
-        let sent = result.is_ok()
-            && encode(failure, &mut failure_bytes).is_ok()
-            && send_channel(control, &failure_bytes, &[]).is_ok();
-        let mut cleanup_failed = close_handle(handles[1].handle).is_err();
-        cleanup_failed |= close_handle(handles[0].handle).is_err();
-        cleanup_failed |= close_handle(control).is_err();
-        return if sent && !cleanup_failed {
-            Ok(0)
-        } else {
-            Err(31)
-        };
-    }
-
-    #[cfg(feature = "wyr1c6-selector29")]
-    let probe = hold_until_malformed_resource_probe(control, ready);
-    #[cfg(not(feature = "wyr1c6-selector29"))]
     let probe = Ok(());
     let result = probe.and_then(|()| hold_until_retire(control, ready));
     let mut cleanup_failed = close_handle(handles[1].handle).is_err();
     cleanup_failed |= close_handle(handles[0].handle).is_err();
     cleanup_failed |= close_handle(control).is_err();
     if cleanup_failed { Err(23) } else { result }
-}
-
-#[cfg(feature = "wyr1c6-selector29")]
-fn hold_until_failure_trigger(
-    control: deepwyrm_syscall::DwHandle,
-    ready: ControlMessage,
-) -> Result<(), u32> {
-    let observed = wait_many(
-        core::slice::from_ref(&DwWaitItemV1 {
-            handle: control,
-            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
-        }),
-        deepwyrm_syscall::DW_DEADLINE_INFINITE,
-    )
-    .map_err(|_| 32u32)?;
-    if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
-        return Err(33);
-    }
-    let mut bytes = [0u8; TRIGGER_FAILURE_BYTES];
-    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(control, &mut bytes, &mut handles).map_err(|_| 34u32)?;
-    if counts.bytes != bytes.len() || counts.handles != 0 {
-        close_received(&handles, counts.handles);
-        return Err(35);
-    }
-    let expected = match ready {
-        ControlMessage::Ready {
-            role_id,
-            bundle_generation,
-            attempt_generation,
-            endpoint,
-            transaction_id,
-        } => ControlMessage::TriggerFailure {
-            role_id,
-            bundle_generation,
-            attempt_generation,
-            endpoint,
-            transaction_id,
-        },
-        _ => return Err(36),
-    };
-    if parse(&bytes) == Ok(expected) {
-        Ok(())
-    } else {
-        Err(37)
-    }
-}
-
-#[cfg(feature = "wyr1c6-selector29")]
-fn hold_until_malformed_resource_probe(
-    control: deepwyrm_syscall::DwHandle,
-    ready: ControlMessage,
-) -> Result<(), u32> {
-    let observed = wait_many(
-        core::slice::from_ref(&DwWaitItemV1 {
-            handle: control,
-            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
-        }),
-        deepwyrm_syscall::DW_DEADLINE_INFINITE,
-    )
-    .map_err(|_| 38u32)?;
-    if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
-        return Err(39);
-    }
-    let mut bytes = [0u8; RESOURCE_BUNDLE_BYTES];
-    let mut handles = [DwReceivedHandleInfoV1::default(); 2];
-    let counts = receive_channel(control, &mut bytes, &mut handles).map_err(|_| 40u32)?;
-    if counts.bytes != bytes.len() || counts.handles != 2 {
-        close_received(&handles, counts.handles);
-        return Err(41);
-    }
-    let (role_id, active_generation, attempt_generation, endpoint, transaction_id) = match ready {
-        ControlMessage::Ready {
-            role_id,
-            bundle_generation,
-            attempt_generation,
-            endpoint,
-            transaction_id,
-        } => (
-            role_id,
-            bundle_generation,
-            attempt_generation,
-            endpoint,
-            transaction_id,
-        ),
-        _ => {
-            close_received(&handles, counts.handles);
-            return Err(42);
-        }
-    };
-    match parse(&bytes) {
-        Ok(ControlMessage::ResourceBundle {
-            role_id: observed_role,
-            bundle_generation,
-            attempt_generation: observed_attempt,
-            endpoint: observed_endpoint,
-            transaction_id: observed_transaction,
-        }) if observed_role == role_id
-            && observed_attempt == attempt_generation
-            && observed_endpoint == endpoint
-            && observed_transaction == transaction_id
-            && bundle_generation == active_generation => {}
-        _ => {
-            close_received(&handles, counts.handles);
-            return Err(43);
-        }
-    }
-    let resource_rights = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_INSPECT.0);
-    let valid_types = valid(handles[0], DW_OBJECT_TYPE_DEVICE_RESOURCE, resource_rights)
-        && valid(handles[1], DW_OBJECT_TYPE_DEVICE_RESOURCE, resource_rights);
-    let first_resource = device_resource_info(handles[0].handle);
-    let second_resource = device_resource_info(handles[1].handle);
-    let valid_mapping = match (first_resource, second_resource) {
-        (Ok(first), Ok(second)) => {
-            let valid_resource = |resource: deepwyrm_syscall::DwDeviceResourceInfoV1| {
-                resource.size == DW_DEVICE_RESOURCE_INFO_V1_SIZE
-                    && resource.version == DW_DEVICE_RESOURCE_INFO_V1_VERSION
-                    && resource.kind == DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT
-                    && resource.flags == 0
-                    && resource.resource_id == 1
-                    && resource.lease_generation == active_generation.0
-                    && resource.pio_base == 0x2f8
-                    && resource.pio_length == 8
-                    && resource.interrupt_source == 3
-                    && resource.reserved == 0
-            };
-            valid_resource(first) && valid_resource(second)
-        }
-        _ => false,
-    };
-    let mut cleanup_failed = close_handle(handles[1].handle).is_err();
-    cleanup_failed |= close_handle(handles[0].handle).is_err();
-    if !valid_types || !valid_mapping || cleanup_failed {
-        return Err(44);
-    }
-    let failure = ControlMessage::Failure {
-        role_id,
-        bundle_generation: active_generation,
-        attempt_generation,
-        endpoint,
-        transaction_id,
-        code: wyrmroot_device_proto::FailureCode::MalformedResource,
-    };
-    let mut failure_bytes = [0u8; FAILURE_BYTES];
-    encode(failure, &mut failure_bytes).map_err(|_| 45u32)?;
-    send_channel(control, &failure_bytes, &[]).map_err(|_| 46u32)
 }
 
 #[cfg(feature = "wyr1c5-production")]

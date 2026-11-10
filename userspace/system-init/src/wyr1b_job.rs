@@ -5,12 +5,8 @@ use deepwyrm_syscall::DwHandle;
 use crate::launch_transaction::LaunchTransactions;
 use crate::wyr1b::{EndpointGrant, EndpointKind, JobController, JobError};
 use wyrmroot_launch_proto::Reservation;
-#[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-use wyrmroot_launch_proto::{Message, parse_message};
 
 pub(crate) const MAX_SESSIONS: usize = 16;
-#[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-const WAIT_REQUEST_BYTES: usize = 56;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Session {
@@ -40,29 +36,6 @@ impl LaunchSessionScope {
             Self::ConsoleLauncher => false,
             Self::ShellJobs => {
                 let production = matches!(path, "bin/hello" | "bin/cpu-hog");
-                #[cfg(feature = "wyr1e-selector33")]
-                {
-                    production
-                        || matches!(
-                            path,
-                            "test/wyr1-e/exit-nonzero"
-                                | "test/wyr1-e/fault"
-                                | "test/wyr1-e/malformed-elf"
-                        )
-                }
-                #[cfg(feature = "wyr1e8-selector33")]
-                {
-                    production
-                        || matches!(
-                            path,
-                            "test/wyr1-e/exit-nonzero"
-                                | "test/wyr1-e/fault"
-                                | "test/wyr1-e/malformed-elf"
-                        )
-                        || path == wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH
-                        || path == wyrmroot_wyr1e_test_actors::STDOUT_PRESSURE_PATH
-                }
-                #[cfg(not(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33")))]
                 {
                     production
                 }
@@ -94,15 +67,6 @@ pub(crate) struct PendingWait {
     pub(crate) grant: EndpointGrant,
     pub(crate) reservation: Reservation,
     pub(crate) job_id: u64,
-    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-    request: [u8; WAIT_REQUEST_BYTES],
-}
-
-#[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-impl PendingWait {
-    pub(crate) fn request_bytes(&self) -> &[u8; WAIT_REQUEST_BYTES] {
-        &self.request
-    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -325,19 +289,6 @@ impl JobDispatcher {
         {
             return Err(JobError::ResourceIdentity);
         }
-        #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-        let request: [u8; WAIT_REQUEST_BYTES] = {
-            let parsed = parse_message(request_bytes, 0).map_err(|_| JobError::ResourceIdentity)?;
-            if parsed.reservation != reservation
-                || !matches!(parsed.message, Message::Wait { job_id: parsed_job } if parsed_job == job_id)
-            {
-                return Err(JobError::ResourceIdentity);
-            }
-            request_bytes
-                .try_into()
-                .map_err(|_| JobError::ResourceIdentity)?
-        };
-        #[cfg(not(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33")))]
         let _ = request_bytes;
         if self.pending_waits.iter().flatten().any(|pending| {
             pending.grant == grant
@@ -354,8 +305,6 @@ impl JobDispatcher {
             grant,
             reservation,
             job_id,
-            #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-            request,
         });
         Ok(())
     }
@@ -401,20 +350,6 @@ impl JobDispatcher {
             .ok_or(JobError::WrongState)?;
         self.pending_waits[index] = None;
         Ok(())
-    }
-
-    #[cfg(feature = "wyr1e8-selector33")]
-    pub(crate) fn remove_barrier_result(
-        &mut self,
-        pending: PendingWait,
-        expected: crate::wyr1b::JobResult,
-    ) -> Result<(), JobError> {
-        self.jobs.remove_invisible_completed(
-            pending.grant.endpoint_id,
-            pending.grant.endpoint_generation,
-            pending.job_id,
-            expected,
-        )
     }
 
     fn drop_session_waits(&mut self, grant: EndpointGrant) {
@@ -526,25 +461,6 @@ mod tests {
         assert!(LaunchSessionScope::ShellJobs.admits_legacy_launch("bin/hello"));
         assert!(LaunchSessionScope::ShellJobs.admits_legacy_launch("bin/cpu-hog"));
         assert!(!LaunchSessionScope::ShellJobs.admits_legacy_launch("bin/hello-extra"));
-        #[cfg(feature = "wyr1e-selector33")]
-        for path in [
-            "test/wyr1-e/exit-nonzero",
-            "test/wyr1-e/fault",
-            "test/wyr1-e/malformed-elf",
-        ] {
-            assert!(LaunchSessionScope::ShellJobs.admits_legacy_launch(path));
-        }
-        #[cfg(feature = "wyr1e8-selector33")]
-        for path in [
-            "test/wyr1-e/exit-nonzero",
-            "test/wyr1-e/fault",
-            "test/wyr1-e/malformed-elf",
-            wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH,
-            wyrmroot_wyr1e_test_actors::STDOUT_PRESSURE_PATH,
-        ] {
-            assert!(LaunchSessionScope::ShellJobs.admits_legacy_launch(path));
-        }
-        #[cfg(not(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33")))]
         assert!(!LaunchSessionScope::ShellJobs.admits_legacy_launch("test/wyr1-e/fault"));
         assert!(!LaunchSessionScope::ShellJobs.admits_legacy_launch("test/wyr1-e/fault-extra"));
         assert!(LaunchSessionScope::ConsoleLauncher.admits_shell_v1());
@@ -761,7 +677,5 @@ mod tests {
         assert_eq!(cancelled.grant, owner);
         assert_eq!(cancelled.reservation.transaction_id, 1);
         assert_eq!(cancelled.job_id, 9);
-        #[cfg(feature = "wyr1e-selector33")]
-        assert_eq!(cancelled.request_bytes(), &wait_request(replay, 9));
     }
 }

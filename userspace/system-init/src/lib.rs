@@ -6,16 +6,6 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-#[cfg(any(
-    all(feature = "wyr1e-production", feature = "wyr1d-selector32"),
-    all(feature = "wyr1e-production", feature = "dw1e3-selector31"),
-    all(feature = "wyr1e-production", feature = "wyr1c6-selector29")
-))]
-compile_error!("WYR1-E production and selector-only init policies are mutually exclusive");
-
-#[cfg(all(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-compile_error!("WYR1-E7 and E8 selector profiles are mutually exclusive");
-
 // The WYR1-E production product is the WYR1-C6 resource product plus the
 // shell controller; every selector built on it inherits both. The manifest's
 // feature lists say so, and these refuse a build in which one stopped doing so.
@@ -24,22 +14,6 @@ compile_error!("WYR1-E7 and E8 selector profiles are mutually exclusive");
     not(all(feature = "wyr1c6-production", feature = "wyr1e-shell-controller"))
 ))]
 compile_error!("wyr1e-production must compose wyr1c6-production and wyr1e-shell-controller");
-
-#[cfg(all(
-    any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"),
-    not(feature = "wyr1e-production")
-))]
-compile_error!("the WYR1-E7 and E8 selector profiles are additive over wyr1e-production");
-
-// Selector 29 runs on the WYR1-C6 resource product, which is the WYR1-C5
-// four-capability resource product; main.rs selects
-// `continue_system_init_resource_product` for exactly the C4/C5 family. These
-// refuse a build in which the manifest stopped composing them.
-#[cfg(all(
-    feature = "wyr1c6-selector29",
-    not(all(feature = "wyr1c6-production", feature = "wyr1c6-test-evidence"))
-))]
-compile_error!("wyr1c6-selector29 must compose wyr1c6-production and wyr1c6-test-evidence");
 
 #[cfg(all(feature = "wyr1c6-production", not(feature = "wyr1c5-production")))]
 compile_error!("wyr1c6-production must compose the wyr1c5-production resource product");
@@ -53,25 +27,13 @@ use {wyrmroot_devmgr as _, wyrmroot_uart16550d as _};
 
 pub mod evidence;
 pub mod gate;
-#[cfg(any(test, feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-mod launch_request_facts;
 mod launch_transaction;
 pub mod resident_loop;
 pub mod wyr1b;
 pub mod wyr1b_gate;
 mod wyr1b_job;
 pub mod wyr1b_native;
-#[cfg(feature = "wyr1c6-selector29")]
-pub mod wyr1c6_gate;
 pub mod wyr1c_native;
-#[cfg(feature = "wyr1d-selector32")]
-pub mod wyr1d_gate;
-#[cfg(any(test, feature = "wyr1e-selector33"))]
-mod wyr1e7_evidence;
-#[cfg(any(test, feature = "wyr1e8-selector33"))]
-mod wyr1e8_evidence;
-#[cfg(feature = "wyr1f-closure")]
-mod wyr1f_closure;
 
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
@@ -318,10 +280,6 @@ const fn failure_kind(error: &InitError) -> u8 {
         | InitError::Evidence(_)
         | InitError::Wyr1BGateConfig(_)
         | InitError::Wyr1BEvidence(_) => 0x08,
-        #[cfg(feature = "wyr1b-test-evidence")]
-        InitError::StartupMapping(_) | InitError::OrdinaryMapping(_) => 0x07,
-        #[cfg(feature = "wyr1c6-selector29")]
-        InitError::Wyr1C6GateConfig(_) => 0x08,
         InitError::RecoveryTransition {
             initiating_kind,
             emergency_cleanup,
@@ -546,206 +504,12 @@ pub struct TickFailure {
     pub saturated: bool,
 }
 
-/// Test-only application status that preserves the top-level init failure
-/// category across the selector's process-exit boundary. These values are
-/// diagnostic evidence, not part of the production application-status ABI.
-#[cfg(any(
-    feature = "wyr1-test-evidence",
-    feature = "wyr1b-test-evidence",
-    feature = "wyr1c6-selector29"
-))]
-const fn test_failure_category(error: &InitError) -> u32 {
-    match error {
-        InitError::WrongManifestProfile => 0x01,
-        InitError::UnlaunchableRole => 0x02,
-        InitError::WrongActivationOrder => 0x03,
-        // Its own category rather than 0x03's: this space has room, and the
-        // point of splitting the variant was that "an expected slot was
-        // absent" and "the activation order was violated" are different
-        // findings. 0x21..=0x24 were unallocated.
-        InitError::AbsentState(_) => 0x21,
-        InitError::LaunchProtocol(_) => 0x22,
-        InitError::MissingAttemptResources => 0x04,
-        InitError::ResourcesAlreadyInstalled => 0x05,
-        InitError::ResourceIdentityMismatch => 0x06,
-        InitError::InvalidResourceHandle => 0x07,
-        InitError::Restart(_) => 0x08,
-        InitError::Bootfs(_) => 0x09,
-        InitError::MissingRetainedMaterial => 0x0a,
-        InitError::NonExecutableRole => 0x0b,
-        InitError::Manifest(_) => 0x0c,
-        InitError::ZeroBootGeneration => 0x0d,
-        InitError::ArtifactIdentityMismatch(_) => 0x0e,
-        InitError::Native(_) => 0x0f,
-        InitError::Capability(_) => 0x10,
-        InitError::Mapping(_) => 0x11,
-        #[cfg(feature = "wyr1b-test-evidence")]
-        InitError::StartupMapping(_) => 0x11,
-        #[cfg(feature = "wyr1b-test-evidence")]
-        InitError::OrdinaryMapping(_) => 0x11,
-        InitError::Launch(_) => 0x12,
-        InitError::Loader(_) => 0x13,
-        InitError::Supervision => 0x14,
-        InitError::Cleanup => 0x15,
-        InitError::Accounting => 0x16,
-        InitError::GateConfig(_) => 0x17,
-        InitError::Evidence(_) => 0x18,
-        InitError::Wyr1BGateConfig(_) => 0x19,
-        InitError::RegistryProtocol(_) => 0x1a,
-        InitError::Wyr1BGateProtocol(_) => 0x1b,
-        InitError::Wyr1BGateMismatch => 0x1c,
-        InitError::Wyr1BModel(_) => 0x1d,
-        InitError::Wyr1BEvidence(_) => 0x1e,
-        #[cfg(feature = "wyr1c6-selector29")]
-        InitError::Wyr1C6GateConfig(_) => 0x1f,
-        InitError::RecoveryTransition { .. } => 0x20,
-        InitError::RegistryAbandoned(_) => 0x23,
-        InitError::BootstrapRetirement(_) => 0x26,
-        // F3A.7i. Its own category rather than `Cleanup`'s 0x15, for the
-        // reason the variant exists: a shutdown that could not release
-        // something and an ordinary cleanup failure are different findings.
-        // 0x28 was unallocated.
-        InitError::SessionShutdown(_) => 0x28,
-    }
-}
-
-/// Selector-29-only status preserving the pre-READY system-init failure
-/// category across the primordial Process-exit boundary.
-#[cfg(feature = "wyr1c6-selector29")]
-#[must_use]
-pub const fn wyr1c6_test_failure_application_status(error: &InitError) -> u32 {
-    match error {
-        InitError::Native(error) => 0xAF1D_0000 | wyrmroot_runtime::native_error_code(*error),
-        _ => 0xAF1C_0000 | test_failure_category(error),
-    }
-}
-
-#[cfg(feature = "wyr1-test-evidence")]
-#[must_use]
-pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
-    0xAF11_0000 | test_failure_category(error)
-}
-
-/// Coarse, bounded classification of the queried startup bootfs size.
-#[cfg(feature = "wyr1b-test-evidence")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum StartupBootfsSizeClass {
-    Zero = 0,
-    SmallNonzero = 1,
-    Admitted = 2,
-    OverMaximum = 3,
-    GarbageHigh = 4,
-}
-
-/// Selector-27-only evidence for the initial bootfs mapping-plan failure.
-#[cfg(feature = "wyr1b-test-evidence")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StartupMappingDiagnostic {
-    error: MappingPlanError,
-    size_class: StartupBootfsSizeClass,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(crate) enum MappingDiagnosticSite {
     RoleRemap = 1,
     JobDispatcher = 2,
     RegistryReplacement = 3,
-}
-
-/// Selector-27-only evidence for a post-startup bootfs mapping-plan failure.
-#[cfg(feature = "wyr1b-test-evidence")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OrdinaryMappingDiagnostic {
-    site: MappingDiagnosticSite,
-    error: MappingPlanError,
-    size_class: StartupBootfsSizeClass,
-}
-
-#[cfg(feature = "wyr1b-test-evidence")]
-const fn startup_bootfs_size_class(size: u64) -> StartupBootfsSizeClass {
-    if size == 0 {
-        StartupBootfsSizeClass::Zero
-    } else if size < wyrmroot_runtime::PAGE_SIZE {
-        StartupBootfsSizeClass::SmallNonzero
-    } else if size <= wyrmroot_runtime::MAX_BOOTFS_LOGICAL_SIZE {
-        StartupBootfsSizeClass::Admitted
-    } else if size < (1_u64 << 63) {
-        StartupBootfsSizeClass::OverMaximum
-    } else {
-        StartupBootfsSizeClass::GarbageHigh
-    }
-}
-
-#[cfg(feature = "wyr1b-test-evidence")]
-const fn mapping_failure_ordinal(
-    site: u32,
-    error: MappingPlanError,
-    size_class: StartupBootfsSizeClass,
-) -> u32 {
-    // Exhaustive on the error axis per `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md`
-    // §3.4: a fourth `MappingPlanError` variant must fail to compile here rather
-    // than silently become the implausible-combination sentinel. The size-class
-    // axis keeps its sentinel, because most of the product genuinely cannot
-    // occur and `0x1f` is the right answer when it appears to.
-    const IMPLAUSIBLE: u32 = 0x1f;
-    let outcome = match error {
-        MappingPlanError::EmptyArchive => match size_class {
-            StartupBootfsSizeClass::Zero => 0,
-            _ => IMPLAUSIBLE,
-        },
-        MappingPlanError::ArchiveTooLarge => match size_class {
-            StartupBootfsSizeClass::OverMaximum => 1,
-            StartupBootfsSizeClass::GarbageHigh => 2,
-            _ => IMPLAUSIBLE,
-        },
-        MappingPlanError::RoundingOverflow => IMPLAUSIBLE,
-    };
-    if outcome == IMPLAUSIBLE {
-        outcome
-    } else {
-        site * 3 + outcome + 1
-    }
-}
-
-/// Selector-27 test evidence keeps supplementary mapping detail in the byte
-/// above the category. Its low five bits carry the claim-bearing ordinal that
-/// survives primordial application-summary compression: three reachable
-/// mapping outcomes for each of four ordered mapping sites produce `1..=12`.
-#[cfg(feature = "wyr1b-test-evidence")]
-#[must_use]
-pub const fn wyr1b_test_failure_application_status(error: &InitError) -> u32 {
-    let (detail, ordinal) = match error {
-        InitError::StartupMapping(diagnostic) => {
-            let variant = match diagnostic.error {
-                MappingPlanError::EmptyArchive => 1,
-                MappingPlanError::ArchiveTooLarge => 2,
-                MappingPlanError::RoundingOverflow => 3,
-            };
-            (
-                (variant << 4) | diagnostic.size_class as u32,
-                mapping_failure_ordinal(0, diagnostic.error, diagnostic.size_class),
-            )
-        }
-        InitError::OrdinaryMapping(diagnostic) => {
-            let variant = match diagnostic.error {
-                MappingPlanError::EmptyArchive => 1,
-                MappingPlanError::ArchiveTooLarge => 2,
-                MappingPlanError::RoundingOverflow => 3,
-            };
-            (
-                ((diagnostic.site as u32) << 6) | (variant << 3) | diagnostic.size_class as u32,
-                mapping_failure_ordinal(
-                    diagnostic.site as u32,
-                    diagnostic.error,
-                    diagnostic.size_class,
-                ),
-            )
-        }
-        _ => (0, test_failure_category(error)),
-    };
-    0xAF11_0000 | (detail << 8) | ordinal
 }
 
 /// Boot-lifetime owner of the fixed supervisor state and primordial authority.
@@ -770,10 +534,6 @@ pub struct ResidentSystemInit {
     wyr1b: Option<wyr1b_native::ResidentState>,
     wyr1b_evidence: Option<wyr1b_gate::EvidenceLog>,
     wyr1c: Option<wyr1c_native::ResidentState>,
-    /// The declared final-closure episode. Present only in the instrumented
-    /// artifact; `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4.
-    #[cfg(feature = "wyr1f-closure")]
-    wyr1f: wyr1f_closure::ClosureEpisode,
 }
 
 /// Broad primordial resource-domain custody. It is intentionally not a field
@@ -905,22 +665,6 @@ impl ResidentSystemInit {
     #[must_use]
     pub fn wyr1b_evidence_record(&self, index: usize) -> Option<&[u8; wyr1b_gate::RECORD_BYTES]> {
         self.wyr1b_evidence.as_ref()?.record_at(index)
-    }
-
-    /// Returns one completed selector-29 WRC6 record. Incomplete joins expose
-    /// no record and therefore cannot be submitted as acceptance evidence.
-    #[cfg(feature = "wyr1c6-selector29")]
-    #[must_use]
-    pub fn write_wyr1c6_evidence_record(
-        &self,
-        index: usize,
-        output: &mut [u8; wyr1c6_gate::RECORD_BYTES],
-    ) -> Option<()> {
-        self.wyr1c
-            .as_ref()?
-            .c6_evidence
-            .as_ref()?
-            .encode_record_at(index, output)
     }
 
     /// Advances the permanent fixed-role control loop without inventing service
@@ -1268,10 +1012,6 @@ pub enum InitError {
     Native(NativeError),
     Capability(CapabilityValidationError),
     Mapping(MappingPlanError),
-    #[cfg(feature = "wyr1b-test-evidence")]
-    StartupMapping(StartupMappingDiagnostic),
-    #[cfg(feature = "wyr1b-test-evidence")]
-    OrdinaryMapping(OrdinaryMappingDiagnostic),
     Launch(wyrmroot_loader::launch::LaunchError),
     /// A launch-protocol message refused parsing, with the reason it refused.
     ///
@@ -1294,8 +1034,6 @@ pub enum InitError {
     Wyr1BGateMismatch,
     Wyr1BModel(wyr1b::JobError),
     Wyr1BEvidence(wyr1b_gate::GateError),
-    #[cfg(feature = "wyr1c6-selector29")]
-    Wyr1C6GateConfig(wyr1c6_gate::GateError),
     /// A bounded recovery transition failed, naming the operation it failed in.
     /// An expected state slot was absent, at the numbered site that found it.
     ///
@@ -1643,24 +1381,6 @@ impl SystemInit {
         self.index(role).map(|i| self.roles[i].restart.state())
     }
 
-    #[cfg(feature = "wyr1c6-selector29")]
-    #[must_use]
-    pub const fn c6_startup_profiles_exclude_direct_device_authority(&self) -> bool {
-        matches!(
-            self.registry_startup_profile,
-            StartupProfile::BootstrapRegistry
-        ) && matches!(
-            self.devmgr_startup_profile,
-            StartupProfile::DeviceCoordinator
-        )
-    }
-
-    #[cfg(feature = "wyr1c6-selector29")]
-    #[must_use]
-    pub fn role_failure_count(&self, role: RoleId) -> Option<usize> {
-        self.index(role)
-            .map(|index| self.roles[index].restart.history().len())
-    }
     #[must_use]
     pub fn resources(&self, role: RoleId) -> Option<&AttemptResources> {
         self.index(role)
@@ -1688,24 +1408,6 @@ impl SystemInit {
     #[must_use]
     pub const fn outstanding_reservations(&self) -> usize {
         self.accounting.outstanding()
-    }
-
-    /// Installs the declared gate configuration and its evidence log on an
-    /// already-built controller.
-    ///
-    /// F3A.7k: until now only the closure fixture called this. The resident
-    /// product builds its controller through `from_wyr1e_manifest`, which
-    /// leaves both empty, and nothing on that path read the retained gate
-    /// config: the declared degraded episode was inert in every real
-    /// instrumented boot, and the supervisor had no evidence log to emit.
-    /// `wyr1c_native::activate_in_place` now calls it for the instrumented
-    /// init; the production init compiles none of this.
-    #[cfg(feature = "wyr1f-closure")]
-    pub(crate) fn install_wyr1f_gate(&mut self, gate: GateConfig) -> Result<(), InitError> {
-        self.gate = Some(gate);
-        self.evidence =
-            Some(EvidenceLog::new(gate.nonce, gate.scenario).map_err(InitError::Evidence)?);
-        Ok(())
     }
 
     #[must_use]
@@ -2104,22 +1806,6 @@ impl SystemInit {
         Ok(())
     }
 
-    /// Records a production role's bring-up READY that this controller did
-    /// not observe through `ready`, because the role is not one it activates.
-    /// F3A.7k; see `wyr1f_closure::BringupEvidence`.
-    #[cfg(feature = "wyr1f-closure")]
-    pub(crate) fn record_bringup_ready(
-        &mut self,
-        role: RoleId,
-        generation: u64,
-        transaction: u64,
-    ) -> Result<(), InitError> {
-        if self.index(role).is_some() {
-            return Err(InitError::WrongActivationOrder);
-        }
-        self.record_evidence(EvidenceEvent::Ready, role, generation, transaction, 0)
-    }
-
     fn finalize_evidence(&mut self, result: RecoveryResult) -> Result<(), InitError> {
         if let Some(evidence) = &mut self.evidence {
             match result {
@@ -2303,27 +1989,6 @@ pub trait Wyr1BPlatform: InitPlatform {
         rights: DwRights,
     ) -> Result<DwHandle, NativeError>;
 
-    /// Sends one observer-only WRE1 record to the selector-33 kernel relay.
-    #[cfg(feature = "wyr1e-selector33")]
-    fn submit_wyr1e7_evidence(&mut self, _record: &[u8; 192]) -> Result<(), NativeError> {
-        #[cfg(test)]
-        return Ok(());
-        #[cfg(not(test))]
-        Err(NativeError::Output(
-            wyrmroot_runtime::NativeOutputError::InvalidWaitResult,
-        ))
-    }
-
-    /// Sends one observer-only WRE1 v1.1 record to the selector-33 relay.
-    #[cfg(feature = "wyr1e8-selector33")]
-    fn submit_wyr1e8_evidence(&mut self, _record: &[u8; 192]) -> Result<(), NativeError> {
-        #[cfg(test)]
-        return Ok(());
-        #[cfg(not(test))]
-        Err(NativeError::Output(
-            wyrmroot_runtime::NativeOutputError::InvalidWaitResult,
-        ))
-    }
 }
 
 /// Runs the native selected-generation activation through NORMAL or DEGRADED.
@@ -2354,8 +2019,6 @@ where
             )
         },
     )?;
-    #[cfg(feature = "wyr1f-closure")]
-    let wyr1f = wyr1f_closure::ClosureEpisode::new(activation.controller.gate_config());
     Ok(ResidentSystemInit {
         controller: activation.controller,
         authority,
@@ -2367,8 +2030,6 @@ where
         wyr1b: None,
         wyr1b_evidence: None,
         wyr1c: None,
-        #[cfg(feature = "wyr1f-closure")]
-        wyr1f,
     })
 }
 
@@ -2770,14 +2431,6 @@ where
 }
 
 fn startup_mapping_error(error: MappingPlanError, size: u64) -> InitError {
-    #[cfg(feature = "wyr1b-test-evidence")]
-    {
-        InitError::StartupMapping(StartupMappingDiagnostic {
-            error,
-            size_class: startup_bootfs_size_class(size),
-        })
-    }
-    #[cfg(not(feature = "wyr1b-test-evidence"))]
     {
         let _ = size;
         InitError::Mapping(error)
@@ -2789,15 +2442,6 @@ pub(crate) fn ordinary_mapping_error(
     error: MappingPlanError,
     size: u64,
 ) -> InitError {
-    #[cfg(feature = "wyr1b-test-evidence")]
-    {
-        InitError::OrdinaryMapping(OrdinaryMappingDiagnostic {
-            site,
-            error,
-            size_class: startup_bootfs_size_class(size),
-        })
-    }
-    #[cfg(not(feature = "wyr1b-test-evidence"))]
     {
         let _ = (site, size);
         InitError::Mapping(error)
@@ -2884,8 +2528,6 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     let controller = validate_retained_bootfs(bootfs)?;
-    #[cfg(feature = "wyr1f-closure")]
-    let wyr1f = wyr1f_closure::ClosureEpisode::new(controller.gate_config());
     let resident = slot.write(ResidentSystemInit {
         controller,
         authority,
@@ -2897,8 +2539,6 @@ where
         wyr1b: None,
         wyr1b_evidence: None,
         wyr1c: None,
-        #[cfg(feature = "wyr1f-closure")]
-        wyr1f,
     });
     resident.result = activate_retained_bootfs_state(
         system,
@@ -3781,10 +3421,6 @@ mod native_cleanup_tests {
         close_count: usize,
         wake_now: Option<u64>,
         wait_deadline: Option<u64>,
-        #[cfg(feature = "wyr1-test-evidence")]
-        wyr1_submitted: [[u8; 114]; 2],
-        #[cfg(feature = "wyr1-test-evidence")]
-        wyr1_submissions: usize,
         wyr1b_calls: usize,
     }
 
@@ -3798,10 +3434,6 @@ mod native_cleanup_tests {
                 close_count: 0,
                 wake_now: None,
                 wait_deadline: None,
-                #[cfg(feature = "wyr1-test-evidence")]
-                wyr1_submitted: [[0; 114]; 2],
-                #[cfg(feature = "wyr1-test-evidence")]
-                wyr1_submissions: 0,
                 wyr1b_calls: 0,
             }
         }
@@ -4157,317 +3789,6 @@ mod native_cleanup_tests {
         controller
     }
 
-    /// Contract §11 item 4: shell exit and restart under DEGRADED.
-    ///
-    /// The half of that obligation that lives in the supervisor. §5.4 argues a
-    /// replacement shell cannot silently restore NORMAL because wyrmsh READY
-    /// "hits the `_ => {}` arm" of `ready()`. That arm is real but is not what
-    /// protects this: `ready()` rejects wyrmsh before reaching any arm, because
-    /// `index()` maps only Registryd and Devmgr. The protection is stronger
-    /// than the argument given for it -- no wyrmsh generation can enter the
-    /// supervisor's mode machinery at all -- and the same holds for the three
-    /// other non-early roles, so a replacement consoled cannot restore NORMAL
-    /// either.
-    #[cfg(feature = "wyr1f-closure")]
-    #[test]
-    fn no_console_or_shell_generation_can_restore_normal_after_degraded() {
-        let mut controller = ready_registry_controller();
-        install_ready_attempt(&mut controller, RoleId::Devmgr, 1, 0x1002, (11, 21, 31), 3);
-        controller
-            .retire_active_fail_closed(
-                RoleId::Devmgr,
-                1,
-                0x1002,
-                9,
-                AttemptFailure::WaitFailed,
-                CleanupDisposition::Complete,
-            )
-            .unwrap();
-        assert_eq!(controller.mode(), SystemMode::Degraded);
-        assert_eq!(controller.degraded_transitions(), 1);
-
-        // Every role outside the two early slots is refused outright, at any
-        // generation or transaction, and leaves the mode alone.
-        for role in [RoleId::Uart16550d, RoleId::Consoled, RoleId::Wyrmsh] {
-            for (generation, transaction) in [(1, 0x1002), (2, 0x2002), (9, 0x9009)] {
-                assert_eq!(
-                    controller.ready(role, generation, transaction, 20),
-                    Err(InitError::UnlaunchableRole)
-                );
-                assert_eq!(
-                    controller.child_started(role, generation, transaction, 20),
-                    Err(InitError::UnlaunchableRole)
-                );
-            }
-        }
-        assert_eq!(controller.mode(), SystemMode::Degraded);
-        assert_eq!(controller.degraded_transitions(), 1);
-
-        // DEGRADED is a trustworthy substrate. It is not FATAL, and reaching
-        // it did not consume the distinction.
-        assert_ne!(controller.mode(), SystemMode::Fatal);
-        controller.fatal();
-        assert_eq!(controller.mode(), SystemMode::Fatal);
-    }
-
-    /// The final closure episode, driven through the real transition owner.
-    ///
-    /// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4. The episode itself never
-    /// fails a role, counts an attempt, moves a deadline or sets a mode, so
-    /// this test asserts the property on `SystemInit`: one episode drives the
-    /// reached `NORMAL -> ActivatingEarlyRoles -> ... -> PermanentFailure ->
-    /// DEGRADED` path exactly once, `degraded_transitions` is exactly 1, and
-    /// exactly one `PermanentFailure` evidence record is emitted -- no matter
-    /// how many times the trigger is delivered.
-    #[cfg(feature = "wyr1f-closure")]
-    #[test]
-    fn the_declared_episode_exhausts_the_real_supervisor_exactly_once() {
-        use crate::gate::{GateConfig, GateContract, GateScenario};
-        use crate::wyr1f_closure::ClosureEpisode;
-
-        let gate = GateConfig {
-            contract: GateContract::Dw1Wyr1InteractiveClosure,
-            scenario: GateScenario::DegradedRecovery,
-            nonce: 0x00ff,
-        };
-        let mut controller = ready_registry_controller();
-        controller.evidence = Some(EvidenceLog::new(gate.nonce, gate.scenario).unwrap());
-        let devmgr =
-            install_ready_attempt(&mut controller, RoleId::Devmgr, 1, 0x1002, (11, 21, 31), 3);
-        assert_eq!(controller.mode(), SystemMode::Normal);
-
-        let mut episode = ClosureEpisode::new(Some(gate));
-        // Deliver the trigger before the join, repeatedly. Nothing arms.
-        for _ in 0..4 {
-            episode.observe_ready_join(true, false);
-            assert!(!episode.take_trigger());
-        }
-        assert_eq!(controller.mode(), SystemMode::Normal);
-        assert_eq!(controller.degraded_transitions(), 0);
-
-        episode.observe_ready_join(true, true);
-        assert!(episode.take_trigger());
-        // Everything from here is the supervisor's, exactly as `recover_devmgr`
-        // and `launch_devmgr_replacement` drive it: `fail`, `cleanup_complete`,
-        // then `advance_or_degrade`'s `start_replacement` or its terminal
-        // report. The episode contributes nothing but the refusal.
-        let mut now = 10;
-        let mut generation = devmgr.generation;
-        let mut transaction = devmgr.transaction_id;
-        let mut attempts = 0_u32;
-        while episode.refuses_activation() {
-            attempts += 1;
-            assert!(attempts < 16, "the episode must exhaust deterministically");
-            // The running owner is lost as `recover_devmgr` loses it; each
-            // replacement fails as `launch_devmgr_replacement`'s refusal arm
-            // fails it. The supervisor admits exactly one failure kind per
-            // state, which is itself the check that this is the reached path.
-            let failure = match controller.role_state(RoleId::Devmgr).unwrap() {
-                RestartState::Ready { .. } => AttemptFailure::WaitFailed,
-                _ => AttemptFailure::CreationFailed,
-            };
-            controller
-                .fail(RoleId::Devmgr, generation, transaction, now, failure)
-                .unwrap();
-            controller
-                .cleanup_complete(RoleId::Devmgr, generation, transaction, now + 1)
-                .unwrap();
-            match controller.role_state(RoleId::Devmgr).unwrap() {
-                RestartState::PermanentFailure { .. } => {
-                    // `advance_or_degrade` reports the terminal result here.
-                    episode.observe_terminal();
-                }
-                RestartState::Backoff {
-                    next_generation,
-                    deadline_ns,
-                    ..
-                } => {
-                    now = deadline_ns;
-                    transaction = next_transaction(transaction).unwrap();
-                    generation = next_generation;
-                    controller
-                        .start_replacement(RoleId::Devmgr, now, generation, transaction)
-                        .unwrap();
-                    // The mode does not leave NORMAL during the retries.
-                    // Contract §5.4 names `terminal()` and an intermediate
-                    // ActivatingEarlyRoles hop, but `terminal()` belongs to
-                    // `wyr1b_native::control_tick`, and a product with a
-                    // `wyr1c` resident dispatches to `wyr1c_native::control_tick`
-                    // instead, where `recover_devmgr` uses `fail`. See the
-                    // §5.4 amendment.
-                    assert_eq!(controller.mode(), SystemMode::Normal);
-                }
-                other => panic!("unexpected state {other:?}"),
-            }
-        }
-
-        // The WYR0-I budget is four attempts including the initial launch: the
-        // running owner plus three replacements, and no more.
-        assert_eq!(attempts, 4);
-        assert_eq!(controller.mode(), SystemMode::Degraded);
-        assert_eq!(controller.degraded_transitions(), 1);
-        assert!(episode.is_complete());
-
-        // Exactly one PermanentFailure record, and re-delivering the trigger
-        // after the terminal result adds neither a transition nor a record.
-        let permanent = (0..)
-            .map_while(|index| controller.evidence_line(index))
-            .filter(|line| &line[39..41] == b"04")
-            .count();
-        assert_eq!(permanent, 1);
-        for _ in 0..4 {
-            episode.observe_ready_join(true, true);
-            assert!(!episode.take_trigger());
-            assert!(!episode.refuses_activation());
-        }
-        assert_eq!(controller.degraded_transitions(), 1);
-    }
-
-    #[cfg(feature = "wyr1e8-selector33")]
-    #[test]
-    fn admitted_recovery_keeps_owner_reserved_until_exact_cleanup() {
-        let mut controller = ready_registry_controller();
-        controller
-            .admit_recovery(RoleId::Registryd, 1, 0x1001, 3_000_000_000)
-            .unwrap();
-        assert_eq!(controller.outstanding_reservations(), 1);
-        assert!(controller.resources(RoleId::Registryd).is_some());
-        let restart = controller.roles[0].restart;
-        let accounting = controller.accounting;
-        assert_eq!(
-            controller.admit_recovery(RoleId::Registryd, 1, 0x1001, 3_000_000_001),
-            Err(InitError::Restart(RestartTransitionError::InvalidState))
-        );
-        assert_eq!(controller.roles[0].restart, restart);
-        assert_eq!(controller.accounting, accounting);
-        assert_eq!(
-            controller.cleanup_complete(RoleId::Registryd, 2, 0x1001, 3_000_000_001),
-            Err(InitError::Restart(RestartTransitionError::StaleGeneration))
-        );
-        assert_eq!(controller.outstanding_reservations(), 1);
-        controller
-            .cleanup_complete(RoleId::Registryd, 1, 0x1001, 3_000_000_001)
-            .unwrap();
-        assert_eq!(controller.outstanding_reservations(), 0);
-        assert!(controller.resources(RoleId::Registryd).is_none());
-        assert_ne!(controller.mode(), SystemMode::Degraded);
-        assert_eq!(
-            controller.role_state(RoleId::Registryd),
-            Some(RestartState::Backoff {
-                next_attempt: 2,
-                next_generation: 2,
-                deadline_ns: 3_025_000_001,
-            })
-        );
-    }
-
-    #[cfg(feature = "wyr1e8-selector33")]
-    #[test]
-    fn recovery_admission_rejects_wrong_owner_and_invalid_clock_without_mutation() {
-        for (role, generation, transaction, now, error) in [
-            (
-                RoleId::Consoled,
-                1,
-                0x1001,
-                3_000_000_000,
-                InitError::UnlaunchableRole,
-            ),
-            (
-                RoleId::Registryd,
-                2,
-                0x1001,
-                3_000_000_000,
-                InitError::Restart(RestartTransitionError::StaleGeneration),
-            ),
-            (
-                RoleId::Registryd,
-                1,
-                0x1002,
-                3_000_000_000,
-                InitError::Restart(RestartTransitionError::TransactionMismatch),
-            ),
-            (
-                RoleId::Registryd,
-                1,
-                0x1001,
-                0,
-                InitError::Restart(RestartTransitionError::TimeRegression),
-            ),
-            (
-                RoleId::Registryd,
-                1,
-                0x1001,
-                u64::MAX,
-                InitError::Restart(RestartTransitionError::ArithmeticOverflow),
-            ),
-        ] {
-            let mut controller = ready_registry_controller();
-            let unchanged = ready_registry_controller();
-            assert_eq!(
-                controller.admit_recovery(role, generation, transaction, now),
-                Err(error)
-            );
-            assert_eq!(controller, unchanged);
-        }
-    }
-
-    #[cfg(feature = "wyr1e8-selector33")]
-    #[test]
-    fn recovery_admission_requires_exact_published_resources_without_mutation() {
-        let mutations: [fn(&mut SystemInit); 6] = [
-            |controller| controller.roles[0].resources.as_mut().unwrap().role = RoleId::Devmgr,
-            |controller| {
-                controller.roles[0]
-                    .resources
-                    .as_mut()
-                    .unwrap()
-                    .reservation
-                    .role = RoleId::Devmgr
-            },
-            |controller| {
-                controller.roles[0]
-                    .resources
-                    .as_mut()
-                    .unwrap()
-                    .reservation
-                    .published = false
-            },
-            |controller| {
-                controller.roles[0]
-                    .resources
-                    .as_mut()
-                    .unwrap()
-                    .reservation
-                    .released = true
-            },
-            |controller| controller.accounting.slots[0].published = false,
-            |controller| controller.accounting.slots[0].nonce += 1,
-        ];
-        for mutate in mutations {
-            let mut controller = ready_registry_controller();
-            let mut unchanged = ready_registry_controller();
-            mutate(&mut controller);
-            mutate(&mut unchanged);
-            assert_eq!(
-                controller.admit_recovery(RoleId::Registryd, 1, 0x1001, 3_000_000_000),
-                Err(InitError::Accounting)
-            );
-            assert_eq!(controller, unchanged);
-        }
-        let mut controller = ready_registry_controller();
-        let retained = controller.roles[0].resources.take().unwrap();
-        let restart = controller.roles[0].restart;
-        let accounting = controller.accounting;
-        assert_eq!(
-            controller.admit_recovery(RoleId::Registryd, 1, 0x1001, 3_000_000_000),
-            Err(InitError::MissingAttemptResources)
-        );
-        assert_eq!(controller.roles[0].restart, restart);
-        assert_eq!(controller.accounting, accounting);
-        controller.roles[0].resources = Some(retained);
-        assert_eq!(controller, ready_registry_controller());
-    }
-
     #[test]
     fn fail_closed_complete_retirement_releases_accounting_and_degrades() {
         let mut controller = ready_registry_controller();
@@ -4583,8 +3904,6 @@ mod native_cleanup_tests {
             wyr1b: None,
             wyr1b_evidence: None,
             wyr1c: None,
-            #[cfg(feature = "wyr1f-closure")]
-            wyr1f: wyr1f_closure::ClosureEpisode::new(None),
         };
         (resident, registry, devmgr)
     }
@@ -4626,26 +3945,8 @@ mod native_cleanup_tests {
     /// The resident loop's own platform for `MockNative`. Selectors 29 and 34
     /// drive their own scenario from the loop on every tick, which this fixture
     /// does not carry, so the loop tests below run in every other shape.
-    #[cfg(not(feature = "wyr1c6-selector29"))]
     impl resident_loop::ResidentLoopPlatform for MockNative {
-        /// Records each submission, then refuses it, as a kernel that will
-        /// not take the record would.
-        #[cfg(feature = "wyr1-test-evidence")]
-        fn submit_wyr1_evidence(&mut self, record: &[u8; 114]) -> Result<(), NativeError> {
-            if let Some(slot) = self.wyr1_submitted.get_mut(self.wyr1_submissions) {
-                *slot = *record;
-            }
-            self.wyr1_submissions += 1;
-            Err(FAILURE)
-        }
 
-        #[cfg(feature = "wyr1b-test-evidence")]
-        fn submit_wyr1b_evidence(
-            &mut self,
-            _record: &[u8; wyr1b_gate::RECORD_BYTES],
-        ) -> Result<(), NativeError> {
-            Err(FAILURE)
-        }
     }
 
     /// F3A.7g, the last step: a completed session ends permanent init's
@@ -4655,7 +3956,6 @@ mod native_cleanup_tests {
     /// before the wait: `MockNative` fails any wait, so a loop that slept
     /// before checking, or checked only after a later tick, would report
     /// 0xAF01_0005 instead.
-    #[cfg(not(feature = "wyr1c6-selector29"))]
     #[test]
     fn permanent_init_leaves_its_loop_when_the_session_is_complete() {
         let (mut resident, _, _) = two_role_resident();
@@ -4673,7 +3973,6 @@ mod native_cleanup_tests {
 
     /// The control for the test above: the same resident with its session
     /// still open does not leave the loop, and reaches the tick wait.
-    #[cfg(not(feature = "wyr1c6-selector29"))]
     #[test]
     fn an_open_session_keeps_permanent_init_in_its_loop() {
         let (mut resident, _, _) = two_role_resident();
@@ -4688,101 +3987,13 @@ mod native_cleanup_tests {
         assert_eq!(waits.wait_count, 3);
     }
 
-    /// F3A.6: a fatally failed bring-up submits the evidence it already
-    /// encoded before it reports the failure, and a refused submission does
-    /// not replace the failure's own status.
-    ///
-    /// The tick fails because its instant is older than the last tick's.
-    /// Selector 25's drain is the only one that runs on a failed tick, so this
-    /// runs where `wyr1-test-evidence` is compiled (the wyr1f shape).
-    #[cfg(all(feature = "wyr1-test-evidence", not(feature = "wyr1c6-selector29")))]
-    #[test]
-    fn a_fatal_control_tick_submits_its_evidence_before_reporting_the_failure() {
-        let failing_resident = || {
-            let (mut resident, _, _) = two_role_resident();
-            let mut log = EvidenceLog::new(0x00ff, crate::gate::GateScenario::Normal).unwrap();
-            log.record(EvidenceEvent::Ready, 1, 1, 0x1001, 0).unwrap();
-            log.record(EvidenceEvent::Ready, 2, 1, 0x1002, 0).unwrap();
-            resident.controller.evidence = Some(log);
-            resident.last_tick_ns = MockNative::new().now + 1;
-            resident
-        };
-        let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
-
-        let mut twin = failing_resident();
-        let error = twin
-            .control_tick_product(
-                &mut MockNative::new(),
-                &mut loader,
-                &mut ResidentWaits { wait_count: 0 },
-                MockNative::new().now,
-            )
-            .expect_err("the fixture's tick fails");
-
-        let mut resident = failing_resident();
-        let records = [
-            *resident
-                .controller
-                .evidence
-                .as_ref()
-                .unwrap()
-                .line(0)
-                .unwrap(),
-            *resident
-                .controller
-                .evidence
-                .as_ref()
-                .unwrap()
-                .line(1)
-                .unwrap(),
-        ];
-        let mut native = MockNative::new();
-        let mut waits = ResidentWaits { wait_count: 0 };
-        assert_eq!(
-            resident_loop::continue_resident(&mut resident, &mut native, &mut loader, &mut waits),
-            resident_tick_failure_application_status(&error)
-        );
-        assert!(!resident.evidence_finalized());
-        assert_eq!(native.wyr1_submissions, 2);
-        assert_eq!(native.wyr1_submitted, records);
-    }
-
-    /// The ordinary drain: once the evidence is finalized, the loop submits
-    /// every record, and a refused submission is the loop's failure.
-    #[cfg(all(feature = "wyr1-test-evidence", not(feature = "wyr1c6-selector29")))]
-    #[test]
-    fn finalized_evidence_is_submitted_after_a_successful_tick() {
-        let (mut resident, _, _) = two_role_resident();
-        let mut log = EvidenceLog::new(0x00ff, crate::gate::GateScenario::Normal).unwrap();
-        log.record(EvidenceEvent::Ready, 1, 1, 0x1001, 0).unwrap();
-        let record = *log.line(0).unwrap();
-        resident.controller.evidence = Some(log);
-        resident.evidence_finalized = true;
-        let mut native = MockNative::new();
-        let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
-        let mut waits = ResidentWaits { wait_count: 0 };
-
-        assert_eq!(
-            resident_loop::continue_resident(&mut resident, &mut native, &mut loader, &mut waits),
-            0xAF01_0008
-        );
-        assert_eq!(waits.wait_count, 3, "the tick succeeded first");
-        assert_eq!(native.wyr1_submissions, 1);
-        assert_eq!(native.wyr1_submitted[0], record);
-    }
-
     /// The loop sleeps one tick period past the tick's own instant. Products
     /// with resident handshakes (selectors 29, 31, 32 and production) tick at
     /// the supervision backoff, the rest once a second; the selectors' half
     /// is a build-time assertion beside `RESIDENT_TICK_NS`.
-    #[cfg(not(feature = "wyr1c6-selector29"))]
     #[test]
     fn the_resident_loop_waits_one_tick_period_past_the_tick() {
-        let expected = if cfg!(any(
-            feature = "dw1e3-selector31",
-            feature = "wyr1d-selector32",
-            feature = "wyr1e-production"
-        )) {
+        let expected = if cfg!(feature = "wyr1e-production") {
             WYR0_I_SUPERVISION_POLICY.backoff_ns
         } else {
             1_000_000_000
@@ -5463,404 +4674,6 @@ mod native_cleanup_tests {
         }
     }
 
-    #[cfg(feature = "wyr1e8-selector33")]
-    #[test]
-    fn e8_failure_detail_is_finite_unique_and_keeps_the_narrowest_operation() {
-        for operation in [
-            RecoveryOperation::TriggerWait,
-            RecoveryOperation::Quiesced,
-            RecoveryOperation::RequestRetire,
-            RecoveryOperation::RetireDependents,
-            RecoveryOperation::ReapDriver,
-            RecoveryOperation::AcknowledgeReaped,
-            RecoveryOperation::DriverRetired,
-            RecoveryOperation::RebindPublication,
-            RecoveryOperation::ActionDeadline,
-            RecoveryOperation::RecoveryFallback,
-            RecoveryOperation::RetireRegistry,
-            RecoveryOperation::LaunchRegistry,
-            RecoveryOperation::CommitRegistry,
-            RecoveryOperation::StartConsole,
-        ] {
-            let error = attribute_failure::<()>(operation, Err(InitError::Cleanup)).unwrap_err();
-            assert_eq!(
-                resident_tick_failure_application_status(&error),
-                0xAF18_0004 | (operation as u32) << 8
-            );
-        }
-
-        for (error, expected_kind) in [
-            (InitError::WrongActivationOrder, 0x01),
-            (InitError::Accounting, 0x02),
-            (InitError::Supervision, 0x03),
-            (InitError::Cleanup, 0x04),
-            (InitError::WrongManifestProfile, 0x06),
-            (InitError::UnlaunchableRole, 0x07),
-            (
-                InitError::Evidence(evidence::EvidenceError::AlreadyTerminal),
-                0x08,
-            ),
-            (InitError::ZeroBootGeneration, 0x0f),
-        ] {
-            let error =
-                attribute_failure::<()>(RecoveryOperation::TriggerWait, Err(error)).unwrap_err();
-            assert_eq!(
-                resident_tick_failure_application_status(&error),
-                0xAF18_0100 | expected_kind
-            );
-        }
-        // F3A.6c gave a native status its own tag carrying the magnitude, so
-        // kind 0x05 no longer reads as `0xAF18_<op>05`.
-        let native = attribute_failure::<()>(
-            RecoveryOperation::TriggerWait,
-            Err(InitError::Native(NativeError::Status(
-                deepwyrm_syscall::DwStatus(-11),
-            ))),
-        )
-        .unwrap_err();
-        assert_eq!(
-            resident_tick_failure_application_status(&native),
-            0xAF1E_010B
-        );
-
-        let nested = attribute_failure(
-            RecoveryOperation::DriverRetired,
-            attribute_failure::<()>(
-                RecoveryOperation::RebindPublication,
-                Err(InitError::Cleanup),
-            ),
-        )
-        .unwrap_err();
-        assert_eq!(
-            resident_tick_failure_application_status(&nested),
-            0xAF18_0804
-        );
-        assert_eq!(
-            resident_tick_failure_application_status(&InitError::RecoveryTransition {
-                operation: 0,
-                initiating_kind: 0,
-                payload: 0,
-                emergency_cleanup: EmergencyCleanup::NotRun,
-            }),
-            0xAF18_0F0F
-        );
-        assert_eq!(
-            attribute_failure(RecoveryOperation::RequestRetire, Ok::<_, InitError>(7)),
-            Ok(7)
-        );
-    }
-
-    #[cfg(feature = "wyr1e8-selector33")]
-    #[test]
-    fn recovery_supervision_failures_keep_their_source_family() {
-        for (operation, expected) in [
-            (RecoveryOperation::Quiesced, 0xAF18_0203),
-            (RecoveryOperation::ActionDeadline, 0xAF18_0903),
-            (RecoveryOperation::RecoveryFallback, 0xAF18_0A03),
-        ] {
-            let initiating =
-                attribute_failure::<()>(operation, Err(InitError::Supervision)).unwrap_err();
-            let nested =
-                attribute_failure::<()>(RecoveryOperation::RebindPublication, Err(initiating))
-                    .unwrap_err();
-            let dispatched = dispatch_failure(
-                nested,
-                EmergencyCleanup::Attempted {
-                    channel_close_failed: false,
-                    owner_cleanup_failed: false,
-                },
-            );
-            assert_eq!(
-                resident_tick_failure_application_status(&dispatched),
-                expected
-            );
-            assert_eq!(attribute_failure(operation, Ok::<_, InitError>(7)), Ok(7));
-        }
-    }
-
-    #[cfg(feature = "wyr1e8-selector33")]
-    #[test]
-    fn registry_recovery_failures_keep_phase_and_nested_operations() {
-        for (operation, expected) in [
-            (RecoveryOperation::RetireDependents, 0xAF18_0404),
-            (RecoveryOperation::RebindPublication, 0xAF18_0804),
-            (RecoveryOperation::ActionDeadline, 0xAF18_0904),
-            (RecoveryOperation::RetireRegistry, 0xAF18_0B04),
-            (RecoveryOperation::LaunchRegistry, 0xAF18_0C04),
-            (RecoveryOperation::CommitRegistry, 0xAF18_0D04),
-            (RecoveryOperation::StartConsole, 0xAF18_0E04),
-        ] {
-            let error = attribute_failure::<()>(operation, Err(InitError::Cleanup)).unwrap_err();
-            assert_eq!(resident_tick_failure_application_status(&error), expected);
-            let nested =
-                attribute_failure::<()>(RecoveryOperation::StartConsole, Err(error)).unwrap_err();
-            assert_eq!(
-                nested,
-                InitError::RecoveryTransition {
-                    operation: operation as u8,
-                    initiating_kind: 4,
-                    payload: 0,
-                    emergency_cleanup: EmergencyCleanup::NotRun,
-                }
-            );
-            let deadline = attribute_failure::<()>(
-                RecoveryOperation::ActionDeadline,
-                Err(InitError::Supervision),
-            )
-            .unwrap_err();
-            let nested_deadline = attribute_failure::<()>(operation, Err(deadline)).unwrap_err();
-            assert_eq!(
-                resident_tick_failure_application_status(&nested_deadline),
-                0xAF18_0903
-            );
-            assert_eq!(
-                attribute_failure(operation, Ok::<_, InitError>(Some(7))),
-                Ok(Some(7))
-            );
-            assert_eq!(
-                attribute_failure(operation, Ok::<Option<u64>, InitError>(None)),
-                Ok(None)
-            );
-        }
-        // F3A.6e gave 0x10..=0xfe to the bring-up operations, so only 0x00
-        // and 0xff still clamp to the sentinel.
-        for operation in [0, u8::MAX] {
-            let error = InitError::RecoveryTransition {
-                operation,
-                initiating_kind: 4,
-                payload: 0,
-                emergency_cleanup: EmergencyCleanup::NotRun,
-            };
-            assert_eq!(
-                resident_tick_failure_application_status(&error),
-                0xAF18_0F04
-            );
-        }
-        assert_eq!(
-            resident_tick_failure_application_status(&InitError::RecoveryTransition {
-                operation: RecoveryOperation::ReceiveProduct as u8,
-                initiating_kind: 4,
-                payload: 0,
-                emergency_cleanup: EmergencyCleanup::NotRun,
-            }),
-            0xAF18_1004
-        );
-        assert_eq!(
-            resident_tick_failure_application_status(&InitError::Cleanup),
-            0xAF18_0F04
-        );
-    }
-
-    #[cfg(feature = "wyr1e8-selector33")]
-    #[test]
-    fn dispatch_failure_keeps_initiating_detail_and_cleanup_outcome_separate() {
-        let initiating = attribute_failure::<()>(
-            RecoveryOperation::Quiesced,
-            Err(InitError::Native(NativeError::Status(
-                deepwyrm_syscall::DwStatus(-11),
-            ))),
-        )
-        .unwrap_err();
-        let cleanup = EmergencyCleanup::Attempted {
-            channel_close_failed: true,
-            owner_cleanup_failed: false,
-        };
-        let joined = dispatch_failure(initiating, cleanup);
-        assert_eq!(
-            joined,
-            InitError::RecoveryTransition {
-                operation: RecoveryOperation::Quiesced as u8,
-                initiating_kind: 0x05,
-                // F3A.6c: the native status's magnitude survives attribution.
-                payload: 11,
-                emergency_cleanup: cleanup,
-            }
-        );
-        assert_eq!(
-            resident_tick_failure_application_status(&joined),
-            0xAF18_0204
-        );
-
-        let completed = dispatch_failure(
-            InitError::Accounting,
-            EmergencyCleanup::Attempted {
-                channel_close_failed: false,
-                owner_cleanup_failed: false,
-            },
-        );
-        assert_eq!(
-            resident_tick_failure_application_status(&completed),
-            0xAF18_0F02
-        );
-        assert_eq!(
-            dispatch_failure(InitError::Accounting, EmergencyCleanup::DisconnectFailed),
-            InitError::RecoveryTransition {
-                operation: 0x0f,
-                initiating_kind: 0x02,
-                payload: 0,
-                emergency_cleanup: EmergencyCleanup::DisconnectFailed,
-            }
-        );
-        let disconnect_failed =
-            dispatch_failure(InitError::Accounting, EmergencyCleanup::DisconnectFailed);
-        assert_eq!(
-            resident_tick_failure_application_status(&disconnect_failed),
-            0xAF18_0F04
-        );
-    }
-
-    #[cfg(feature = "wyr1c6-selector29")]
-    #[test]
-    fn wyr1c6_test_failure_status_preserves_pre_ready_category() {
-        assert_eq!(
-            wyr1c6_test_failure_application_status(&InitError::WrongManifestProfile),
-            0xAF1C_0001
-        );
-        assert_eq!(
-            wyr1c6_test_failure_application_status(&InitError::Capability(
-                CapabilityValidationError::InvalidFreshCapability,
-            )),
-            0xAF1C_0010
-        );
-        assert_eq!(
-            wyr1c6_test_failure_application_status(&InitError::Accounting),
-            0xAF1C_0016
-        );
-        assert_eq!(
-            wyr1c6_test_failure_application_status(&InitError::Native(NativeError::Status(
-                deepwyrm_syscall::DwStatus(-11),
-            ))),
-            0xAF1D_000B
-        );
-    }
-
-    #[cfg(feature = "wyr1-test-evidence")]
-    #[test]
-    fn wyr1_test_failure_status_preserves_top_level_category() {
-        assert_eq!(
-            wyr1_test_failure_application_status(&InitError::Cleanup),
-            0xAF11_0015
-        );
-        assert_eq!(
-            wyr1_test_failure_application_status(&InitError::Accounting),
-            0xAF11_0016
-        );
-        assert_eq!(
-            wyr1_test_failure_application_status(&InitError::WrongActivationOrder),
-            0xAF11_0003
-        );
-    }
-
-    #[cfg(feature = "wyr1b-test-evidence")]
-    #[test]
-    fn wyr1b_startup_mapping_status_encodes_variant_and_size_class() {
-        let cases = [
-            (0, 0xAF11_1001),
-            (wyrmroot_runtime::MAX_BOOTFS_LOGICAL_SIZE + 1, 0xAF11_2302),
-            (u64::MAX, 0xAF11_2403),
-        ];
-        for (size, expected) in cases {
-            let error = MappingPlan::for_bootfs(size).unwrap_err();
-            let status = wyr1b_test_failure_application_status(&startup_mapping_error(error, size));
-            assert_eq!(status, expected);
-        }
-    }
-
-    #[cfg(feature = "wyr1b-test-evidence")]
-    #[test]
-    fn startup_bootfs_size_classes_cover_stable_boundaries() {
-        use wyrmroot_runtime::{MAX_BOOTFS_LOGICAL_SIZE, PAGE_SIZE};
-
-        let cases = [
-            (0, StartupBootfsSizeClass::Zero),
-            (1, StartupBootfsSizeClass::SmallNonzero),
-            (PAGE_SIZE - 1, StartupBootfsSizeClass::SmallNonzero),
-            (PAGE_SIZE, StartupBootfsSizeClass::Admitted),
-            (MAX_BOOTFS_LOGICAL_SIZE, StartupBootfsSizeClass::Admitted),
-            (
-                MAX_BOOTFS_LOGICAL_SIZE + 1,
-                StartupBootfsSizeClass::OverMaximum,
-            ),
-            ((1_u64 << 63) - 1, StartupBootfsSizeClass::OverMaximum),
-            (1_u64 << 63, StartupBootfsSizeClass::GarbageHigh),
-            (u64::MAX, StartupBootfsSizeClass::GarbageHigh),
-        ];
-        for (size, expected) in cases {
-            assert_eq!(startup_bootfs_size_class(size), expected);
-        }
-    }
-
-    #[cfg(feature = "wyr1b-test-evidence")]
-    #[test]
-    fn ordinary_mapping_status_encodes_site_variant_and_size_class() {
-        let sites = [
-            MappingDiagnosticSite::RoleRemap,
-            MappingDiagnosticSite::JobDispatcher,
-            MappingDiagnosticSite::RegistryReplacement,
-        ];
-        let sizes = [0, wyrmroot_runtime::MAX_BOOTFS_LOGICAL_SIZE + 1, u64::MAX];
-        for (site_index, site) in sites.into_iter().enumerate() {
-            for (outcome_index, size) in sizes.into_iter().enumerate() {
-                let error = MappingPlan::for_bootfs(size).unwrap_err();
-                let expected_ordinal = 4 + (site_index as u32 * 3) + outcome_index as u32;
-                let status = wyr1b_test_failure_application_status(&ordinary_mapping_error(
-                    site, error, size,
-                ));
-                assert_eq!(status & 0x1f, expected_ordinal);
-            }
-        }
-    }
-
-    #[cfg(feature = "wyr1b-test-evidence")]
-    #[test]
-    fn mapping_ordinals_survive_kernel_application_summary_compression() {
-        let sizes = [0, wyrmroot_runtime::MAX_BOOTFS_LOGICAL_SIZE + 1, u64::MAX];
-        let mut statuses = [0_u32; 12];
-        for (index, size) in sizes.into_iter().enumerate() {
-            let error = MappingPlan::for_bootfs(size).unwrap_err();
-            statuses[index] =
-                wyr1b_test_failure_application_status(&startup_mapping_error(error, size));
-        }
-        for (site_index, site) in [
-            MappingDiagnosticSite::RoleRemap,
-            MappingDiagnosticSite::JobDispatcher,
-            MappingDiagnosticSite::RegistryReplacement,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            for (outcome_index, size) in sizes.into_iter().enumerate() {
-                let error = MappingPlan::for_bootfs(size).unwrap_err();
-                statuses[3 + site_index * 3 + outcome_index] =
-                    wyr1b_test_failure_application_status(&ordinary_mapping_error(
-                        site, error, size,
-                    ));
-            }
-        }
-        let mut seen = 0_u16;
-        for (index, status) in statuses.into_iter().enumerate() {
-            let ordinal = status & 0x1f;
-            let expected = index as u32 + 1;
-            assert_eq!(ordinal, expected);
-            assert_eq!(0x20 | ordinal, 0x21 + index as u32);
-            let bit = 1_u16 << ordinal;
-            assert_eq!(seen & bit, 0);
-            seen |= bit;
-        }
-        assert_eq!(seen, 0x1ffe);
-    }
-
-    #[cfg(feature = "wyr1b-test-evidence")]
-    #[test]
-    fn non_mapping_category_status_is_unchanged() {
-        for (error, expected) in [
-            (InitError::Cleanup, 0xAF11_0015),
-            (InitError::Accounting, 0xAF11_0016),
-        ] {
-            assert_eq!(wyr1b_test_failure_application_status(&error), expected);
-        }
-    }
-
     #[test]
     fn resident_fits_locked_native_stack_partition() {
         extern crate std;
@@ -5868,32 +4681,12 @@ mod native_cleanup_tests {
 
         std::println!("resident bytes: {}", size_of::<ResidentSystemInit>());
 
-        // Selector 32 retains a JobV2 dispatcher alongside the device resident.
-        // Reserve 40 KiB of the existing 108 KiB execution stack for residency;
-        // this partition is a userspace budget, not a startup ABI limit.
-        //
-        // Selector 29 gets its own tier rather than either of those. It carries
-        // twenty-two selector-private evidence fields in
-        // `wyr1c_native::ResidentState`, which grow that resident from 512 bytes
-        // to 1,864 and put the total 360 bytes over the 20 KiB partition. That
-        // state exists only under `wyr1c6-selector29`, so the growth is real and
-        // intended -- but 40 KiB would be twice what it needs and would stop this
-        // gate biting for a long time. 22 KiB sits just above the current 20,840
-        // and still fails on the next unexamined field.
-        //
-        // Selector 31 is 20,520 bytes, 40 over the 20 KiB partition. No gate ran
-        // this test in that shape until S3 added `dw1e3-model`, so the overrun
-        // was never seen; it is recorded as budget debt, not fitted, and 21 KiB
-        // keeps the same "fails on the next field" margin as selector 29's tier.
-        let resident_budget = if cfg!(any(
-            feature = "wyr1d-selector32",
-            feature = "wyr1e-production"
-        )) {
+        // The interactive product retains a JobV2 dispatcher alongside the
+        // device resident. Reserve 40 KiB of the existing 108 KiB execution
+        // stack for residency; this partition is a userspace budget, not a
+        // startup ABI limit.
+        let resident_budget = if cfg!(feature = "wyr1e-production") {
             40
-        } else if cfg!(feature = "wyr1c6-selector29") {
-            22
-        } else if cfg!(feature = "dw1e3-selector31") {
-            21
         } else {
             20
         };
@@ -5908,313 +4701,5 @@ mod native_cleanup_tests {
             wyrmroot_loader::elf::STACK_BYTES as usize - wyrmroot_runtime::STARTUP_BLOCK_V2_SIZE,
             108 * 1024
         );
-    }
-}
-
-/// Guards the one property card R1's second run proved was missing: that a
-/// selector-private evidence build reports *which* init failure it hit.
-///
-/// The status dispatch in `main.rs` selects on features, and its production arm
-/// is a negated default. A new selector that does not name a status therefore
-/// inherits `FatalRebootRequired` silently -- one value standing for all
-/// thirty-two `InitError` categories -- and the defect stays invisible until a
-/// run fails and proves nothing. This reads the crate's own manifest rather than
-/// a hand-kept list, so the check cannot drift from the features that exist.
-#[cfg(test)]
-mod selector_status_coverage {
-    /// Selectors that predate this rule and still collapse to
-    /// `FatalRebootRequired` at the pre-READY boundary. They are accepted or
-    /// frozen products: giving them a cause-preserving status changes their
-    /// binaries and therefore their product identity, which is not card R1's to
-    /// do. Recorded as debt so the check still fails closed for new work.
-    const KNOWN_COLLAPSING: [&str; 4] = [
-        "dw1e3-selector31",
-        "wyr1d-selector32",
-        "wyr1e-selector33",
-        "wyr1e8-selector33",
-    ];
-
-    /// Features that switch on a runtime evidence surface but are never built
-    /// as a selector on their own: they are composed into one that is. Selector
-    /// 29 is `wyr1c6-production` plus `wyr1c6-test-evidence`, and the status is
-    /// gated on the composed name, so the component must not be required to
-    /// carry one itself.
-    const COMPONENT_FEATURES: [&str; 1] = ["wyr1c6-test-evidence"];
-
-    /// Selector features whose names predate the `*-selector<N>` convention.
-    /// These are selectors 25 and 27, and both do name a status.
-    const LEGACY_SELECTORS: [&str; 2] = ["wyr1-test-evidence", "wyr1b-test-evidence"];
-
-    /// Selector features that carry their failure status through an evidence
-    /// feature they compose, rather than naming one of their own. F3A.7k:
-    /// selector 35's `wyr1f-closure` composes `wyr1-test-evidence` to submit
-    /// WYR1EVID1, and that feature's status arm is the one it reaches. The
-    /// check below requires the composition to be in the manifest and the
-    /// component's arm to preserve the category, so the entry cannot outlive
-    /// either fact.
-    const COMPOSED_SELECTORS: [(&str, &str); 1] = [("wyr1f-closure", "wyr1-test-evidence")];
-
-    const MANIFEST: &str = include_str!("../Cargo.toml");
-    const MAIN: &str = include_str!("main.rs");
-
-    /// Just the pre-READY status dispatch, not all of `main.rs`.
-    ///
-    /// Scoping matters: every selector also appears in `main.rs` as a
-    /// `#[cfg(feature = ...)] use ... as _;` line, so searching the whole file
-    /// would let an import stand in for a status arm and this check would pass
-    /// for a selector that still collapses.
-    fn dispatch(main: &str) -> &str {
-        let start = main
-            .find("match result {")
-            .expect("main dispatches on the init result");
-        let rest = &main[start..];
-        // `native_main` is a top-level item, so rustfmt closes it with `}` in
-        // column zero; the resident loop that used to follow it moved to
-        // `resident_loop.rs` in S3.
-        let end = rest
-            .find("\n}\n")
-            .expect("the dispatch ends with native_main");
-        let region = &rest[..end];
-        // If the dispatch moves, fail loudly rather than searching an empty
-        // region and silently passing.
-        assert!(
-            region.contains("fatal_application_status"),
-            "the status dispatch no longer looks like itself; re-anchor this check"
-        );
-        region
-    }
-
-    /// True when `dispatch` gates on exactly this feature name. Compares the
-    /// whole name so `wyr1e-selector33` cannot be satisfied by
-    /// `wyr1e8-selector33`.
-    fn names_feature(dispatch: &str, selector: &str) -> bool {
-        const NEEDLE: &str = "feature = \"";
-        let mut rest = dispatch;
-        while let Some(index) = rest.find(NEEDLE) {
-            let after = &rest[index + NEEDLE.len()..];
-            if let Some(end) = after.find('"')
-                && &after[..end] == selector
-            {
-                return true;
-            }
-            rest = after;
-        }
-        false
-    }
-
-    /// True when the selector appears as a *positive* condition of this one-line
-    /// `cfg`, rather than inside a `not(...)`.
-    fn positively_gated(attribute: &str, selector: &str) -> bool {
-        attribute
-            .split("not(")
-            .next()
-            .is_some_and(|positive| names_feature(positive, selector))
-    }
-
-    /// True when the dispatch answers this selector by returning a status other
-    /// than the coarse production one.
-    ///
-    /// Merely naming the selector is not enough, and this is the distinction the
-    /// check turns on: the negated production arm lists every selector that must
-    /// *not* reach `fatal_application_status`, so a selector can be named all
-    /// over the dispatch and still collapse. What matters is that some arm
-    /// positively gated on it returns something else.
-    ///
-    /// The gated statement must follow its `cfg` directly. S3 found that
-    /// skipping attribute lines let a selector's `cfg` whose own `return` had
-    /// been deleted borrow the next arm's: the orphaned attribute then stacks
-    /// onto that arm, which a stacked `not(...)` of the same selector removes
-    /// from the selector's build, so the selector collapses while this passed.
-    fn preserves_category(dispatch: &str, selector: &str) -> bool {
-        let mut lines = dispatch.lines();
-        while let Some(line) = lines.next() {
-            let line = line.trim();
-            if !line.starts_with("#[cfg(") || !positively_gated(line, selector) {
-                continue;
-            }
-            for next in lines.by_ref() {
-                let next = next.trim();
-                if next.is_empty() || next.starts_with("//") {
-                    continue;
-                }
-                if next.starts_with('#') {
-                    break;
-                }
-                return next.contains("return") && !next.contains("fatal_application_status");
-            }
-        }
-        false
-    }
-
-    /// True when the manifest declares `name` as a feature, not merely
-    /// mentions it (a dependency feature can carry the same name).
-    fn declares_feature(manifest: &str, name: &str) -> bool {
-        manifest.lines().any(|line| {
-            line.split_once('=')
-                .is_some_and(|(left, _)| left.trim() == name)
-        })
-    }
-
-    /// Visits every feature whose definition turns on a selector-private
-    /// evidence surface in the runtime. That dependency feature is what makes a
-    /// build selector-private, so it is the honest definition of "must preserve
-    /// its failure category".
-    fn for_each_evidence_selector(manifest: &str, mut visit: impl FnMut(&str)) {
-        let features = manifest
-            .split("[features]")
-            .nth(1)
-            .expect("system-init declares features");
-        let features = features
-            .split("\n[")
-            .next()
-            .expect("the features section ends");
-        let mut name: Option<&str> = None;
-        let mut evidence = false;
-        for line in features.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((left, right)) = line.split_once('=') {
-                if let Some(previous) = name
-                    && evidence
-                {
-                    visit(previous);
-                }
-                name = Some(left.trim());
-                evidence = right.contains("-test-evidence");
-            } else if line.contains("-test-evidence") {
-                evidence = true;
-            }
-        }
-        if let Some(previous) = name
-            && evidence
-        {
-            visit(previous);
-        }
-    }
-
-    #[test]
-    fn every_evidence_selector_either_preserves_its_category_or_is_recorded_debt() {
-        let mut saw_selector_31 = false;
-        for_each_evidence_selector(MANIFEST, |selector| {
-            if selector == "dw1e3-selector31" {
-                saw_selector_31 = true;
-            }
-            if COMPONENT_FEATURES.contains(&selector) {
-                return;
-            }
-            if let Some((_, component)) = COMPOSED_SELECTORS
-                .iter()
-                .find(|(composed, _)| *composed == selector)
-            {
-                let line = MANIFEST
-                    .lines()
-                    .find(|line| {
-                        line.split_once(" = [")
-                            .is_some_and(|(name, _)| name.trim() == selector)
-                    })
-                    .expect("a composed selector is declared on one manifest line");
-                assert!(
-                    line.split('"').any(|part| part == *component),
-                    "{selector} no longer composes {component}"
-                );
-                assert!(
-                    preserves_category(dispatch(MAIN), component),
-                    "{component}, which {selector} relies on, names no failure status"
-                );
-                return;
-            }
-            // Fail closed on a name that is neither a recognised selector
-            // spelling nor a declared component, so a future feature cannot slip
-            // past this check by being named something new.
-            assert!(
-                selector.contains("selector") || LEGACY_SELECTORS.contains(&selector),
-                "{selector} enables a runtime evidence surface but is neither a \
-                 *-selector<N> feature nor a declared component; classify it in \
-                 COMPONENT_FEATURES or LEGACY_SELECTORS so this check keeps \
-                 meaning something."
-            );
-            if KNOWN_COLLAPSING.contains(&selector) {
-                return;
-            }
-            assert!(
-                preserves_category(dispatch(MAIN), selector),
-                "{selector} is a selector-private evidence build but names no \
-                 failure status in main.rs, so every InitError would collapse to \
-                 FatalRebootRequired. Add a status that preserves the category, \
-                 or record it in KNOWN_COLLAPSING with the reason."
-            );
-        });
-        // If this trips, the manifest parse stopped matching the manifest and
-        // the check above proved nothing.
-        assert!(
-            saw_selector_31,
-            "selector 31 was not seen as an evidence build"
-        );
-    }
-
-    #[test]
-    fn the_recorded_debt_is_real_and_not_stale() {
-        for selector in KNOWN_COLLAPSING {
-            assert!(
-                declares_feature(MANIFEST, selector),
-                "{selector} is recorded as collapsing but no longer exists"
-            );
-            assert!(
-                !preserves_category(dispatch(MAIN), selector),
-                "{selector} now names a status in main.rs; remove it from \
-                 KNOWN_COLLAPSING rather than leaving the debt recorded"
-            );
-        }
-    }
-
-    #[test]
-    fn the_needle_match_is_exact_and_not_a_prefix() {
-        let sample = "#[cfg(feature = \"wyr1e8-selector33\")]";
-        assert!(names_feature(sample, "wyr1e8-selector33"));
-        assert!(!names_feature(sample, "wyr1e-selector33"));
-        assert!(!names_feature(sample, "wyr1e8"));
-    }
-
-    #[test]
-    fn being_named_in_the_negated_production_arm_does_not_count() {
-        // This is the shape that made an earlier version of this check pass for
-        // a selector whose status arm had been deleted.
-        let fallback = "\
-#[cfg(not(any(\n\
-    feature = \"wyr1-test-evidence\",\n\
-    feature = \"r1-selector34\"\n\
-)))]\n\
-return fatal_application_status(&error) as u32;\n";
-        assert!(!preserves_category(fallback, "r1-selector34"));
-
-        let arm = "\
-#[cfg(feature = \"r1-selector34\")]\n\
-return r1_test_failure_application_status(&error);\n";
-        assert!(preserves_category(arm, "r1-selector34"));
-
-        // A selector excluded by a sibling arm's not(...) must not be credited
-        // to that arm, but must still be credited to its own.
-        let composed = "\
-#[cfg(all(feature = \"wyr1-test-evidence\", not(feature = \"wyr1b-test-evidence\")))]\n\
-return wyr1_test_failure_application_status(&error);\n";
-        assert!(preserves_category(composed, "wyr1-test-evidence"));
-        assert!(!preserves_category(composed, "wyr1b-test-evidence"));
-
-        // A selector whose own return was deleted leaves its cfg stacked onto
-        // the next arm; that arm is not the selector's.
-        let orphaned = "\
-#[cfg(feature = \"wyr1b-test-evidence\")]\n\
-#[cfg(all(feature = \"wyr1-test-evidence\", not(feature = \"wyr1b-test-evidence\")))]\n\
-return wyr1_test_failure_application_status(&error);\n";
-        assert!(!preserves_category(orphaned, "wyr1b-test-evidence"));
-    }
-
-    #[test]
-    fn a_feature_is_declared_only_by_its_own_line() {
-        let manifest = "a = []\nb = [\"dep/a-selector\"]\n";
-        assert!(declares_feature(manifest, "a"));
-        assert!(!declares_feature(manifest, "a-selector"));
     }
 }

@@ -2,8 +2,6 @@
 #![cfg_attr(target_os = "wyrmroot", no_main)]
 #![deny(unsafe_code)]
 
-#[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_dw1e3_com2_test as _;
 use wyrmroot_runtime::{NativePlatform, StartupBlock};
 use {
     deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_loader as _,

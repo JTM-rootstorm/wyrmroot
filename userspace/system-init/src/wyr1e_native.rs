@@ -3,11 +3,6 @@
 use super::*;
 use crate::wyr1b::EndpointGrant;
 use crate::wyr1b_job::{JobDispatcher, LaunchSessionScope, SessionOwner};
-#[cfg(feature = "wyr1e8-selector33")]
-use crate::wyr1b_native::{
-    E8RecoveryAction, finish_e8_dependent_retirement, retire_console_product_with_result,
-    retire_console_product_with_result_before,
-};
 use crate::wyr1b_native::{
     InstalledPeer, JobDispatcherPollOutcome, ShellControllerState, ShellLaunchContext,
     create_controller_channel_pair, install_client, poll_job_dispatcher_with_shell,
@@ -69,9 +64,6 @@ pub(super) struct State {
     next_console_transaction: u64,
     next_publication_observer: u64,
     console_launch_attempts: u8,
-    /// F3A.7k. Bring-up READY evidence for UART, console and shell.
-    #[cfg(feature = "wyr1f-closure")]
-    pub(super) wyr1f_bringup: crate::wyr1f_closure::BringupEvidence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,8 +84,6 @@ pub(super) enum PollOutcome {
     /// F3A.6j: `RecoverRegistry` alone covered twenty product sites across
     /// three functions, so a transcript that named it named most of this file.
     RecoverRegistry(u8),
-    #[cfg(feature = "wyr1e8-selector33")]
-    RecoverRegistryForE8,
 }
 
 fn reconcile_job_dispatcher_outcome(
@@ -111,19 +101,10 @@ fn reconcile_job_dispatcher_outcome(
     if peer.grant != grant {
         return Err(InitError::Accounting);
     }
-    #[cfg(feature = "wyr1e8-selector33")]
-    if !state.shell.routine_console_relaunch_allowed() {
-        return Err(InitError::Supervision);
-    }
     state.console = None;
     state.awaiting_ready = false;
     state.bootstrap_released = false;
     state.console_transaction = 0;
-    #[cfg(feature = "wyr1e8-selector33")]
-    state
-        .shell
-        .clear_e8_console_control(peer.loaded.launch_channel)
-        .map_err(|_| InitError::Cleanup)?;
     Ok(Some(PollOutcome::LaunchConsole))
 }
 
@@ -141,79 +122,7 @@ impl State {
             next_console_transaction: FIRST_CONSOLE_TRANSACTION,
             next_publication_observer: FIRST_PUBLICATION_OBSERVER,
             console_launch_attempts: 0,
-            #[cfg(feature = "wyr1f-closure")]
-            wyr1f_bringup: crate::wyr1f_closure::BringupEvidence::new(),
         })
-    }
-
-    #[cfg(all(test, feature = "wyr1e8-selector33"))]
-    pub(super) fn from_e8_registry_fixture(
-        shell: ShellControllerState,
-        jobs: JobDispatcher,
-        console: InstalledPeer,
-    ) -> Self {
-        Self {
-            jobs,
-            console: Some(console),
-            shell,
-            publication_observer: None,
-            awaiting_ready: false,
-            bootstrap_released: false,
-            ready_deadline: 0,
-            console_transaction: 0,
-            next_console_transaction: FIRST_CONSOLE_TRANSACTION,
-            next_publication_observer: FIRST_PUBLICATION_OBSERVER,
-            console_launch_attempts: 0,
-        }
-    }
-
-    /// A console product already installed and serving, with the shell half of
-    /// the closure READY join already recorded.
-    #[cfg(all(test, feature = "wyr1f-closure"))]
-    pub(super) fn wyr1f_degraded_fixture(
-        registry_generation: u64,
-        console: InstalledPeer,
-    ) -> Result<Self, InitError> {
-        let mut shell = ShellControllerState::new(registry_generation)?;
-        shell.observe_wyr1f_shell_ready(1, 1);
-        Ok(Self {
-            jobs: JobDispatcher::new(),
-            console: Some(console),
-            shell,
-            publication_observer: None,
-            awaiting_ready: false,
-            bootstrap_released: false,
-            ready_deadline: 0,
-            console_transaction: 0,
-            next_console_transaction: FIRST_CONSOLE_TRANSACTION,
-            next_publication_observer: FIRST_PUBLICATION_OBSERVER,
-            console_launch_attempts: 0,
-            #[cfg(feature = "wyr1f-closure")]
-            wyr1f_bringup: crate::wyr1f_closure::BringupEvidence::new(),
-        })
-    }
-
-    #[cfg(all(test, feature = "wyr1f-closure"))]
-    pub(super) const fn wyr1f_console(&self) -> Option<InstalledPeer> {
-        self.console
-    }
-
-    #[cfg(all(test, feature = "wyr1e8-selector33"))]
-    pub(super) fn e8_fixture_publication_observer(&self) -> Option<(DwHandle, EndpointGrant, u64)> {
-        self.publication_observer.map(|observer| {
-            (
-                observer.client,
-                observer.grant,
-                observer.expected_service_generation,
-            )
-        })
-    }
-
-    #[cfg(all(test, feature = "wyr1e8-selector33"))]
-    pub(super) fn into_e8_registry_fixture_parts(
-        self,
-    ) -> (ShellControllerState, JobDispatcher, Option<InstalledPeer>) {
-        (self.shell, self.jobs, self.console)
     }
 
     fn take_console_transaction(&mut self) -> Result<u64, InitError> {
@@ -277,15 +186,6 @@ where
         .issue(operation, EndpointKind::RegistryClient)
         .map_err(InitError::Wyr1BModel)?;
     let (registry_endpoint, client) = create_controller_channel_pair(system)?;
-    #[cfg(feature = "wyr1e8-selector33")]
-    if let Err(error) = e6
-        .shell
-        .require_recovery_live_at(system.now().map_err(InitError::Native)?)
-    {
-        let failed =
-            system.close_handle(registry_endpoint).is_err() | system.close_handle(client).is_err();
-        return Err(if failed { InitError::Cleanup } else { error });
-    }
     if let Err(error) = install_client(
         system,
         registry.control_channel,
@@ -296,18 +196,6 @@ where
         let cleanup_failed =
             system.close_handle(registry_endpoint).is_err() | system.close_handle(client).is_err();
         return Err(if cleanup_failed {
-            InitError::Cleanup
-        } else {
-            error
-        });
-    }
-    #[cfg(feature = "wyr1e8-selector33")]
-    if let Err(error) = e6
-        .shell
-        .require_recovery_live_at(system.now().map_err(InitError::Native)?)
-    {
-        e6.shell.poison(grant.registry_generation);
-        return Err(if system.close_handle(client).is_err() {
             InitError::Cleanup
         } else {
             error
@@ -331,18 +219,6 @@ where
             InitError::Cleanup
         } else {
             InitError::Native(error)
-        });
-    }
-    #[cfg(feature = "wyr1e8-selector33")]
-    if let Err(error) = e6
-        .shell
-        .require_recovery_live_at(system.now().map_err(InitError::Native)?)
-    {
-        e6.shell.poison(grant.registry_generation);
-        return Err(if system.close_handle(client).is_err() {
-            InitError::Cleanup
-        } else {
-            error
         });
     }
     e6.publication_observer = Some(PublicationObserver {
@@ -421,9 +297,6 @@ where
     if e6.console.is_some() {
         return Err(InitError::WrongActivationOrder);
     }
-    #[cfg(feature = "wyr1e8-selector33")]
-    e6.shell
-        .require_recovery_live_at(system.now().map_err(InitError::Native)?)?;
     let image = Archive::new(bootfs)
         .map_err(InitError::Bootfs)?
         .lookup(CONSOLE_PATH.as_bytes())
@@ -448,16 +321,6 @@ where
             return Err(error);
         }
     };
-    #[cfg(feature = "wyr1e8-selector33")]
-    if let Err(error) = e6
-        .shell
-        .require_recovery_live_at(system.now().map_err(InitError::Native)?)
-    {
-        let failed = system.close_handle(registry_endpoint).is_err()
-            | system.close_handle(child_registry).is_err()
-            | system.close_handle(group).is_err();
-        return Err(if failed { InitError::Cleanup } else { error });
-    }
     if let Err(error) = install_client(
         system,
         registry_control,
@@ -468,16 +331,6 @@ where
         let failed = system.close_handle(registry_endpoint).is_err()
             | system.close_handle(child_registry).is_err()
             | system.close_handle(group).is_err();
-        return Err(if failed { InitError::Cleanup } else { error });
-    }
-    #[cfg(feature = "wyr1e8-selector33")]
-    if let Err(error) = e6
-        .shell
-        .require_recovery_live_at(system.now().map_err(InitError::Native)?)
-    {
-        e6.shell.poison(topology.generation());
-        let failed =
-            system.close_handle(child_registry).is_err() | system.close_handle(group).is_err();
         return Err(if failed { InitError::Cleanup } else { error });
     }
     let (launch_endpoint, child_launch) = match create_controller_channel_pair(system) {
@@ -504,21 +357,6 @@ where
         } else {
             InitError::Wyr1BModel(error)
         });
-    }
-    #[cfg(feature = "wyr1e8-selector33")]
-    if let Err(error) = e6
-        .shell
-        .require_recovery_live_at(system.now().map_err(InitError::Native)?)
-    {
-        e6.shell.poison(topology.generation());
-        let failed = e6
-            .jobs
-            .disconnect_session(launch_grant)
-            .map_or(true, |handle| system.close_handle(handle).is_err())
-            | system.close_handle(child_launch).is_err()
-            | system.close_handle(child_registry).is_err()
-            | system.close_handle(group).is_err();
-        return Err(if failed { InitError::Cleanup } else { error });
     }
     let loaded = match load_consoled_process(
         loader,
@@ -594,15 +432,6 @@ where
         } else {
             InitError::Wyr1BModel(error)
         });
-    }
-    #[cfg(feature = "wyr1e8-selector33")]
-    if let Err(error) = e6.shell.set_e8_console_control(loaded.launch_channel) {
-        e6.shell.poison(topology.generation());
-        let failed = cleanup_loaded(system, waits, loaded, group, true).is_err()
-            | e6.jobs
-                .disconnect_session(launch_grant)
-                .map_or(true, |handle| system.close_handle(handle).is_err());
-        return Err(if failed { InitError::Cleanup } else { error });
     }
     e6.ready_deadline = ready_deadline;
     e6.console = Some(InstalledPeer {
@@ -806,25 +635,6 @@ where
         clear_publication_observer(e6, system, registry_generation, false)?;
         return Ok(Some(PollOutcome::RecoverDevmgr));
     }
-    #[cfg(feature = "wyr1e-selector33")]
-    e6.shell.observe_serial_for_e7(
-        observer.expected_service_generation,
-        observer.expected_driver.attempt_generation.0,
-        observer.expected_driver.supervisor_generation.0,
-    )?;
-    #[cfg(feature = "wyr1e8-selector33")]
-    e6.shell.observe_serial_for_e8(
-        observer.expected_service_generation,
-        observer.expected_driver,
-    )?;
-    // F3A.7k. The serial device published by exactly the driver attempt init
-    // expected, still running: the UART's READY, as far as init can see it.
-    #[cfg(feature = "wyr1f-closure")]
-    e6.wyr1f_bringup.observe(
-        crate::wyr1f_closure::BringupRole::Uart,
-        observer.expected_driver.attempt_generation.0,
-        current.request.transaction_id,
-    );
     clear_publication_observer(e6, system, registry_generation, false)?;
     Ok(Some(PollOutcome::LaunchConsole))
 }
@@ -869,16 +679,7 @@ where
     e6.awaiting_ready = false;
     e6.bootstrap_released = false;
     e6.console_transaction = 0;
-    #[cfg(feature = "wyr1e8-selector33")]
-    let control_failed = e6
-        .shell
-        .clear_e8_console_control(peer.loaded.launch_channel)
-        .is_err();
     let cleanup = retire_console_product(system, waits, &mut e6.jobs, peer, false);
-    #[cfg(feature = "wyr1e8-selector33")]
-    if control_failed || cleanup.is_err() {
-        return Err(InitError::Cleanup);
-    }
     cleanup?;
     // Whether this ends the session is `conclude_session`'s decision, not
     // this route's: see there.
@@ -1019,8 +820,6 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    #[cfg(feature = "wyr1e8-selector33")]
-    ensure_recovery_live(resident, now)?;
     let publication = poll_publication_observer(resident, system, waits, now);
     let publication = attribute_failure(RecoveryOperation::RebindPublication, publication);
     if let Some(outcome) = publication? {
@@ -1039,14 +838,6 @@ where
         None => return Err(InitError::AbsentState(absent_owner_site(state))),
     };
     let e6 = state.e6.as_mut().ok_or(InitError::AbsentState(0x8e))?;
-    // R7B-4 class D1e. This gate used to carry a second reason -- a parked WAIT
-    // reply -- which R6C's argument retires: the reply sits in ordinary
-    // `pending_waits` storage and `e8_wait_is_held` refuses to answer it twice,
-    // so nothing needs the dispatcher stopped for it. What remains is evidence
-    // adjacency, which is a real obligation and keeps its own name.
-    #[cfg(feature = "wyr1e8-selector33")]
-    let poll_shell_jobs = !e6.shell.e8_tuple_waiting_for_serial();
-    #[cfg(not(feature = "wyr1e8-selector33"))]
     let poll_shell_jobs = true;
     if poll_shell_jobs {
         let dispatcher_result = {
@@ -1093,9 +884,6 @@ where
     let Some(console) = e6.console else {
         return Ok(PollOutcome::Stable);
     };
-    #[cfg(feature = "wyr1e8-selector33")]
-    let defer_to_coordinated_retirement = e6.shell.recovery_owns_console_retirement();
-    #[cfg(not(feature = "wyr1e8-selector33"))]
     let defer_to_coordinated_retirement = false;
     let observed = match poll_console_event(
         system,
@@ -1126,16 +914,12 @@ where
         ));
     }
     if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
-        #[cfg(not(feature = "wyr1e8-selector33"))]
         if !e6.awaiting_ready {
             retire_current_console(e6, system, waits, state.topology.generation(), true)?;
             return Ok(PollOutcome::RecoverRegistry(
                 crate::wyr1c_native::abandoned::phase::CONSOLE_UNSOLICITED,
             ));
         }
-        #[cfg(feature = "wyr1e8-selector33")]
-        let mut bytes = [0u8; wyrmroot_consoled::quiesce_control::FRAME_BYTES];
-        #[cfg(not(feature = "wyr1e8-selector33"))]
         let mut bytes = [0u8; 64];
         let mut handles = [DwReceivedHandleInfoV1::default(); 1];
         let counts =
@@ -1192,81 +976,6 @@ where
                 ))
             };
         }
-        // The WRC8 quiesce exchange is R7A class D1/D3 and stays the selector's;
-        // R7B-2 only made the attribution around it ordinary.
-        #[cfg(feature = "wyr1e8-selector33")]
-        if bytes[..counts.bytes].starts_with(b"WRC8") {
-            let message = attribute_failure(
-                RecoveryOperation::Quiesced,
-                wyrmroot_consoled::quiesce_control::parse(&bytes[..counts.bytes])
-                    .map_err(|_| InitError::Accounting),
-            )?;
-            match message {
-                wyrmroot_consoled::quiesce_control::Message::ReadyFacts(facts) => {
-                    e6.shell.observe_e8_serial_ready(
-                        system,
-                        crate::wyr1e8_evidence::SerialReady {
-                            console_generation: facts.console_generation,
-                            status_generation: facts.status_generation,
-                            shell_generation: facts.shell_generation,
-                            attach_transaction: facts.attach_transaction,
-                            stream_generation: facts.stream_generation,
-                            bundle_generation: facts.bundle_generation,
-                        },
-                    )?;
-                    return Ok(PollOutcome::Stable);
-                }
-                wyrmroot_consoled::quiesce_control::Message::Quiesced(identity) => {
-                    let quiesced_at = system.now().map_err(InitError::Native)?;
-                    attribute_failure(
-                        RecoveryOperation::Quiesced,
-                        e6.shell.require_recovery_live_at(quiesced_at),
-                    )?;
-                    let action = attribute_failure(
-                        RecoveryOperation::Quiesced,
-                        e6.shell.accept_e8_quiesced(identity, quiesced_at),
-                    )?;
-                    if action == E8RecoveryAction::Registry {
-                        return Ok(PollOutcome::RecoverRegistryForE8);
-                    }
-                    attribute_failure(
-                        RecoveryOperation::RequestRetire,
-                        e6.shell.require_recovery_live(system),
-                    )?;
-                    attribute_failure(
-                        RecoveryOperation::RequestRetire,
-                        (|| {
-                            let request = state.driver.ok_or(InitError::AbsentState(0x8f))?.request;
-                            let devmgr = state.devmgr.ok_or(InitError::AbsentState(0x90))?;
-                            let identity = e6.shell.e8_driver_identity(request)?;
-                            let mut request_bytes =
-                                [0u8; wyrmroot_device_proto::d5_controller::RECORD_BYTES];
-                            wyrmroot_device_proto::d5_controller::encode(
-                            wyrmroot_device_proto::d5_controller::D5ControllerMessage::RequestRetire(
-                                identity,
-                            ),
-                            &mut request_bytes,
-                        )
-                        .map_err(|_| InitError::Accounting)?;
-                            system
-                                .send_channel(devmgr.loaded.launch_channel, &request_bytes)
-                                .map_err(InitError::Native)
-                        })(),
-                    )?;
-                    attribute_failure(
-                        RecoveryOperation::RequestRetire,
-                        e6.shell.require_recovery_live(system),
-                    )?;
-                    return Ok(PollOutcome::Stable);
-                }
-                wyrmroot_consoled::quiesce_control::Message::Quiesce(_) => {
-                    return attribute_failure(
-                        RecoveryOperation::Quiesced,
-                        Err(InitError::WrongActivationOrder),
-                    );
-                }
-            }
-        }
         if wyrmroot_loader::launch::parse_ready_for_profile(
             LaunchProfile::Consoled,
             &bytes[..counts.bytes],
@@ -1302,13 +1011,6 @@ where
                 crate::wyr1c_native::abandoned::phase::CONSOLE_RECOVERY_LIVE,
             ));
         }
-        // F3A.7k. consoled's READY, validated against its own transaction.
-        #[cfg(feature = "wyr1f-closure")]
-        e6.wyr1f_bringup.observe(
-            crate::wyr1f_closure::BringupRole::Console,
-            console.grant.role_generation,
-            e6.console_transaction,
-        );
         e6.awaiting_ready = false;
         return Ok(PollOutcome::Stable);
     }
@@ -1375,16 +1077,7 @@ where
     e6.awaiting_ready = false;
     e6.bootstrap_released = false;
     e6.console_transaction = 0;
-    #[cfg(feature = "wyr1e8-selector33")]
-    let control_failed = e6
-        .shell
-        .clear_e8_console_control(peer.loaded.launch_channel)
-        .is_err();
     let result = retire_console_product(system, waits, &mut e6.jobs, peer, true);
-    #[cfg(feature = "wyr1e8-selector33")]
-    if control_failed || result.is_err() {
-        return Err(InitError::Cleanup);
-    }
     result
 }
 
@@ -1439,33 +1132,6 @@ where
         .ok_or(InitError::AbsentState(0x93))?;
     let generation = state.topology.generation();
     let e6 = state.e6.as_mut().ok_or(InitError::AbsentState(0x94))?;
-    #[cfg(feature = "wyr1e8-selector33")]
-    let pending_action = e6.shell.e8_pending_action();
-    #[cfg(feature = "wyr1e8-selector33")]
-    let expected_action = if poison_registry {
-        E8RecoveryAction::Registry
-    } else {
-        E8RecoveryAction::Driver
-    };
-    #[cfg(feature = "wyr1e8-selector33")]
-    if pending_action.is_some_and(|action| action != expected_action) {
-        return Err(InitError::WrongActivationOrder);
-    }
-    #[cfg(feature = "wyr1e8-selector33")]
-    let held = match pending_action {
-        Some(_) => Some(e6.shell.e8_held_for_action(expected_action)?),
-        None => None,
-    };
-    // R7B-4 class D1c. This used to also check the barrier's own `deadline`
-    // copy against the episode's, and fail `Accounting` when they disagreed.
-    // The copy is gone -- the episode deadline has been ordinary state since
-    // R7B-1 -- so there is nothing left to disagree, and the liveness check is
-    // the whole of what was ever being asked here.
-    #[cfg(feature = "wyr1e8-selector33")]
-    if held.is_some() {
-        e6.shell
-            .require_recovery_live_at(system.now().map_err(InitError::Native)?)?;
-    }
     if poison_registry {
         e6.shell.poison(generation);
     }
@@ -1475,11 +1141,6 @@ where
         .is_some_and(|observer| system.close_handle(observer.client).is_err());
     let Some(peer) = e6.console.take() else {
         return if observer_failed || {
-            #[cfg(feature = "wyr1e8-selector33")]
-            {
-                pending_action.is_some()
-            }
-            #[cfg(not(feature = "wyr1e8-selector33"))]
             {
                 false
             }
@@ -1492,68 +1153,16 @@ where
     e6.awaiting_ready = false;
     e6.bootstrap_released = false;
     e6.console_transaction = 0;
-    #[cfg(feature = "wyr1e8-selector33")]
-    let control_failed = e6
-        .shell
-        .clear_e8_console_control(peer.loaded.launch_channel)
-        .is_err();
-    #[cfg(feature = "wyr1e8-selector33")]
-    let console_result = match held {
-        Some(_) => retire_console_product_with_result_before(
-            system,
-            waits,
-            &mut e6.jobs,
-            peer,
-            // Closing the ConsoleLauncher session is consoled's graceful
-            // retirement signal. Let it close the child status endpoint before
-            // stdout, then force-clean only the outer shell below. Immediate
-            // consoled task-group teardown races that ordering and can expose
-            // stdout loss instead of the required status-loss result.
-            false,
-            e6.shell.recovery_deadline(),
-        ),
-        None => retire_console_product_with_result(system, waits, &mut e6.jobs, peer, true),
-    };
-    #[cfg(not(feature = "wyr1e8-selector33"))]
     let console_result = retire_console_product(system, waits, &mut e6.jobs, peer, true);
     if observer_failed || console_result.is_err() || {
-        #[cfg(feature = "wyr1e8-selector33")]
-        {
-            control_failed
-        }
-        #[cfg(not(feature = "wyr1e8-selector33"))]
         {
             false
         }
     } {
         Err(InitError::Cleanup)
     } else {
-        #[cfg(feature = "wyr1e8-selector33")]
-        if let Some(held) = held {
-            let result = console_result?.ok_or(InitError::AbsentState(0x95))?;
-            finish_e8_dependent_retirement(system, &mut e6.jobs, &mut e6.shell, held, result)?;
-        }
         Ok(())
     }
-}
-
-/// The two halves of the final closure episode's READY join, each read from
-/// the owner that actually establishes it.
-///
-/// The console half is consoled's own validated READY -- `awaiting_ready`
-/// cleared with a console installed -- not a printed string and not a
-/// selector-local boolean. The shell half is the first `system/wyrmsh`
-/// generation reaching `JobDispatchOutcome::Launched`, recorded by the
-/// dispatcher that owns it. `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4.
-#[cfg(feature = "wyr1f-closure")]
-pub(super) fn wyr1f_ready_join(resident: &ResidentSystemInit) -> (bool, bool) {
-    let Some(e6) = resident.wyr1c.as_ref().and_then(|state| state.e6.as_ref()) else {
-        return (false, false);
-    };
-    (
-        e6.console.is_some() && !e6.awaiting_ready,
-        e6.shell.wyr1f_shell_ready().is_some(),
-    )
 }
 
 /// Whether a console product is installed on the stream the current device
@@ -1939,11 +1548,6 @@ mod tests {
         state.awaiting_ready = true;
         state.bootstrap_released = true;
         state.console_transaction = 23;
-        #[cfg(feature = "wyr1e8-selector33")]
-        state
-            .shell
-            .set_e8_console_control(peer.loaded.launch_channel)
-            .unwrap();
 
         assert_eq!(
             reconcile_job_dispatcher_outcome(
@@ -1969,13 +1573,6 @@ mod tests {
         let peer = console_peer();
         let mut state = State::new(7).unwrap();
         state.console = Some(peer);
-        // Under E8 a live console always holds its control: installing the
-        // console sets it before the peer is installed.
-        #[cfg(feature = "wyr1e8-selector33")]
-        state
-            .shell
-            .set_e8_console_control(peer.loaded.launch_channel)
-            .unwrap();
         state.shell.observe_session_shutdown();
 
         let outcome = reconcile_job_dispatcher_outcome(
@@ -2257,87 +1854,6 @@ mod tests {
         assert_eq!(waits.query_count, 0);
     }
 
-    /// Selector 33's E7 serial hook sees only a publication that validated,
-    /// from the exact driver attempt init expected, still running: every
-    /// refusal returns before it, and the accepted one reaches it once.
-    #[cfg(feature = "wyr1e-selector33")]
-    #[test]
-    fn only_the_validated_current_serial_publication_reaches_the_e7_hook() {
-        let observed = observer();
-        let registry = observed.grant.registry_generation;
-        let mut stale = driver_attempt();
-        stale.request.transaction_id += 1;
-        for (label, driver, task_state, now) in [
-            (
-                "past its deadline",
-                driver_attempt(),
-                DW_TASK_STATE_RUNNING,
-                observed.deadline,
-            ),
-            (
-                "exited",
-                driver_attempt(),
-                DW_TASK_STATE_EXITED,
-                observed.deadline - 1,
-            ),
-            (
-                "not yet running",
-                driver_attempt(),
-                DW_TASK_STATE_CREATED,
-                observed.deadline - 1,
-            ),
-            (
-                "another attempt",
-                stale,
-                DW_TASK_STATE_RUNNING,
-                observed.deadline - 1,
-            ),
-        ] {
-            let mut e6 = State::new(registry).unwrap();
-            e6.publication_observer = Some(observed);
-            let mut platform = ObserverPlatform::generation(observed, now);
-            let mut waits = ObserverWaits {
-                state: task_state,
-                query_count: 0,
-            };
-            assert_eq!(
-                poll_publication_observer_state(
-                    &mut e6,
-                    Some(driver),
-                    registry,
-                    &mut platform,
-                    &mut waits,
-                    now,
-                ),
-                Ok(Some(PollOutcome::RecoverDevmgr)),
-                "{label}"
-            );
-            assert!(!e6.shell.e7_serial_observed(), "{label}");
-            assert!(e6.publication_observer.is_none(), "{label}");
-        }
-
-        let mut e6 = State::new(registry).unwrap();
-        e6.publication_observer = Some(observed);
-        let mut platform = ObserverPlatform::generation(observed, observed.deadline - 1);
-        let mut waits = ObserverWaits {
-            state: DW_TASK_STATE_RUNNING,
-            query_count: 0,
-        };
-        assert_eq!(
-            poll_publication_observer_state(
-                &mut e6,
-                Some(driver_attempt()),
-                registry,
-                &mut platform,
-                &mut waits,
-                observed.deadline - 1,
-            ),
-            Ok(Some(PollOutcome::LaunchConsole))
-        );
-        assert!(e6.shell.e7_serial_observed());
-        assert!(e6.publication_observer.is_none());
-    }
-
     #[test]
     fn exact_queued_watch_cannot_launch_an_already_exited_driver() {
         let observed = observer();
@@ -2390,62 +1906,4 @@ mod tests {
         assert!(e6.publication_observer.is_none());
     }
 
-    /// F1B.4: the closure episode's READY join reads the two owners' live
-    /// state and carries no identity, so a stale generation, endpoint or
-    /// replayed READY has nothing to be presented as. The shell half is the
-    /// first generation's latch and is never replaced.
-    #[cfg(feature = "wyr1f-closure")]
-    #[test]
-    fn the_closure_ready_join_reads_live_owner_state_and_no_tuple() {
-        let join_for = |registry_generation: u64, console: InstalledPeer, shell: (u64, u64)| {
-            let mut e6 = State::wyr1f_degraded_fixture(registry_generation, console).unwrap();
-            // The fixture's own latch is (1, 1); this one arrives later and
-            // must not replace it.
-            e6.shell.observe_wyr1f_shell_ready(shell.0, shell.1);
-            assert_eq!(e6.shell.wyr1f_shell_ready(), Some((1, 1)));
-            let (resident, _, _) = crate::wyr1c_native::recovery_fixture_resident(
-                [0x1F; 32],
-                registry_generation,
-                e6,
-                RegistryTopology::new(registry_generation).unwrap(),
-                None,
-            )
-            .unwrap();
-            resident
-        };
-        let mut other = console_peer();
-        other.grant.registry_generation = 9;
-        other.grant.endpoint_id = 40;
-        other.grant.endpoint_generation = 41;
-        other.grant.role_generation = 42;
-        other.loaded.process = DwHandle(0x9400);
-        // Every identity the owners hold may differ; the join cannot tell.
-        for resident in [
-            join_for(7, console_peer(), (2, 3)),
-            join_for(8, other, (0x55, 0x66)),
-        ] {
-            assert_eq!(wyr1f_ready_join(&resident), (true, true));
-        }
-
-        // Each half follows its owner's live state.
-        let mut resident = join_for(7, console_peer(), (2, 3));
-        fn e6(resident: &mut ResidentSystemInit) -> &mut State {
-            resident.wyr1c.as_mut().unwrap().e6.as_mut().unwrap()
-        }
-        e6(&mut resident).awaiting_ready = true;
-        assert_eq!(wyr1f_ready_join(&resident), (false, true));
-        e6(&mut resident).awaiting_ready = false;
-        e6(&mut resident).console = None;
-        assert_eq!(wyr1f_ready_join(&resident), (false, true));
-        let mut fresh = ShellControllerState::new(7).unwrap();
-        assert_eq!(fresh.wyr1f_shell_ready(), None);
-        core::mem::swap(&mut e6(&mut resident).shell, &mut fresh);
-        assert_eq!(wyr1f_ready_join(&resident), (false, false));
-        // A session that ended keeps the first generation's latch.
-        core::mem::swap(&mut e6(&mut resident).shell, &mut fresh);
-        e6(&mut resident).shell.observe_session_shutdown();
-        assert_eq!(e6(&mut resident).shell.wyr1f_shell_ready(), Some((1, 1)));
-        resident.wyr1c.as_mut().unwrap().e6 = None;
-        assert_eq!(wyr1f_ready_join(&resident), (false, false));
-    }
 }

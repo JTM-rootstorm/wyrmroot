@@ -22,7 +22,6 @@ members = [
     "userspace/i2-stress",
     "userspace/init0",
     "userspace/system-init",
-    "userspace/wyr1-bootstrap-stubs",
     "userspace/wyr1-retained-stubs",
     "userspace/loader-smoke",
     "userspace/registryd",
@@ -32,11 +31,6 @@ members = [
     "userspace/consoled",
     "userspace/wyrmsh",
     "userspace/dw1b-preemption",
-    "userspace/wyr1e-test-actors",
-    "userspace/dw1c-preemption",
-    "userspace/dw1d6-device-test",
-    "userspace/dw1e3-com2-test",
-    "userspace/wyr1b-gate",
 ]
 
 [workspace.package]

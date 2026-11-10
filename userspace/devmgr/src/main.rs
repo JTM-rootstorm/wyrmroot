@@ -2,17 +2,8 @@
 #![cfg_attr(target_os = "wyrmroot", no_main)]
 #![deny(unsafe_code)]
 
-#[cfg(any(
-    all(feature = "wyr1e-production", feature = "wyr1d-selector32"),
-    all(feature = "wyr1e-production", feature = "dw1e3-selector31"),
-    all(feature = "wyr1e-production", feature = "wyr1c6-selector29")
-))]
-compile_error!("WYR1-E production and selector-only devmgr policies are mutually exclusive");
-
 #[cfg(target_os = "wyrmroot")]
 use core::panic::PanicInfo;
-#[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_dw1e3_com2_test as _;
 #[cfg(target_os = "wyrmroot")]
 use wyrmroot_runtime::panic_abort;
 use wyrmroot_runtime::{NativePlatform, StartupBlock};

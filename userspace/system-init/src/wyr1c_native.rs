@@ -5,23 +5,12 @@
 //! domain custody and delegates only its reduced claim authority.
 
 use super::*;
-#[cfg(feature = "wyr1d-selector32")]
-#[path = "wyr1d_native.rs"]
-mod selector32;
 #[cfg(feature = "wyr1e-production")]
 #[path = "wyr1e_native.rs"]
 mod wyr1e;
 use crate::wyr1b::{EndpointKind, RegistryTopology};
-#[cfg(all(test, feature = "wyr1e8-selector33"))]
-use crate::wyr1b_job::JobDispatcher;
-#[cfg(all(test, any(feature = "wyr1e8-selector33", feature = "wyr1f-closure")))]
-use crate::wyr1b_native::InstalledPeer;
-#[cfg(all(test, feature = "wyr1e8-selector33"))]
-use crate::wyr1b_native::ShellControllerState;
 #[cfg(all(test, feature = "wyr1e-production"))]
 use crate::wyr1b_native::registry_native_attempt_for_fixture;
-#[cfg(feature = "dw1e3-selector31")]
-use crate::wyr1b_native::{InstalledPeer, launch_registry_client_actor};
 use crate::wyr1b_native::{
     RegistryNativeAttempt, create_controller_channel_pair, establish_registry_topology,
     launch_registry_until_ready, launch_registry_until_ready_before, poison_registry_generation,
@@ -29,41 +18,20 @@ use crate::wyr1b_native::{
     retire_registry_for_recovery_before,
 };
 use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DwHandleTransferV1};
-#[cfg(any(
-    feature = "dw1e3-selector31",
-    feature = "wyr1d-selector32",
-    feature = "wyr1e-production"
-))]
+#[cfg(feature = "wyr1e-production")]
 use wyrmroot_device_proto::SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
-#[cfg(not(any(
-    feature = "dw1e3-selector31",
-    feature = "wyr1d-selector32",
-    feature = "wyr1e-production"
-)))]
+#[cfg(not(feature = "wyr1e-production"))]
 use wyrmroot_device_proto::SERIAL_CONSOLE_PUBLICATION_POLICY;
-#[cfg(any(
-    test,
-    not(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))
-))]
+#[cfg(any(test, not(feature = "wyr1e-production")))]
 use wyrmroot_device_proto::controller::encode as encode_controller;
 use wyrmroot_device_proto::coordinator::{
     RegistryEndpoint, RegistryEndpointGeneration, RegistryEndpointId, RegistryGeneration,
     SupervisorGeneration,
 };
-#[cfg(any(
-    feature = "wyr1c6-production",
-    feature = "dw1e3-selector31",
-    feature = "wyr1d-selector32"
-))]
+#[cfg(feature = "wyr1c6-production")]
 use wyrmroot_device_proto::driver_launch::encode_reaped;
-#[cfg(any(
-    feature = "wyr1c6-production",
-    feature = "dw1e3-selector31",
-    feature = "wyr1d-selector32"
-))]
+#[cfg(feature = "wyr1c6-production")]
 use wyrmroot_device_proto::driver_launch::parse_driver_retired;
-#[cfg(feature = "wyr1c6-selector29")]
-use wyrmroot_device_proto::driver_launch::{C6_FACT_BYTES, C6Fact, parse_c6_fact};
 use wyrmroot_device_proto::{
     DriverLaunchRequest,
     controller::{ControllerMessage, StatusCode, parse as parse_controller},
@@ -92,18 +60,6 @@ use wyrmroot_loader::{
 const DRIVER_CONTROL_INGRESS_RIGHTS: DwRights = CHILD_CHANNEL_TRANSFER_RIGHTS;
 #[cfg(not(feature = "wyr1c5-production"))]
 const DRIVER_CONTROL_INGRESS_RIGHTS: DwRights = CHILD_CHANNEL_RIGHTS;
-#[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_dw1e3_com2_test::{
-    CHALLENGE_BYTES as E3A_CHALLENGE_BYTES, CHALLENGE_GENERATION as E3A_CHALLENGE_GENERATION,
-    CONTROL_BYTES as E3A_CONTROL_BYTES, ChallengeBinding,
-    ControllerMessage as E3AControllerMessage, DevmgrConfig, DevmgrReady,
-    RESPONSE_BYTES as E3A_RESPONSE_BYTES, TRANSPORT_EMPTY_FACT_BYTES, TransportEmptyFact,
-    challenge as e3a_challenge, encode as encode_e3a_controller, encode_begin_retire,
-    encode_challenge_binding, encode_devmgr_config as encode_e3a_devmgr_config,
-    encode_finalize_retire, fnv1a64 as e3a_fnv1a64, parse as parse_e3a_controller,
-    parse_binding_ready, parse_devmgr_ready, parse_retire_stage1_ready, parse_transport_empty_fact,
-    response as e3a_response,
-};
 use wyrmroot_registry_proto::{
     Header as RegistryHeader, MessageType as RegistryMessageType, ProtocolVersion,
     encode_install_publication,
@@ -116,22 +72,6 @@ const DEVMGR_PATH: &str = "system/devmgr";
 const PUBLICATION_ID_BASE: u64 = 0xC1_0000;
 const SERVICE_GENERATION_BASE: u64 = 0xC1_0800;
 const PUBLICATION_TRANSACTION_BASE: u64 = 0xC1_1000;
-#[cfg(feature = "dw1e3-selector31")]
-const E3A_PROBE_PATH: &str = "test/dw1e3/com2-probe";
-#[cfg(feature = "dw1e3-selector31")]
-const E3A_PROBE_TRANSACTION_ID: u64 = 0xE3A0_0001;
-#[cfg(feature = "dw1e3-selector31")]
-const E3A_PROBE_CLIENT_ID_BASE: u64 = 0x2_E3A0;
-
-#[cfg(feature = "dw1e3-selector31")]
-fn e3a_probe_client_id(challenge_generation: u64) -> Result<u64, InitError> {
-    match challenge_generation {
-        1 | 2 => E3A_PROBE_CLIENT_ID_BASE
-            .checked_add(challenge_generation)
-            .ok_or(InitError::Accounting),
-        _ => Err(InitError::WrongActivationOrder),
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PublicationCorrelation {
@@ -185,8 +125,6 @@ struct DriverNativeAttempt {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ResidentState {
-    #[cfg(feature = "wyr1d-selector32")]
-    d5: Option<selector32::State>,
     #[cfg(feature = "wyr1e-production")]
     e6: Option<wyr1e::State>,
     resource_domain: Option<ResourceDomainCustody>,
@@ -201,72 +139,6 @@ pub(crate) struct ResidentState {
     next_controller_transaction: u64,
     driver: Option<DriverNativeAttempt>,
     last_reaped_driver: Option<DriverLaunchRequest>,
-    #[cfg(feature = "dw1e3-selector31")]
-    e3a_probe: Option<InstalledPeer>,
-    #[cfg(feature = "dw1e3-selector31")]
-    e3a_stream_generation: Option<u64>,
-    #[cfg(feature = "dw1e3-selector31")]
-    e3a_binding: Option<ChallengeBinding>,
-    #[cfg(feature = "dw1e3-selector31")]
-    e3a_response_committed: bool,
-    #[cfg(feature = "dw1e3-selector31")]
-    e3a_transport_empty: Option<TransportEmptyFact>,
-    #[cfg(feature = "dw1e3-selector31")]
-    e3a_begin_retire_sent: bool,
-    #[cfg(feature = "dw1e3-selector31")]
-    e3a_stage1_ready: bool,
-    #[cfg(feature = "dw1e3-selector31")]
-    e3a_peer_closed: bool,
-    #[cfg(feature = "dw1e3-selector31")]
-    e3a_finalize_retire_sent: bool,
-    #[cfg(feature = "dw1e3-selector31")]
-    e3a_next_challenge_generation: u64,
-    #[cfg(feature = "dw1e3-selector31")]
-    e3a_terminal_claimed: bool,
-    #[cfg(feature = "dw1e3-selector31")]
-    e3a_u2_probe_reaped_successfully: bool,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_gate_config: crate::wyr1c6_gate::GateConfig,
-    #[cfg(feature = "wyr1c6-selector29")]
-    pub(crate) c6_evidence: Option<crate::wyr1c6_gate::EvidenceLog>,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_d1_lease: Option<u64>,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_d1_supervisor: Option<u64>,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_d1_cleanup_complete: bool,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_d1_driver_failures: u64,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_d2_lease: Option<u64>,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_d2_supervisor: Option<u64>,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_d2_role: Option<u64>,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_u1_irq: Option<u64>,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_u1_attempt: Option<u64>,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_u1_endpoint: Option<u64>,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_p1_service_generation: u64,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_p1_registry_generation: u64,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_p1_endpoint_generation: u64,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_u2_irq: Option<u64>,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_u2_attempt: Option<u64>,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_u2_endpoint: Option<u64>,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_p2_service_generation: u64,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_p2_registry_generation: u64,
-    #[cfg(feature = "wyr1c6-selector29")]
-    c6_p2_endpoint_generation: u64,
     last_driver_attempt: u64,
     last_driver_session: u64,
     last_driver_endpoint: u64,
@@ -292,26 +164,14 @@ enum ResidentPollEvent {
     /// The registry's process exited.
     RegistryExited,
     DriverExited,
-    #[cfg(feature = "dw1e3-selector31")]
-    ProbeControlReadable,
-    #[cfg(feature = "dw1e3-selector31")]
-    ProbeControlLost,
-    #[cfg(feature = "dw1e3-selector31")]
-    ProbeExited,
 }
 
 fn classify_resident_poll(
     result: DwWaitResultV1,
     registry_present: bool,
     driver_present: bool,
-    #[cfg(feature = "dw1e3-selector31")] probe_present: bool,
 ) -> Result<ResidentPollEvent, InitError> {
     let item_count = 2 + usize::from(registry_present) * 2 + usize::from(driver_present) + {
-        #[cfg(feature = "dw1e3-selector31")]
-        {
-            usize::from(probe_present) * 2
-        }
-        #[cfg(not(feature = "dw1e3-selector31"))]
         {
             0
         }
@@ -345,34 +205,6 @@ fn classify_resident_poll(
                 && result.observed.0 & DW_SIGNAL_EXITED.0 != 0 =>
         {
             Ok(ResidentPollEvent::DriverExited)
-        }
-        #[cfg(feature = "dw1e3-selector31")]
-        index
-            if probe_present
-                && index == 2 + u32::from(registry_present) * 2 + u32::from(driver_present)
-                && result.observed.0 & DW_SIGNAL_READABLE.0 != 0 =>
-        {
-            // A probe may write ResponseCommitted and close immediately. On
-            // a combined READABLE|PEER_CLOSED wake, consume that queued,
-            // exact message first; a fresh close wake then classifies the
-            // post-response lifetime normally.
-            Ok(ResidentPollEvent::ProbeControlReadable)
-        }
-        #[cfg(feature = "dw1e3-selector31")]
-        index
-            if probe_present
-                && index == 2 + u32::from(registry_present) * 2 + u32::from(driver_present)
-                && result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 =>
-        {
-            Ok(ResidentPollEvent::ProbeControlLost)
-        }
-        #[cfg(feature = "dw1e3-selector31")]
-        index
-            if probe_present
-                && index == 3 + u32::from(registry_present) * 2 + u32::from(driver_present)
-                && result.observed.0 & DW_SIGNAL_EXITED.0 != 0 =>
-        {
-            Ok(ResidentPollEvent::ProbeExited)
         }
         _ => Err(InitError::Supervision),
     }
@@ -539,37 +371,7 @@ where
     let device_manifest = DeviceManifest::parse(manifest_entry.data())
         .map_err(|_| InitError::WrongManifestProfile)?;
     let (manifest, uart_identity) = crate::wyr1b_native::validate_retained_bootfs_c1(bootfs)?;
-    #[cfg(feature = "wyr1c6-selector29")]
-    let (c6_gate_config, c6_evidence) = {
-        let entry = archive
-            .lookup(crate::wyr1c6_gate::GATE_PATH.as_bytes())
-            .map_err(map_lookup)?;
-        let config =
-            crate::wyr1c6_gate::parse_config(entry.data()).map_err(InitError::Wyr1C6GateConfig)?;
-        let evidence = Some(
-            crate::wyr1c6_gate::EvidenceLog::new(config.nonce)
-                .map_err(InitError::Wyr1C6GateConfig)?,
-        );
-        (config, evidence)
-    };
     validate_device_identity(device_manifest, uart_identity)?;
-    // F3A.7k. The instrumented init's declared scenario and evidence nonce
-    // live in the retained gate config (closure contract §5.4). Read here,
-    // before the episode is built from it, and refused rather than skipped if
-    // it does not parse: an instrumented boot with no gate would run as the
-    // normal product while claiming to be the degraded one.
-    #[cfg(feature = "wyr1f-closure")]
-    let manifest = {
-        let mut manifest = manifest;
-        let entry = archive
-            .lookup(crate::gate::GATE_CONFIG_PATH.as_bytes())
-            .map_err(map_lookup)?;
-        let gate = crate::gate::parse_gate_config(entry.data()).map_err(InitError::GateConfig)?;
-        manifest.install_wyr1f_gate(gate)?;
-        manifest
-    };
-    #[cfg(feature = "wyr1f-closure")]
-    let wyr1f = crate::wyr1f_closure::ClosureEpisode::new(manifest.gate_config());
     let resident = slot.write(ResidentSystemInit {
         controller: manifest,
         authority,
@@ -581,8 +383,6 @@ where
         wyr1b: None,
         wyr1b_evidence: None,
         wyr1c: None,
-        #[cfg(feature = "wyr1f-closure")]
-        wyr1f,
     });
     resident.controller.become_operational()?;
     let mut ready = [0u8; HEADER_BYTES];
@@ -645,8 +445,6 @@ where
     #[cfg(feature = "wyr1e-production")]
     let e6 = Some(wyr1e::State::new(topology.generation())?);
     let state = ResidentState {
-        #[cfg(feature = "wyr1d-selector32")]
-        d5: Some(selector32::State::new(bootfs)?),
         #[cfg(feature = "wyr1e-production")]
         e6,
         resource_domain,
@@ -661,72 +459,6 @@ where
         next_controller_transaction: devmgr.next_controller_transaction,
         driver: None,
         last_reaped_driver: None,
-        #[cfg(feature = "dw1e3-selector31")]
-        e3a_probe: None,
-        #[cfg(feature = "dw1e3-selector31")]
-        e3a_stream_generation: None,
-        #[cfg(feature = "dw1e3-selector31")]
-        e3a_binding: None,
-        #[cfg(feature = "dw1e3-selector31")]
-        e3a_response_committed: false,
-        #[cfg(feature = "dw1e3-selector31")]
-        e3a_transport_empty: None,
-        #[cfg(feature = "dw1e3-selector31")]
-        e3a_begin_retire_sent: false,
-        #[cfg(feature = "dw1e3-selector31")]
-        e3a_stage1_ready: false,
-        #[cfg(feature = "dw1e3-selector31")]
-        e3a_peer_closed: false,
-        #[cfg(feature = "dw1e3-selector31")]
-        e3a_finalize_retire_sent: false,
-        #[cfg(feature = "dw1e3-selector31")]
-        e3a_next_challenge_generation: E3A_CHALLENGE_GENERATION,
-        #[cfg(feature = "dw1e3-selector31")]
-        e3a_terminal_claimed: false,
-        #[cfg(feature = "dw1e3-selector31")]
-        e3a_u2_probe_reaped_successfully: false,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_gate_config,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_evidence,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_d1_lease: None,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_d1_supervisor: None,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_d1_cleanup_complete: false,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_d1_driver_failures: 0,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_d2_lease: None,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_d2_supervisor: None,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_d2_role: None,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_u1_irq: None,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_u1_attempt: None,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_u1_endpoint: None,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_p1_service_generation: 0,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_p1_registry_generation: 0,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_p1_endpoint_generation: 0,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_u2_irq: None,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_u2_attempt: None,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_u2_endpoint: None,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_p2_service_generation: 0,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_p2_registry_generation: 0,
-        #[cfg(feature = "wyr1c6-selector29")]
-        c6_p2_endpoint_generation: 0,
         last_driver_attempt: 0,
         last_driver_session: 0,
         last_driver_endpoint: 0,
@@ -1169,9 +901,9 @@ where
     })
 }
 
-#[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
+#[cfg(feature = "wyr1e-production")]
 const PUBLICATION_REQUEST_BYTES: usize = wyrmroot_device_proto::controller_v1_1::RECORD_BYTES;
-#[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
+#[cfg(not(feature = "wyr1e-production"))]
 const PUBLICATION_REQUEST_BYTES: usize = wyrmroot_device_proto::controller::INSTALL_BYTES;
 
 fn encode_publication_request(
@@ -1179,7 +911,7 @@ fn encode_publication_request(
     service_generation: u64,
 ) -> Result<[u8; PUBLICATION_REQUEST_BYTES], ()> {
     let mut bytes = [0u8; PUBLICATION_REQUEST_BYTES];
-    #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
+    #[cfg(feature = "wyr1e-production")]
     wyrmroot_device_proto::controller_v1_1::encode(
         wyrmroot_device_proto::controller_v1_1::PublicationMessage {
             controller,
@@ -1188,7 +920,7 @@ fn encode_publication_request(
         &mut bytes,
     )
     .map_err(|_| ())?;
-    #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
+    #[cfg(not(feature = "wyr1e-production"))]
     {
         let _ = service_generation;
         encode_controller(controller, &mut bytes).map_err(|_| ())?;
@@ -1204,17 +936,9 @@ fn install_publication<S: Wyr1BPlatform>(
     endpoint: DwHandle,
 ) -> Result<(), InitError> {
     let mut bytes = [0u8; 256];
-    #[cfg(any(
-        feature = "dw1e3-selector31",
-        feature = "wyr1d-selector32",
-        feature = "wyr1e-production"
-    ))]
+    #[cfg(feature = "wyr1e-production")]
     let policy = SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
-    #[cfg(not(any(
-        feature = "dw1e3-selector31",
-        feature = "wyr1d-selector32",
-        feature = "wyr1e-production"
-    )))]
+    #[cfg(not(feature = "wyr1e-production"))]
     let policy = SERIAL_CONSOLE_PUBLICATION_POLICY;
     let size = encode_install_publication(
         RegistryHeader {
@@ -1387,19 +1111,7 @@ fn receive_controller_status<S: InitPlatform>(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DevmgrControlInput {
-    #[cfg(feature = "wyr1d-selector32")]
-    D5Ready(wyrmroot_device_proto::d5_controller::D5DriverIdentity),
-    #[cfg(feature = "wyr1d-selector32")]
-    D5TxDrained(wyrmroot_device_proto::d5_controller::D5DrainIdentity),
     Status(ControllerMessage),
-    #[cfg(feature = "wyr1c6-selector29")]
-    C6Fact(C6Fact),
-    #[cfg(feature = "dw1e3-selector31")]
-    TransportEmpty(TransportEmptyFact),
-    #[cfg(feature = "dw1e3-selector31")]
-    BindingReady(ChallengeBinding),
-    #[cfg(feature = "dw1e3-selector31")]
-    RetireStage1Ready(ChallengeBinding),
     DriverLaunch {
         request: DriverLaunchRequest,
         child_endpoint: DwHandle,
@@ -1423,53 +1135,6 @@ fn receive_devmgr_control<S: InitPlatform>(
         return Err(InitError::WrongManifestProfile);
     }
     match &bytes[..4] {
-        #[cfg(feature = "wyr1d-selector32")]
-        b"WDR5" => {
-            if counts.handles != 0 {
-                close_received_native(system, &handles, counts.handles)?;
-                return Err(InitError::WrongManifestProfile);
-            }
-            match wyrmroot_device_proto::d5_controller::parse(&bytes[..counts.bytes])
-                .map_err(|_| InitError::WrongManifestProfile)?
-            {
-                wyrmroot_device_proto::d5_controller::D5ControllerMessage::DriverReady(
-                    identity,
-                ) => Ok(DevmgrControlInput::D5Ready(identity)),
-                wyrmroot_device_proto::d5_controller::D5ControllerMessage::TxDrained(identity) => {
-                    Ok(DevmgrControlInput::D5TxDrained(identity))
-                }
-                _ => Err(InitError::WrongManifestProfile),
-            }
-        }
-        #[cfg(feature = "dw1e3-selector31")]
-        b"WDE3" => {
-            if counts.handles != 0 || counts.bytes != TRANSPORT_EMPTY_FACT_BYTES {
-                close_received_native(system, &handles, counts.handles)?;
-                return Err(InitError::WrongManifestProfile);
-            }
-            match u16::from_le_bytes([bytes[6], bytes[7]]) {
-                3 => parse_transport_empty_fact(&bytes[..counts.bytes])
-                    .map(DevmgrControlInput::TransportEmpty)
-                    .map_err(|_| InitError::WrongManifestProfile),
-                5 => parse_binding_ready(&bytes[..counts.bytes])
-                    .map(DevmgrControlInput::BindingReady)
-                    .map_err(|_| InitError::WrongManifestProfile),
-                8 => parse_retire_stage1_ready(&bytes[..counts.bytes])
-                    .map(DevmgrControlInput::RetireStage1Ready)
-                    .map_err(|_| InitError::WrongManifestProfile),
-                _ => Err(InitError::WrongManifestProfile),
-            }
-        }
-        #[cfg(feature = "wyr1c6-selector29")]
-        b"WRCF" => {
-            if counts.handles != 0 || counts.bytes != C6_FACT_BYTES {
-                close_received_native(system, &handles, counts.handles)?;
-                return Err(InitError::WrongManifestProfile);
-            }
-            let fact = parse_c6_fact(&bytes[..counts.bytes])
-                .map_err(|_| InitError::WrongManifestProfile)?;
-            Ok(DevmgrControlInput::C6Fact(fact))
-        }
         b"WRCS" => {
             if counts.handles != 0 {
                 close_received_native(system, &handles, counts.handles)?;
@@ -1551,386 +1216,6 @@ fn close_received_native<S: InitPlatform>(
     } else {
         Ok(())
     }
-}
-
-#[cfg(feature = "wyr1c6-selector29")]
-fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(), InitError> {
-    #[cfg(feature = "wyr1c6-selector29")]
-    if fact.event == 19 {
-        let (d1_lease, cleanup_complete) = resident
-            .wyr1c
-            .as_ref()
-            .map(|state| (state.c6_d1_lease, state.c6_d1_cleanup_complete))
-            .ok_or(InitError::AbsentState(0x13))?;
-        let d1_lease = d1_lease.ok_or(InitError::AbsentState(0x14))?;
-        if !cleanup_complete
-            || fact.lease <= d1_lease
-            || fact.binding != 1
-            || fact.value == 0
-            || fact.aux != COM2_ROLE_ID.0
-        {
-            return Err(InitError::WrongManifestProfile);
-        }
-        let state = resident
-            .wyr1c
-            .as_mut()
-            .ok_or(InitError::AbsentState(0x15))?;
-        state
-            .c6_evidence
-            .as_mut()
-            .ok_or(InitError::AbsentState(0x16))?
-            .record(
-                crate::wyr1c6_gate::GateEvent::D1GrantAvailable,
-                d1_lease,
-                0,
-                1,
-                0,
-            )
-            .map_err(|_| InitError::WrongManifestProfile)?;
-    }
-    let state = resident
-        .wyr1c
-        .as_mut()
-        .ok_or(InitError::AbsentState(0x17))?;
-    let valid = match fact.event {
-        1 => fact.lease != 0 && fact.binding == 1 && fact.value != 0 && fact.aux == COM2_ROLE_ID.0,
-        2 => Some(fact.lease) == state.c6_d1_lease && fact.binding == 1,
-        3 => {
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && fact.binding != 0
-                && fact.value != 0
-                && fact.aux != 0
-        }
-        4 | 6 | 8 => {
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && Some(fact.binding) == state.c6_u1_irq
-                && Some(fact.value) == state.c6_u1_attempt
-                && Some(fact.aux) == state.c6_u1_endpoint
-        }
-        5 => {
-            let binding = state.binding;
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && binding.is_some_and(|binding| {
-                    fact.binding == binding.generation.0
-                        && fact.aux == binding.endpoint.generation.0
-                })
-                && fact.value == state.c6_u1_attempt.unwrap_or(0)
-                && state.publication_service_generation != 0
-        }
-        7 => {
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && fact.binding == state.c6_p1_registry_generation
-                && Some(fact.value) == state.c6_u1_attempt
-                && fact.aux == state.c6_p1_endpoint_generation
-        }
-        9 => {
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && Some(fact.binding) == state.c6_u1_irq
-                && fact.value == 1
-                && fact.aux == 0
-        }
-        10 => {
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && fact.binding != 0
-                && Some(fact.binding) != state.c6_u1_irq
-                && fact.value > state.c6_u1_attempt.unwrap_or(0)
-                && fact.aux != 0
-        }
-        11 => {
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && Some(fact.binding) == state.c6_u2_irq
-                && Some(fact.value) == state.c6_u2_attempt
-                && Some(fact.aux) == state.c6_u2_endpoint
-        }
-        12 => {
-            let binding = state.binding;
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && binding.is_some_and(|binding| {
-                    fact.binding == binding.generation.0
-                        && fact.aux == binding.endpoint.generation.0
-                })
-                && Some(fact.value) == state.c6_u2_attempt
-                && state.publication_service_generation > state.c6_p1_service_generation
-        }
-        13 => {
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && fact.binding == state.c6_p1_registry_generation
-                && Some(fact.value) == state.c6_u1_attempt
-                && fact.aux == 3
-        }
-        14 => {
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && fact.binding == state.c6_p2_registry_generation
-                && Some(fact.value) == state.c6_d1_supervisor
-                && fact.aux == 0
-        }
-        15 => {
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && fact.binding == state.c6_p2_service_generation
-                && Some(fact.value) == state.c6_u2_attempt
-                && fact.aux == state.c6_p2_endpoint_generation
-        }
-        16 => {
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && Some(fact.binding) == state.c6_u2_irq
-                && Some(fact.value) == state.c6_u2_attempt
-                && Some(fact.aux) == state.c6_u2_endpoint
-        }
-        17 => {
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && fact.binding == 0
-                && Some(fact.value) == state.c6_d1_supervisor
-                && fact.aux == 1
-        }
-        18 => {
-            fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && fact.binding == 0
-                && fact.value == 1
-                && fact.aux == 0
-        }
-        19 => {
-            let active = state.devmgr;
-            fact.lease > state.c6_d1_lease.unwrap_or(0)
-                && fact.binding == 1
-                && fact.value != 0
-                && fact.aux != 0
-                && active.is_some_and(|active| {
-                    active.role == RoleId::Devmgr && active.generation == fact.value
-                })
-        }
-        20..=22 => {
-            let active = state.devmgr;
-            fact.lease == state.c6_d2_lease.unwrap_or(0)
-                && fact.binding == 1
-                && Some(fact.value) == state.c6_d2_supervisor
-                && Some(fact.aux) == state.c6_d2_role
-                && active.is_some_and(|active| {
-                    active.role == RoleId::Devmgr && active.generation == fact.value
-                })
-        }
-        23 => {
-            fact.lease == state.c6_d2_lease.unwrap_or(0)
-                && fact.binding == 0
-                && fact.value == 3
-                && fact.aux == 0
-                && resident
-                    .controller
-                    .c6_startup_profiles_exclude_direct_device_authority()
-                && state.resource_domain.is_some_and(|custody| {
-                    custody
-                        .devmgr_claim_authority(ResourceDomainMembership::InitOutsideDomain)
-                        .is_err()
-                })
-                && state.driver.is_none()
-        }
-        24 => {
-            fact.lease == state.c6_d2_lease.unwrap_or(0)
-                && fact.binding == 0
-                && fact.value == 0
-                && fact.aux == 0
-                && state.c6_gate_config.physical_io_not_performed
-        }
-        25 => {
-            let devmgr_failures = resident
-                .controller
-                .role_failure_count(RoleId::Devmgr)
-                .unwrap_or(usize::MAX);
-            fact.lease == state.c6_d2_lease.unwrap_or(0)
-                && fact.binding == 0
-                && fact.value == state.c6_d1_driver_failures
-                && fact.aux == devmgr_failures as u64
-        }
-        26 => {
-            fact.lease == state.c6_d2_lease.unwrap_or(0)
-                && fact.binding == 0
-                && fact.value == u64::from(WYR0_I_SUPERVISION_POLICY.max_attempts)
-                && fact.aux == WYR0_I_SUPERVISION_POLICY.backoff_ns
-        }
-        _ => false,
-    };
-    if !valid {
-        return Err(InitError::WrongManifestProfile);
-    }
-    let event = match fact.event {
-        1 => crate::wyr1c6_gate::GateEvent::D1Begin,
-        2 => crate::wyr1c6_gate::GateEvent::D1Lease,
-        3 => crate::wyr1c6_gate::GateEvent::U1Start,
-        4 => crate::wyr1c6_gate::GateEvent::U1Ready,
-        5 => crate::wyr1c6_gate::GateEvent::P1Publish,
-        6 => crate::wyr1c6_gate::GateEvent::U1Failure,
-        7 => crate::wyr1c6_gate::GateEvent::P1Retire,
-        8 => crate::wyr1c6_gate::GateEvent::U1Reap,
-        9 => crate::wyr1c6_gate::GateEvent::OldIrqReleased,
-        10 => crate::wyr1c6_gate::GateEvent::U2Start,
-        11 => crate::wyr1c6_gate::GateEvent::U2Ready,
-        12 => crate::wyr1c6_gate::GateEvent::P2Publish,
-        13 => crate::wyr1c6_gate::GateEvent::StaleReject,
-        14 => crate::wyr1c6_gate::GateEvent::D1Failure,
-        15 => crate::wyr1c6_gate::GateEvent::P2Retire,
-        16 => crate::wyr1c6_gate::GateEvent::U2Reap,
-        17 => crate::wyr1c6_gate::GateEvent::D1GenerationClean,
-        18 => crate::wyr1c6_gate::GateEvent::D1GrantAvailable,
-        19 => crate::wyr1c6_gate::GateEvent::D2Lease,
-        20 => crate::wyr1c6_gate::GateEvent::D2Start,
-        21 => crate::wyr1c6_gate::GateEvent::D2Claim,
-        22 => crate::wyr1c6_gate::GateEvent::D2Ready,
-        23 => crate::wyr1c6_gate::GateEvent::NoAuthority,
-        24 => crate::wyr1c6_gate::GateEvent::NoIo,
-        25 => crate::wyr1c6_gate::GateEvent::Accounting,
-        26 => crate::wyr1c6_gate::GateEvent::Bounded,
-        _ => return Err(InitError::WrongManifestProfile),
-    };
-    let evidence_binding = c6_evidence_binding(
-        fact.event,
-        fact.binding,
-        state.publication_service_generation,
-        state.c6_p1_service_generation,
-        state.c6_p2_service_generation,
-    );
-    let log = state
-        .c6_evidence
-        .as_mut()
-        .ok_or(InitError::AbsentState(0x18))?;
-    log.record(event, fact.lease, evidence_binding, fact.value, fact.aux)
-        .map_err(|_| InitError::WrongManifestProfile)?;
-    match fact.event {
-        1 => {
-            state.c6_d1_lease = Some(fact.lease);
-            state.c6_d1_supervisor = Some(fact.value);
-        }
-        3 => {
-            state.c6_u1_irq = Some(fact.binding);
-            state.c6_u1_attempt = Some(fact.value);
-            state.c6_u1_endpoint = Some(fact.aux);
-        }
-        5 => {
-            state.c6_p1_service_generation = state.publication_service_generation;
-            state.c6_p1_registry_generation = fact.binding;
-            state.c6_p1_endpoint_generation = fact.aux;
-        }
-        6 => {
-            state.c6_d1_driver_failures = state
-                .c6_d1_driver_failures
-                .checked_add(1)
-                .ok_or(InitError::Accounting)?;
-        }
-        10 => {
-            state.c6_u2_irq = Some(fact.binding);
-            state.c6_u2_attempt = Some(fact.value);
-            state.c6_u2_endpoint = Some(fact.aux);
-        }
-        12 => {
-            state.c6_p2_service_generation = state.publication_service_generation;
-            state.c6_p2_registry_generation = fact.binding;
-            state.c6_p2_endpoint_generation = fact.aux;
-        }
-        19 => {
-            state.c6_d2_lease = Some(fact.lease);
-            state.c6_d2_supervisor = Some(fact.value);
-            state.c6_d2_role = Some(fact.aux);
-        }
-        17 => state.c6_d1_cleanup_complete = true,
-        _ => {}
-    }
-    if fact.event == 22 {
-        emit_c6_terminal_facts(resident)?;
-    }
-    Ok(())
-}
-
-#[cfg(feature = "wyr1c6-selector29")]
-const fn c6_evidence_binding(
-    event: u8,
-    observed_registry_generation: u64,
-    current_service_generation: u64,
-    p1_service_generation: u64,
-    p2_service_generation: u64,
-) -> u64 {
-    match event {
-        5 | 12 => current_service_generation,
-        7 | 13 => p1_service_generation,
-        14 => p2_service_generation,
-        _ => observed_registry_generation,
-    }
-}
-
-#[cfg(feature = "wyr1c6-selector29")]
-fn emit_c6_terminal_facts(resident: &mut ResidentSystemInit) -> Result<(), InitError> {
-    let (lease, driver_failures, devmgr_failures, max_attempts, backoff_ns) = {
-        let state = resident
-            .wyr1c
-            .as_ref()
-            .ok_or(InitError::AbsentState(0x19))?;
-        let devmgr = state.devmgr.ok_or(InitError::AbsentState(0x1a))?;
-        if devmgr.role != RoleId::Devmgr
-            || state.driver.is_some()
-            || state.c6_d2_lease.is_none()
-            || state.c6_d2_supervisor != Some(devmgr.generation)
-            || state.c6_d2_role != Some(COM2_ROLE_ID.0)
-            || !state.c6_gate_config.physical_io_not_performed
-            || !resident
-                .controller
-                .c6_startup_profiles_exclude_direct_device_authority()
-            || !state.resource_domain.is_some_and(|custody| {
-                custody
-                    .devmgr_claim_authority(ResourceDomainMembership::InitOutsideDomain)
-                    .is_err()
-            })
-        {
-            return Err(InitError::WrongManifestProfile);
-        }
-        let lease = state.c6_d2_lease.ok_or(InitError::AbsentState(0x1b))?;
-        let driver_failures = state.c6_d1_driver_failures;
-        let devmgr_failures = resident
-            .controller
-            .role_failure_count(RoleId::Devmgr)
-            .ok_or(InitError::Accounting)?;
-        if driver_failures == 0 || devmgr_failures == 0 {
-            return Err(InitError::Accounting);
-        }
-        (
-            lease,
-            driver_failures,
-            devmgr_failures as u64,
-            WYR0_I_SUPERVISION_POLICY.max_attempts,
-            WYR0_I_SUPERVISION_POLICY.backoff_ns,
-        )
-    };
-    for (event, value, aux) in [
-        (23, 3, 0),
-        (24, 0, 0),
-        (25, driver_failures, devmgr_failures),
-        (26, u64::from(max_attempts), backoff_ns),
-    ] {
-        accept_c6_fact(
-            resident,
-            C6Fact {
-                event,
-                lease,
-                binding: 0,
-                value,
-                aux,
-            },
-        )?;
-    }
-    Ok(())
-}
-
-#[cfg(feature = "wyr1c6-selector29")]
-pub fn finish_c6_evidence(resident: &mut ResidentSystemInit) -> Result<bool, InitError> {
-    let state = resident
-        .wyr1c
-        .as_mut()
-        .ok_or(InitError::AbsentState(0x1c))?;
-    let log = state
-        .c6_evidence
-        .as_mut()
-        .ok_or(InitError::AbsentState(0x1d))?;
-    if !log.ready_for_terminal() {
-        return Ok(false);
-    }
-    log.finish().map_err(|_| InitError::WrongManifestProfile)?;
-    Ok(true)
 }
 
 fn validate_driver_actor(bootfs: &[u8], request: DriverLaunchRequest) -> Result<&[u8], InitError> {
@@ -2162,300 +1447,6 @@ where
     Ok(())
 }
 
-#[cfg(feature = "dw1e3-selector31")]
-fn start_e3a_probe<S, L, W>(
-    resident: &mut ResidentSystemInit,
-    system: &mut S,
-    loader: &mut L,
-    waits: &mut W,
-    bootfs: &[u8],
-) -> Result<(), InitError>
-where
-    S: Wyr1BPlatform,
-    L: LoaderPlatform<Error = NativeError>,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let (
-        devmgr,
-        registry_control,
-        publication_generation,
-        driver_attempt,
-        challenge_generation,
-        already_started,
-    ) = {
-        let state = resident
-            .wyr1c
-            .as_ref()
-            .ok_or(InitError::AbsentState(0x22))?;
-        (
-            state.devmgr.ok_or(InitError::AbsentState(0x23))?,
-            state
-                .registry
-                .ok_or(InitError::AbsentState(0x24))?
-                .control_channel,
-            state.publication_service_generation,
-            state
-                .driver
-                .ok_or(InitError::AbsentState(0x25))?
-                .request
-                .attempt_generation
-                .0,
-            state.e3a_next_challenge_generation,
-            state.e3a_probe.is_some(),
-        )
-    };
-    if already_started || publication_generation == 0 || !matches!(challenge_generation, 1 | 2) {
-        return Err(InitError::WrongActivationOrder);
-    }
-    let nonce = wyrmroot_runtime::dw1e3_build_nonce().map_err(InitError::Native)?;
-    // E3A has no separate payload nonce. E3B supplies both frozen payload
-    // nonces, which the runtime validates as distinct from this evidence key.
-    let challenge = e3a_challenge(
-        wyrmroot_runtime::dw1e3_challenge_nonce(challenge_generation).map_err(InitError::Native)?,
-    );
-    let expected_hash = e3a_fnv1a64(&challenge);
-    let probe_client_id = e3a_probe_client_id(challenge_generation)?;
-
-    // Constructing the process only unblocks devmgr's synchronous staging path;
-    // it does not mean the Interrupt is bound or the registry publication is
-    // committed. The selector-private ready reply is emitted by devmgr only
-    // after both facts hold and its connector broker owns the exact generation.
-    let mut devmgr_config = [0u8; wyrmroot_dw1e3_com2_test::DEVMGR_CONFIG_BYTES];
-    encode_e3a_devmgr_config(
-        DevmgrConfig {
-            nonce,
-            publication_generation,
-        },
-        &mut devmgr_config,
-    )
-    .map_err(|_| InitError::WrongManifestProfile)?;
-    system
-        .send_channel(devmgr.loaded.launch_channel, &devmgr_config)
-        .map_err(InitError::Native)?;
-
-    let now = system.now().map_err(InitError::Native)?;
-    let deadline = now
-        .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
-        .ok_or(InitError::Accounting)?;
-    let observed = waits
-        .wait_many(
-            &[
-                DwWaitItemV1 {
-                    handle: devmgr.loaded.launch_channel,
-                    signals: DW_SIGNAL_READABLE,
-                },
-                DwWaitItemV1 {
-                    handle: devmgr.loaded.process,
-                    signals: DW_SIGNAL_EXITED,
-                },
-            ],
-            DwDeadline(deadline),
-        )
-        .map_err(InitError::Native)?;
-    if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
-        return Err(InitError::Supervision);
-    }
-    let mut devmgr_ready = [0u8; wyrmroot_dw1e3_com2_test::DEVMGR_CONFIG_BYTES];
-    let mut ready_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = system
-        .receive_channel(
-            devmgr.loaded.launch_channel,
-            &mut devmgr_ready,
-            &mut ready_handles,
-        )
-        .map_err(InitError::Native)?;
-    if counts.bytes != devmgr_ready.len() || counts.handles != 0 {
-        close_received_native(system, &ready_handles, counts.handles)?;
-        return Err(InitError::WrongManifestProfile);
-    }
-    let ready = parse_devmgr_ready(&devmgr_ready).map_err(|_| InitError::WrongManifestProfile)?;
-    if ready
-        != (DevmgrReady {
-            nonce,
-            publication_generation,
-        })
-    {
-        return Err(InitError::WrongManifestProfile);
-    }
-
-    let authority = resident.authority;
-    let probe = {
-        let state = resident
-            .wyr1c
-            .as_mut()
-            .ok_or(InitError::AbsentState(0x26))?;
-        launch_registry_client_actor(
-            system,
-            loader,
-            waits,
-            authority,
-            bootfs,
-            registry_control,
-            &mut state.topology,
-            E3A_PROBE_PATH,
-            publication_generation,
-            E3A_PROBE_TRANSACTION_ID,
-            probe_client_id,
-        )?
-    };
-    let result = (|| {
-        // Bind both selector reporters from the controller's retained Process
-        // custody. Deepwyrm resolves this handle in system-init's table, so
-        // neither the probe nor a guessed primordial identity can claim the
-        // controller role.
-        wyrmroot_runtime::dw1e3_bind_probe(probe.loaded.process, nonce)
-            .map_err(InitError::Native)?;
-        let configure = E3AControllerMessage::Configure {
-            nonce,
-            publication_generation,
-            challenge_generation,
-            expected_length: E3A_CHALLENGE_BYTES as u64,
-            expected_hash,
-        };
-        let mut bytes = [0u8; E3A_CONTROL_BYTES];
-        encode_e3a_controller(configure, &mut bytes)
-            .map_err(|_| InitError::WrongManifestProfile)?;
-        system
-            .send_channel(probe.loaded.launch_channel, &bytes)
-            .map_err(InitError::Native)?;
-
-        let now = system.now().map_err(InitError::Native)?;
-        let deadline = now
-            .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
-            .ok_or(InitError::Accounting)?;
-        let observed = waits
-            .wait_many(
-                &[
-                    DwWaitItemV1 {
-                        handle: probe.loaded.launch_channel,
-                        signals: DW_SIGNAL_READABLE,
-                    },
-                    DwWaitItemV1 {
-                        handle: probe.loaded.process,
-                        signals: DW_SIGNAL_EXITED,
-                    },
-                ],
-                DwDeadline(deadline),
-            )
-            .map_err(InitError::Native)?;
-        if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
-            return Err(InitError::Supervision);
-        }
-        let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-        let counts = system
-            .receive_channel(probe.loaded.launch_channel, &mut bytes, &mut handles)
-            .map_err(InitError::Native)?;
-        if counts.bytes != bytes.len() || counts.handles != 0 {
-            close_received_native(system, &handles, counts.handles)?;
-            return Err(InitError::WrongManifestProfile);
-        }
-        let attached = parse_e3a_controller(&bytes).map_err(|_| InitError::WrongManifestProfile)?;
-        let E3AControllerMessage::Attached {
-            nonce: received_nonce,
-            publication_generation: received_publication,
-            stream_generation,
-            challenge_generation: received_challenge_generation,
-        } = attached
-        else {
-            return Err(InitError::WrongManifestProfile);
-        };
-        if received_nonce != nonce
-            || received_publication != publication_generation
-            || received_challenge_generation != challenge_generation
-        {
-            return Err(InitError::WrongManifestProfile);
-        }
-
-        let binding = ChallengeBinding {
-            nonce,
-            attempt_generation: driver_attempt,
-            publication_generation,
-            stream_generation,
-            challenge_generation,
-            expected_length: E3A_CHALLENGE_BYTES as u64,
-            expected_hash,
-        };
-        let mut binding_bytes = [0u8; TRANSPORT_EMPTY_FACT_BYTES];
-        encode_challenge_binding(binding, &mut binding_bytes)
-            .map_err(|_| InitError::WrongManifestProfile)?;
-        system
-            .send_channel(devmgr.loaded.launch_channel, &binding_bytes)
-            .map_err(InitError::Native)?;
-        let now = system.now().map_err(InitError::Native)?;
-        let deadline = now
-            .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
-            .ok_or(InitError::Accounting)?;
-        let observed = waits
-            .wait_many(
-                core::slice::from_ref(&DwWaitItemV1 {
-                    handle: devmgr.loaded.launch_channel,
-                    signals: DW_SIGNAL_READABLE,
-                }),
-                DwDeadline(deadline),
-            )
-            .map_err(InitError::Native)?;
-        if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
-            return Err(InitError::Supervision);
-        }
-        if receive_devmgr_control(system, devmgr.loaded.launch_channel)?
-            != DevmgrControlInput::BindingReady(binding)
-        {
-            return Err(InitError::WrongManifestProfile);
-        }
-        // Action 3 is the sole host-transmit readiness point, and only after
-        // the current driver has returned its exact BindingReady correlation.
-        wyrmroot_runtime::dw1e3_arm_challenge(
-            stream_generation,
-            challenge_generation,
-            E3A_CHALLENGE_BYTES as u64,
-            expected_hash,
-            nonce,
-        )
-        .map_err(InitError::Native)?;
-        let permit = E3AControllerMessage::ArmPermit {
-            nonce,
-            publication_generation,
-            stream_generation,
-            challenge_generation,
-            expected_length: E3A_CHALLENGE_BYTES as u64,
-            expected_hash,
-        };
-        encode_e3a_controller(permit, &mut bytes).map_err(|_| InitError::WrongManifestProfile)?;
-        system
-            .send_channel(probe.loaded.launch_channel, &bytes)
-            .map_err(InitError::Native)?;
-        Ok((stream_generation, binding))
-    })();
-    match result {
-        Ok((stream_generation, binding)) => {
-            let state = resident
-                .wyr1c
-                .as_mut()
-                .ok_or(InitError::AbsentState(0x27))?;
-            state.e3a_probe = Some(probe);
-            state.e3a_stream_generation = Some(stream_generation);
-            state.e3a_binding = Some(binding);
-            state.e3a_response_committed = false;
-            state.e3a_transport_empty = None;
-            state.e3a_begin_retire_sent = false;
-            state.e3a_stage1_ready = false;
-            state.e3a_peer_closed = false;
-            state.e3a_finalize_retire_sent = false;
-            state.e3a_u2_probe_reaped_successfully = false;
-            Ok(())
-        }
-        Err(error) => {
-            let cleanup_failed =
-                cleanup_loaded(system, waits, probe.loaded, probe.task_group, true).is_err();
-            Err(if cleanup_failed {
-                InitError::Cleanup
-            } else {
-                error
-            })
-        }
-    }
-}
-
 fn reap_driver<S, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -2507,626 +1498,7 @@ where
     Ok(request)
 }
 
-#[cfg(feature = "dw1e3-selector31")]
-fn exact_e3a_response(binding: ChallengeBinding) -> Result<(u64, u64), InitError> {
-    let challenge = e3a_challenge(
-        wyrmroot_runtime::dw1e3_challenge_nonce(binding.challenge_generation)
-            .map_err(InitError::Native)?,
-    );
-    if binding.expected_length != E3A_CHALLENGE_BYTES as u64
-        || binding.expected_hash != e3a_fnv1a64(&challenge)
-    {
-        return Err(InitError::WrongManifestProfile);
-    }
-    let response = e3a_response(&challenge);
-    Ok((E3A_RESPONSE_BYTES as u64, e3a_fnv1a64(&response)))
-}
-
-#[cfg(feature = "dw1e3-selector31")]
-fn exact_transport_empty(
-    binding: ChallengeBinding,
-    fact: TransportEmptyFact,
-) -> Result<(), InitError> {
-    let (response_length, response_hash) = exact_e3a_response(binding)?;
-    if fact.nonce != binding.nonce
-        || fact.attempt_generation != binding.attempt_generation
-        || fact.publication_generation != binding.publication_generation
-        || fact.stream_generation != binding.stream_generation
-        || fact.challenge_generation != binding.challenge_generation
-        || fact.response_length != response_length
-        || fact.response_hash != response_hash
-    {
-        return Err(InitError::WrongManifestProfile);
-    }
-    Ok(())
-}
-
-#[cfg(feature = "dw1e3-selector31")]
-fn maybe_begin_e3a_retire<S: InitPlatform>(
-    resident: &mut ResidentSystemInit,
-    system: &mut S,
-) -> Result<(), InitError> {
-    let (
-        devmgr,
-        binding,
-        response_committed,
-        transport_empty,
-        already_sent,
-        u2_probe_reaped_successfully,
-    ) = {
-        let state = resident
-            .wyr1c
-            .as_ref()
-            .ok_or(InitError::AbsentState(0x29))?;
-        (
-            state.devmgr.ok_or(InitError::AbsentState(0x2a))?,
-            state.e3a_binding.ok_or(InitError::AbsentState(0x2b))?,
-            state.e3a_response_committed,
-            state.e3a_transport_empty,
-            state.e3a_begin_retire_sent,
-            state.e3a_u2_probe_reaped_successfully,
-        )
-    };
-    if !response_committed || transport_empty.is_none() {
-        return Ok(());
-    }
-    if binding.challenge_generation == 2 {
-        if !u2_probe_reaped_successfully {
-            // A TEMT wake can win the resident poll before a simultaneously
-            // queued nonzero probe exit.  The exact normal-zero reap is a
-            // controller-side causal join, not merely cleanup.
-            return Ok(());
-        }
-        let terminal_claimed = resident
-            .wyr1c
-            .as_ref()
-            .ok_or(InitError::AbsentState(0x2c))?
-            .e3a_terminal_claimed;
-        if terminal_claimed {
-            return Err(InitError::WrongManifestProfile);
-        }
-        exact_transport_empty(
-            binding,
-            transport_empty.ok_or(InitError::AbsentState(0x2d))?,
-        )?;
-        // The probe cannot make this claim: both its committed response and
-        // the current driver's post-ack TEMT fact have been rejoined here.
-        wyrmroot_runtime::dw1e3_terminal_claim(binding.nonce).map_err(InitError::Native)?;
-        resident
-            .wyr1c
-            .as_mut()
-            .ok_or(InitError::AbsentState(0x2e))?
-            .e3a_terminal_claimed = true;
-        return Ok(());
-    }
-    if binding.challenge_generation != 1 {
-        return Err(InitError::WrongManifestProfile);
-    }
-    if already_sent {
-        return Err(InitError::WrongManifestProfile);
-    }
-    exact_transport_empty(
-        binding,
-        transport_empty.ok_or(InitError::AbsentState(0x2f))?,
-    )?;
-    let mut bytes = [0u8; TRANSPORT_EMPTY_FACT_BYTES];
-    encode_begin_retire(binding, &mut bytes).map_err(|_| InitError::WrongManifestProfile)?;
-    system
-        .send_channel(devmgr.loaded.launch_channel, &bytes)
-        .map_err(InitError::Native)?;
-    resident
-        .wyr1c
-        .as_mut()
-        .ok_or(InitError::AbsentState(0x30))?
-        .e3a_begin_retire_sent = true;
-    Ok(())
-}
-
-#[cfg(feature = "dw1e3-selector31")]
-fn send_e3a_finalize_retire<S: InitPlatform>(
-    resident: &mut ResidentSystemInit,
-    system: &mut S,
-) -> Result<(), InitError> {
-    let (devmgr, binding, stage1_ready, peer_closed, already_sent) = {
-        let state = resident
-            .wyr1c
-            .as_ref()
-            .ok_or(InitError::AbsentState(0x31))?;
-        (
-            state.devmgr.ok_or(InitError::AbsentState(0x32))?,
-            state.e3a_binding.ok_or(InitError::AbsentState(0x33))?,
-            state.e3a_stage1_ready,
-            state.e3a_peer_closed,
-            state.e3a_finalize_retire_sent,
-        )
-    };
-    if !stage1_ready || !peer_closed {
-        return Ok(());
-    }
-    if already_sent {
-        return Err(InitError::WrongManifestProfile);
-    }
-    let mut bytes = [0u8; TRANSPORT_EMPTY_FACT_BYTES];
-    encode_finalize_retire(binding, &mut bytes).map_err(|_| InitError::WrongManifestProfile)?;
-    system
-        .send_channel(devmgr.loaded.launch_channel, &bytes)
-        .map_err(InitError::Native)?;
-    resident
-        .wyr1c
-        .as_mut()
-        .ok_or(InitError::AbsentState(0x34))?
-        .e3a_finalize_retire_sent = true;
-    Ok(())
-}
-
-#[cfg(feature = "dw1e3-selector31")]
-fn receive_e3a_probe_message<S: InitPlatform>(
-    resident: &ResidentSystemInit,
-    system: &mut S,
-) -> Result<E3AControllerMessage, InitError> {
-    let probe = resident
-        .wyr1c
-        .as_ref()
-        .and_then(|state| state.e3a_probe)
-        .ok_or(InitError::AbsentState(0x35))?;
-    let mut bytes = [0u8; E3A_CONTROL_BYTES];
-    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = system
-        .receive_channel(probe.loaded.launch_channel, &mut bytes, &mut handles)
-        .map_err(InitError::Native)?;
-    if counts.bytes != bytes.len() || counts.handles != 0 {
-        close_received_native(system, &handles, counts.handles)?;
-        return Err(InitError::WrongManifestProfile);
-    }
-    parse_e3a_controller(&bytes).map_err(|_| InitError::WrongManifestProfile)
-}
-
-#[cfg(feature = "dw1e3-selector31")]
-fn validate_e3a_u1_finalize_exit<W>(
-    resident: &ResidentSystemInit,
-    waits: &mut W,
-) -> Result<(), InitError>
-where
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let state = resident
-        .wyr1c
-        .as_ref()
-        .ok_or(InitError::AbsentState(0x36))?;
-    let binding = state.e3a_binding.ok_or(InitError::WrongManifestProfile)?;
-    let driver = state.driver.ok_or(InitError::WrongManifestProfile)?;
-    if binding.challenge_generation != 1
-        || !state.e3a_response_committed
-        || !state.e3a_begin_retire_sent
-        || !state.e3a_stage1_ready
-        || !state.e3a_peer_closed
-        || !state.e3a_finalize_retire_sent
-        || state.e3a_terminal_claimed
-    {
-        return Err(InitError::WrongManifestProfile);
-    }
-    exact_transport_empty(
-        binding,
-        state
-            .e3a_transport_empty
-            .ok_or(InitError::WrongManifestProfile)?,
-    )?;
-    let exit = waits
-        .query_task_termination(driver.loaded.process)
-        .map_err(InitError::Native)?;
-    wyrmroot_runtime::validate_successful_exit(&exit).map_err(|_| InitError::WrongManifestProfile)
-}
-
-#[cfg(feature = "dw1e3-selector31")]
-fn reap_e3a_probe<S, W>(
-    resident: &mut ResidentSystemInit,
-    system: &mut S,
-    waits: &mut W,
-    admit_u2: bool,
-) -> Result<(), InitError>
-where
-    S: InitPlatform,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let probe = resident
-        .wyr1c
-        .as_mut()
-        .and_then(|state| state.e3a_probe.take());
-    let Some(probe) = probe else {
-        return Ok(());
-    };
-    let deadline = system
-        .now()
-        .map_err(InitError::Native)?
-        .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
-        .ok_or(InitError::Accounting)?;
-    // Closing only the controller endpoint asks the probe to take its normal
-    // parent-peer-close exit. It has already supplied its close proof.
-    let mut cleanup_failed = system.close_handle(probe.loaded.launch_channel).is_err();
-    let observed_exit = matches!(
-        waits.wait_many(
-            core::slice::from_ref(&DwWaitItemV1 {
-                handle: probe.loaded.process,
-                signals: DW_SIGNAL_EXITED,
-            }),
-            DwDeadline(deadline),
-        ),
-        Ok(result) if result.index == 0 && result.observed.0 & DW_SIGNAL_EXITED.0 != 0
-    ) && matches!(
-        waits.query_task_termination(probe.loaded.process),
-        Ok(info) if info.state == DW_TASK_STATE_EXITED
-    );
-    if !observed_exit {
-        cleanup_failed |= system.terminate_task_group(probe.task_group).is_err();
-        let fallback_deadline = system
-            .now()
-            .ok()
-            .and_then(|now| now.checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns));
-        if let Some(fallback_deadline) = fallback_deadline {
-            let _ = waits.wait_many(
-                core::slice::from_ref(&DwWaitItemV1 {
-                    handle: probe.loaded.process,
-                    signals: DW_SIGNAL_EXITED,
-                }),
-                DwDeadline(fallback_deadline),
-            );
-        } else {
-            cleanup_failed = true;
-        }
-    }
-    cleanup_failed |= !matches!(
-        waits.query_task_termination(probe.loaded.process),
-        Ok(info)
-            if info.state == DW_TASK_STATE_EXITED
-                && (!admit_u2 || wyrmroot_runtime::validate_successful_exit(&info).is_ok())
-    );
-    for handle in [probe.loaded.process, probe.task_group] {
-        cleanup_failed |= system.close_handle(handle).is_err();
-    }
-    if let Some(state) = resident.wyr1c.as_mut() {
-        let retired_generation = state
-            .e3a_binding
-            .map(|binding| binding.challenge_generation)
-            .unwrap_or(0);
-        state.e3a_stream_generation = None;
-        state.e3a_binding = None;
-        state.e3a_response_committed = false;
-        state.e3a_transport_empty = None;
-        state.e3a_begin_retire_sent = false;
-        state.e3a_stage1_ready = false;
-        state.e3a_peer_closed = false;
-        state.e3a_finalize_retire_sent = false;
-        state.e3a_u2_probe_reaped_successfully = false;
-        if cleanup_failed || !admit_u2 {
-            // Any unexpected probe loss poisons the selector lifecycle.  A
-            // failed cleanup must likewise never expose an intermediate U2
-            // admission after a nonzero or incomplete U1 probe exit.
-            state.e3a_next_challenge_generation = 0;
-        } else if retired_generation == 1 {
-            state.e3a_next_challenge_generation = 2;
-        }
-    }
-    if cleanup_failed {
-        Err(InitError::Cleanup)
-    } else {
-        Ok(())
-    }
-}
-
-/// The fresh U2 probe exits normally after it has committed its response.  It
-/// is no longer the active reporter, but its successful exit must be reaped
-/// without clearing the U2 binding or a TEMT fact that is still in flight.
-#[cfg(feature = "dw1e3-selector31")]
-fn reap_e3a_u2_probe_after_response<S, W>(
-    resident: &mut ResidentSystemInit,
-    system: &mut S,
-    waits: &mut W,
-) -> Result<(), InitError>
-where
-    S: InitPlatform,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let probe = {
-        let state = resident
-            .wyr1c
-            .as_mut()
-            .ok_or(InitError::AbsentState(0x37))?;
-        let binding = state.e3a_binding.ok_or(InitError::WrongManifestProfile)?;
-        if binding.challenge_generation != 2
-            || !state.e3a_response_committed
-            || state.e3a_terminal_claimed
-        {
-            return Err(InitError::WrongManifestProfile);
-        }
-        state
-            .e3a_probe
-            .take()
-            .ok_or(InitError::WrongManifestProfile)?
-    };
-    let deadline = system
-        .now()
-        .map_err(InitError::Native)?
-        .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
-        .ok_or(InitError::Accounting)?;
-    let mut cleanup_failed = system.close_handle(probe.loaded.launch_channel).is_err();
-    let observed_exit = matches!(
-        waits.wait_many(
-            core::slice::from_ref(&DwWaitItemV1 {
-                handle: probe.loaded.process,
-                signals: DW_SIGNAL_EXITED,
-            }),
-            DwDeadline(deadline),
-        ),
-        Ok(result) if result.index == 0 && result.observed.0 & DW_SIGNAL_EXITED.0 != 0
-    );
-    let terminal_result = if observed_exit {
-        match waits.query_task_termination(probe.loaded.process) {
-            Ok(exit) => wyrmroot_runtime::validate_successful_exit(&exit)
-                .map_err(|_| InitError::WrongManifestProfile),
-            Err(error) => Err(InitError::Native(error)),
-        }
-    } else {
-        // No exit by the bounded deadline is a selector failure.  Terminate
-        // only in this timeout-cleanup case, then wait/requery so every owned
-        // handle is reconciled before returning the original failure.
-        cleanup_failed |= system.terminate_task_group(probe.task_group).is_err();
-        let fallback_deadline = system
-            .now()
-            .ok()
-            .and_then(|now| now.checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns));
-        let fallback_exited = if let Some(fallback_deadline) = fallback_deadline {
-            matches!(
-                waits.wait_many(
-                core::slice::from_ref(&DwWaitItemV1 {
-                    handle: probe.loaded.process,
-                    signals: DW_SIGNAL_EXITED,
-                }),
-                DwDeadline(fallback_deadline),
-            ),
-                Ok(result) if result.index == 0 && result.observed.0 & DW_SIGNAL_EXITED.0 != 0
-            ) && matches!(
-                waits.query_task_termination(probe.loaded.process),
-                Ok(info) if info.state == DW_TASK_STATE_EXITED
-            )
-        } else {
-            false
-        };
-        if !fallback_exited {
-            // We have already closed the controller endpoint, but process and
-            // task-group ownership remain live until a later cleanup/reap can
-            // prove EXITED. Do not forget them on a successful-but-ineffective
-            // terminate request.
-            resident
-                .wyr1c
-                .as_mut()
-                .ok_or(InitError::AbsentState(0x38))?
-                .e3a_probe = Some(probe);
-            return Err(InitError::Cleanup);
-        }
-        Err(InitError::Supervision)
-    };
-    for handle in [probe.loaded.process, probe.task_group] {
-        cleanup_failed |= system.close_handle(handle).is_err();
-    }
-    if cleanup_failed {
-        return Err(InitError::Cleanup);
-    }
-    terminal_result?;
-    resident
-        .wyr1c
-        .as_mut()
-        .ok_or(InitError::AbsentState(0x39))?
-        .e3a_u2_probe_reaped_successfully = true;
-    // TEMT may already be present when the exit is observed. Re-run the
-    // controller join only after this exact normal-zero reap has committed.
-    maybe_begin_e3a_retire(resident, system)
-}
-
-#[cfg(feature = "dw1e3-selector31")]
-fn e3a_u2_probe_may_exit(resident: &ResidentSystemInit) -> bool {
-    resident.wyr1c.as_ref().is_some_and(|state| {
-        state
-            .e3a_binding
-            .is_some_and(|binding| binding.challenge_generation == 2)
-            && state.e3a_response_committed
-            && !state.e3a_terminal_claimed
-    })
-}
-
-#[cfg(feature = "dw1e3-selector31")]
-fn poison_e3a_lifecycle(resident: &mut ResidentSystemInit) {
-    if let Some(state) = resident.wyr1c.as_mut() {
-        state.e3a_next_challenge_generation = 0;
-        state.e3a_stream_generation = None;
-        state.e3a_binding = None;
-        state.e3a_response_committed = false;
-        state.e3a_transport_empty = None;
-        state.e3a_begin_retire_sent = false;
-        state.e3a_stage1_ready = false;
-        state.e3a_peer_closed = false;
-        state.e3a_finalize_retire_sent = false;
-        state.e3a_u2_probe_reaped_successfully = false;
-    }
-}
-
-#[cfg(feature = "dw1e3-selector31")]
-fn fail_e3a_u2_probe_exit<S, W>(
-    resident: &mut ResidentSystemInit,
-    system: &mut S,
-    waits: &mut W,
-    error: InitError,
-) -> Result<(), InitError>
-where
-    S: InitPlatform,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    // A timed-out U2 reap can retain the process/task-group for a second
-    // bounded cleanup attempt. Consume that owner before poisoning its
-    // correlations so a live probe is never orphaned by this failure path.
-    let probe_cleanup = reap_e3a_probe(resident, system, waits, false);
-    poison_e3a_lifecycle(resident);
-    let driver_cleanup = if resident
-        .wyr1c
-        .as_ref()
-        .is_some_and(|state| state.driver.is_some())
-    {
-        reap_driver(resident, system, waits, true).map(|_| ())
-    } else {
-        Ok(())
-    };
-    if probe_cleanup.is_err() || driver_cleanup.is_err() {
-        Err(InitError::Cleanup)
-    } else {
-        Err(error)
-    }
-}
-
-/// A devmgr or registry recovery cannot inherit an in-flight selector probe.
-/// Consume its exact owners first and poison all selector correlations so a
-/// delayed report cannot advance Q1/Q2 or make a terminal claim.
-#[cfg(feature = "dw1e3-selector31")]
-fn fail_closed_e3a_recovery<S, W>(
-    resident: &mut ResidentSystemInit,
-    system: &mut S,
-    waits: &mut W,
-) -> Option<bool>
-where
-    S: InitPlatform,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let active = resident.wyr1c.as_ref().is_some_and(|state| {
-        state.e3a_probe.is_some()
-            || state.e3a_binding.is_some()
-            || state.e3a_stream_generation.is_some()
-    });
-    if !active {
-        return None;
-    }
-    let probe_cleanup = reap_e3a_probe(resident, system, waits, false);
-    let driver_cleanup = if resident
-        .wyr1c
-        .as_ref()
-        .is_some_and(|state| state.driver.is_some())
-    {
-        reap_driver(resident, system, waits, true).map(|_| ())
-    } else {
-        Ok(())
-    };
-    poison_e3a_lifecycle(resident);
-    // The triggering registry/devmgr role is still owned by its recovery
-    // caller. Leave a fatal-cleanup disposition for that caller to consume
-    // both actor lifetimes before this resident can return.
-    resident.result = RecoveryResult::Fatal;
-    Some(probe_cleanup.is_err() || driver_cleanup.is_err())
-}
-
-/// Selector-31 recovery is terminal when a Q1/Q2 correlation was active: no
-/// replacement may inherit the poisoned state.  Consume both root actors even
-/// if only one delivered the triggering failure, then permanently retire their
-/// controller reservations without relaunching either role.
-#[cfg(feature = "dw1e3-selector31")]
-fn finish_e3a_fatal_recovery<S, W>(
-    resident: &mut ResidentSystemInit,
-    system: &mut S,
-    waits: &mut W,
-    child_cleanup_failed: bool,
-) -> Result<(), InitError>
-where
-    S: InitPlatform,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let (registry, devmgr) = {
-        let state = resident
-            .wyr1c
-            .as_mut()
-            .ok_or(InitError::AbsentState(0x3a))?;
-        let registry = state.registry.take();
-        let devmgr = state.devmgr.take();
-        state.binding = None;
-        state.waiting_registry_observed = false;
-        (registry, devmgr)
-    };
-    resident.active[0] = None;
-    resident.active[1] = None;
-    // A child probe/driver failure remains fatal even when both root roles
-    // subsequently terminate and reap cleanly. Do not erase the originating
-    // cleanup failure while consuming the root actors.
-    let mut cleanup_failed = child_cleanup_failed;
-    if let Some(devmgr) = devmgr {
-        cleanup_failed |=
-            cleanup_loaded(system, waits, devmgr.loaded, devmgr.task_group, true).is_err();
-        cleanup_failed |= resident
-            .controller
-            .retire_attempt_after_fatal(RoleId::Devmgr)
-            .is_err();
-    }
-    if let Some(registry) = registry {
-        cleanup_failed |= cleanup_loaded(
-            system,
-            waits,
-            registry.active.loaded,
-            registry.active.task_group,
-            true,
-        )
-        .is_err();
-        cleanup_failed |= system.close_handle(registry.control_channel).is_err();
-        cleanup_failed |= resident
-            .controller
-            .retire_attempt_after_fatal(RoleId::Registryd)
-            .is_err();
-    }
-    resident.controller.fatal();
-    resident.result = RecoveryResult::Fatal;
-    if cleanup_failed {
-        Err(InitError::Cleanup)
-    } else {
-        Ok(())
-    }
-}
-
-/// A probe channel close or process exit is never a normal lifecycle edge.
-/// Take both owned lifetimes down before returning failure so neither a stale
-/// reporter nor a surviving driver can later advance the selector.
-#[cfg(feature = "dw1e3-selector31")]
-fn fail_e3a_probe_supervision<S, W>(
-    resident: &mut ResidentSystemInit,
-    system: &mut S,
-    waits: &mut W,
-    validate_exit: bool,
-) -> Result<(), InitError>
-where
-    S: InitPlatform,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    let exit_error = if validate_exit {
-        let probe = resident
-            .wyr1c
-            .as_ref()
-            .and_then(|state| state.e3a_probe)
-            .ok_or(InitError::AbsentState(0x3b))?;
-        match waits.query_task_termination(probe.loaded.process) {
-            Ok(exit) => wyrmroot_runtime::validate_successful_exit(&exit)
-                .map_err(|_| InitError::WrongManifestProfile)
-                .err(),
-            Err(error) => Some(InitError::Native(error)),
-        }
-    } else {
-        None
-    };
-    let probe_cleanup = reap_e3a_probe(resident, system, waits, false);
-    let driver_cleanup = reap_driver(resident, system, waits, true);
-    if probe_cleanup.is_err() || driver_cleanup.is_err() {
-        Err(InitError::Cleanup)
-    } else {
-        Err(exit_error.unwrap_or(InitError::WrongManifestProfile))
-    }
-}
-
-#[cfg(any(
-    feature = "wyr1c6-production",
-    feature = "dw1e3-selector31",
-    feature = "wyr1d-selector32"
-))]
+#[cfg(feature = "wyr1c6-production")]
 fn acknowledge_driver_reaped<S: InitPlatform>(
     system: &mut S,
     devmgr: ActiveNativeRole,
@@ -3259,19 +1631,6 @@ where
         };
         item_count += 1;
     }
-    #[cfg(feature = "dw1e3-selector31")]
-    if let Some(probe) = state.e3a_probe {
-        items[item_count] = DwWaitItemV1 {
-            handle: probe.loaded.launch_channel,
-            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
-        };
-        item_count += 1;
-        items[item_count] = DwWaitItemV1 {
-            handle: probe.loaded.process,
-            signals: DW_SIGNAL_EXITED,
-        };
-        item_count += 1;
-    }
     let observed = system.wait_many(&items[..item_count], DwDeadline(now_ns));
     match observed {
         Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {}
@@ -3281,8 +1640,6 @@ where
                 result,
                 registry_present,
                 driver_present,
-                #[cfg(feature = "dw1e3-selector31")]
-                state.e3a_probe.is_some(),
             )?;
             let size = system
                 .query_memory_object_size(resident.authority.bootfs)
@@ -3306,68 +1663,6 @@ where
                                 .ok_or(InitError::AbsentState(0x3d))?;
                             let devmgr = state.devmgr.ok_or(InitError::AbsentState(0x3e))?;
                             match receive_devmgr_control(system, devmgr.loaded.launch_channel) {
-                                #[cfg(feature = "wyr1d-selector32")]
-                                Ok(DevmgrControlInput::D5Ready(identity)) => {
-                                    selector32::driver_ready(
-                                        resident, system, loader, waits, bootfs, identity,
-                                    )
-                                }
-                                #[cfg(feature = "wyr1d-selector32")]
-                                Ok(DevmgrControlInput::D5TxDrained(identity)) => {
-                                    selector32::tx_drained(resident, system, identity)
-                                }
-                                #[cfg(feature = "dw1e3-selector31")]
-                                Ok(DevmgrControlInput::TransportEmpty(fact)) => {
-                                    let binding = resident
-                                        .wyr1c
-                                        .as_ref()
-                                        .and_then(|state| state.e3a_binding)
-                                        .ok_or(InitError::AbsentState(0x3f))?;
-                                    let duplicate = resident
-                                        .wyr1c
-                                        .as_ref()
-                                        .ok_or(InitError::AbsentState(0x40))?
-                                        .e3a_transport_empty
-                                        .is_some();
-                                    if duplicate {
-                                        return Err(InitError::WrongManifestProfile);
-                                    }
-                                    exact_transport_empty(binding, fact)?;
-                                    resident
-                                        .wyr1c
-                                        .as_mut()
-                                        .ok_or(InitError::AbsentState(0x41))?
-                                        .e3a_transport_empty = Some(fact);
-                                    maybe_begin_e3a_retire(resident, system)
-                                }
-                                #[cfg(feature = "dw1e3-selector31")]
-                                Ok(DevmgrControlInput::BindingReady(_binding)) => {
-                                    Err(InitError::WrongManifestProfile)
-                                }
-                                #[cfg(feature = "dw1e3-selector31")]
-                                Ok(DevmgrControlInput::RetireStage1Ready(binding)) => {
-                                    let state = resident
-                                        .wyr1c
-                                        .as_mut()
-                                        .ok_or(InitError::AbsentState(0x42))?;
-                                    if !state.e3a_begin_retire_sent
-                                        || state.e3a_stage1_ready
-                                        || state.e3a_binding != Some(binding)
-                                    {
-                                        return Err(InitError::WrongManifestProfile);
-                                    }
-                                    state.e3a_stage1_ready = true;
-                                    // The probe's peer-close report and devmgr's
-                                    // stage-1 relay travel over independent
-                                    // channels. Rejoin the exact facts here as
-                                    // well as in the peer-close branch so either
-                                    // valid arrival order can release U1.
-                                    send_e3a_finalize_retire(resident, system)
-                                }
-                                #[cfg(feature = "wyr1c6-selector29")]
-                                Ok(DevmgrControlInput::C6Fact(fact)) => {
-                                    accept_c6_fact(resident, fact)
-                                }
                                 Ok(DevmgrControlInput::Status(message)) => {
                                     let duplicate =
                                         state.registry.is_none() && state.waiting_registry_observed;
@@ -3435,22 +1730,13 @@ where
                                         start_wyr1e_or_recover_registry(
                                             resident, system, loader, waits, bootfs,
                                         )?;
-                                        #[cfg(feature = "dw1e3-selector31")]
-                                        {
-                                            start_e3a_probe(resident, system, loader, waits, bootfs)
-                                        }
-                                        #[cfg(not(feature = "dw1e3-selector31"))]
                                         {
                                             Ok(())
                                         }
                                     }
                                 }
                                 Ok(DevmgrControlInput::DriverRetired { bytes }) => {
-                                    #[cfg(any(
-                                        feature = "wyr1c6-production",
-                                        feature = "dw1e3-selector31",
-                                        feature = "wyr1d-selector32"
-                                    ))]
+                                    #[cfg(feature = "wyr1c6-production")]
                                     {
                                         let retired = (|| {
                                             let state = resident
@@ -3462,11 +1748,6 @@ where
                                                 .ok_or(InitError::AbsentState(0x45))?;
                                             parse_driver_retired(&bytes, request)
                                                 .map_err(|_| InitError::WrongManifestProfile)?;
-                                            #[cfg(feature = "wyr1d-selector32")]
-                                            return selector32::observe_driver_retired(
-                                                resident, request,
-                                            );
-                                            #[cfg(not(feature = "wyr1d-selector32"))]
                                             {
                                                 let rebound = rebind_publication(
                                                     resident,
@@ -3482,11 +1763,7 @@ where
                                         })();
                                         attribute_failure(RecoveryOperation::DriverRetired, retired)
                                     }
-                                    #[cfg(not(any(
-                                        feature = "wyr1c6-production",
-                                        feature = "dw1e3-selector31",
-                                        feature = "wyr1d-selector32"
-                                    )))]
+                                    #[cfg(not(feature = "wyr1c6-production"))]
                                     {
                                         let _ = bytes;
                                         Err(InitError::WrongManifestProfile)
@@ -3521,35 +1798,11 @@ where
                             abandoned::reason(abandoned::trigger::EXITED, abandoned::phase::NONE),
                         ),
                         ResidentPollEvent::DriverExited => {
-                            #[cfg(feature = "dw1e3-selector31")]
-                            if let Err(error) = validate_e3a_u1_finalize_exit(resident, waits) {
-                                let driver_cleanup = reap_driver(resident, system, waits, false);
-                                let probe_cleanup = reap_e3a_probe(resident, system, waits, false);
-                                return Err(if driver_cleanup.is_err() || probe_cleanup.is_err() {
-                                    InitError::Cleanup
-                                } else {
-                                    error
-                                });
-                            }
                             #[cfg(feature = "wyr1e-production")]
                             let dependent_retirement =
                                 wyr1e::retire_dependents(resident, system, waits, false);
-                            #[cfg(all(
-                                feature = "wyr1e-production",
-                                feature = "wyr1e8-selector33"
-                            ))]
-                            let dependent_retirement = attribute_failure(
-                                RecoveryOperation::RetireDependents,
-                                dependent_retirement,
-                            );
                             #[cfg(feature = "wyr1e-production")]
                             dependent_retirement?;
-                            #[cfg(feature = "wyr1e8-selector33")]
-                            let _request = {
-                                let deadline = wyr1e::recovery_deadline(resident)?;
-                                reap_driver_before(resident, system, waits, false, deadline)
-                            };
-                            #[cfg(not(feature = "wyr1e8-selector33"))]
                             let _request = reap_driver(resident, system, waits, false);
                             let _request =
                                 attribute_failure(RecoveryOperation::ReapDriver, _request)?;
@@ -3581,13 +1834,7 @@ where
                             }
                             #[cfg(not(feature = "wyr1e-production"))]
                             {
-                                #[cfg(feature = "dw1e3-selector31")]
-                                reap_e3a_probe(resident, system, waits, true)?;
-                                #[cfg(any(
-                                    feature = "wyr1c6-production",
-                                    feature = "dw1e3-selector31",
-                                    feature = "wyr1d-selector32"
-                                ))]
+                                #[cfg(feature = "wyr1c6-production")]
                                 {
                                     let state = resident
                                         .wyr1c
@@ -3600,120 +1847,9 @@ where
                                 Ok(())
                             }
                         }
-                        #[cfg(feature = "dw1e3-selector31")]
-                        ResidentPollEvent::ProbeControlReadable => {
-                            let message = receive_e3a_probe_message(resident, system)?;
-                            let binding = resident
-                                .wyr1c
-                                .as_ref()
-                                .and_then(|state| state.e3a_binding)
-                                .ok_or(InitError::AbsentState(0x4a))?;
-                            match message {
-                                E3AControllerMessage::ResponseCommitted {
-                                    nonce,
-                                    publication_generation,
-                                    stream_generation,
-                                    challenge_generation,
-                                    response_length,
-                                    response_hash,
-                                } => {
-                                    let (expected_length, expected_hash) =
-                                        exact_e3a_response(binding)?;
-                                    let state = resident
-                                        .wyr1c
-                                        .as_mut()
-                                        .ok_or(InitError::AbsentState(0x4b))?;
-                                    if state.e3a_response_committed
-                                        || nonce != binding.nonce
-                                        || publication_generation != binding.publication_generation
-                                        || stream_generation != binding.stream_generation
-                                        || challenge_generation != binding.challenge_generation
-                                        || response_length != expected_length
-                                        || response_hash != expected_hash
-                                    {
-                                        return Err(InitError::WrongManifestProfile);
-                                    }
-                                    state.e3a_response_committed = true;
-                                    maybe_begin_e3a_retire(resident, system)
-                                }
-                                E3AControllerMessage::StreamPeerClosed {
-                                    nonce,
-                                    publication_generation,
-                                    stream_generation,
-                                    challenge_generation,
-                                } => {
-                                    let state = resident
-                                        .wyr1c
-                                        .as_ref()
-                                        .ok_or(InitError::AbsentState(0x4c))?;
-                                    if !state.e3a_response_committed
-                                        || state.e3a_peer_closed
-                                        || nonce != binding.nonce
-                                        || publication_generation != binding.publication_generation
-                                        || stream_generation != binding.stream_generation
-                                        || challenge_generation != binding.challenge_generation
-                                    {
-                                        return Err(InitError::WrongManifestProfile);
-                                    }
-                                    wyrmroot_runtime::dw1e3_report(
-                                        wyrmroot_runtime::Dw1e3ReportEvent::Driver1PeerClosed,
-                                        stream_generation,
-                                        0,
-                                        nonce,
-                                    )
-                                    .map_err(InitError::Native)?;
-                                    resident
-                                        .wyr1c
-                                        .as_mut()
-                                        .ok_or(InitError::AbsentState(0x4d))?
-                                        .e3a_peer_closed = true;
-                                    send_e3a_finalize_retire(resident, system)
-                                }
-                                _ => Err(InitError::WrongManifestProfile),
-                            }
-                        }
-                        #[cfg(feature = "dw1e3-selector31")]
-                        ResidentPollEvent::ProbeControlLost => {
-                            if e3a_u2_probe_may_exit(resident) {
-                                match reap_e3a_u2_probe_after_response(resident, system, waits) {
-                                    Ok(()) => Ok(()),
-                                    Err(error) => {
-                                        fail_e3a_u2_probe_exit(resident, system, waits, error)
-                                    }
-                                }
-                            } else {
-                                fail_e3a_probe_supervision(resident, system, waits, false)
-                            }
-                        }
-                        #[cfg(feature = "dw1e3-selector31")]
-                        ResidentPollEvent::ProbeExited => {
-                            if e3a_u2_probe_may_exit(resident) {
-                                match reap_e3a_u2_probe_after_response(resident, system, waits) {
-                                    Ok(()) => Ok(()),
-                                    Err(error) => {
-                                        fail_e3a_u2_probe_exit(resident, system, waits, error)
-                                    }
-                                }
-                            } else {
-                                fail_e3a_probe_supervision(resident, system, waits, true)
-                            }
-                        }
                     },
                 )
                 .map_err(InitError::Native)??;
-        }
-    }
-    #[cfg(feature = "wyr1d-selector32")]
-    {
-        selector32::poll(resident, system, loader, waits, now_ns)?;
-        if selector32::claim_publication_rebind(resident, system.now().map_err(InitError::Native)?)?
-        {
-            rebind_publication(
-                resident,
-                system,
-                waits,
-                PublicationRebindContext::DriverRetirement,
-            )?;
         }
     }
     #[cfg(feature = "wyr1e-production")]
@@ -3745,22 +1881,12 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     let outcome = wyr1e::poll(resident, system, loader, waits, now_ns)?;
-    #[cfg(feature = "wyr1f-closure")]
-    let outcome = wyr1f_closure_trigger(resident, outcome);
-    #[cfg(feature = "wyr1f-closure")]
-    record_wyr1f_bringup(resident)?;
     // F3A.7g. Handled before the recovery dispatch below, and outside the
     // bootfs mapping it opens: every other non-`Stable` outcome rebuilds
     // something out of the archive, and this one builds nothing.
     if outcome == wyr1e::PollOutcome::SessionComplete {
         retire_for_session_shutdown(resident, system, waits)?;
         resident.observe_session_complete();
-        // F3A.7k. The end of the session is the end of the instrumented
-        // run, so it is where the supervisor's evidence gets its terminal
-        // record. `main` submits the finalized log, and the kernel answers
-        // the terminal record with DWTEST1 before init exits.
-        #[cfg(feature = "wyr1f-closure")]
-        finalize_wyr1f_evidence(resident)?;
         return Ok(resident.controller.mode());
     }
     if outcome != wyr1e::PollOutcome::Stable {
@@ -3814,20 +1940,6 @@ where
                             false,
                             false,
                             abandoned::reason(abandoned::trigger::WYR1E_POLL, phase),
-                        ),
-                        #[cfg(feature = "wyr1e8-selector33")]
-                        wyr1e::PollOutcome::RecoverRegistryForE8 => recover_registry(
-                            resident,
-                            system,
-                            loader,
-                            waits,
-                            bootfs,
-                            false,
-                            true,
-                            abandoned::reason(
-                                abandoned::trigger::WYR1E_POLL_E8,
-                                abandoned::phase::NONE,
-                            ),
                         ),
                     }?;
                     Ok(resident.controller.mode())
@@ -3959,75 +2071,6 @@ where
     cleanup
 }
 
-/// Delivers the one declared final-closure trigger, and closes the episode
-/// when the supervisor reaches its own terminal result.
-///
-/// It substitutes exactly the `RecoverDevmgr` outcome that a real
-/// publication-observer failure produces, and only on an otherwise `Stable`
-/// poll, so it never overrides a recovery the supervisor already wants. Every
-/// transition, retry, deadline and mode change after that is `SystemInit`'s.
-#[cfg(feature = "wyr1f-closure")]
-fn wyr1f_closure_trigger(
-    resident: &mut ResidentSystemInit,
-    outcome: wyr1e::PollOutcome,
-) -> wyr1e::PollOutcome {
-    if resident.controller.mode() == SystemMode::Degraded {
-        resident.wyr1f.observe_terminal();
-    }
-    if outcome != wyr1e::PollOutcome::Stable {
-        return outcome;
-    }
-    let (console_ready, shell_ready) = wyr1e::wyr1f_ready_join(resident);
-    resident
-        .wyr1f
-        .observe_ready_join(console_ready, shell_ready);
-    if resident.wyr1f.take_trigger() {
-        return wyr1e::PollOutcome::RecoverDevmgr;
-    }
-    outcome
-}
-
-/// Moves each bring-up READY the resident path has observed into the
-/// controller's evidence log, in dependency order. The shell's comes from the
-/// dispatcher's READY-join latch, which already holds the first generation.
-#[cfg(feature = "wyr1f-closure")]
-fn record_wyr1f_bringup(resident: &mut ResidentSystemInit) -> Result<(), InitError> {
-    let Some(e6) = resident.wyr1c.as_mut().and_then(|state| state.e6.as_mut()) else {
-        return Ok(());
-    };
-    if let Some((generation, transaction)) = e6.shell.wyr1f_shell_ready() {
-        e6.wyr1f_bringup.observe(
-            crate::wyr1f_closure::BringupRole::Shell,
-            generation,
-            transaction,
-        );
-    }
-    while let Some((role, generation, transaction)) = e6.wyr1f_bringup.next_due() {
-        resident
-            .controller
-            .record_bringup_ready(role, generation, transaction)?;
-        e6.wyr1f_bringup.mark_recorded();
-    }
-    Ok(())
-}
-
-/// The supervisor's terminal evidence record, written once when the session
-/// ends. `DEGRADED` if the supervisor reached it, `NORMAL` otherwise.
-#[cfg(feature = "wyr1f-closure")]
-fn finalize_wyr1f_evidence(resident: &mut ResidentSystemInit) -> Result<(), InitError> {
-    if resident.evidence_finalized {
-        return Ok(());
-    }
-    let result = if resident.controller.mode() == SystemMode::Degraded {
-        crate::RecoveryResult::Degraded
-    } else {
-        crate::RecoveryResult::Recovered
-    };
-    resident.controller.finalize_evidence(result)?;
-    resident.evidence_finalized = true;
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn recover_registry<S, L, W>(
     resident: &mut ResidentSystemInit,
@@ -4055,17 +2098,9 @@ where
     let action_deadline = wyr1e::recovery_deadline(resident)?;
     #[cfg(not(feature = "wyr1e-production"))]
     let action_deadline = None;
-    #[cfg(feature = "wyr1e8-selector33")]
-    if action_deadline.is_some() && !_e8_quiesced {
-        return Err(InitError::Supervision);
-    }
     #[cfg(feature = "wyr1e-production")]
     if action_deadline.is_some() {
         wyr1e::ensure_recovery_live(resident, system.now().map_err(InitError::Native)?)?;
-    }
-    #[cfg(feature = "dw1e3-selector31")]
-    if let Some(child_cleanup_failed) = fail_closed_e3a_recovery(resident, system, waits) {
-        return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);
     }
     // Four arms for one fact, and two of them threw the cause away: outside
     // the selector this was a bare `bool`, so a dependent retirement that
@@ -4284,15 +2319,6 @@ pub(crate) const E8_REGISTRY_FIXTURE_DEVMGR_CONTROL: DwHandle = DwHandle(0xE8B5_
 #[cfg(all(test, feature = "wyr1e-production"))]
 pub(crate) const E8_REGISTRY_FIXTURE_DRIVER_PROCESS: DwHandle = DwHandle(0xE8B5_0030);
 
-#[cfg(all(test, feature = "wyr1e8-selector33"))]
-pub(crate) struct E8RegistryRecoveryFixtureResult {
-    pub(crate) shell: ShellControllerState,
-    pub(crate) jobs: JobDispatcher,
-    pub(crate) topology: RegistryTopology,
-    pub(crate) registry_generation: u64,
-    pub(crate) publication_generation: u64,
-}
-
 #[cfg(all(test, feature = "wyr1e-production"))]
 fn install_e8_registry_fixture_role(
     controller: &mut SystemInit,
@@ -4432,8 +2458,6 @@ fn recovery_fixture_resident(
         last_tick_ns: 0,
         wyr1b: None,
         wyr1b_evidence: None,
-        #[cfg(feature = "wyr1f-closure")]
-        wyr1f: crate::wyr1f_closure::ClosureEpisode::new(None),
         wyr1c: Some(ResidentState {
             e6: Some(e6),
             resource_domain: Some(ResourceDomainCustody::new(DwHandle(0xE8B5_0043))),
@@ -4511,227 +2535,6 @@ where
     Ok((resident.result, state.topology.generation(), role))
 }
 
-/// The driver request the closure fixture's retained driver was launched from.
-#[cfg(all(test, feature = "wyr1f-closure"))]
-pub(crate) fn wyr1f_fixture_driver_request() -> DriverLaunchRequest {
-    DriverLaunchRequest {
-        supervisor_generation: SupervisorGeneration(1),
-        role_id: wyrmroot_device_proto::COM2_ROLE_ID,
-        attempt_generation: wyrmroot_device_proto::coordinator::AttemptGeneration(1),
-        launch_session: wyrmroot_device_proto::coordinator::LaunchSessionGeneration(2),
-        endpoint: wyrmroot_device_proto::ControlEndpoint {
-            id: wyrmroot_device_proto::coordinator::EndpointId(3),
-            generation: wyrmroot_device_proto::coordinator::EndpointGeneration(1),
-        },
-        transaction_id: 9,
-        driver_path: wyrmroot_device_proto::DEVICE_DRIVER_PATH,
-        actor_identity: wyrmroot_device_proto::manifest::ContentIdentity([0x5a; 32]),
-        child_is_channel: true,
-        child_rights: wyrmroot_device_proto::DirectControlRights::ExactReduced,
-    }
-}
-
-/// What one declared closure episode leaves behind.
-#[cfg(all(test, feature = "wyr1f-closure"))]
-#[derive(Debug)]
-pub(crate) struct Wyr1fDegradedOutcome {
-    pub(crate) result: RecoveryResult,
-    pub(crate) mode: SystemMode,
-    pub(crate) degraded_transitions: u8,
-    pub(crate) console: Option<InstalledPeer>,
-    pub(crate) driver_retained: bool,
-    pub(crate) devmgr_state: Option<RestartState>,
-    pub(crate) permanent_failure_records: usize,
-    pub(crate) refuses_activation: bool,
-}
-
-/// Drives one declared closure episode through the production recovery path.
-///
-/// Nothing here is synthetic except the resident the episode starts from: the
-/// trigger is taken through `wyr1f_closure_trigger`, and the consequence is
-/// `recover_devmgr` and `launch_devmgr_replacement` exactly as the product
-/// runs them. `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4 and §11 item 4.
-#[cfg(all(test, feature = "wyr1f-closure"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn exercise_wyr1f_degraded_episode<S, L, W>(
-    system: &mut S,
-    loader: &mut L,
-    waits: &mut W,
-    bootfs: &[u8],
-    registry_identity: [u8; 32],
-    registry_generation: u64,
-    console: InstalledPeer,
-    driver_request: DriverLaunchRequest,
-    deliveries: u32,
-) -> Result<Wyr1fDegradedOutcome, InitError>
-where
-    S: Wyr1BPlatform,
-    L: LoaderPlatform<Error = NativeError>,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    use crate::gate::{GateConfig, GateContract, GateScenario};
-    let e6 = wyr1e::State::wyr1f_degraded_fixture(registry_generation, console)?;
-    let (mut resident, _devmgr, _driver) = recovery_fixture_resident(
-        registry_identity,
-        registry_generation,
-        e6,
-        RegistryTopology::new(registry_generation).map_err(InitError::Wyr1BModel)?,
-        Some(driver_request),
-    )?;
-    let gate = GateConfig {
-        contract: GateContract::Dw1Wyr1InteractiveClosure,
-        scenario: GateScenario::DegradedRecovery,
-        nonce: 0x00ff,
-    };
-    resident.controller.install_wyr1f_gate(gate)?;
-    resident.wyr1f = crate::wyr1f_closure::ClosureEpisode::new(Some(gate));
-
-    // Deliver the trigger `deliveries` times. A second episode, a re-armed
-    // one, or a reset retry budget would all show up in the outcome.
-    let mut fired = 0_u32;
-    for _ in 0..deliveries {
-        if wyr1f_closure_trigger(&mut resident, wyr1e::PollOutcome::Stable)
-            == wyr1e::PollOutcome::RecoverDevmgr
-        {
-            fired += 1;
-            recover_devmgr(&mut resident, system, loader, waits, bootfs)?;
-        }
-    }
-    assert_eq!(fired, 1, "exactly one episode per boot");
-    // One more poll, as the idle product makes it, to close the episode.
-    let idle = wyr1f_closure_trigger(&mut resident, wyr1e::PollOutcome::Stable);
-    assert_eq!(
-        idle,
-        wyr1e::PollOutcome::Stable,
-        "an idle poll re-triggered"
-    );
-
-    let permanent_failure_records = (0..)
-        .map_while(|index| resident.controller.evidence_line(index))
-        .filter(|line| &line[39..41] == b"04")
-        .count();
-    let state = resident
-        .wyr1c
-        .as_ref()
-        .ok_or(InitError::AbsentState(0x57))?;
-    Ok(Wyr1fDegradedOutcome {
-        result: resident.result,
-        mode: resident.controller.mode(),
-        degraded_transitions: resident.controller.degraded_transitions(),
-        console: state.e6.as_ref().and_then(wyr1e::State::wyr1f_console),
-        driver_retained: state.driver.is_some(),
-        devmgr_state: resident.controller.role_state(RoleId::Devmgr),
-        permanent_failure_records,
-        refuses_activation: resident.wyr1f.refuses_activation(),
-    })
-}
-
-/// Test-only bridge from the reached S3 held-WAIT state into the production
-/// registry-recovery orchestrator. The caller supplies real dispatcher-owned
-/// shell/job state; this function performs the actual dependent retirement,
-/// registry process retirement/relaunch, topology restart, devmgr WAIT/rebind,
-/// and current-driver publication observation before returning the surviving
-/// owners for the S4 evidence continuation.
-#[cfg(all(test, feature = "wyr1e8-selector33"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn exercise_e8_registry_recovery_orchestrator<S, L, W, E>(
-    system: &mut S,
-    loader: &mut L,
-    waits: &mut W,
-    bootfs: &[u8],
-    registry_identity: [u8; 32],
-    registry_generation: u64,
-    shell: ShellControllerState,
-    jobs: JobDispatcher,
-    console: InstalledPeer,
-    topology: RegistryTopology,
-    driver_request: DriverLaunchRequest,
-    enqueue_publication: E,
-) -> Result<E8RegistryRecoveryFixtureResult, InitError>
-where
-    S: Wyr1BPlatform,
-    L: LoaderPlatform<Error = NativeError>,
-    W: SupervisionPlatform<Error = NativeError>,
-    E: FnOnce(&mut S, DwHandle, &[u8]) -> Result<(), NativeError>,
-{
-    let e6 = wyr1e::State::from_e8_registry_fixture(shell, jobs, console);
-    let (mut resident, devmgr, driver) = recovery_fixture_resident(
-        registry_identity,
-        registry_generation,
-        e6,
-        topology,
-        Some(driver_request),
-    )?;
-    recover_registry(
-        &mut resident,
-        system,
-        loader,
-        waits,
-        bootfs,
-        false,
-        true,
-        abandoned::reason(abandoned::trigger::NONE, abandoned::phase::NONE),
-    )?;
-
-    let (client, grant, publication_generation) = resident
-        .wyr1c
-        .as_ref()
-        .and_then(|state| state.e6.as_ref())
-        .and_then(wyr1e::State::e8_fixture_publication_observer)
-        .ok_or(InitError::AbsentState(0x58))?;
-    let mut publication = [0u8; 72];
-    let publication_len = wyrmroot_registry_proto::encode_generation_changed(
-        RegistryHeader {
-            message_type: RegistryMessageType::GenerationChanged,
-            registry_generation: grant.registry_generation,
-            endpoint_id: grant.endpoint_id,
-            endpoint_generation: grant.endpoint_generation,
-            transaction_id: 1,
-        },
-        publication_generation,
-        &mut publication,
-    )
-    .map_err(InitError::RegistryProtocol)?;
-    enqueue_publication(system, client, &publication[..publication_len])
-        .map_err(InitError::Native)?;
-    let now = system.now().map_err(InitError::Native)?;
-    let publication_outcome = wyr1e::poll(&mut resident, system, loader, waits, now)
-        .unwrap_or_else(|error| panic!("production publication observer failed: {error:?}"));
-    assert_eq!(
-        publication_outcome,
-        wyr1e::PollOutcome::LaunchConsole,
-        "production publication outcome"
-    );
-
-    let mut state = resident.wyr1c.take().ok_or(InitError::AbsentState(0x59))?;
-    let replacement_generation = state.topology.generation();
-    assert!(
-        replacement_generation > registry_generation,
-        "replacement generation"
-    );
-    assert_eq!(
-        state.publication_service_generation, publication_generation,
-        "publication generation"
-    );
-    assert!(state.registry.is_some(), "replacement registry owner");
-    assert_eq!(state.devmgr, Some(devmgr), "retained devmgr owner");
-    assert_eq!(state.driver, driver, "retained driver owner");
-    let e6 = state.e6.take().ok_or(InitError::AbsentState(0x5a))?;
-    assert!(
-        e6.e8_fixture_publication_observer().is_none(),
-        "publication observation consumed"
-    );
-    let (shell, jobs, console) = e6.into_e8_registry_fixture_parts();
-    assert!(console.is_none(), "old console retired");
-    Ok(E8RegistryRecoveryFixtureResult {
-        shell,
-        jobs,
-        topology: state.topology,
-        registry_generation: replacement_generation,
-        publication_generation,
-    })
-}
-
 #[cfg(feature = "wyr1e-production")]
 fn start_wyr1e_or_recover_registry<S, L, W>(
     resident: &mut ResidentSystemInit,
@@ -4746,10 +2549,6 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     let result = wyr1e::start_after_driver_constructed(resident, system);
-    #[cfg(feature = "wyr1e8-selector33")]
-    if result.is_err() && wyr1e::recovery_deadline(resident)?.is_some() {
-        return result;
-    }
     match result {
         Ok(()) => Ok(()),
         Err(_) if wyr1e::registry_recovery_required(resident) => recover_registry(
@@ -4795,65 +2594,6 @@ where
     recover_devmgr(resident, system, loader, waits, bootfs)
 }
 
-#[cfg(feature = "wyr1c6-selector29")]
-fn selector29_restarting_d1(
-    devmgr_generation: u64,
-    active_driver: Option<DriverLaunchRequest>,
-    last_reaped_driver: Option<DriverLaunchRequest>,
-) -> bool {
-    if devmgr_generation != wyrmroot_device_proto::SELECTOR29_FAILURE_SUPERVISOR_GENERATION {
-        return false;
-    }
-    active_driver.or(last_reaped_driver).is_some_and(|request| {
-        request.supervisor_generation.0
-            == wyrmroot_device_proto::SELECTOR29_FAILURE_SUPERVISOR_GENERATION
-            && request.attempt_generation.0
-                > wyrmroot_device_proto::SELECTOR29_FAILURE_ATTEMPT_GENERATION
-    })
-}
-
-#[cfg(feature = "wyr1c6-selector29")]
-const fn selector29_terminal_fact_for_event(
-    next: crate::wyr1c6_gate::GateEvent,
-) -> Result<Option<u8>, InitError> {
-    match next {
-        crate::wyr1c6_gate::GateEvent::StaleReject => Ok(Some(13)),
-        crate::wyr1c6_gate::GateEvent::D1Failure => Ok(Some(14)),
-        crate::wyr1c6_gate::GateEvent::P2Retire => Ok(None),
-        _ => Err(InitError::WrongManifestProfile),
-    }
-}
-
-#[cfg(feature = "wyr1c6-selector29")]
-fn selector29_next_d1_terminal_fact(
-    resident: &ResidentSystemInit,
-) -> Result<Option<u8>, InitError> {
-    let next = resident
-        .wyr1c
-        .as_ref()
-        .and_then(|state| state.c6_evidence.as_ref())
-        .and_then(crate::wyr1c6_gate::EvidenceLog::next_expected_event)
-        .ok_or(InitError::AbsentState(0x5b))?;
-    selector29_terminal_fact_for_event(next)
-}
-
-#[cfg(feature = "wyr1c6-selector29")]
-fn drain_selector29_d1_terminal_facts<S: InitPlatform>(
-    resident: &mut ResidentSystemInit,
-    system: &mut S,
-    devmgr: ActiveNativeRole,
-) -> Result<(), InitError> {
-    while let Some(expected) = selector29_next_d1_terminal_fact(resident)? {
-        match receive_devmgr_control(system, devmgr.loaded.launch_channel)? {
-            DevmgrControlInput::C6Fact(fact) if fact.event == expected => {
-                accept_c6_fact(resident, fact)?;
-            }
-            _ => return Err(InitError::WrongManifestProfile),
-        }
-    }
-    Ok(())
-}
-
 fn recover_devmgr<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -4866,14 +2606,6 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    #[cfg(feature = "wyr1e8-selector33")]
-    if wyr1e::recovery_deadline(resident)?.is_some() {
-        return Err(InitError::Supervision);
-    }
-    #[cfg(feature = "dw1e3-selector31")]
-    if let Some(child_cleanup_failed) = fail_closed_e3a_recovery(resident, system, waits) {
-        return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);
-    }
     // `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.3.1 item 4. A coordinator change
     // does not by itself invalidate the device topology beneath it, so the
     // console stack is retained *through* the recovery episode and torn down
@@ -4896,34 +2628,6 @@ where
         resident.result = RecoveryResult::Degraded;
         return Err(InitError::Cleanup);
     }
-    #[cfg(feature = "wyr1c6-selector29")]
-    let restarting_d1 = {
-        let state = resident
-            .wyr1c
-            .as_ref()
-            .ok_or(InitError::AbsentState(0x5c))?;
-        selector29_restarting_d1(
-            state
-                .devmgr
-                .map(|devmgr| devmgr.generation)
-                .unwrap_or_default(),
-            state.driver.map(|driver| driver.request),
-            state.last_reaped_driver,
-        )
-    };
-    #[cfg(feature = "wyr1c6-selector29")]
-    if restarting_d1 {
-        let devmgr = resident
-            .wyr1c
-            .as_ref()
-            .and_then(|state| state.devmgr)
-            .ok_or(InitError::AbsentState(0x5d))?;
-        // D1 sends the final stale-rejection and failure facts immediately
-        // before exiting. A process-exit wait may win over the readable launch
-        // channel, so drain those already-buffered facts before synthesizing
-        // P2 retirement and U2 reap evidence.
-        drain_selector29_d1_terminal_facts(resident, system, devmgr)?;
-    }
     if !retained_device_topology
         && resident
             .wyr1c
@@ -4933,52 +2637,6 @@ where
     {
         resident.result = RecoveryResult::Degraded;
         return Err(InitError::Cleanup);
-    }
-    #[cfg(feature = "wyr1c6-selector29")]
-    if restarting_d1 {
-        let (lease, p2_binding, p2_attempt, p2_endpoint, irq, u2_attempt, u2_endpoint) = {
-            let state = resident
-                .wyr1c
-                .as_ref()
-                .ok_or(InitError::AbsentState(0x5e))?;
-            (
-                state.c6_d1_lease.ok_or(InitError::AbsentState(0x5f))?,
-                if state.c6_p2_service_generation == 0 {
-                    return Err(InitError::WrongActivationOrder);
-                } else {
-                    state.c6_p2_service_generation
-                },
-                state.c6_u2_attempt.ok_or(InitError::AbsentState(0x60))?,
-                if state.c6_p2_endpoint_generation == 0 {
-                    return Err(InitError::WrongActivationOrder);
-                } else {
-                    state.c6_p2_endpoint_generation
-                },
-                state.c6_u2_irq.ok_or(InitError::AbsentState(0x61))?,
-                state.c6_u2_attempt.ok_or(InitError::AbsentState(0x62))?,
-                state.c6_u2_endpoint.ok_or(InitError::AbsentState(0x63))?,
-            )
-        };
-        accept_c6_fact(
-            resident,
-            C6Fact {
-                event: 15,
-                lease,
-                binding: p2_binding,
-                value: p2_attempt,
-                aux: p2_endpoint,
-            },
-        )?;
-        accept_c6_fact(
-            resident,
-            C6Fact {
-                event: 16,
-                lease,
-                binding: irq,
-                value: u2_attempt,
-                aux: u2_endpoint,
-            },
-        )?;
     }
     let active = resident
         .wyr1c
@@ -5044,24 +2702,6 @@ where
         active.transaction_id,
         retired_at,
     )?;
-    #[cfg(feature = "wyr1c6-selector29")]
-    if restarting_d1 {
-        let lease = resident
-            .wyr1c
-            .as_ref()
-            .and_then(|state| state.c6_d1_lease)
-            .ok_or(InitError::AbsentState(0x67))?;
-        accept_c6_fact(
-            resident,
-            C6Fact {
-                event: 17,
-                lease,
-                binding: 0,
-                value: active.generation,
-                aux: 1,
-            },
-        )?;
-    }
     if advance_or_degrade(
         system,
         &mut resident.controller,
@@ -5139,14 +2779,6 @@ where
             resident.result = RecoveryResult::Degraded;
             return Ok(());
         };
-        // The declared episode refuses each replacement activation, before any
-        // topology grant or publication is issued, so nothing is reserved that
-        // the refusal would then have to unwind. The refusal is an ordinary
-        // attempt failure and takes the ordinary arm below: the episode never
-        // counts an attempt, moves a deadline or sets a mode itself.
-        #[cfg(feature = "wyr1f-closure")]
-        let refused = resident.wyr1f.refuses_activation();
-        #[cfg(not(feature = "wyr1f-closure"))]
         let refused = false;
         let attempt = if refused {
             Err(InitError::Supervision)
@@ -5246,12 +2878,7 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublicationRebindContext {
     RegistryRecovery,
-    #[cfg(any(
-        test,
-        feature = "wyr1c6-production",
-        feature = "dw1e3-selector31",
-        feature = "wyr1d-selector32"
-    ))]
+    #[cfg(any(test, feature = "wyr1c6-production"))]
     DriverRetirement,
 }
 
@@ -5268,12 +2895,7 @@ impl PublicationRebindContext {
                 Ok(StatusCode::OperationalResourceOwned)
             }
             Self::RegistryRecovery => Ok(StatusCode::OperationalWaitingForDeviceBundle),
-            #[cfg(any(
-                test,
-                feature = "wyr1c6-production",
-                feature = "dw1e3-selector31",
-                feature = "wyr1d-selector32"
-            ))]
+            #[cfg(any(test, feature = "wyr1c6-production"))]
             Self::DriverRetirement => {
                 let reaped = _reaped.ok_or(InitError::AbsentState(0x6c))?;
                 if _driver.is_some() || reaped.supervisor_generation != _supervisor {
@@ -5328,15 +2950,6 @@ where
     let (binding, publication_service_generation, transaction_id) = match rebound {
         Ok(rebound) => rebound,
         Err(error) => {
-            #[cfg(feature = "wyr1e8-selector33")]
-            if deadline_cap.is_some() {
-                state
-                    .e6
-                    .as_mut()
-                    .ok_or(InitError::AbsentState(0x70))?
-                    .shell
-                    .poison(registry.active.generation);
-            }
             return Err(error);
         }
     };
@@ -5483,16 +3096,6 @@ mod tests {
     };
 
     const FAILURE: NativeError = NativeError::Status(DwStatus(-1));
-
-    #[cfg(feature = "dw1e3-selector31")]
-    #[test]
-    fn selector31_probe_generations_use_distinct_sticky_registry_client_ids() {
-        let u1 = e3a_probe_client_id(1).unwrap();
-        let u2 = e3a_probe_client_id(2).unwrap();
-        assert_ne!(u1, u2);
-        assert_eq!(e3a_probe_client_id(0), Err(InitError::WrongActivationOrder));
-        assert_eq!(e3a_probe_client_id(3), Err(InitError::WrongActivationOrder));
-    }
 
     struct RebindPlatform {
         inbound: [u8; wyrmroot_device_proto::controller::STATUS_BYTES],
@@ -5663,7 +3266,7 @@ mod tests {
                 assert_eq!(self.send_count, 2);
                 assert_eq!(channel, devmgr().loaded.launch_channel);
                 assert_eq!(transfers[0].handle, DwHandle(51));
-                #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
+                #[cfg(feature = "wyr1e-production")]
                 {
                     let parsed = wyrmroot_device_proto::controller_v1_1::parse(bytes).unwrap();
                     self.controller_request = Some(parsed.controller);
@@ -5673,7 +3276,7 @@ mod tests {
                         self.registry_service_generation
                     );
                 }
-                #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
+                #[cfg(not(feature = "wyr1e-production"))]
                 {
                     self.controller_request = Some(parse_controller(bytes).unwrap());
                 }
@@ -6087,48 +3690,10 @@ mod tests {
                 transaction_id: result.2,
             })
         );
-        #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
+        #[cfg(feature = "wyr1e-production")]
         assert_eq!(platform.controller_service_generation, Some(result.1));
-        #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
+        #[cfg(not(feature = "wyr1e-production"))]
         assert_eq!(platform.controller_service_generation, None);
-    }
-
-    #[cfg(feature = "wyr1e8-selector33")]
-    #[test]
-    fn e8_rebind_expiry_precedes_namespace_and_endpoint_effects() {
-        let mut platform = RebindPlatform::with_status(waiting_device_status());
-        let mut waits = StatusWaits {
-            fail: false,
-            exit: None,
-        };
-        let mut topology = RegistryTopology::new(2).unwrap();
-        let mut publications = PublicationAllocator::new();
-
-        assert_eq!(
-            perform_rebind(
-                &mut platform,
-                &mut waits,
-                &mut topology,
-                &mut publications,
-                DwHandle(40),
-                devmgr(),
-                9,
-                StatusCode::OperationalWaitingForDeviceBundle,
-                Some(100),
-            ),
-            Err(InitError::Supervision)
-        );
-        assert_eq!(platform.send_count, 0);
-        assert_eq!(platform.close_count, 0);
-        assert_eq!(
-            topology
-                .issue(7, EndpointKind::Publication)
-                .unwrap()
-                .endpoint_id,
-            1
-        );
-        let mut untouched = PublicationAllocator::new();
-        assert_eq!(publications.issue().unwrap(), untouched.issue().unwrap());
     }
 
     #[test]
@@ -6139,7 +3704,7 @@ mod tests {
             transaction_id: 9,
         };
         let bytes = encode_publication_request(request, 0xC1_0801).unwrap();
-        #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
+        #[cfg(feature = "wyr1e-production")]
         {
             let parsed = wyrmroot_device_proto::controller_v1_1::parse(&bytes).unwrap();
             assert_eq!(parsed.controller, request);
@@ -6147,7 +3712,7 @@ mod tests {
             assert_ne!(parsed.service_generation, binding().generation.0);
             assert!(parse_controller(&bytes).is_err());
         }
-        #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
+        #[cfg(not(feature = "wyr1e-production"))]
         assert_eq!(parse_controller(&bytes), Ok(request));
     }
 
@@ -6227,8 +3792,6 @@ mod tests {
                 },
                 true,
                 false,
-                #[cfg(feature = "dw1e3-selector31")]
-                false,
             )
             .unwrap()
         };
@@ -6283,51 +3846,6 @@ mod tests {
         assert_ne!(initial.publication_id, initial.service_generation);
         assert_ne!(initial.publication_id, initial.transaction_id);
         assert_ne!(initial.service_generation, initial.transaction_id);
-    }
-
-    #[cfg(feature = "wyr1c6-selector29")]
-    #[test]
-    fn c6_publication_records_use_service_generation_not_registry_generation() {
-        let registry_generation = 7;
-        let p1_service_generation = 0xC1_0801;
-        let p2_service_generation = 0xC1_0802;
-
-        assert_eq!(
-            c6_evidence_binding(5, registry_generation, p1_service_generation, 0, 0),
-            p1_service_generation
-        );
-        assert_eq!(
-            c6_evidence_binding(
-                7,
-                registry_generation,
-                p2_service_generation,
-                p1_service_generation,
-                0,
-            ),
-            p1_service_generation
-        );
-        assert_eq!(
-            c6_evidence_binding(
-                12,
-                registry_generation,
-                p2_service_generation,
-                p1_service_generation,
-                0,
-            ),
-            p2_service_generation
-        );
-        assert_eq!(
-            c6_evidence_binding(
-                14,
-                registry_generation,
-                p2_service_generation,
-                p1_service_generation,
-                p2_service_generation,
-            ),
-            p2_service_generation
-        );
-        assert!(p2_service_generation > p1_service_generation);
-        assert_ne!(p1_service_generation, registry_generation);
     }
 
     fn wrdm(identity: [u8; 32]) -> [u8; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES] {
@@ -6597,8 +4115,6 @@ mod tests {
                 },
                 true,
                 true,
-                #[cfg(feature = "dw1e3-selector31")]
-                false,
             ),
             Ok(ResidentPollEvent::DriverExited)
         );
@@ -6611,595 +4127,9 @@ mod tests {
                 },
                 false,
                 true,
-                #[cfg(feature = "dw1e3-selector31")]
-                false,
             ),
             Ok(ResidentPollEvent::DriverExited)
         );
-    }
-
-    #[cfg(feature = "wyr1c6-selector29")]
-    #[test]
-    fn selector29_d1_restart_survives_u2_reaping_but_not_d2_replacement() {
-        let mut u1 = driver_request();
-        u1.supervisor_generation = SupervisorGeneration(1);
-        u1.attempt_generation = wyrmroot_device_proto::coordinator::AttemptGeneration(
-            wyrmroot_device_proto::SELECTOR29_FAILURE_ATTEMPT_GENERATION,
-        );
-        let mut u2 = u1;
-        u2.attempt_generation.0 += 1;
-
-        assert!(selector29_restarting_d1(1, Some(u2), Some(u1)));
-        assert!(selector29_restarting_d1(1, None, Some(u2)));
-        assert!(!selector29_restarting_d1(1, None, Some(u1)));
-        assert!(!selector29_restarting_d1(2, None, Some(u2)));
-    }
-
-    #[cfg(feature = "wyr1c6-selector29")]
-    #[test]
-    fn selector29_d1_exit_drains_stale_and_failure_before_p2_retirement() {
-        assert_eq!(
-            selector29_terminal_fact_for_event(crate::wyr1c6_gate::GateEvent::StaleReject),
-            Ok(Some(13))
-        );
-        assert_eq!(
-            selector29_terminal_fact_for_event(crate::wyr1c6_gate::GateEvent::D1Failure),
-            Ok(Some(14))
-        );
-        assert_eq!(
-            selector29_terminal_fact_for_event(crate::wyr1c6_gate::GateEvent::P2Retire),
-            Ok(None)
-        );
-        assert_eq!(
-            selector29_terminal_fact_for_event(crate::wyr1c6_gate::GateEvent::P2Publish),
-            Err(InitError::WrongManifestProfile)
-        );
-    }
-
-    /// Selector 31's lifecycle joins, driven through the functions that make
-    /// them. Structural refactor S3 rows 201-207; these replace text tests that
-    /// read the joins' spelling from this file.
-    #[cfg(feature = "dw1e3-selector31")]
-    mod selector31 {
-        use super::*;
-        use deepwyrm_syscall::{DW_TASK_STATE_EXITED, DW_TERMINATION_NORMAL_EXIT, DwSignals};
-
-        const PROBE: InstalledPeer = InstalledPeer {
-            grant: crate::wyr1b::EndpointGrant {
-                registry_generation: 1,
-                endpoint_id: 0x31,
-                endpoint_generation: 1,
-                role_generation: 1,
-                kind: crate::wyr1b::EndpointKind::RegistryClient,
-            },
-            loaded: LoadedProcess {
-                process: DwHandle(0x3101),
-                launch_channel: DwHandle(0x3102),
-            },
-            task_group: DwHandle(0x3103),
-        };
-        const DRIVER_PROCESS: DwHandle = DwHandle(0x3201);
-
-        fn exit(application_code: u64) -> DwTaskTerminationInfoV1 {
-            DwTaskTerminationInfoV1 {
-                size: deepwyrm_syscall::DW_TASK_TERMINATION_INFO_V1_SIZE,
-                version: 1,
-                state: DW_TASK_STATE_EXITED,
-                reason: DW_TERMINATION_NORMAL_EXIT,
-                application_code: application_code as _,
-                ..DwTaskTerminationInfoV1::default()
-            }
-        }
-
-        fn waits(application_code: u64) -> StatusWaits {
-            StatusWaits {
-                fail: false,
-                exit: Some(exit(application_code)),
-            }
-        }
-
-        fn platform() -> RebindPlatform {
-            let mut platform =
-                RebindPlatform::with_reply([0; wyrmroot_device_proto::controller::STATUS_BYTES]);
-            platform.accept_sends = true;
-            platform.accept_terminate = true;
-            platform
-        }
-
-        /// A binding for `generation`. Only generation 1 is exact on the host:
-        /// generation 2's challenge nonce comes from the product build, so any
-        /// path that reaches `exact_e3a_response` for it fails.
-        fn binding(generation: u64) -> ChallengeBinding {
-            let challenge = e3a_challenge(wyrmroot_runtime::dw1e3_challenge_nonce(1).unwrap());
-            ChallengeBinding {
-                nonce: 0x3131,
-                attempt_generation: 2,
-                publication_generation: 3,
-                stream_generation: 4,
-                challenge_generation: generation,
-                expected_length: E3A_CHALLENGE_BYTES as u64,
-                expected_hash: e3a_fnv1a64(&challenge),
-            }
-        }
-
-        fn temt(binding: ChallengeBinding) -> TransportEmptyFact {
-            let (response_length, response_hash) = exact_e3a_response(binding).unwrap();
-            TransportEmptyFact {
-                nonce: binding.nonce,
-                attempt_generation: binding.attempt_generation,
-                publication_generation: binding.publication_generation,
-                stream_generation: binding.stream_generation,
-                challenge_generation: binding.challenge_generation,
-                response_length,
-                response_hash,
-            }
-        }
-
-        fn fixture(binding: Option<ChallengeBinding>) -> (ResidentSystemInit, ActiveNativeRole) {
-            let (mut resident, _registry, devmgr) =
-                crate::native_cleanup_tests::two_role_resident();
-            resident.wyr1c = Some(ResidentState {
-                resource_domain: None,
-                registry: None,
-                topology: RegistryTopology::new(1).unwrap(),
-                devmgr: Some(devmgr),
-                binding: None,
-                publication_service_generation: 1,
-                waiting_registry_observed: false,
-                publication_allocator: PublicationAllocator::new(),
-                last_controller_transaction: 0,
-                next_controller_transaction: 1,
-                driver: Some(DriverNativeAttempt {
-                    loaded: LoadedProcess {
-                        process: DRIVER_PROCESS,
-                        launch_channel: DwHandle(0x3202),
-                    },
-                    task_group: DwHandle(0x3203),
-                    request: driver_request(),
-                }),
-                last_reaped_driver: None,
-                e3a_probe: Some(PROBE),
-                e3a_stream_generation: Some(4),
-                e3a_binding: binding,
-                e3a_response_committed: false,
-                e3a_transport_empty: None,
-                e3a_begin_retire_sent: false,
-                e3a_stage1_ready: false,
-                e3a_peer_closed: false,
-                e3a_finalize_retire_sent: false,
-                e3a_next_challenge_generation: binding.map_or(1, |b| b.challenge_generation),
-                e3a_terminal_claimed: false,
-                e3a_u2_probe_reaped_successfully: false,
-                last_driver_attempt: 0,
-                last_driver_session: 0,
-                last_driver_endpoint: 0,
-                last_driver_transaction: 0,
-            });
-            (resident, devmgr)
-        }
-
-        fn selector(resident: &mut ResidentSystemInit) -> &mut ResidentState {
-            resident.wyr1c.as_mut().unwrap()
-        }
-
-        /// Row 201: U1's retirement begins only once the probe's committed
-        /// response and the driver's exact TEMT fact have both been rejoined,
-        /// and only once.
-        #[test]
-        fn u1_retirement_begins_only_after_the_response_and_its_exact_temt_join() {
-            let u1 = binding(1);
-            let (mut resident, devmgr) = fixture(Some(u1));
-            let mut system = platform();
-
-            selector(&mut resident).e3a_transport_empty = Some(temt(u1));
-            assert_eq!(maybe_begin_e3a_retire(&mut resident, &mut system), Ok(()));
-            assert_eq!(system.send_plain_count, 0, "no response yet");
-
-            selector(&mut resident).e3a_response_committed = true;
-            selector(&mut resident).e3a_transport_empty = None;
-            assert_eq!(maybe_begin_e3a_retire(&mut resident, &mut system), Ok(()));
-            assert_eq!(system.send_plain_count, 0, "no TEMT yet");
-
-            let mut stale = temt(u1);
-            stale.stream_generation += 1;
-            selector(&mut resident).e3a_transport_empty = Some(stale);
-            assert_eq!(
-                maybe_begin_e3a_retire(&mut resident, &mut system),
-                Err(InitError::WrongManifestProfile)
-            );
-            assert_eq!(system.send_plain_count, 0, "a stale TEMT is not a join");
-
-            selector(&mut resident).e3a_transport_empty = Some(temt(u1));
-            assert_eq!(maybe_begin_e3a_retire(&mut resident, &mut system), Ok(()));
-            assert_eq!(
-                &system.sent[..system.send_plain_count],
-                &[devmgr.loaded.launch_channel]
-            );
-            assert!(selector(&mut resident).e3a_begin_retire_sent);
-            assert_eq!(
-                maybe_begin_e3a_retire(&mut resident, &mut system),
-                Err(InitError::WrongManifestProfile),
-                "begin-retire is sent once"
-            );
-            assert_eq!(system.send_plain_count, 1);
-        }
-
-        /// Row 201: finalize-retire waits for both stage-1 readiness and the
-        /// probe's stream peer-close proof, and is sent once.
-        #[test]
-        fn u1_finalize_retire_waits_for_stage1_and_the_peer_close() {
-            let (mut resident, devmgr) = fixture(Some(binding(1)));
-            let mut system = platform();
-            for (stage1, closed) in [(false, false), (true, false), (false, true)] {
-                selector(&mut resident).e3a_stage1_ready = stage1;
-                selector(&mut resident).e3a_peer_closed = closed;
-                assert_eq!(send_e3a_finalize_retire(&mut resident, &mut system), Ok(()));
-                assert_eq!(
-                    system.send_plain_count, 0,
-                    "stage1={stage1} closed={closed}"
-                );
-            }
-            selector(&mut resident).e3a_stage1_ready = true;
-            selector(&mut resident).e3a_peer_closed = true;
-            assert_eq!(send_e3a_finalize_retire(&mut resident, &mut system), Ok(()));
-            assert_eq!(
-                &system.sent[..system.send_plain_count],
-                &[devmgr.loaded.launch_channel]
-            );
-            assert!(selector(&mut resident).e3a_finalize_retire_sent);
-            assert_eq!(
-                send_e3a_finalize_retire(&mut resident, &mut system),
-                Err(InitError::WrongManifestProfile)
-            );
-        }
-
-        /// Rows 201 and 204: only an exact normal-zero U1 probe exit, reaped
-        /// with U2 admitted, advances the selector to a fresh U2; every other
-        /// reap poisons it. Every probe owner is consumed either way.
-        #[test]
-        fn only_a_clean_u1_probe_reap_admits_u2() {
-            for (admit_u2, code, next, result) in [
-                (true, 0, 2, Ok(())),
-                (true, 1, 0, Err(InitError::Cleanup)),
-                (false, 0, 0, Ok(())),
-            ] {
-                let (mut resident, _) = fixture(Some(binding(1)));
-                selector(&mut resident).e3a_response_committed = true;
-                let mut system = platform();
-                assert_eq!(
-                    reap_e3a_probe(&mut resident, &mut system, &mut waits(code), admit_u2),
-                    result,
-                    "admit_u2={admit_u2} code={code}"
-                );
-                assert_eq!(
-                    &system.closed[..system.close_count],
-                    &[
-                        PROBE.loaded.launch_channel,
-                        PROBE.loaded.process,
-                        PROBE.task_group
-                    ]
-                );
-                assert_eq!(
-                    system.terminate_count, 0,
-                    "a probe that exited is not terminated"
-                );
-                let state = selector(&mut resident);
-                assert_eq!(state.e3a_next_challenge_generation, next);
-                assert_eq!(state.e3a_probe, None);
-                assert_eq!(state.e3a_binding, None);
-                assert!(!state.e3a_response_committed);
-            }
-        }
-
-        /// Row 202: U1's exit is accepted only with the whole finalize state
-        /// joined and an exact normal-zero exit.
-        #[test]
-        fn u1_exit_requires_complete_finalize_state_and_a_zero_normal_exit() {
-            let u1 = binding(1);
-            let complete = |resident: &mut ResidentSystemInit| {
-                let state = selector(resident);
-                state.e3a_response_committed = true;
-                state.e3a_transport_empty = Some(temt(u1));
-                state.e3a_begin_retire_sent = true;
-                state.e3a_stage1_ready = true;
-                state.e3a_peer_closed = true;
-                state.e3a_finalize_retire_sent = true;
-            };
-            let (mut resident, _) = fixture(Some(u1));
-            complete(&mut resident);
-            assert_eq!(
-                validate_e3a_u1_finalize_exit(&resident, &mut waits(0)),
-                Ok(())
-            );
-            assert_eq!(
-                validate_e3a_u1_finalize_exit(&resident, &mut waits(1)),
-                Err(InitError::WrongManifestProfile)
-            );
-            let breaks: [fn(&mut ResidentState); 8] = [
-                |state| state.e3a_response_committed = false,
-                |state| state.e3a_begin_retire_sent = false,
-                |state| state.e3a_stage1_ready = false,
-                |state| state.e3a_peer_closed = false,
-                |state| state.e3a_finalize_retire_sent = false,
-                |state| state.e3a_terminal_claimed = true,
-                |state| state.e3a_transport_empty = None,
-                |state| state.driver = None,
-            ];
-            for (index, broken) in breaks.into_iter().enumerate() {
-                let (mut resident, _) = fixture(Some(u1));
-                complete(&mut resident);
-                broken(selector(&mut resident));
-                assert_eq!(
-                    validate_e3a_u1_finalize_exit(&resident, &mut waits(0)),
-                    Err(InitError::WrongManifestProfile),
-                    "break {index}"
-                );
-            }
-            let (mut resident, _) = fixture(Some(binding(2)));
-            complete(&mut resident);
-            assert_eq!(
-                validate_e3a_u1_finalize_exit(&resident, &mut waits(0)),
-                Err(InitError::WrongManifestProfile),
-                "a U2 binding is not a U1 exit"
-            );
-        }
-
-        /// Row 203: a probe channel loss or exit outside the U2 post-response
-        /// window is a failure that consumes the probe and the driver and
-        /// poisons the selector, even when the exit itself was clean.
-        #[test]
-        fn probe_loss_outside_the_u2_window_fails_without_advancement() {
-            for validate_exit in [false, true] {
-                let (mut resident, _) = fixture(Some(binding(1)));
-                selector(&mut resident).e3a_response_committed = true;
-                assert!(!e3a_u2_probe_may_exit(&resident));
-                let mut system = platform();
-                assert_eq!(
-                    fail_e3a_probe_supervision(
-                        &mut resident,
-                        &mut system,
-                        &mut waits(0),
-                        validate_exit
-                    ),
-                    Err(InitError::WrongManifestProfile)
-                );
-                assert_eq!(
-                    &system.terminated[..system.terminate_count],
-                    &[DwHandle(0x3203)]
-                );
-                let state = selector(&mut resident);
-                assert_eq!(state.e3a_probe, None);
-                assert_eq!(state.driver, None);
-                assert_eq!(state.e3a_next_challenge_generation, 0);
-                assert_eq!(state.e3a_binding, None);
-            }
-            let (mut resident, _) = fixture(Some(binding(1)));
-            assert_eq!(
-                fail_e3a_probe_supervision(&mut resident, &mut platform(), &mut waits(7), true),
-                Err(InitError::WrongManifestProfile)
-            );
-        }
-
-        /// Row 203: only U2, after its committed response and before the
-        /// terminal claim, may exit as a lifecycle edge.
-        #[test]
-        fn only_a_committed_unclaimed_u2_probe_may_exit() {
-            for (generation, committed, claimed, may_exit) in [
-                (2, true, false, true),
-                (1, true, false, false),
-                (2, false, false, false),
-                (2, true, true, false),
-            ] {
-                let (mut resident, _) = fixture(Some(binding(generation)));
-                selector(&mut resident).e3a_response_committed = committed;
-                selector(&mut resident).e3a_terminal_claimed = claimed;
-                assert_eq!(e3a_u2_probe_may_exit(&resident), may_exit);
-            }
-        }
-
-        /// Row 204: U2's post-response reap accepts only an exact normal-zero
-        /// exit, terminates only on timeout, and keeps the probe's owners when
-        /// even the fallback wait cannot prove it exited.
-        #[test]
-        fn the_u2_reap_accepts_only_a_normal_zero_exit() {
-            let committed_u2 = || {
-                let (mut resident, _) = fixture(Some(binding(2)));
-                selector(&mut resident).e3a_response_committed = true;
-                resident
-            };
-
-            let (mut u1, _) = fixture(Some(binding(1)));
-            selector(&mut u1).e3a_response_committed = true;
-            assert_eq!(
-                reap_e3a_u2_probe_after_response(&mut u1, &mut platform(), &mut waits(0)),
-                Err(InitError::WrongManifestProfile)
-            );
-            assert_eq!(
-                selector(&mut u1).e3a_probe,
-                Some(PROBE),
-                "U1 is not reaped here"
-            );
-
-            let mut resident = committed_u2();
-            let mut system = platform();
-            assert_eq!(
-                reap_e3a_u2_probe_after_response(&mut resident, &mut system, &mut waits(3)),
-                Err(InitError::WrongManifestProfile)
-            );
-            assert_eq!(system.terminate_count, 0);
-            assert!(!selector(&mut resident).e3a_u2_probe_reaped_successfully);
-
-            let mut resident = committed_u2();
-            let mut system = platform();
-            assert_eq!(
-                reap_e3a_u2_probe_after_response(&mut resident, &mut system, &mut waits(0)),
-                Ok(())
-            );
-            assert_eq!(system.terminate_count, 0);
-            let reaped = selector(&mut resident);
-            assert!(reaped.e3a_u2_probe_reaped_successfully);
-            assert_eq!(reaped.e3a_probe, None);
-            assert_eq!(
-                reaped.e3a_binding,
-                Some(binding(2)),
-                "U2's binding survives its reap"
-            );
-
-            let mut resident = committed_u2();
-            let mut system = platform();
-            let mut silent = StatusWaits {
-                fail: false,
-                exit: None,
-            };
-            assert_eq!(
-                reap_e3a_u2_probe_after_response(&mut resident, &mut system, &mut silent),
-                Err(InitError::Cleanup)
-            );
-            assert_eq!(
-                &system.terminated[..system.terminate_count],
-                &[PROBE.task_group]
-            );
-            assert_eq!(
-                selector(&mut resident).e3a_probe,
-                Some(PROBE),
-                "owners are kept"
-            );
-        }
-
-        /// Row 205: a recovery with a live selector correlation consumes the
-        /// probe and driver, poisons Q1/Q2 and leaves the resident fatal; a
-        /// recovery with none is not touched.
-        #[test]
-        fn recovery_poisons_an_active_selector_lifecycle_and_is_fatal() {
-            let (mut idle, _) = fixture(None);
-            selector(&mut idle).e3a_probe = None;
-            selector(&mut idle).e3a_stream_generation = None;
-            assert_eq!(
-                fail_closed_e3a_recovery(&mut idle, &mut platform(), &mut waits(0)),
-                None
-            );
-            assert_eq!(idle.result, RecoveryResult::Recovered);
-
-            // A binding with no probe left (its reap already ran) is still a
-            // live correlation, and only the poison clears it.
-            let (mut orphaned, _) = fixture(Some(binding(1)));
-            selector(&mut orphaned).e3a_probe = None;
-            selector(&mut orphaned).e3a_response_committed = true;
-            assert_eq!(
-                fail_closed_e3a_recovery(&mut orphaned, &mut platform(), &mut waits(0)),
-                Some(false)
-            );
-            assert_eq!(selector(&mut orphaned).e3a_binding, None);
-            assert!(!selector(&mut orphaned).e3a_response_committed);
-            assert_eq!(selector(&mut orphaned).e3a_next_challenge_generation, 0);
-            assert_eq!(orphaned.result, RecoveryResult::Fatal);
-
-            let (mut resident, devmgr) = fixture(Some(binding(1)));
-            selector(&mut resident).e3a_response_committed = true;
-            let mut system = platform();
-            assert_eq!(
-                fail_closed_e3a_recovery(&mut resident, &mut system, &mut waits(0)),
-                Some(false)
-            );
-            assert_eq!(resident.result, RecoveryResult::Fatal);
-            {
-                let state = selector(&mut resident);
-                assert_eq!(state.e3a_probe, None);
-                assert_eq!(state.driver, None);
-                assert_eq!(state.e3a_binding, None);
-                assert_eq!(state.e3a_next_challenge_generation, 0);
-                assert!(!state.e3a_response_committed);
-            }
-
-            assert_eq!(
-                finish_e3a_fatal_recovery(&mut resident, &mut system, &mut waits(0), true),
-                Err(InitError::Cleanup),
-                "a child cleanup failure stays fatal"
-            );
-            assert_eq!(selector(&mut resident).devmgr, None);
-            assert_eq!(resident.active, [None, None]);
-            assert_eq!(resident.controller.mode(), SystemMode::Fatal);
-            assert!(
-                system.terminated[..system.terminate_count].contains(&devmgr.task_group),
-                "devmgr is consumed, not relaunched"
-            );
-        }
-
-        /// Row 206: a combined READABLE|PEER_CLOSED wake on the probe channel
-        /// is classified readable first, so a queued response is consumed
-        /// before the close.
-        #[test]
-        fn a_combined_probe_wake_drains_the_queued_message_first() {
-            let classify = |index, observed: DwSignals| {
-                classify_resident_poll(
-                    DwWaitResultV1 {
-                        index,
-                        observed,
-                        ..DwWaitResultV1::default()
-                    },
-                    true,
-                    true,
-                    true,
-                )
-            };
-            assert_eq!(
-                classify(5, DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0)),
-                Ok(ResidentPollEvent::ProbeControlReadable)
-            );
-            assert_eq!(
-                classify(5, DW_SIGNAL_PEER_CLOSED),
-                Ok(ResidentPollEvent::ProbeControlLost)
-            );
-            assert_eq!(
-                classify(6, DW_SIGNAL_EXITED),
-                Ok(ResidentPollEvent::ProbeExited)
-            );
-            assert_eq!(classify(7, DW_SIGNAL_EXITED), Err(InitError::Supervision));
-        }
-
-        /// Row 207: U2's terminal claim waits for its committed response, the
-        /// TEMT fact and the exact normal-zero reap of the U2 probe, and is
-        /// made once. The claim itself is a kernel call, so the host can only
-        /// show every way it is withheld.
-        #[test]
-        fn the_u2_terminal_claim_waits_for_the_response_temt_and_reap_join() {
-            let u2 = binding(2);
-            let fact = TransportEmptyFact {
-                nonce: u2.nonce,
-                attempt_generation: u2.attempt_generation,
-                publication_generation: u2.publication_generation,
-                stream_generation: u2.stream_generation,
-                challenge_generation: 2,
-                response_length: E3A_RESPONSE_BYTES as u64,
-                response_hash: 0,
-            };
-            for (committed, temt, reaped) in [
-                (false, true, true),
-                (true, false, true),
-                (true, true, false),
-            ] {
-                let (mut resident, _) = fixture(Some(u2));
-                let state = selector(&mut resident);
-                state.e3a_response_committed = committed;
-                state.e3a_transport_empty = temt.then_some(fact);
-                state.e3a_u2_probe_reaped_successfully = reaped;
-                let mut system = platform();
-                assert_eq!(maybe_begin_e3a_retire(&mut resident, &mut system), Ok(()));
-                assert!(!selector(&mut resident).e3a_terminal_claimed);
-                assert_eq!(system.send_plain_count, 0, "U2 never sends begin-retire");
-            }
-            let (mut resident, _) = fixture(Some(u2));
-            let state = selector(&mut resident);
-            state.e3a_response_committed = true;
-            state.e3a_transport_empty = Some(fact);
-            state.e3a_u2_probe_reaped_successfully = true;
-            state.e3a_terminal_claimed = true;
-            assert_eq!(
-                maybe_begin_e3a_retire(&mut resident, &mut platform()),
-                Err(InitError::WrongManifestProfile),
-                "the claim is made once"
-            );
-        }
     }
 
     /// The session teardown retires each role once. `active[0]` and

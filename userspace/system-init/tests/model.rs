@@ -2,8 +2,6 @@ use deepwyrm_syscall::DwHandle;
 use wyrmroot_bootfs::builder::{Builder as BootfsBuilder, FileMode};
 use wyrmroot_device_proto as _;
 use wyrmroot_devmgr as _;
-#[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_dw1e3_com2_test as _;
 use wyrmroot_launch_proto as _;
 use wyrmroot_loader::launch::{self, HEADER_BYTES, LaunchProfile};
 use wyrmroot_registry_proto as _;

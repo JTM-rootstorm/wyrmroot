@@ -1751,48 +1751,23 @@ const FEATURE_COMBINATIONS_HAND_MAINTAINED: &[(&str, &str)] = &[
     // system-init: every selector and the product shapes. `wyr1e-production`
     // is the WYR1-F production shape and comes from `feature_combinations`.
     ("wyrmroot-system-init", "native-init"),
-    ("wyrmroot-system-init", "native-init,wyr1-test-evidence"),
-    ("wyrmroot-system-init", "native-init,wyr1b-test-evidence"),
     ("wyrmroot-system-init", "native-init,wyr1e-shell-controller"),
-    ("wyrmroot-system-init", "wyr1-test-evidence"),
-    ("wyrmroot-system-init", "wyr1b-test-evidence"),
     ("wyrmroot-system-init", "wyr1c4-production"),
     ("wyrmroot-system-init", "wyr1c5-production"),
     ("wyrmroot-system-init", "wyr1c6-production"),
-    (
-        "wyrmroot-system-init",
-        "wyr1c6-production,wyr1c6-selector29",
-    ),
-    ("wyrmroot-system-init", "wyr1c6-test-evidence"),
-    ("wyrmroot-system-init", "wyr1d-selector32"),
     ("wyrmroot-system-init", "wyr1e-shell-controller"),
-    ("wyrmroot-system-init", "wyr1e-production,wyr1f-closure"),
-    ("wyrmroot-system-init", "wyr1e-selector33"),
-    ("wyrmroot-system-init", "wyr1e8-selector33"),
-    ("wyrmroot-system-init", "wyr1f-closure"),
-    ("wyrmroot-system-init", "dw1e3-selector31"),
     // consoled. `native-consoled,wyr1e-wyrmsh` is the WYR1-F production
     // shape and comes from `feature_combinations`.
-    ("wyrmroot-consoled", "native-consoled,wyr1d-selector32"),
-    (
-        "wyrmroot-consoled",
-        "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery",
-    ),
     ("wyrmroot-consoled", "wyr1e-wyrmsh"),
     // devmgr. `wyr1e8-production` is the WYR1-F production shape and comes
     // from `feature_combinations`.
     ("wyrmroot-devmgr", "native-devmgr"),
     ("wyrmroot-devmgr", "wyr1c4-production"),
     ("wyrmroot-devmgr", "wyr1c5-production"),
-    ("wyrmroot-devmgr", "wyr1c6-production,wyr1c6-selector29"),
     ("wyrmroot-devmgr", "wyr1d-production"),
-    ("wyrmroot-devmgr", "wyr1d-selector32"),
     ("wyrmroot-devmgr", "wyr1e-production"),
-    ("wyrmroot-devmgr", "dw1e3-selector31"),
     // uart16550d. `native-uart16550d` is the WYR1-F production shape and
     // comes from `feature_combinations`.
-    ("wyrmroot-uart16550d", "wyr1d-selector32"),
-    ("wyrmroot-uart16550d", "dw1e3-selector31"),
     // The other roles and payloads, in their product shapes. `native-registryd`
     // (registryd), `native-wyrmsh` (wyrmsh), `native-stream-hello` (hello) and
     // `native-job-cpu-hog` (cpu-hog) are also the WYR1-F production shapes and
@@ -1801,35 +1776,14 @@ const FEATURE_COMBINATIONS_HAND_MAINTAINED: &[(&str, &str)] = &[
     ("wyrmroot-console-echo", "native-console-echo"),
     ("wyrmroot-hello", "native-hello"),
     ("wyrmroot-hello", "native-job-hello"),
-    ("wyrmroot-dw1c-preemption", "native-payloads"),
-    ("wyrmroot-dw1d6-device-test", "native-payloads"),
-    ("wyrmroot-dw1e3-com2-test", "native-probe"),
-    ("wyrmroot-wyr1b-gate", "native-gate"),
-    ("wyrmroot-wyr1-bootstrap-stubs", "native-stubs"),
     ("wyrmroot-wyr1-retained-stubs", "native-retained"),
     ("wyrmroot-wyr1-retained-stubs", "wyr1c5-production"),
-    (
-        "wyrmroot-wyr1-retained-stubs",
-        "wyr1c6-production,wyr1c6-selector29",
-    ),
-    ("wyrmroot-wyr1e-test-actors", "native-exit-nonzero"),
-    ("wyrmroot-wyr1e-test-actors", "native-fault"),
-    ("wyrmroot-wyr1e-test-actors", "native-recovery-trigger"),
-    ("wyrmroot-wyr1e-test-actors", "native-stdout-pressure"),
     // init0 and the bootstrap, for the DW1 and WYR1 products.
-    ("wyrmroot-init0", "dw1c-preemption-integration"),
-    ("wyrmroot-init0", "native-init0,dw1c-preemption-integration"),
-    ("wyrmroot-bootstrap", "dw1d6-synthetic"),
     ("wyrmroot-bootstrap", "native-bootstrap"),
     (
         "wyrmroot-bootstrap",
         "native-bootstrap,wyr0-init0-integration",
     ),
-    (
-        "wyrmroot-bootstrap",
-        "native-bootstrap,wyr0-init0-integration,dw1c-bootstrap-supervision",
-    ),
-    ("wyrmroot-bootstrap", "native-bootstrap,dw1d6-synthetic"),
     // Selector 22 (DW0-I2 runtime stress). No product builder mints its image
     // (`WYR0_I2_STRESS_PAYLOAD.md` records the manual build), so without these
     // rows nothing would notice its controller, init0 or bootstrap shape stop

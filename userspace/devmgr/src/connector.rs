@@ -3,10 +3,8 @@
 //! Native code owns actual Channel handles. This module names every ownership
 //! transition so the native adapter never infers cleanup from event order.
 
-#[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e8-production"))]
+#[cfg(feature = "wyr1e8-production")]
 use wyrmroot_device_proto::D5DriverIdentity;
-#[cfg(feature = "wyr1d-selector32")]
-use wyrmroot_device_proto::D5StreamIdentity;
 use wyrmroot_device_proto::connector::{ConnectorErrorCode, ConnectorIdentity, ConnectorMessage};
 use wyrmroot_device_proto::control::FailureCode;
 use wyrmroot_device_proto::control_v1_1::{ControlIdentityV1_1, ControlMessageV1_1};
@@ -36,17 +34,6 @@ impl AttachCorrelation {
             driver_attempt_generation: self.driver.control.attempt_generation.0,
             driver_control_endpoint_id: self.driver.control.endpoint.id.0,
             driver_control_endpoint_generation: self.driver.control.endpoint.generation.0,
-            attach_transaction_id: self.attach_transaction_id,
-            stream_generation: self.stream_generation,
-        }
-    }
-
-    #[cfg(feature = "wyr1d-selector32")]
-    pub const fn d5_stream_identity(self) -> D5StreamIdentity {
-        D5StreamIdentity {
-            driver: self.driver.d5_identity(),
-            publication_generation: self.driver.publication_generation,
-            client_transaction_id: self.client_transaction_id,
             attach_transaction_id: self.attach_transaction_id,
             stream_generation: self.stream_generation,
         }
@@ -86,7 +73,7 @@ impl AttachCorrelation {
     }
 }
 
-#[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e8-production"))]
+#[cfg(feature = "wyr1e8-production")]
 impl PublishedDriver {
     pub const fn d5_identity(self) -> D5DriverIdentity {
         D5DriverIdentity {
@@ -648,25 +635,6 @@ impl ConnectorBroker {
             return Err(ConnectorModelError::Stale);
         }
         let _ = self.retire_current();
-        self.client_release_observed(attach)?;
-        Ok(attach)
-    }
-
-    /// D5 accepts a consoled release certificate only after exact driver-reap
-    /// proof has moved the active slot to `AwaitingClientRelease`. All fields
-    /// are checked before ownership changes, so stale, wrong, early, and
-    /// duplicate certificates are non-mutating.
-    #[cfg(feature = "wyr1d-selector32")]
-    pub fn selector32_certify_client_release(
-        &mut self,
-        observed: D5StreamIdentity,
-    ) -> Result<AttachCorrelation, ConnectorModelError> {
-        let ConnectorSlot::AwaitingClientRelease { attach, .. } = self.slot else {
-            return Err(ConnectorModelError::Stale);
-        };
-        if attach.d5_stream_identity() != observed {
-            return Err(ConnectorModelError::Stale);
-        }
         self.client_release_observed(attach)?;
         Ok(attach)
     }
@@ -1236,37 +1204,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "wyr1d-selector32")]
-    #[test]
-    fn selector32_release_requires_exact_post_reap_stream_identity() {
-        let published = driver(10, 1);
-        let mut broker = ConnectorBroker::new(Some(published), 100, 200).unwrap();
-        let attach = attach_once(&mut broker, 10, 7);
-        assert_eq!(
-            broker.selector32_certify_client_release(attach.d5_stream_identity()),
-            Err(ConnectorModelError::Stale)
-        );
-        assert_eq!(broker.driver_attempt_reaped(published), Ok(None));
-        let before = broker.slot();
-        let mut stale = attach.d5_stream_identity();
-        stale.stream_generation += 1;
-        assert_eq!(
-            broker.selector32_certify_client_release(stale),
-            Err(ConnectorModelError::Stale)
-        );
-        assert_eq!(broker.slot(), before);
-        assert_eq!(
-            broker.selector32_certify_client_release(attach.d5_stream_identity()),
-            Ok(attach)
-        );
-        assert_eq!(broker.slot(), ConnectorSlot::Empty);
-        assert_eq!(
-            broker.selector32_certify_client_release(attach.d5_stream_identity()),
-            Err(ConnectorModelError::Stale)
-        );
-        assert_eq!(broker.slot(), ConnectorSlot::Empty);
-    }
-
     #[test]
     fn stale_reaped_attempt_cannot_mutate_current_or_active_slot() {
         let published = driver(10, 1);
@@ -1281,60 +1218,4 @@ mod tests {
         assert_eq!(broker.slot(), before_slot);
     }
 
-    #[cfg(feature = "wyr1d-selector32")]
-    #[test]
-    fn selector32_drain_relay_requires_exact_pending_active_fence_once() {
-        use crate::d5_drain::DrainRelay;
-        use wyrmroot_device_proto::d5_controller::D5DrainIdentity;
-        let published = driver(10, 1);
-        let mut broker = ConnectorBroker::new(Some(published), 100, 200).unwrap();
-        let attach = attach_once(&mut broker, 10, 7);
-        let identity = D5DrainIdentity {
-            driver: published.d5_identity(),
-            attach_transaction_id: attach.attach_transaction_id,
-            stream_generation: attach.stream_generation,
-            target_tx_bytes: 45,
-            leg: 2,
-        };
-        let mut relay = DrainRelay::default();
-        assert!(!relay.permits_retire(identity.driver));
-        assert!(relay.validate_completion(identity, &broker).is_err());
-        assert!(
-            relay
-                .request(
-                    D5DrainIdentity {
-                        attach_transaction_id: 99,
-                        ..identity
-                    },
-                    &broker
-                )
-                .is_err()
-        );
-        relay.request(identity, &broker).unwrap();
-        assert!(relay.request(identity, &broker).is_err());
-        assert!(!relay.permits_retire(identity.driver));
-        assert!(
-            relay
-                .validate_completion(
-                    D5DrainIdentity {
-                        stream_generation: 99,
-                        ..identity
-                    },
-                    &broker
-                )
-                .is_err()
-        );
-        relay.validate_completion(identity, &broker).unwrap();
-        // Failed forwarding cannot enable retirement or consume the pending fence.
-        assert!(!relay.permits_retire(identity.driver));
-        relay.validate_completion(identity, &broker).unwrap();
-        relay.forwarded(identity).unwrap();
-        assert!(relay.permits_retire(identity.driver));
-        assert!(relay.validate_completion(identity, &broker).is_err());
-        assert!(relay.forwarded(identity).is_err());
-        assert!(relay.request(identity, &broker).is_err());
-        broker.driver_attempt_reaped(published).unwrap();
-        let mut stale = DrainRelay::default();
-        assert!(stale.request(identity, &broker).is_err());
-    }
 }

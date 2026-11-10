@@ -1,5 +1,3 @@
-#[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_dw1e3_com2_test as _;
 use {
     deepwyrm_syscall as _, wyrmroot_bootfs as _, wyrmroot_device_proto as _, wyrmroot_devmgr as _,
     wyrmroot_launch_proto as _, wyrmroot_loader as _, wyrmroot_registry_proto as _,
@@ -46,7 +44,6 @@ fn console_launcher_is_installed_before_consoled_can_send_shell_v1() {
     let owner = launch.find("attach_session_owner(").unwrap();
     assert!(install < load && load < owner);
     assert!(launch.contains("ConsoledLoadRequest"));
-    assert!(!launch.contains("wyr1d-selector32"));
 }
 
 /// Source text because the dispatcher-before-console-wait order is inline in
@@ -207,18 +204,6 @@ fn console_relaunch_is_finite_and_registry_replacement_is_the_only_budget_reset(
     assert!(native.contains(
         "wyr1e::PollOutcome::RecoverRegistryForE8=>recover_registry(resident,system,loader,waits,bootfs,false,true"
     ));
-}
-
-/// Source text because selector 32's resident poll is reached only from the
-/// resident `control_tick`, which no host fake drives, and the property is
-/// partly an absence (no shell-v1 dispatcher, no console launcher scope).
-#[test]
-fn selector32_resident_remains_on_historical_launch_and_gate_paths() {
-    assert!(SELECTOR32.contains("d5.jobs.install_session(launch_grant, launch_endpoint)"));
-    assert!(SELECTOR32.contains("poll_job_dispatcher(system, loader, waits"));
-    assert!(SELECTOR32.contains("Status::configure(d5.gate.nonce())"));
-    assert!(!SELECTOR32.contains("poll_job_dispatcher_with_shell"));
-    assert!(!SELECTOR32.contains("LaunchSessionScope::ConsoleLauncher"));
 }
 
 /// Contract §11 item 4, the dispatcher half: ordinary `exit` and fresh-shell

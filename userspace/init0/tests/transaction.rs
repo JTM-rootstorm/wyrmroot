@@ -1,10 +1,4 @@
-#![cfg_attr(
-    any(
-        feature = "i-capability-integration",
-        feature = "dw1c-preemption-integration"
-    ),
-    allow(unused_crate_dependencies)
-)]
+#![cfg_attr(feature = "i-capability-integration", allow(unused_crate_dependencies))]
 #![cfg(not(feature = "i-capability-integration"))]
 
 // This fixture locks the ordinary `init0 -> hello` profile. The capability selector changes the
@@ -183,10 +177,6 @@ struct Fixture {
     close_failures: Vec<DwHandle>,
     sent: Vec<u8>,
     closed: Vec<DwHandle>,
-    #[cfg(feature = "dw1c-preemption-integration")]
-    dw1c_arm: Option<[wyrmroot_runtime::Dw1cActorBindV1; wyrmroot_runtime::DW1C_ACTOR_COUNT]>,
-    #[cfg(feature = "dw1c-preemption-integration")]
-    dw1c_complete: Option<u64>,
 }
 
 impl Fixture {
@@ -218,10 +208,6 @@ impl Fixture {
             close_failures: Vec::new(),
             sent: Vec::new(),
             closed: Vec::new(),
-            #[cfg(feature = "dw1c-preemption-integration")]
-            dw1c_arm: None,
-            #[cfg(feature = "dw1c-preemption-integration")]
-            dw1c_complete: None,
         }
     }
 }
@@ -304,51 +290,6 @@ impl Init0System for Fixture {
         }
     }
 
-    #[cfg(feature = "dw1c-preemption-integration")]
-    fn create_dw1c_relay(&mut self, _: DwRights) -> Result<(DwHandle, DwHandle), NativeError> {
-        Ok((DwHandle(700), DwHandle(701)))
-    }
-
-    #[cfg(feature = "dw1c-preemption-integration")]
-    fn send_dw1c_with_handles(
-        &mut self,
-        _: DwHandle,
-        _: &[u8],
-        _: &[DwHandleTransferV1],
-    ) -> Result<(), NativeError> {
-        Ok(())
-    }
-
-    #[cfg(feature = "dw1c-preemption-integration")]
-    fn await_dw1c_token2_relay_ready(&mut self, _: DwDeadline) -> Result<(), NativeError> {
-        Ok(())
-    }
-
-    #[cfg(feature = "dw1c-preemption-integration")]
-    fn dw1c_deadline_after(
-        &mut self,
-        interval_nanoseconds: u64,
-    ) -> Result<DwDeadline, NativeError> {
-        Ok(DwDeadline(DEADLINE.0 + interval_nanoseconds))
-    }
-
-    #[cfg(feature = "dw1c-preemption-integration")]
-    fn arm_dw1c_preemption(
-        &mut self,
-        bindings: &[wyrmroot_runtime::Dw1cActorBindV1; wyrmroot_runtime::DW1C_ACTOR_COUNT],
-        _: DwDeadline,
-    ) -> Result<(), NativeError> {
-        assert!(self.dw1c_arm.is_none());
-        self.dw1c_arm = Some(*bindings);
-        Ok(())
-    }
-
-    #[cfg(feature = "dw1c-preemption-integration")]
-    fn complete_dw1c_workload(&mut self, digest: u64) -> Result<(), NativeError> {
-        assert!(self.dw1c_complete.is_none());
-        self.dw1c_complete = Some(digest);
-        Ok(())
-    }
 }
 
 struct Loader {

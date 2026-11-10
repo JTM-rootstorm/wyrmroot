@@ -77,16 +77,7 @@ Usage:
     tools/pinned-cargo xtask wyr1c6 inspect --request <wyr1-c6-request.toml>
     tools/pinned-cargo xtask wyr1c6 run --request <wyr1-c6-request.toml>
     tools/pinned-cargo xtask wyr1c6 evidence --request <wyr1-c6-request.toml>
-    cargo xtask dw1c preflight --output <fresh-directory> --progress-digest <16-hex>
-    cargo xtask dw1c prepare --request <dw1-c-request.toml>
-    cargo xtask dw1c freeze --output <directory>
-    cargo xtask dw1c image --request <dw1-c-request.toml>
-    cargo xtask dw1c image-rebuild --request <dw1-c-request.toml>
-    cargo xtask dw1c inspect --request <dw1-c-request.toml>
-    tools/pinned-cargo xtask dw1d6 freeze --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>
     tools/pinned-cargo xtask dw1-e3a-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-nonce>
-    tools/pinned-cargo xtask dw1-e3b-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce> <16-hex-challenge-1-nonce> <16-hex-challenge-2-nonce>
-    tools/pinned-cargo xtask wyr1-d5-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce>
     cargo xtask grammar dump
 
 `grammar dump` emits the DW1-F/WYR1-F request/receipt/handoff/pair/result
@@ -293,47 +284,11 @@ pub(crate) enum Action {
         smp: String,
         output: String,
     },
-    Dw1CPreflight {
-        output: String,
-        progress_digest: String,
-    },
-    Dw1CPrepare(String),
-    Dw1CFreeze {
-        output: String,
-        deep_repository: String,
-        deep_revision: String,
-        evidence_nonce: String,
-        progress_digest: String,
-    },
-    Dw1CImage(String),
-    Dw1CImageRebuild(String),
-    Dw1CInspect(String),
-    Dw1D6Freeze {
-        output: String,
-        deep_repository: String,
-        deep_revision: String,
-        evidence_nonce: String,
-        evidence_challenge: String,
-    },
     Dw1E3APrepare {
         output: String,
         deep_repository: String,
         deep_revision: String,
         nonce: String,
-    },
-    Dw1E3BPrepare {
-        output: String,
-        deep_repository: String,
-        deep_revision: String,
-        evidence_nonce: String,
-        challenge_1_nonce: String,
-        challenge_2_nonce: String,
-    },
-    Wyr1D5Prepare {
-        output: String,
-        deep_repository: String,
-        deep_revision: String,
-        evidence_nonce: String,
     },
     GrammarDump,
     Unavailable(&'static str),
@@ -401,11 +356,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "wyr1e8" => dispatch_wyr1e8(&arguments[1..]),
         "wyr1f" => dispatch_wyr1f(&arguments[1..]),
         "wyr1c6" => dispatch_wyr1c6(&arguments[1..]),
-        "dw1c" => dispatch_dw1c(&arguments[1..]),
-        "dw1d6" => dispatch_dw1d6(&arguments[1..]),
         "dw1-e3a-prepare" => dispatch_dw1e3a_prepare(&arguments[1..]),
-        "dw1-e3b-prepare" => dispatch_dw1e3b_prepare(&arguments[1..]),
-        "wyr1-d5-prepare" => dispatch_wyr1d5_prepare(&arguments[1..]),
         "grammar" => dispatch_grammar(&arguments[1..]),
         "dev-boot" => dispatch_dev_boot(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
@@ -464,78 +415,6 @@ fn dispatch_dw1e3a_prepare(arguments: &[String]) -> Result<Action, Failure> {
         }),
         _ => Err(Failure::usage(
             "dw1-e3a-prepare requires <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-nonce>",
-        )),
-    }
-}
-
-fn dispatch_dw1e3b_prepare(arguments: &[String]) -> Result<Action, Failure> {
-    match arguments {
-        [
-            output,
-            deep_repository,
-            deep_revision,
-            evidence_nonce,
-            challenge_1_nonce,
-            challenge_2_nonce,
-        ] => Ok(Action::Dw1E3BPrepare {
-            output: output.clone(),
-            deep_repository: deep_repository.clone(),
-            deep_revision: deep_revision.clone(),
-            evidence_nonce: evidence_nonce.clone(),
-            challenge_1_nonce: challenge_1_nonce.clone(),
-            challenge_2_nonce: challenge_2_nonce.clone(),
-        }),
-        _ => Err(Failure::usage(
-            "dw1-e3b-prepare requires <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce> <16-hex-challenge-1-nonce> <16-hex-challenge-2-nonce>",
-        )),
-    }
-}
-
-fn dispatch_wyr1d5_prepare(arguments: &[String]) -> Result<Action, Failure> {
-    match arguments {
-        [output, deep_repository, deep_revision, evidence_nonce] => Ok(Action::Wyr1D5Prepare {
-            output: output.clone(),
-            deep_repository: deep_repository.clone(),
-            deep_revision: deep_revision.clone(),
-            evidence_nonce: evidence_nonce.clone(),
-        }),
-        _ => Err(Failure::usage(
-            "wyr1-d5-prepare requires <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce>",
-        )),
-    }
-}
-
-fn dispatch_dw1d6(arguments: &[String]) -> Result<Action, Failure> {
-    match arguments {
-        [
-            command,
-            output_flag,
-            output,
-            deep_flag,
-            deep_repository,
-            revision_flag,
-            deep_revision,
-            nonce_flag,
-            evidence_nonce,
-            challenge_flag,
-            evidence_challenge,
-        ] if command == "freeze"
-            && output_flag == "--output"
-            && deep_flag == "--deep-repository"
-            && revision_flag == "--deep-revision"
-            && nonce_flag == "--evidence-nonce"
-            && challenge_flag == "--evidence-challenge" =>
-        {
-            Ok(Action::Dw1D6Freeze {
-                output: output.clone(),
-                deep_repository: deep_repository.clone(),
-                deep_revision: deep_revision.clone(),
-                evidence_nonce: evidence_nonce.clone(),
-                evidence_challenge: evidence_challenge.clone(),
-            })
-        }
-        _ => Err(Failure::usage(
-            "dw1d6 requires freeze --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>",
         )),
     }
 }
@@ -730,63 +609,6 @@ fn dispatch_wyr1f(arguments: &[String]) -> Result<Action, Failure> {
         }
         _ => Err(Failure::usage(
             "wyr1f requires prepare --scenario <normal|normal-instrumented|degraded> --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> [--evidence-nonce <16-uppercase-hex>] or inspect --product <directory>",
-        )),
-    }
-}
-
-fn dispatch_dw1c(arguments: &[String]) -> Result<Action, Failure> {
-    match arguments {
-        [command, output_flag, output, digest_flag, progress_digest]
-            if command == "preflight"
-                && output_flag == "--output"
-                && digest_flag == "--progress-digest" =>
-        {
-            Ok(Action::Dw1CPreflight {
-                output: output.clone(),
-                progress_digest: progress_digest.clone(),
-            })
-        }
-        [
-            command,
-            output_flag,
-            output,
-            deep_flag,
-            deep_repository,
-            revision_flag,
-            deep_revision,
-            nonce_flag,
-            evidence_nonce,
-            digest_flag,
-            progress_digest,
-        ] if command == "freeze"
-            && output_flag == "--output"
-            && deep_flag == "--deep-repository"
-            && revision_flag == "--deep-revision"
-            && nonce_flag == "--evidence-nonce"
-            && digest_flag == "--progress-digest" =>
-        {
-            Ok(Action::Dw1CFreeze {
-                output: output.clone(),
-                deep_repository: deep_repository.clone(),
-                deep_revision: deep_revision.clone(),
-                evidence_nonce: evidence_nonce.clone(),
-                progress_digest: progress_digest.clone(),
-            })
-        }
-        [command, flag, request] if command == "image" && flag == "--request" => {
-            Ok(Action::Dw1CImage(request.clone()))
-        }
-        [command, flag, request] if command == "image-rebuild" && flag == "--request" => {
-            Ok(Action::Dw1CImageRebuild(request.clone()))
-        }
-        [command, flag, request] if command == "inspect" && flag == "--request" => {
-            Ok(Action::Dw1CInspect(request.clone()))
-        }
-        [command, flag, request] if command == "prepare" && flag == "--request" => {
-            Ok(Action::Dw1CPrepare(request.clone()))
-        }
-        _ => Err(Failure::usage(
-            "dw1c requires preflight --output <fresh-dir> --progress-digest <16-hex>, freeze --output <fresh-dir> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --progress-digest <16-hex>, or image|image-rebuild|inspect|prepare --request <dw1-c-request.toml>",
         )),
     }
 }
@@ -1207,97 +1029,6 @@ mod tests {
     }
 
     #[test]
-    fn dw1c_product_commands_dispatch_to_request_bound_actions() {
-        assert_eq!(
-            dispatch(&arguments(&[
-                "dw1c",
-                "preflight",
-                "--output",
-                "preflight",
-                "--progress-digest",
-                &"B".repeat(16),
-            ])),
-            Ok(Action::Dw1CPreflight {
-                output: "preflight".into(),
-                progress_digest: "B".repeat(16),
-            })
-        );
-        assert_eq!(
-            dispatch(&arguments(&[
-                "dw1c",
-                "freeze",
-                "--output",
-                "freeze",
-                "--deep-repository",
-                "/deep",
-                "--deep-revision",
-                &"a".repeat(40),
-                "--evidence-nonce",
-                &"A".repeat(16),
-                "--progress-digest",
-                &"B".repeat(16),
-            ])),
-            Ok(Action::Dw1CFreeze {
-                output: "freeze".into(),
-                deep_repository: "/deep".into(),
-                deep_revision: "a".repeat(40),
-                evidence_nonce: "A".repeat(16),
-                progress_digest: "B".repeat(16)
-            })
-        );
-        assert_eq!(
-            dispatch(&arguments(&["dw1c", "image", "--request", "request.toml"])),
-            Ok(Action::Dw1CImage("request.toml".into()))
-        );
-        assert_eq!(
-            dispatch(&arguments(&[
-                "dw1c",
-                "image-rebuild",
-                "--request",
-                "request.toml"
-            ])),
-            Ok(Action::Dw1CImageRebuild("request.toml".into()))
-        );
-        assert_eq!(
-            dispatch(&arguments(&[
-                "dw1c",
-                "inspect",
-                "--request",
-                "request.toml"
-            ])),
-            Ok(Action::Dw1CInspect("request.toml".into()))
-        );
-    }
-
-    #[test]
-    fn dw1d6_freeze_requires_the_explicit_candidate_and_evidence_pair() {
-        assert_eq!(
-            dispatch(&arguments(&[
-                "dw1d6",
-                "freeze",
-                "--output",
-                "freeze",
-                "--deep-repository",
-                "/home/mike/Documents/Programming/OS-Project/deepwyrm",
-                "--deep-revision",
-                &"a".repeat(40),
-                "--evidence-nonce",
-                &"A".repeat(16),
-                "--evidence-challenge",
-                &"B".repeat(16),
-            ])),
-            Ok(Action::Dw1D6Freeze {
-                output: "freeze".into(),
-                deep_repository: "/home/mike/Documents/Programming/OS-Project/deepwyrm".into(),
-                deep_revision: "a".repeat(40),
-                evidence_nonce: "A".repeat(16),
-                evidence_challenge: "B".repeat(16),
-            })
-        );
-        assert!(USAGE.contains("tools/pinned-cargo xtask dw1d6 freeze --output"));
-    }
-
-    #[test]
     fn wyr1c6_prepare_has_no_caller_supplied_artifact_directory() {
         assert_eq!(
             dispatch(&arguments(&[
@@ -1346,27 +1077,6 @@ mod tests {
         );
         assert!(dispatch(&arguments(&["dw1-e3a-prepare", "freeze"])).is_err());
         assert!(USAGE.contains("dw1-e3a-prepare <fresh-directory>"));
-    }
-
-    #[test]
-    fn wyr1d5_prepare_accepts_only_source_and_selector_nonce_inputs() {
-        assert_eq!(
-            dispatch(&arguments(&[
-                "wyr1-d5-prepare",
-                "freeze",
-                "/home/mike/Documents/Programming/OS-Project/deepwyrm",
-                &"a".repeat(40),
-                "D500000000000001",
-            ])),
-            Ok(Action::Wyr1D5Prepare {
-                output: "freeze".into(),
-                deep_repository: "/home/mike/Documents/Programming/OS-Project/deepwyrm".into(),
-                deep_revision: "a".repeat(40),
-                evidence_nonce: "D500000000000001".into(),
-            })
-        );
-        assert!(dispatch(&arguments(&["wyr1-d5-prepare", "freeze"])).is_err());
-        assert!(USAGE.contains("wyr1-d5-prepare <fresh-directory>"));
     }
 
     #[test]

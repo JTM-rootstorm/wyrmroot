@@ -171,7 +171,6 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-bootfs",
  "wyrmroot-bootstrap-proto",
- "wyrmroot-dw1d6-device-test",
  "wyrmroot-loader",
  "wyrmroot-runtime",
 ]
@@ -218,7 +217,6 @@ version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-device-proto",
- "wyrmroot-dw1e3-com2-test",
  "wyrmroot-loader",
  "wyrmroot-registry-proto",
  "wyrmroot-runtime",
@@ -231,36 +229,6 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-loader",
  "wyrmroot-runtime",
-]
-
-[[package]]
-name = "wyrmroot-dw1c-preemption"
-version = "0.0.0"
-dependencies = [
- "deepwyrm-syscall",
- "wyrmroot-loader",
- "wyrmroot-runtime",
-]
-
-[[package]]
-name = "wyrmroot-dw1d6-device-test"
-version = "0.0.0"
-dependencies = [
- "deepwyrm-syscall",
- "wyrmroot-loader",
- "wyrmroot-runtime",
-]
-
-[[package]]
-name = "wyrmroot-dw1e3-com2-test"
-version = "0.0.0"
-dependencies = [
- "deepwyrm-syscall",
- "wyrmroot-device-proto",
- "wyrmroot-loader",
- "wyrmroot-registry-proto",
- "wyrmroot-runtime",
- "wyrmroot-stream-proto",
 ]
 
 [[package]]
@@ -375,7 +343,6 @@ dependencies = [
  "wyrmroot-consoled",
  "wyrmroot-device-proto",
  "wyrmroot-devmgr",
- "wyrmroot-dw1e3-com2-test",
  "wyrmroot-launch-proto",
  "wyrmroot-loader",
  "wyrmroot-registry-proto",
@@ -384,7 +351,6 @@ dependencies = [
  "wyrmroot-runtime",
  "wyrmroot-uart16550d",
  "wyrmroot-wyr1b-gate-proto",
- "wyrmroot-wyr1e-test-actors",
 ]
 
 [[package]]
@@ -398,20 +364,10 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-device-proto",
  "wyrmroot-devmgr",
- "wyrmroot-dw1e3-com2-test",
  "wyrmroot-loader",
  "wyrmroot-runtime",
  "wyrmroot-stream-proto",
  "wyrmroot-uart16550-core",
-]
-
-[[package]]
-name = "wyrmroot-wyr1-bootstrap-stubs"
-version = "0.0.0"
-dependencies = [
- "deepwyrm-syscall",
- "wyrmroot-loader",
- "wyrmroot-runtime",
 ]
 
 [[package]]
@@ -425,30 +381,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "wyrmroot-wyr1b-gate"
-version = "0.0.0"
-dependencies = [
- "deepwyrm-syscall",
- "wyrmroot-launch-proto",
- "wyrmroot-loader",
- "wyrmroot-registry-proto",
- "wyrmroot-runtime",
- "wyrmroot-wyr1b-gate-proto",
-]
-
-[[package]]
 name = "wyrmroot-wyr1b-gate-proto"
 version = "0.0.0"
-
-[[package]]
-name = "wyrmroot-wyr1e-test-actors"
-version = "0.0.0"
-dependencies = [
- "deepwyrm-syscall",
- "wyrmroot-bootfs",
- "wyrmroot-loader",
- "wyrmroot-runtime",
-]
 
 [[package]]
 name = "wyrmroot-wyrmsh"

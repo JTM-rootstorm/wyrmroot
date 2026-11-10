@@ -18,9 +18,7 @@ required-features = ["native-consoled"]
 
 [features]
 default = []
-wyr1d-selector32 = []
 wyr1e-wyrmsh = []
-wyr1e8-recovery = ["wyr1e-wyrmsh"]
 native-consoled = [
     "dep:deepwyrm-syscall",
     "dep:wyrmroot-device-proto",

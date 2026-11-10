@@ -2,10 +2,7 @@ mod abi_pairing;
 mod cli;
 mod deep_layout;
 mod dev_boot;
-mod dw1c;
-mod dw1d6;
 mod dw1e3a;
-mod dw1e3b;
 mod elf_runtime;
 mod error;
 #[cfg(test)]
@@ -30,7 +27,6 @@ mod wyr1_vm;
 mod wyr1b;
 mod wyr1c;
 mod wyr1c6;
-mod wyr1d5;
 mod wyr1e;
 mod wyr1e8;
 mod wyr1f;
@@ -227,44 +223,6 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             std::path::Path::new(&output),
         )
         .map(Some),
-        Action::Dw1CPreflight {
-            output,
-            progress_digest,
-        } => dw1c::preflight(std::path::Path::new(&output), &progress_digest).map(Some),
-        Action::Dw1CPrepare(request) => dw1c::prepare(std::path::Path::new(&request)).map(Some),
-        Action::Dw1CFreeze {
-            output,
-            deep_repository,
-            deep_revision,
-            evidence_nonce,
-            progress_digest,
-        } => dw1c::freeze(
-            std::path::Path::new(&output),
-            std::path::Path::new(&deep_repository),
-            &deep_revision,
-            &evidence_nonce,
-            &progress_digest,
-        )
-        .map(Some),
-        Action::Dw1CImage(request) => dw1c::image(std::path::Path::new(&request)).map(Some),
-        Action::Dw1CImageRebuild(request) => {
-            dw1c::image_rebuild(std::path::Path::new(&request)).map(Some)
-        }
-        Action::Dw1CInspect(request) => dw1c::inspect(std::path::Path::new(&request)).map(Some),
-        Action::Dw1D6Freeze {
-            output,
-            deep_repository,
-            deep_revision,
-            evidence_nonce,
-            evidence_challenge,
-        } => dw1d6::freeze(
-            std::path::Path::new(&output),
-            std::path::Path::new(&deep_repository),
-            &deep_revision,
-            &evidence_nonce,
-            &evidence_challenge,
-        )
-        .map(Some),
         Action::Dw1E3APrepare {
             output,
             deep_repository,
@@ -275,34 +233,6 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             std::path::Path::new(&deep_repository),
             &deep_revision,
             &nonce,
-        )
-        .map(Some),
-        Action::Dw1E3BPrepare {
-            output,
-            deep_repository,
-            deep_revision,
-            evidence_nonce,
-            challenge_1_nonce,
-            challenge_2_nonce,
-        } => dw1e3b::prepare(
-            std::path::Path::new(&output),
-            std::path::Path::new(&deep_repository),
-            &deep_revision,
-            &evidence_nonce,
-            &challenge_1_nonce,
-            &challenge_2_nonce,
-        )
-        .map(Some),
-        Action::Wyr1D5Prepare {
-            output,
-            deep_repository,
-            deep_revision,
-            evidence_nonce,
-        } => wyr1d5::prepare(
-            std::path::Path::new(&output),
-            std::path::Path::new(&deep_repository),
-            &deep_revision,
-            &evidence_nonce,
         )
         .map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),

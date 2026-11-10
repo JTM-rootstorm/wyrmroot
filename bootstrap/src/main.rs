@@ -21,8 +21,6 @@ use wyrmroot_bootstrap::i0_negative_terminal_detail;
 use wyrmroot_bootstrap::run_bootstrap;
 #[cfg(feature = "primordial-blocking-cleanup")]
 use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
-#[cfg(feature = "dw1d6-synthetic")]
-use wyrmroot_bootstrap::run_d6_synthetic_bootstrap;
 #[cfg(not(any(
     feature = "primordial-blocking-cleanup",
     feature = "native-loader-smoke-integration",
@@ -61,20 +59,7 @@ use wyrmroot_runtime::{
     map_bootfs_read_only, panic_abort, query_capability_info, query_memory_object_size,
     receive_channel, send_channel, unmap_bootfs,
 };
-#[cfg(any(
-    feature = "native-loader-smoke-integration",
-    feature = "i0-negative-malformed-elf",
-    feature = "i0-negative-malformed-startup",
-    feature = "i0-negative-capability-count",
-    feature = "i0-negative-capability-type",
-    feature = "i0-negative-capability-rights",
-    feature = "dw1d6-synthetic",
-    not(any(
-        feature = "primordial-blocking-cleanup",
-        feature = "primordial-user-exception",
-        feature = "primordial-invalid-return"
-    ))
-))]
+#[cfg(any(feature = "native-loader-smoke-integration", feature = "i0-negative-malformed-elf", feature = "i0-negative-malformed-startup", feature = "i0-negative-capability-count", feature = "i0-negative-capability-type", feature = "i0-negative-capability-rights", not(any(feature = "primordial-blocking-cleanup", feature = "primordial-user-exception", feature = "primordial-invalid-return"))))]
 use wyrmroot_runtime::{NativeLoaderPlatform, NativeSupervisionPlatform, monotonic_deadline_after};
 
 #[cfg(any(
@@ -90,15 +75,8 @@ use wyrmroot_runtime::{NativeLoaderPlatform, NativeSupervisionPlatform, monotoni
         feature = "primordial-invalid-return"
     ))
 ))]
-const BOOTSTRAP_SUPERVISION_TIMEOUT_NS: u64 = if cfg!(feature = "dw1c-bootstrap-supervision") {
-    // Selector 28 deliberately sends init0 READY only after its complete
-    // transaction, matching the established selector-26 contract. Its own
-    // controller enforces separate setup/ARM, 240-second workload, and cleanup
-    // deadlines. This outer watchdog must contain those phases without
-    // replacing them or moving READY ahead of a possible selector failure.
-    270_000_000_000
-} else if cfg!(feature = "i2-bootstrap-supervision") {
-    // Selector 22 likewise sends init0 READY only after the whole I2
+const BOOTSTRAP_SUPERVISION_TIMEOUT_NS: u64 = if cfg!(feature = "i2-bootstrap-supervision") {
+    // Selector 22 sends init0 READY only after the whole I2
     // controller, whose stage-7 concurrent-unmap rounds run for seconds.
     // init0 bounds that controller by its 120-second I2 deadline; this outer
     // watchdog contains it.
@@ -241,21 +219,7 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     panic_abort()
 }
 
-#[cfg(not(any(
-    feature = "primordial-blocking-cleanup",
-    feature = "primordial-user-exception",
-    feature = "primordial-invalid-return",
-    feature = "native-loader-smoke-integration",
-    feature = "i0-negative-malformed-elf",
-    feature = "i0-negative-malformed-startup",
-    feature = "i0-negative-capability-count",
-    feature = "i0-negative-capability-type",
-    feature = "i0-negative-capability-rights",
-    feature = "dw1d6-synthetic",
-    any(feature = "wyr1c4-production", feature = "wyr1c5-production"),
-    feature = "i-capability-integration",
-    feature = "wyr0-init0-integration"
-)))]
+#[cfg(not(any(feature = "primordial-blocking-cleanup", feature = "primordial-user-exception", feature = "primordial-invalid-return", feature = "native-loader-smoke-integration", feature = "i0-negative-malformed-elf", feature = "i0-negative-malformed-startup", feature = "i0-negative-capability-count", feature = "i0-negative-capability-type", feature = "i0-negative-capability-rights", any(feature = "wyr1c4-production", feature = "wyr1c5-production"), feature = "i-capability-integration", feature = "wyr0-init0-integration")))]
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
         Ok(deadline) => deadline,
@@ -291,21 +255,6 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
         &mut supervisor,
         startup.bootstrap_channel().as_abi(),
         deadline,
-    ) {
-        Ok(()) => 0,
-        Err(error) => system.exit_code(&error),
-    }
-}
-
-#[cfg(feature = "dw1d6-synthetic")]
-fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
-    let mut system = NativeSystem::new();
-    match run_d6_synthetic_bootstrap(
-        &mut system,
-        &mut NativeLoaderPlatform,
-        startup.bootstrap_channel().as_abi(),
-        wyrmroot_dw1d6_device_test::BUILD_NONCE,
-        wyrmroot_dw1d6_device_test::BUILD_CHALLENGE,
     ) {
         Ok(()) => 0,
         Err(error) => system.exit_code(&error),

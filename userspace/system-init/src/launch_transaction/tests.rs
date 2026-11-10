@@ -612,10 +612,7 @@ fn a_session_and_a_job_each_find_their_own_open_transaction() {
 #[test]
 fn the_arenas_ungated_cost_fits_the_tightest_resident_tier() {
     use core::mem::size_of;
-    let ungated = cfg!(not(any(
-        feature = "wyr1e-selector33",
-        feature = "wyr1e8-selector33"
-    )));
+    let ungated = true;
     if ungated {
         assert!(
             size_of::<LaunchTransactions>() <= LAUNCH_ARENA_BUDGET_BYTES,

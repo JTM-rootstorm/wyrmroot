@@ -7,9 +7,6 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-#[cfg(all(feature = "wyr1d-selector32", feature = "wyr1e-wyrmsh"))]
-compile_error!("selector-32 console-echo and WYR1-E wyrmsh policies are mutually exclusive");
-
 #[cfg(test)]
 extern crate std;
 // The recording platform is a dev-dependency; only the native role's tests
@@ -24,8 +21,6 @@ use wyrmroot_runtime as _;
 /// `tools/verify-vm-request.py`, which is a declared cross-repository lineage
 /// contract, and R7B-4 decides whether this leg survives at all. One rename
 /// there, not two.
-#[cfg(any(test, feature = "wyr1e8-recovery"))]
-pub mod quiesce_control;
 
 /// The native role, which `src/main.rs` held until S2U step 3. It exists only
 /// with `native-consoled`, which every consoled binary shape requires.
@@ -3117,5 +3112,3 @@ mod tests {
         assert!(model.validate_invariants());
     }
 }
-#[cfg(feature = "wyr1d-selector32")]
-pub mod selector32;

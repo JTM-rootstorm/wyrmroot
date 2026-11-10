@@ -127,73 +127,6 @@ fn c5_moves_exact_reduced_bundle_then_requires_ready_before_publish() {
 /// Source text until S3: the role runs over the platform seam, but no
 /// RecordingPlatform script drives this path yet.
 #[test]
-fn selector29_stale_probes_run_after_p2_publication_and_close_before_probe() {
-    let retry_start = NATIVE
-        .find("resident.driver_retry_ready(now)")
-        .expect("bounded retry path");
-    let retry = &NATIVE[retry_start..];
-    let launch = retry
-        .find("launch_driver_with_bundle(")
-        .expect("U2 launch and P2 publication complete before return");
-    let malformed = retry
-        .find("probe_malformed_resource_mapping(\n                        platform,\n                        launched,")
-        .expect("post-P2 malformed resource mapping probe");
-    let stale_control = retry
-        .find("probe_stale_driver_endpoint(platform, stale_control")
-        .expect("post-P2 stale control probe");
-    let stale_publication = retry
-        .find("probe_stale_publication(platform, stale_publication")
-        .expect("post-P2 stale publication probe");
-    let close_control = NATIVE
-        .find("close_handle(control).map_err(|_| failure(41))")
-        .expect("old control closes at cleanup");
-    let close_publication = NATIVE
-        .find(".close_handle(stale_publication)\n                    .map_err(|_| failure(149))")
-        .expect("old publication closes at cleanup");
-    assert!(launch < malformed && malformed < stale_control && stale_control < stale_publication);
-    assert!(close_control < retry_start);
-    assert!(close_publication < retry_start);
-    assert!(!NATIVE.contains("if send_channel(publication, &bytes[..stale_size], &[]).is_ok()"));
-    let bundle = &NATIVE[NATIVE.find("fn launch_driver_with_bundle<").unwrap()..];
-    let publish = bundle.find("publish_driver(platform, publication").unwrap();
-    let p2 = bundle
-        .find("} else {\n                        12")
-        .expect("P2 fact remains explicit");
-    assert!(publish < p2);
-}
-
-/// Source text until S3: the role runs over the platform seam, but no
-/// RecordingPlatform script drives this path yet.
-#[test]
-fn selector29_malformed_mapping_probe_moves_wrong_second_type_and_requires_typed_rejection() {
-    let probe = &NATIVE[NATIVE
-        .find("fn probe_malformed_resource_mapping<")
-        .expect("selector-29 malformed resource probe")
-        ..NATIVE.find("fn publish_driver<").expect("next C5 helper")];
-    assert_eq!(
-        probe
-            .matches("duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)")
-            .count(),
-        2
-    );
-    assert!(!probe.contains("create_interrupt("));
-    assert!(probe.contains("bundle_generation: active_generation"));
-    assert_eq!(
-        probe
-            .matches("requested_rights: DEVICE_RESOURCE_DRIVER_RIGHTS")
-            .count(),
-        2
-    );
-    assert!(probe.contains("operation: DW_HANDLE_TRANSFER_MOVE"));
-    assert!(probe.contains("code: FailureCode::MalformedResource"));
-    assert!(!probe.contains("device_pio_read"));
-    assert!(!probe.contains("device_pio_write"));
-    assert!(!probe.contains("interrupt_ack"));
-}
-
-/// Source text until S3: the role runs over the platform seam, but no
-/// RecordingPlatform script drives this path yet.
-#[test]
 fn c6_inline_publication_rebind_is_acknowledged_before_driver_backoff() {
     let cleanup = &NATIVE[NATIVE
         .find("send_driver_retired(platform, bootstrap, request)?")
@@ -252,29 +185,6 @@ fn publication_acknowledgements_use_the_shared_lifecycle_producer_and_failure_st
             .count(),
         2
     );
-}
-
-#[test]
-fn selector29_native_path_has_no_physical_device_io_calls() {
-    assert!(!NATIVE.contains("device_pio_read"));
-    assert!(!NATIVE.contains("device_pio_write"));
-    assert!(!NATIVE.contains("interrupt_ack"));
-}
-
-/// Source text until S3: the role runs over the platform seam, but no
-/// RecordingPlatform script drives this path yet.
-#[test]
-fn selector29_fact_delivery_handles_bounded_channel_backpressure() {
-    let send = &NATIVE[NATIVE.find("fn send_bootstrap_channel<").unwrap()..];
-    let send = &send[..send.find("fn send_c6_fact<").unwrap()];
-    assert!(send.contains("for _ in 0..4"));
-    assert!(send.contains("DW_STATUS_WOULD_BLOCK"));
-    assert!(send.contains("DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0"));
-    assert!(send.contains("WYR0_I_SUPERVISION_POLICY.ready_timeout_ns"));
-    assert!(!send.contains("DW_DEADLINE_INFINITE"));
-    assert!(NATIVE.contains(
-        "send_bootstrap_channel(\n        platform,\n        bootstrap,\n        &launch,"
-    ));
 }
 
 /// Source text until S3: the role runs over the platform seam, but no

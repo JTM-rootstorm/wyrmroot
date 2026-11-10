@@ -288,23 +288,6 @@ struct LaunchSlot {
     resources: Option<LaunchResources>,
     ready_deadline: Option<DwDeadline>,
     failure: Option<LaunchFailure>,
-    /// The request's contribution to the evidence record, taken while the
-    /// request bytes were still in hand.
-    ///
-    /// R6B-2. A deferred reply cannot re-read the request, and cannot keep it:
-    /// `MAX_LAUNCH_MESSAGE_BYTES` is 17,760 and §7.1 of the reset plan measured
-    /// that out. Two digests and a reservation are the whole of what the join
-    /// needs from it. Gated with the evidence, because a build with no evidence
-    /// surface has nothing to record and should not pay 88 bytes a slot to
-    /// carry it -- the default resident tier has 144 bytes of headroom in
-    /// total.
-    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-    request_facts: Option<crate::launch_request_facts::LaunchRequestFacts>,
-    /// Which recovery leg this launch was classified as, if it was one.
-    ///
-    /// Its reservation is the slot's, so only the action has to be carried.
-    #[cfg(feature = "wyr1e8-selector33")]
-    trigger_action: Option<crate::wyr1b_native::E8RecoveryAction>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -369,10 +352,6 @@ impl LaunchTransactions {
             resources: None,
             ready_deadline: None,
             failure: None,
-            #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-            request_facts: None,
-            #[cfg(feature = "wyr1e8-selector33")]
-            trigger_action: None,
         });
         Ok(LaunchToken {
             slot: index,
@@ -510,60 +489,6 @@ impl LaunchTransactions {
     ) -> Result<Option<LaunchResources>, LaunchTransactionError> {
         let slot = self.slot_mut(token)?;
         Ok(slot.resources.take())
-    }
-
-    /// Records the request-derived half of the evidence record.
-    ///
-    /// R6B-2. Refuses a second attach rather than overwriting: two different
-    /// requests cannot both be the one this transaction answers, and silently
-    /// keeping the later one would put a digest in the record that no reader
-    /// could reproduce.
-    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-    pub(crate) fn attach_request_facts(
-        &mut self,
-        token: LaunchToken,
-        facts: crate::launch_request_facts::LaunchRequestFacts,
-    ) -> Result<(), LaunchTransactionError> {
-        if facts.reservation() != self.slot(token)?.reservation {
-            return Err(LaunchTransactionError::ResourceIdentity);
-        }
-        let slot = self.slot_mut(token)?;
-        if slot.request_facts.is_some() {
-            return Err(LaunchTransactionError::ResourceIdentity);
-        }
-        slot.request_facts = Some(facts);
-        Ok(())
-    }
-
-    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-    pub(crate) fn request_facts(
-        &self,
-        token: LaunchToken,
-    ) -> Result<Option<crate::launch_request_facts::LaunchRequestFacts>, LaunchTransactionError>
-    {
-        self.slot(token).map(|slot| slot.request_facts)
-    }
-
-    #[cfg(feature = "wyr1e8-selector33")]
-    pub(crate) fn attach_trigger_action(
-        &mut self,
-        token: LaunchToken,
-        action: crate::wyr1b_native::E8RecoveryAction,
-    ) -> Result<(), LaunchTransactionError> {
-        let slot = self.slot_mut(token)?;
-        if slot.trigger_action.is_some() {
-            return Err(LaunchTransactionError::ResourceIdentity);
-        }
-        slot.trigger_action = Some(action);
-        Ok(())
-    }
-
-    #[cfg(feature = "wyr1e8-selector33")]
-    pub(crate) fn trigger_action(
-        &self,
-        token: LaunchToken,
-    ) -> Result<Option<crate::wyr1b_native::E8RecoveryAction>, LaunchTransactionError> {
-        self.slot(token).map(|slot| slot.trigger_action)
     }
 
     pub(crate) fn arm_ready_deadline(

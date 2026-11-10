@@ -233,7 +233,6 @@ fn a_malformed_init_closes_every_handle_then_the_bootstrap() {
 /// registry client and the bootstrap Channel, in that order, and stops at
 /// step 8. Selector 32 reads its configuration off the bootstrap Channel
 /// before this close, so the sequence is this build's only without it.
-#[cfg(not(feature = "wyr1d-selector32"))]
 #[test]
 fn a_failed_self_root_close_releases_the_authorities_then_the_bootstrap() {
     use wyrmroot_loader::launch::encode_consoled_init;

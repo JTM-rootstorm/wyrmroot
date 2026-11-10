@@ -8,11 +8,9 @@ use deepwyrm_syscall::{
     DwWaitResultV1,
 };
 use wyrmroot_bootfs as _;
-#[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
+#[cfg(feature = "wyr1e-production")]
 use wyrmroot_consoled as _;
 use wyrmroot_device_proto as _;
-#[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_dw1e3_com2_test as _;
 use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
 use wyrmroot_registry_proto as _;
@@ -27,23 +25,10 @@ use wyrmroot_runtime::{
 use wyrmroot_system_init::continue_system_init_product;
 #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
 use wyrmroot_system_init::continue_system_init_resource_product;
-#[cfg(not(any(
-    feature = "wyr1-test-evidence",
-    feature = "wyr1b-test-evidence",
-    feature = "wyr1c6-selector29"
-)))]
 use wyrmroot_system_init::fatal_application_status;
 use wyrmroot_system_init::validate_wait_until_completion;
-#[cfg(feature = "wyr1-test-evidence")]
-use wyrmroot_system_init::wyr1_test_failure_application_status;
-#[cfg(feature = "wyr1b-test-evidence")]
-use wyrmroot_system_init::wyr1b_test_failure_application_status;
-#[cfg(feature = "wyr1c6-selector29")]
-use wyrmroot_system_init::wyr1c6_test_failure_application_status;
 use wyrmroot_system_init::{InitPlatform, Wyr1BPlatform, resident_loop};
 use wyrmroot_wyr1b_gate_proto as _;
-#[cfg(feature = "wyr1e8-selector33")]
-use wyrmroot_wyr1e_test_actors as _;
 
 struct NativeSystem;
 
@@ -65,7 +50,6 @@ impl InitPlatform for NativeSystem {
     fn query_memory_object_size(&mut self, handle: DwHandle) -> Result<u64, NativeError> {
         query_memory_object_size(handle)
     }
-    #[cfg_attr(feature = "wyr1b-test-evidence", inline(always))]
     fn with_bootfs_bytes<R>(
         &mut self,
         root: DwHandle,
@@ -161,38 +145,10 @@ impl Wyr1BPlatform for NativeSystem {
         wyrmroot_runtime::materialize_read_only_memory(root, bytes, rights)
     }
 
-    #[cfg(feature = "wyr1e-selector33")]
-    fn submit_wyr1e7_evidence(&mut self, record: &[u8; 192]) -> Result<(), NativeError> {
-        wyrmroot_runtime::submit_wyr1e7_evidence(record)
-    }
-
-    #[cfg(feature = "wyr1e8-selector33")]
-    fn submit_wyr1e8_evidence(&mut self, record: &[u8; 192]) -> Result<(), NativeError> {
-        wyrmroot_runtime::submit_wyr1e8_evidence(record)
-    }
 }
 
 impl resident_loop::ResidentLoopPlatform for NativeSystem {
-    #[cfg(feature = "wyr1-test-evidence")]
-    fn submit_wyr1_evidence(&mut self, record: &[u8; 114]) -> Result<(), NativeError> {
-        wyrmroot_runtime::submit_wyr1_evidence(record)
-    }
 
-    #[cfg(feature = "wyr1b-test-evidence")]
-    fn submit_wyr1b_evidence(
-        &mut self,
-        record: &[u8; wyrmroot_system_init::wyr1b_gate::RECORD_BYTES],
-    ) -> Result<(), NativeError> {
-        wyrmroot_runtime::submit_wyr1b_evidence(record)
-    }
-
-    #[cfg(feature = "wyr1c6-selector29")]
-    fn submit_wyr1c6_evidence(
-        &mut self,
-        record: &[u8; wyrmroot_system_init::wyr1c6_gate::RECORD_BYTES],
-    ) -> Result<(), NativeError> {
-        wyrmroot_runtime::submit_wyr1c6_evidence(record)
-    }
 }
 
 fn native_main(startup: StartupBlock<'_>) -> u32 {
@@ -218,17 +174,6 @@ fn native_main(startup: StartupBlock<'_>) -> u32 {
     match result {
         Ok(status) => status,
         Err(error) => {
-            #[cfg(feature = "wyr1c6-selector29")]
-            return wyr1c6_test_failure_application_status(&error);
-            #[cfg(feature = "wyr1b-test-evidence")]
-            return wyr1b_test_failure_application_status(&error);
-            #[cfg(all(feature = "wyr1-test-evidence", not(feature = "wyr1b-test-evidence")))]
-            return wyr1_test_failure_application_status(&error);
-            #[cfg(not(any(
-                feature = "wyr1-test-evidence",
-                feature = "wyr1b-test-evidence",
-                feature = "wyr1c6-selector29"
-            )))]
             return fatal_application_status(&error) as u32;
         }
     }

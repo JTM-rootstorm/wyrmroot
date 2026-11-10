@@ -1,7 +1,6 @@
 //! Production generated DeviceResource and Interrupt syscall facade.
 //!
-//! This module contains only ordinary generated ABI operations. Selector-private
-//! DW1-D6 evidence transport remains isolated in `dw1d6`.
+//! This module contains only ordinary generated ABI operations.
 
 use deepwyrm_syscall::{
     DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT, DW_ABI_INFO_V1_SIZE, DW_ABI_VERSION,

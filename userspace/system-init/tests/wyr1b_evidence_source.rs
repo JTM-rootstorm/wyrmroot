@@ -1,5 +1,3 @@
-#[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_dw1e3_com2_test as _;
 use {
     deepwyrm_syscall as _, wyrmroot_bootfs as _, wyrmroot_device_proto as _, wyrmroot_devmgr as _,
     wyrmroot_launch_proto as _, wyrmroot_loader as _, wyrmroot_registry_proto as _,
@@ -23,83 +21,6 @@ fn item<'a>(source: &'a str, start: &str, indent: &str) -> &'a str {
     let close = format!("\n{indent}}}\n");
     let to = source[from..].find(&close).unwrap() + from;
     &source[from..to]
-}
-
-/// Selector 27's resident drain submits its own records, under its own
-/// feature, through the runtime's selector-27 call. Source text: selector 27's
-/// shape (`wyr1b-test-evidence`) is only `check`ed by the gate, so no host
-/// test can run its drain, and `main.rs`'s native submission is type-checked
-/// only. Selector 25's drain is host-tested through `MockNative` in the shapes
-/// that run it (`a_fatal_control_tick_submits_its_evidence_before_reporting_the_failure`
-/// and `finalized_evidence_is_submitted_after_a_successful_tick` in lib.rs).
-#[test]
-fn selector_27_submission_feature_is_separate_from_selector_25() {
-    let feature = |name: &str| {
-        MANIFEST
-            .lines()
-            .find(|line| line.split_once(" = ").is_some_and(|(left, _)| left == name))
-            .unwrap_or_else(|| panic!("{name} is not declared"))
-    };
-    assert_eq!(
-        feature("wyr1-test-evidence"),
-        "wyr1-test-evidence = [\"native-init\", \"wyrmroot-runtime/wyr1-test-evidence\"]"
-    );
-    assert_eq!(
-        feature("wyr1b-test-evidence"),
-        "wyr1b-test-evidence = [\"native-init\", \"wyrmroot-runtime/wyr1b-test-evidence\"]"
-    );
-    let resident_loop = item(LOOP, "pub fn continue_resident<", "");
-    assert!(resident_loop.contains(
-        "    #[cfg(feature = \"wyr1b-test-evidence\")]
-    {
-        let mut index = 0;
-        while let Some(record) = resident.wyr1b_evidence_record(index) {
-            if system.submit_wyr1b_evidence(record).is_err() {"
-    ));
-    assert!(
-        item(MAIN, "fn submit_wyr1b_evidence(", "    ")
-            .contains("wyrmroot_runtime::submit_wyr1b_evidence(record)")
-    );
-    assert!(
-        item(MAIN, "fn submit_wyr1_evidence(", "    ")
-            .contains("wyrmroot_runtime::submit_wyr1_evidence(record)")
-    );
-    assert_eq!(
-        NATIVE.matches("*wyr1b_evidence = Some(evidence)").count(),
-        1
-    );
-}
-
-/// The product's first bootfs mapping reports the startup diagnostic, once.
-///
-/// Source text because the startup and ordinary diagnostics differ only in
-/// selector 27's shape (`wyr1b-test-evidence`), which the gate only `check`s;
-/// in every tested shape both collapse to `InitError::Mapping`, so no gated
-/// host test can tell the sites apart. Scoped to the product activation and
-/// to `startup_mapping_error`.
-#[test]
-fn selector_27_startup_mapping_diagnostic_is_bound_to_the_initial_mapping_only() {
-    let product_start = LIB.find("fn activate_received_product_in_place").unwrap();
-    let product_end = LIB[product_start..]
-        .find("fn receive_and_activate<S, T>")
-        .map(|offset| product_start + offset)
-        .unwrap();
-    let product = &LIB[product_start..product_end];
-    assert_eq!(
-        product
-            .matches(".map_err(|error| startup_mapping_error(error, size))?")
-            .count(),
-        1
-    );
-    assert!(
-        item(
-            LIB,
-            "fn startup_mapping_error(error: MappingPlanError, size: u64)",
-            ""
-        )
-        .contains("InitError::StartupMapping(StartupMappingDiagnostic")
-    );
-    assert!(MAIN.contains("return wyr1b_test_failure_application_status(&error);"));
 }
 
 #[test]
@@ -167,9 +88,6 @@ fn selector_27_dispatcher_keeps_one_protocol_sized_payload_and_stream_set() {
     assert!(NATIVE.contains("#[inline(always)]\npub(crate) fn poll_job_dispatcher"));
     assert!(WYR1B_MODEL.contains("#[inline(always)]\npub(crate) fn prepare_reserved_job"));
     assert!(LIB.contains("#[inline(always)]\n    pub fn control_tick_product"));
-    assert!(MAIN.contains(
-        "#[cfg_attr(feature = \"wyr1b-test-evidence\", inline(always))]\n    fn with_bootfs_bytes"
-    ));
 }
 
 /// Each post-startup bootfs mapping names its own site.

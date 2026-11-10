@@ -21,7 +21,6 @@ default = []
 native-init0 = []
 i2-stress-integration = []
 i-capability-integration = ["dep:wyrmroot-i-capability"]
-dw1c-preemption-integration = ["wyrmroot-runtime/dw1c-test-evidence"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true

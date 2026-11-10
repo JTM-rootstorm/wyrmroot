@@ -7,12 +7,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_dw1e3_com2_test as _;
-
 pub mod connector;
-#[cfg(feature = "wyr1d-selector32")]
-pub mod d5_drain;
 #[cfg(feature = "native-devmgr")]
 pub mod role;
 pub mod staging;
@@ -1997,7 +1992,7 @@ mod tests {
     /// resident's fresh endpoint-local transaction, launch transaction + 1,
     /// never the launch transaction the publication was made under: the
     /// registry's replay protection would refuse a reused one.
-    #[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
+    #[cfg(feature = "wyr1c6-production")]
     #[test]
     fn c6_retirement_uses_a_fresh_endpoint_local_registry_transaction() {
         use deepwyrm_syscall::{DW_STATUS_BAD_STATE, DwHandle};
@@ -2042,7 +2037,7 @@ mod tests {
     /// model step with no platform: the first activation builds the broker
     /// around that driver, a second for the same driver is refused, and an
     /// empty broker with no current driver is re-pointed at it.
-    #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
+    #[cfg(feature = "wyr1e-production")]
     #[test]
     fn connector_broker_activation_publishes_the_ready_driver_once() {
         use crate::connector::ConnectorBroker;
