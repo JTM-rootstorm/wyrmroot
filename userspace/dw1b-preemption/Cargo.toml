@@ -10,20 +10,6 @@ license = "GPL-3.0-or-later"
 path = "src/lib.rs"
 
 [[bin]]
-name = "wyrmroot-dw1b-cpu-hog"
-path = "src/bin/cpu_hog.rs"
-test = false
-bench = false
-required-features = ["native-payloads"]
-
-[[bin]]
-name = "wyrmroot-dw1b-progress"
-path = "src/bin/progress.rs"
-test = false
-bench = false
-required-features = ["native-payloads"]
-
-[[bin]]
 name = "wyrmroot-job-cpu-hog"
 path = "src/bin/job_cpu_hog.rs"
 test = false
@@ -32,7 +18,6 @@ required-features = ["native-job-cpu-hog"]
 
 [features]
 default = []
-native-payloads = ["wyrmroot-runtime/dw1b-test-evidence"]
 native-job-cpu-hog = []
 
 [dependencies]

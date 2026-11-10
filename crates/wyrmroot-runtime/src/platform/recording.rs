@@ -213,19 +213,6 @@ pub enum Call {
     SubmitWyr1e8Evidence {
         record: Vec<u8>,
     },
-    #[cfg(feature = "r1-test-evidence")]
-    SubmitR1Evidence {
-        record: Vec<u8>,
-    },
-    #[cfg(feature = "dw1b-test-evidence")]
-    ArmDw1bPreemption {
-        hog_process: DwHandle,
-        progress_process: DwHandle,
-    },
-    #[cfg(feature = "dw1b-test-evidence")]
-    SubmitDw1bProgress {
-        digest: u64,
-    },
     #[cfg(feature = "dw1c-test-evidence")]
     ArmDw1cPreemption {
         bindings: [crate::Dw1cActorBindV1; crate::DW1C_ACTOR_COUNT],
@@ -922,33 +909,6 @@ impl EvidencePlatform for RecordingPlatform {
         self.unit(Call::SubmitWyr1e8Evidence {
             record: record.to_vec(),
         })
-    }
-
-    #[cfg(feature = "r1-test-evidence")]
-    fn submit_r1_evidence(
-        &mut self,
-        record: &[u8; crate::R1_EVIDENCE_RECORD_BYTES],
-    ) -> Result<(), NativeError> {
-        self.unit(Call::SubmitR1Evidence {
-            record: record.to_vec(),
-        })
-    }
-
-    #[cfg(feature = "dw1b-test-evidence")]
-    fn arm_dw1b_preemption(
-        &mut self,
-        hog_process: DwHandle,
-        progress_process: DwHandle,
-    ) -> Result<(), NativeError> {
-        self.unit(Call::ArmDw1bPreemption {
-            hog_process,
-            progress_process,
-        })
-    }
-
-    #[cfg(feature = "dw1b-test-evidence")]
-    fn submit_dw1b_progress(&mut self, digest: u64) -> Result<(), NativeError> {
-        self.unit(Call::SubmitDw1bProgress { digest })
     }
 
     #[cfg(feature = "dw1c-test-evidence")]

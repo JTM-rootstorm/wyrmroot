@@ -1,15 +1,11 @@
 #![cfg_attr(
     any(
         feature = "i-capability-integration",
-        feature = "dw1b-preemption-integration",
         feature = "dw1c-preemption-integration"
     ),
     allow(unused_crate_dependencies)
 )]
-#![cfg(not(any(
-    feature = "i-capability-integration",
-    feature = "dw1b-preemption-integration"
-)))]
+#![cfg(not(feature = "i-capability-integration"))]
 
 // This fixture locks the ordinary `init0 -> hello` profile. The capability selector changes the
 // child launch contract and has dedicated feature-gated library tests instead.

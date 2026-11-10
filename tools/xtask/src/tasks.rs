@@ -1283,8 +1283,6 @@ const NAMED_HOST_FILTERS: &[(&str, Route)] = &[
     ("selectors", Route::Host),
     ("wyr1e8-producer-fixture", Route::Host),
     ("wyr1d5-clippy", Route::Host),
-    ("r1-clippy", Route::Host),
-    ("r1-status", Route::Host),
     ("dw1e3-model", Route::Host),
     ("wyr1e3-model", Route::Host),
     ("wyr1e3-clippy", Route::Host),
@@ -1476,18 +1474,6 @@ fn named_host_runs(filter: &str) -> Result<Vec<CargoRun>, Failure> {
             .into_iter()
             .map(CargoRun::plain)
             .collect(),
-        // The ordinary clippy gates lint the default feature set, under which
-        // r1_driver does not exist at all: it is compiled only by r1-status,
-        // which runs rustc and not clippy. Without this entry the driver is the
-        // largest unlinted module in the crate.
-        "r1-clippy" => vec![CargoRun::plain(r1_clippy_command())],
-        // Selector 34's failure statuses and its scenario driver only exist
-        // under its own feature, and the launcher rightly refuses
-        // caller-selected features, so the gate has to be named here. It runs
-        // the whole library suite under that feature rather than one test
-        // module: the driver's own tests are gated the same way, and naming
-        // them individually is how a later one would be added and never run.
-        "r1-status" => vec![CargoRun::plain(r1_status_command())],
         // Selector 31's system-init tests used to run in no gate: the shape was
         // only `check`ed by `selectors`, so a test such as
         // `selector31_probe_generations_use_distinct_sticky_registry_client_ids`
@@ -1784,7 +1770,6 @@ const FEATURE_COMBINATIONS_HAND_MAINTAINED: &[(&str, &str)] = &[
     ("wyrmroot-system-init", "wyr1e-selector33"),
     ("wyrmroot-system-init", "wyr1e8-selector33"),
     ("wyrmroot-system-init", "wyr1f-closure"),
-    ("wyrmroot-system-init", "r1-selector34"),
     ("wyrmroot-system-init", "dw1e3-selector31"),
     // consoled. `native-consoled,wyr1e-wyrmsh` is the WYR1-F production
     // shape and comes from `feature_combinations`.
@@ -1816,11 +1801,9 @@ const FEATURE_COMBINATIONS_HAND_MAINTAINED: &[(&str, &str)] = &[
     ("wyrmroot-console-echo", "native-console-echo"),
     ("wyrmroot-hello", "native-hello"),
     ("wyrmroot-hello", "native-job-hello"),
-    ("wyrmroot-dw1b-preemption", "native-payloads"),
     ("wyrmroot-dw1c-preemption", "native-payloads"),
     ("wyrmroot-dw1d6-device-test", "native-payloads"),
     ("wyrmroot-dw1e3-com2-test", "native-probe"),
-    ("wyrmroot-r1-saturation", "native-payloads"),
     ("wyrmroot-wyr1b-gate", "native-gate"),
     ("wyrmroot-wyr1-bootstrap-stubs", "native-stubs"),
     ("wyrmroot-wyr1-retained-stubs", "native-retained"),
@@ -1835,7 +1818,6 @@ const FEATURE_COMBINATIONS_HAND_MAINTAINED: &[(&str, &str)] = &[
     ("wyrmroot-wyr1e-test-actors", "native-stdout-pressure"),
     // init0 and the bootstrap, for the DW1 and WYR1 products.
     ("wyrmroot-init0", "dw1c-preemption-integration"),
-    ("wyrmroot-init0", "native-init0,dw1b-preemption-integration"),
     ("wyrmroot-init0", "native-init0,dw1c-preemption-integration"),
     ("wyrmroot-bootstrap", "dw1d6-synthetic"),
     ("wyrmroot-bootstrap", "native-bootstrap"),
@@ -1996,41 +1978,6 @@ fn selector32_library_commands() -> Vec<Vec<String>> {
         .into()
     })
     .collect()
-}
-
-fn r1_clippy_command() -> Vec<String> {
-    [
-        "clippy",
-        "--locked",
-        "--offline",
-        "--package",
-        "wyrmroot-system-init",
-        "--features",
-        "r1-selector34",
-        "--lib",
-        "--",
-        "-D",
-        "warnings",
-    ]
-    .map(str::to_owned)
-    .into()
-}
-
-fn r1_status_command() -> Vec<String> {
-    [
-        "test",
-        "--locked",
-        "--offline",
-        "--package",
-        "wyrmroot-system-init",
-        "--features",
-        "r1-selector34",
-        "--lib",
-        "--",
-        "--nocapture",
-    ]
-    .map(str::to_owned)
-    .into()
 }
 
 /// system-init's library and integration tests under selector 31.
@@ -2745,9 +2692,8 @@ mod tests {
         encoded_uefi_rustflags_for_target, explicit_test_filter, feature_combinations,
         host_test_arguments, host_test_commands, is_listed_combination, lint_ratchet_shapes,
         named_host_filter, named_host_runs, names_a_test, native_steps, prepare_uefi_target_roots,
-        r1_clippy_command, r1_status_command, render_uefi_inspection_report,
-        role_binary_check_commands, role_binary_lint_command, run_verified_report,
-        selector_library_commands, selector32_library_commands, tests_passed,
+        render_uefi_inspection_report, role_binary_check_commands, role_binary_lint_command,
+        run_verified_report, selector_library_commands, selector32_library_commands, tests_passed,
         validate_regular_artifact, wyr1e8_producer_fixture_command,
     };
     use crate::error::Failure;
@@ -3210,8 +3156,6 @@ mod tests {
             runs("wyr1e8-producer-fixture"),
             [CargoRun::plain(wyr1e8_producer_fixture_command()).requiring_named_tests()]
         );
-        assert_eq!(runs("r1-clippy"), [CargoRun::plain(r1_clippy_command())]);
-        assert_eq!(runs("r1-status"), [CargoRun::plain(r1_status_command())]);
         assert_eq!(
             runs("wyr1d5-clippy"),
             selector32_library_commands()
@@ -3430,8 +3374,6 @@ mod tests {
         };
         assert!(names_a_test(&wyr1e8_producer_fixture_command()));
         assert!(names_a_test(&owned(DW1C_INIT0_TEST_ARGUMENTS)));
-        assert!(!names_a_test(&r1_status_command()));
-        assert!(!names_a_test(&r1_clippy_command()));
         assert!(!names_a_test(&owned(DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS)));
         assert!(!names_a_test(&owned(&[
             "test",

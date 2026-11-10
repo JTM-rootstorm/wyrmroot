@@ -150,7 +150,7 @@ mod tests {
     }
 
     /// The two selectors' ids are not interchangeable, and neither is any
-    /// unallocated id. Test id 34 is `dynamic-launch-saturation`.
+    /// unallocated id. Test id 34 is reserved (retired selector 34).
     #[test]
     fn rejects_a_mismatched_or_unallocated_selector_and_id_pair() {
         for crossed in [

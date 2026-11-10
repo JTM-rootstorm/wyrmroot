@@ -56,10 +56,6 @@ pub mod gate;
 #[cfg(any(test, feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
 mod launch_request_facts;
 mod launch_transaction;
-#[cfg(feature = "r1-selector34")]
-pub mod r1_driver;
-#[cfg(feature = "r1-selector34")]
-pub mod r1_relay;
 pub mod resident_loop;
 pub mod wyr1b;
 pub mod wyr1b_gate;
@@ -247,7 +243,6 @@ pub(crate) enum RecoveryOperation {
 /// is compiled out there. Gated rather than `allow`ed: an unused constant under
 /// one selector is a fact about which encoding that selector uses, and saying
 /// so keeps `-D dead-code` meaningful instead of silencing it.
-#[cfg(not(feature = "r1-selector34"))]
 const UNATTRIBUTED_OPERATION: u8 = 0x0f;
 
 /// One error's own diagnostic instance, or zero where it has nothing to add.
@@ -342,23 +337,6 @@ const fn failure_kind(error: &InitError) -> u8 {
         | InitError::ResourcesAlreadyInstalled
         | InitError::Restart(_)
         | InitError::ZeroBootGeneration => 0x0f,
-        // Selector 34's three causes, grouped by what they are and not by the
-        // feature that adds them. R7B-2 removed this match's wildcard so a new
-        // variant has to be placed deliberately; it did not place these, and
-        // no gate that runs by default compiles them, so the selector stopped
-        // building on 2026-09-15 and stayed broken.
-        //
-        // A probe that exits nonzero, times out on READY or stops draining is
-        // a supervised child failing, which is what 0x03 already names.
-        #[cfg(feature = "r1-selector34")]
-        InitError::R1Probe(_) => 0x03,
-        // A refused relay record is a protocol refusal, like the registry and
-        // gate protocols at 0x06.
-        #[cfg(feature = "r1-selector34")]
-        InitError::R1Relay(_) => 0x06,
-        // A gap census is lost evidence, which is 0x08's group.
-        #[cfg(feature = "r1-selector34")]
-        InitError::R1RelayGap(_) => 0x08,
     }
 }
 
@@ -422,11 +400,6 @@ pub(crate) fn dispatch_failure(error: InitError, emergency_cleanup: EmergencyCle
 /// 32-value space that R1's evidence is written against, not this 8-kind one.
 #[must_use]
 pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 {
-    #[cfg(feature = "r1-selector34")]
-    {
-        0xAF36_0000 | test_failure_category(error)
-    }
-    #[cfg(not(feature = "r1-selector34"))]
     {
         // Not a wildcard over `InitError` in the sense §3.4 forbids: every
         // variant but this one is named by `failure_kind`, whose match is
@@ -517,7 +490,6 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
 /// know which one they are looking at.
 ///
 /// Returns `None` for a word this encoder never produces.
-#[cfg(not(feature = "r1-selector34"))]
 #[must_use]
 pub const fn decode_tick_failure(status: u32) -> Option<TickFailure> {
     match status >> 16 {
@@ -562,7 +534,6 @@ pub const fn decode_tick_failure(status: u32) -> Option<TickFailure> {
 }
 
 /// One decoded tick-failure status.
-#[cfg(not(feature = "r1-selector34"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TickFailure {
     /// `RecoveryOperation`, or `0x0f` when nothing claimed the failure.
@@ -581,8 +552,7 @@ pub struct TickFailure {
 #[cfg(any(
     feature = "wyr1-test-evidence",
     feature = "wyr1b-test-evidence",
-    feature = "wyr1c6-selector29",
-    feature = "r1-selector34"
+    feature = "wyr1c6-selector29"
 ))]
 const fn test_failure_category(error: &InitError) -> u32 {
     match error {
@@ -630,12 +600,6 @@ const fn test_failure_category(error: &InitError) -> u32 {
         InitError::Wyr1C6GateConfig(_) => 0x1f,
         InitError::RecoveryTransition { .. } => 0x20,
         InitError::RegistryAbandoned(_) => 0x23,
-        #[cfg(feature = "r1-selector34")]
-        InitError::R1Probe(failure) => failure.category(),
-        #[cfg(feature = "r1-selector34")]
-        InitError::R1Relay(_) => 0x25,
-        #[cfg(feature = "r1-selector34")]
-        InitError::R1RelayGap(_) => 0x27,
         InitError::BootstrapRetirement(_) => 0x26,
         // F3A.7i. Its own category rather than `Cleanup`'s 0x15, for the
         // reason the variant exists: a shutdown that could not release
@@ -660,240 +624,6 @@ pub const fn wyr1c6_test_failure_application_status(error: &InitError) -> u32 {
 #[must_use]
 pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
     0xAF11_0000 | test_failure_category(error)
-}
-
-/// Why card R1's probe never produced its terminal record, as precisely as the
-/// driver could establish it.
-///
-/// Run 5 reported `Supervision` from two unrelated sites -- the READY handshake
-/// and the report drain -- and both discarded the probe's own normal-exit code,
-/// which is `PROBE_ERROR_BASE | ordinal` and names the exact startup check that
-/// refused. That left the run proving the probe did not report and nothing about
-/// why, which is the same cause-erasing shape the `0xAF34` bases were introduced
-/// to remove, one layer further in. Each variant here is a distinct terminal
-/// status, so a later run says which site failed and, when the kernel recorded
-/// one, with which probe code.
-#[cfg(feature = "r1-selector34")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum R1ProbeFailure {
-    /// The probe exited with its own nonzero application code, kept verbatim.
-    ExitCode(u32),
-    /// The READY handshake failed with no exact terminal record to attribute it
-    /// to: a timeout, or a liveness failure the kernel could not resolve to an
-    /// exit. The probe may still have been running.
-    ReadyUnattributed,
-    /// The probe stopped reporting before its terminal record and its task-state
-    /// record carried no application code -- it had not exited normally, or had
-    /// not exited at all and only closed its channel.
-    DrainUnattributed,
-    /// The probe stopped reporting and the task-state query itself refused, so
-    /// no exit code could be read.
-    DrainQueryFailed,
-}
-
-#[cfg(feature = "r1-selector34")]
-impl R1ProbeFailure {
-    /// Category byte for this failure, continuing `test_failure_category`'s
-    /// sequence so each site is separable in the terminal status.
-    const fn category(self) -> u32 {
-        match self {
-            // `ExitCode` never reaches a category: the status encoder gives it
-            // its own base so the probe's full code survives. It is mapped here
-            // only because `test_failure_category` is total over `InitError`.
-            Self::ExitCode(_) => 0x21,
-            Self::ReadyUnattributed => 0x22,
-            Self::DrainUnattributed => 0x23,
-            Self::DrainQueryFailed => 0x24,
-        }
-    }
-}
-
-/// Packs a relay refusal into sixteen bits, keeping the numbers that identify it.
-///
-/// Run 6 reported `0xAF340001` because the driver answered a refused record with
-/// `InitError::WrongManifestProfile`, one of fourteen sites returning that value.
-/// The refusal itself knows exactly what was wrong -- `OutOfOrder` carries the
-/// expected and observed sequence numbers, `WrongTopology` the two counts that
-/// disagreed -- and all of it was discarded at the boundary.
-///
-/// Layout: kind in the high nibble, its own numbers in the low twelve bits. Both
-/// sequence numbers fit because the relay refuses anything past
-/// `RELAY_CAPACITY` (64), and both topology counts fit because the gate's own
-/// fields are bounded well below 64; each is saturated rather than truncated so a
-/// wild value reads as at-the-limit instead of as a small one.
-/// Six bits, saturating, so a wild value reads as at-the-limit.
-#[cfg(feature = "r1-selector34")]
-const fn saturating_six(value: u64) -> u32 {
-    if value > 0x3f { 0x3f } else { value as u32 }
-}
-
-/// Three bits, saturating, for a gap that should be one.
-#[cfg(feature = "r1-selector34")]
-const fn saturating_three(value: u64) -> u32 {
-    if value > 0x7 { 0x7 } else { value as u32 }
-}
-
-#[cfg(feature = "r1-selector34")]
-const fn r1_relay_detail(error: &r1_relay::RelayError) -> u32 {
-    use r1_relay::RelayError;
-
-    const fn six(value: u64) -> u32 {
-        if value > 0x3f { 0x3f } else { value as u32 }
-    }
-
-    match error {
-        RelayError::Malformed(header) => 0x1000 | r1_relay_header_detail(header),
-        RelayError::UnexpectedHandles => 0x2000,
-        RelayError::WrongTopology {
-            online_cpus,
-            hog_count,
-        } => 0x3000 | (six(*online_cpus as u64) << 6) | six(*hog_count as u64),
-        RelayError::OutOfOrder { expected, observed } => {
-            0x4000 | (six(*expected) << 6) | six(*observed)
-        }
-        RelayError::AfterTerminal => 0x5000,
-        RelayError::Full => 0x6000,
-    }
-}
-
-/// Ordinal of the header rejection behind a `Malformed` refusal.
-///
-/// Enumerated rather than cast so adding a `HeaderError` variant is a compile
-/// error here instead of silently joining whichever ordinal it lands on.
-#[cfg(feature = "r1-selector34")]
-const fn r1_relay_header_detail(error: &wyrmroot_r1_saturation::record::HeaderError) -> u32 {
-    use wyrmroot_r1_saturation::record::HeaderError;
-
-    match error {
-        HeaderError::WrongLength => 0x01,
-        HeaderError::WrongMagic => 0x02,
-        HeaderError::UnsupportedVersion => 0x03,
-        HeaderError::SizeMismatch => 0x04,
-        HeaderError::UnknownKind => 0x05,
-        HeaderError::ZeroSequence => 0x06,
-        HeaderError::ZeroNonce => 0x07,
-    }
-}
-
-/// Selector-34-only status preserving the pre-READY system-init failure category
-/// across the primordial Process-exit boundary.
-///
-/// Card R1's first two runs each died before the probe ran, and the second
-/// reported only `FatalRebootRequired` -- one value standing for all thirty-two
-/// `InitError` categories -- so the run proved the product had failed and
-/// nothing about where. Deepwyrm reports selector 34's terminal application code
-/// unsummarized, so every bit kept here reaches the host transcript intact.
-///
-/// `Native` keeps its own base because `native_error_code` needs a full sixteen
-/// bits: collapsing it into the category byte would discard exactly the status
-/// that identifies which syscall refused.
-#[cfg(feature = "r1-selector34")]
-#[must_use]
-pub const fn r1_test_failure_application_status(error: &InitError) -> u32 {
-    match error {
-        InitError::Native(error) => 0xAF35_0000 | wyrmroot_runtime::native_error_code(*error),
-        // The probe's own code, not a category: `PROBE_ERROR_BASE` occupies the
-        // high half, so the low sixteen bits carry the ordinal that identifies
-        // which of its startup checks refused.
-        InitError::R1Probe(R1ProbeFailure::ExitCode(code)) => 0xAF37_0000 | (*code & 0xffff),
-        // The wildcard this match used to end with was absorbing these three.
-        // They are payload-free, so their category byte is the whole cause and
-        // naming them loses nothing -- but a payload-bearing `R1ProbeFailure`
-        // added later now fails to compile here rather than arriving as a
-        // category, which is what §3.4 is for.
-        InitError::R1Probe(
-            R1ProbeFailure::ReadyUnattributed
-            | R1ProbeFailure::DrainUnattributed
-            | R1ProbeFailure::DrainQueryFailed,
-        ) => 0xAF34_0000 | test_failure_category(error),
-        // A refused record's own reason, for the same purpose: run 6 proved a
-        // record had been refused and nothing about which check refused it.
-        InitError::R1Relay(error) => 0xAF38_0000 | r1_relay_detail(error),
-        // The gap census: which record was expected, how much was still queued
-        // behind the refused one, and whether the loss recurred. `expected` and
-        // `further` saturate at 63 and the gap at 15, so an implausible value
-        // reads as at-the-limit rather than wrapping.
-        InitError::R1RelayGap(census) => {
-            0xAF3B_0000
-                | (saturating_six(census.expected) << 10)
-                | (saturating_six(census.further as u64) << 4)
-                | if census.further_gaps > 0 { 0x8 } else { 0 }
-                | saturating_three(census.observed.saturating_sub(census.expected))
-        }
-        // The retirement wait, whose bare `Supervision` was indistinguishable
-        // from every other supervision failure in the crate -- including the two
-        // driver sites run 5 was attributed to.
-        InitError::BootstrapRetirement(BootstrapRetirementFailure::Wait(error)) => {
-            0xAF39_0000 | wyrmroot_runtime::native_error_code(*error)
-        }
-        InitError::BootstrapRetirement(BootstrapRetirementFailure::WrongResult {
-            index,
-            observed,
-        }) => 0xAF3A_0000 | ((*index & 0xff) << 8) | ((*observed & 0xff) as u32),
-        // Every remaining variant reaches the host as its category byte and
-        // nothing more. They are named rather than swallowed by a wildcard:
-        // `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4 forbids a `_` arm at a
-        // status boundary, so a variant added to `InitError` later fails to
-        // compile here instead of silently joining this list.
-        //
-        // Naming them is not the same as surfacing them. The payloads of
-        // `Bootfs`, `Mapping`, `Loader`, `RegistryProtocol` and `Wyr1BModel`
-        // are on paths selector 34 does not exercise, and this encoder's low
-        // sixteen bits are scarce. Per contract §4.2 their instance belongs in
-        // the liveness snapshot when a card needs it, not spent here. Adding a
-        // base above is the right move only for a payload selector 34 can
-        // actually reach.
-        // F3A.6c's `AbsentState` site number and F3A.6f's
-        // `RegistryAbandoned` reason are named here rather than given a base
-        // of their own, for the reason the paragraph above gives: they are
-        // raised in `wyr1c_native.rs` and `wyr1e_native.rs`, which selector 34
-        // does not exercise, and this encoder's low sixteen bits are scarce.
-        // If a card ever reaches one from selector 34, a base is the right
-        // move then.
-        // F3A.7i's step mask is named here for the same reason: a session
-        // shutdown is raised in `wyr1c_native.rs`, which selector 34 does not
-        // exercise, so its category byte is all this encoder owes it.
-        InitError::SessionShutdown(_)
-        | InitError::AbsentState(_)
-        | InitError::RegistryAbandoned(_)
-        | InitError::LaunchProtocol(_)
-        | InitError::WrongManifestProfile
-        | InitError::UnlaunchableRole
-        | InitError::WrongActivationOrder
-        | InitError::MissingAttemptResources
-        | InitError::ResourcesAlreadyInstalled
-        | InitError::ResourceIdentityMismatch
-        | InitError::InvalidResourceHandle
-        | InitError::Restart(_)
-        | InitError::Bootfs(_)
-        | InitError::MissingRetainedMaterial
-        | InitError::NonExecutableRole
-        | InitError::Manifest(_)
-        | InitError::ZeroBootGeneration
-        | InitError::ArtifactIdentityMismatch(_)
-        | InitError::Capability(_)
-        | InitError::Mapping(_)
-        | InitError::Launch(_)
-        | InitError::Loader(_)
-        | InitError::Supervision
-        | InitError::Cleanup
-        | InitError::Accounting
-        | InitError::GateConfig(_)
-        | InitError::Evidence(_)
-        | InitError::Wyr1BGateConfig(_)
-        | InitError::RegistryProtocol(_)
-        | InitError::Wyr1BGateProtocol(_)
-        | InitError::Wyr1BGateMismatch
-        | InitError::Wyr1BModel(_)
-        | InitError::Wyr1BEvidence(_) => 0xAF34_0000 | test_failure_category(error),
-        #[cfg(feature = "wyr1b-test-evidence")]
-        InitError::StartupMapping(_) | InitError::OrdinaryMapping(_) => {
-            0xAF34_0000 | test_failure_category(error)
-        }
-        #[cfg(feature = "wyr1c6-selector29")]
-        InitError::Wyr1C6GateConfig(_) => 0xAF34_0000 | test_failure_category(error),
-        InitError::RecoveryTransition { .. } => 0xAF34_0000 | test_failure_category(error),
-    }
 }
 
 /// Coarse, bounded classification of the queried startup bootfs size.
@@ -1654,12 +1384,6 @@ pub enum InitError {
         payload: u16,
         emergency_cleanup: EmergencyCleanup,
     },
-    #[cfg(feature = "r1-selector34")]
-    R1Probe(R1ProbeFailure),
-    #[cfg(feature = "r1-selector34")]
-    R1Relay(r1_relay::RelayError),
-    #[cfg(feature = "r1-selector34")]
-    R1RelayGap(RelayGapCensus),
     BootstrapRetirement(BootstrapRetirementFailure),
 }
 
@@ -4902,7 +4626,7 @@ mod native_cleanup_tests {
     /// The resident loop's own platform for `MockNative`. Selectors 29 and 34
     /// drive their own scenario from the loop on every tick, which this fixture
     /// does not carry, so the loop tests below run in every other shape.
-    #[cfg(not(any(feature = "wyr1c6-selector29", feature = "r1-selector34")))]
+    #[cfg(not(feature = "wyr1c6-selector29"))]
     impl resident_loop::ResidentLoopPlatform for MockNative {
         /// Records each submission, then refuses it, as a kernel that will
         /// not take the record would.
@@ -4931,7 +4655,7 @@ mod native_cleanup_tests {
     /// before the wait: `MockNative` fails any wait, so a loop that slept
     /// before checking, or checked only after a later tick, would report
     /// 0xAF01_0005 instead.
-    #[cfg(not(any(feature = "wyr1c6-selector29", feature = "r1-selector34")))]
+    #[cfg(not(feature = "wyr1c6-selector29"))]
     #[test]
     fn permanent_init_leaves_its_loop_when_the_session_is_complete() {
         let (mut resident, _, _) = two_role_resident();
@@ -4949,7 +4673,7 @@ mod native_cleanup_tests {
 
     /// The control for the test above: the same resident with its session
     /// still open does not leave the loop, and reaches the tick wait.
-    #[cfg(not(any(feature = "wyr1c6-selector29", feature = "r1-selector34")))]
+    #[cfg(not(feature = "wyr1c6-selector29"))]
     #[test]
     fn an_open_session_keeps_permanent_init_in_its_loop() {
         let (mut resident, _, _) = two_role_resident();
@@ -4971,10 +4695,7 @@ mod native_cleanup_tests {
     /// The tick fails because its instant is older than the last tick's.
     /// Selector 25's drain is the only one that runs on a failed tick, so this
     /// runs where `wyr1-test-evidence` is compiled (the wyr1f shape).
-    #[cfg(all(
-        feature = "wyr1-test-evidence",
-        not(any(feature = "wyr1c6-selector29", feature = "r1-selector34"))
-    ))]
+    #[cfg(all(feature = "wyr1-test-evidence", not(feature = "wyr1c6-selector29")))]
     #[test]
     fn a_fatal_control_tick_submits_its_evidence_before_reporting_the_failure() {
         let failing_resident = || {
@@ -5028,10 +4749,7 @@ mod native_cleanup_tests {
 
     /// The ordinary drain: once the evidence is finalized, the loop submits
     /// every record, and a refused submission is the loop's failure.
-    #[cfg(all(
-        feature = "wyr1-test-evidence",
-        not(any(feature = "wyr1c6-selector29", feature = "r1-selector34"))
-    ))]
+    #[cfg(all(feature = "wyr1-test-evidence", not(feature = "wyr1c6-selector29")))]
     #[test]
     fn finalized_evidence_is_submitted_after_a_successful_tick() {
         let (mut resident, _, _) = two_role_resident();
@@ -5057,7 +4775,7 @@ mod native_cleanup_tests {
     /// with resident handshakes (selectors 29, 31, 32 and production) tick at
     /// the supervision backoff, the rest once a second; the selectors' half
     /// is a build-time assertion beside `RESIDENT_TICK_NS`.
-    #[cfg(not(any(feature = "wyr1c6-selector29", feature = "r1-selector34")))]
+    #[cfg(not(feature = "wyr1c6-selector29"))]
     #[test]
     fn the_resident_loop_waits_one_tick_period_past_the_tick() {
         let expected = if cfg!(any(
@@ -5418,7 +5136,6 @@ mod native_cleanup_tests {
     /// returned what. `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.3 requires
     /// the instance to survive a diagnostic boundary, so it now does: through
     /// attribution, into its own tag, and back out of the decoder.
-    #[cfg(not(feature = "r1-selector34"))]
     #[test]
     fn a_native_tick_failure_carries_its_own_status_through_attribution() {
         use deepwyrm_syscall::DwStatus;
@@ -5471,7 +5188,6 @@ mod native_cleanup_tests {
     /// which step it happened in, because `0x01..=0x0e` were all recovery
     /// transitions and `0x0f` is the sentinel. The field was always eight bits
     /// wide; only the clamp was four.
-    #[cfg(not(feature = "r1-selector34"))]
     #[test]
     fn an_abandoned_registry_names_the_exit_that_abandoned_it() {
         // F3A.6f's whole point: the two exits used to be indistinguishable
@@ -5554,7 +5270,6 @@ mod native_cleanup_tests {
     /// status that said only "a cleanup failed" -- which is what the first
     /// F3A.7g run reported, as `0xAF18_1704` -- covers thirty-one different
     /// outcomes and names none of them.
-    #[cfg(not(feature = "r1-selector34"))]
     #[test]
     fn a_session_shutdown_reports_every_step_that_failed_and_not_merely_that_one_did() {
         let status =
@@ -5592,7 +5307,6 @@ mod native_cleanup_tests {
         assert_eq!(decoded.operation, UNATTRIBUTED_OPERATION);
     }
 
-    #[cfg(not(feature = "r1-selector34"))]
     #[test]
     fn a_startup_operation_is_nameable_without_moving_any_recovery_value() {
         // Every startup operation round-trips above the sentinel.
@@ -5639,7 +5353,6 @@ mod native_cleanup_tests {
     /// Both sites that parse one reported `InitError::Accounting`, which was
     /// the wrong class as well as a collapse: twenty-three reasons arrived as
     /// kind 0x02, pointing a reader at resource accounting.
-    #[cfg(not(feature = "r1-selector34"))]
     #[test]
     fn a_refused_launch_message_carries_its_reason_and_the_right_class() {
         use wyrmroot_launch_proto::Error as LaunchProtocolError;
@@ -5668,7 +5381,6 @@ mod native_cleanup_tests {
     }
 
     /// F3A.6c: an absent state slot must say which slot.
-    #[cfg(not(feature = "r1-selector34"))]
     #[test]
     fn an_absent_state_tick_failure_carries_its_site() {
         let absent = InitError::AbsentState(0x42);
@@ -5699,26 +5411,10 @@ mod native_cleanup_tests {
 
     #[test]
     fn resident_tick_failure_detail_preserves_the_selected_profile() {
-        // Selector 34 keeps its own category encoding at this boundary: it is a
-        // 32-value space R1's evidence is written against, not this 8-kind one.
-        #[cfg(feature = "r1-selector34")]
-        for error in [
-            InitError::Accounting,
-            InitError::Supervision,
-            InitError::Cleanup,
-            InitError::WrongActivationOrder,
-        ] {
-            assert_eq!(
-                resident_tick_failure_application_status(&error),
-                0xAF36_0000 | test_failure_category(&error)
-            );
-        }
-
         // Every other build reports the operation and the kind. Before R7B-2
         // only E8 did, and the rest returned 0xAF01_0006 for all four of these
         // -- one value standing for every fatal tick, which is the reading that
         // stalled A8.
-        #[cfg(not(feature = "r1-selector34"))]
         for (error, expected) in [
             (InitError::Accounting, 0xAF18_0F02),
             (InitError::Supervision, 0xAF18_0F03),
@@ -5731,7 +5427,6 @@ mod native_cleanup_tests {
         // An attributed failure reports its operation in place of 0x0f, and a
         // failed emergency cleanup reports kind 04 while the initiating kind
         // stays in the private carrier rather than being lost.
-        #[cfg(not(feature = "r1-selector34"))]
         {
             assert_eq!(
                 resident_tick_failure_application_status(&InitError::RecoveryTransition {
@@ -5755,7 +5450,6 @@ mod native_cleanup_tests {
 
         // 0xAF01_0006 is now unreachable: operation 0x00 cannot be produced, so
         // the old collapsed value still reads as a pre-R7B-2 build.
-        #[cfg(not(feature = "r1-selector34"))]
         for error in [
             InitError::Accounting,
             InitError::Supervision,
@@ -6402,10 +6096,10 @@ mod selector_status_coverage {
 
     #[test]
     fn every_evidence_selector_either_preserves_its_category_or_is_recorded_debt() {
-        let mut saw_selector_34 = false;
+        let mut saw_selector_31 = false;
         for_each_evidence_selector(MANIFEST, |selector| {
-            if selector == "r1-selector34" {
-                saw_selector_34 = true;
+            if selector == "dw1e3-selector31" {
+                saw_selector_31 = true;
             }
             if COMPONENT_FEATURES.contains(&selector) {
                 return;
@@ -6455,8 +6149,8 @@ mod selector_status_coverage {
         // If this trips, the manifest parse stopped matching the manifest and
         // the check above proved nothing.
         assert!(
-            saw_selector_34,
-            "selector 34 was not seen as an evidence build"
+            saw_selector_31,
+            "selector 31 was not seen as an evidence build"
         );
     }
 
@@ -6522,1031 +6216,5 @@ return wyr1_test_failure_application_status(&error);\n";
         let manifest = "a = []\nb = [\"dep/a-selector\"]\n";
         assert!(declares_feature(manifest, "a"));
         assert!(!declares_feature(manifest, "a-selector"));
-    }
-}
-
-#[cfg(all(test, feature = "r1-selector34"))]
-mod r1_failure_status_tests {
-    use super::*;
-
-    /// A refused record must reach the host as which refusal, with its numbers.
-    ///
-    /// Run 6's `0xAF340001` could have been any of six refusals at any of
-    /// fourteen sites. These assertions are the difference between that and a
-    /// status that names the check and the values that failed it.
-    #[test]
-    fn every_relay_refusal_keeps_its_own_numbers_and_stays_distinct() {
-        use crate::r1_relay::RelayError;
-        use wyrmroot_r1_saturation::record::HeaderError;
-
-        let status = |error| r1_test_failure_application_status(&InitError::R1Relay(error));
-
-        // The two refusals that carry numbers must carry them intact.
-        assert_eq!(
-            status(RelayError::OutOfOrder {
-                expected: 3,
-                observed: 7,
-            }),
-            0xAF38_40c7
-        );
-        assert_eq!(
-            status(RelayError::WrongTopology {
-                online_cpus: 1,
-                hog_count: 3,
-            }),
-            0xAF38_3043
-        );
-        // Saturation, not truncation: a wild count must not read as a small one.
-        assert_eq!(
-            status(RelayError::OutOfOrder {
-                expected: u64::MAX,
-                observed: 64,
-            }),
-            0xAF38_4fff
-        );
-
-        let cases = [
-            RelayError::Malformed(HeaderError::WrongLength),
-            RelayError::Malformed(HeaderError::WrongMagic),
-            RelayError::Malformed(HeaderError::UnsupportedVersion),
-            RelayError::Malformed(HeaderError::SizeMismatch),
-            RelayError::Malformed(HeaderError::UnknownKind),
-            RelayError::Malformed(HeaderError::ZeroSequence),
-            RelayError::Malformed(HeaderError::ZeroNonce),
-            RelayError::UnexpectedHandles,
-            RelayError::WrongTopology {
-                online_cpus: 1,
-                hog_count: 3,
-            },
-            RelayError::OutOfOrder {
-                expected: 1,
-                observed: 2,
-            },
-            RelayError::AfterTerminal,
-            RelayError::Full,
-        ];
-        for (index, error) in cases.iter().enumerate() {
-            let mine = status(*error);
-            // No refusal may collide with another, nor with the category space
-            // every other pre-READY failure reports through.
-            assert_ne!(
-                mine & 0xffff_0000,
-                0xAF34_0000,
-                "a relay refusal fell back into the collapsed category space"
-            );
-            for other in &cases[index + 1..] {
-                assert_ne!(
-                    mine,
-                    status(*other),
-                    "two relay refusals share one terminal status"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn every_category_survives_the_pre_ready_boundary_distinctly() {
-        // The point of the status is that different failures read differently.
-        // Two categories mapping to one value would put us back where run 2 was.
-        let cases = [
-            (InitError::WrongManifestProfile, 0xAF34_0001),
-            (InitError::UnlaunchableRole, 0xAF34_0002),
-            (InitError::WrongActivationOrder, 0xAF34_0003),
-            (InitError::NonExecutableRole, 0xAF34_000b),
-            (InitError::ZeroBootGeneration, 0xAF34_000d),
-            (InitError::Supervision, 0xAF34_0014),
-            (InitError::Cleanup, 0xAF34_0015),
-            (InitError::Accounting, 0xAF34_0016),
-        ];
-        for (error, expected) in &cases {
-            assert_eq!(
-                r1_test_failure_application_status(error),
-                *expected,
-                "{error:?} lost its category"
-            );
-        }
-        // Pairwise, so the check needs no allocation in this no_std crate.
-        let mut outer = 0;
-        while outer < cases.len() {
-            let mut inner = outer + 1;
-            while inner < cases.len() {
-                assert_ne!(
-                    r1_test_failure_application_status(&cases[outer].0),
-                    r1_test_failure_application_status(&cases[inner].0),
-                    "two categories collided"
-                );
-                inner += 1;
-            }
-            outer += 1;
-        }
-    }
-
-    #[test]
-    fn a_native_failure_keeps_the_status_that_says_which_syscall_refused() {
-        // DW_STATUS_NO_RESOURCES is what run 1 turned on, so it is the case
-        // worth pinning: the code must survive, not become a bare "native".
-        let error = InitError::Native(NativeError::Status(deepwyrm_syscall::DwStatus(-13)));
-        assert_eq!(r1_test_failure_application_status(&error), 0xAF35_000d);
-        let output = InitError::Native(NativeError::Output(
-            wyrmroot_runtime::NativeOutputError::InvalidChannelReceive,
-        ));
-        assert_eq!(r1_test_failure_application_status(&output), 0xAF35_8003);
-    }
-
-    /// Every base selector 34 can report: the pre-READY encoder's six and the
-    /// resident tick's one.
-    const R1_BASES: [u32; 8] = [
-        0xAF34_0000,
-        0xAF35_0000,
-        0xAF36_0000,
-        0xAF37_0000,
-        0xAF38_0000,
-        0xAF39_0000,
-        0xAF3A_0000,
-        0xAF3B_0000,
-    ];
-
-    /// One value of every `InitError` variant selector 34 compiles, and of
-    /// every sub-variant the encoder gives its own arm.
-    ///
-    /// `named` matches every variant with no wildcard, so a variant added to
-    /// `InitError` fails to compile in this function until it is named here;
-    /// name it and give it a witness in the same edit, and its base is then
-    /// checked below like every other.
-    fn witnesses() -> [InitError; 43] {
-        use crate::r1_relay::RelayError;
-        const fn named(error: &InitError) -> usize {
-            match error {
-                InitError::WrongManifestProfile
-                | InitError::UnlaunchableRole
-                | InitError::WrongActivationOrder
-                | InitError::MissingAttemptResources
-                | InitError::ResourcesAlreadyInstalled
-                | InitError::ResourceIdentityMismatch
-                | InitError::InvalidResourceHandle
-                | InitError::Restart(_)
-                | InitError::Bootfs(_)
-                | InitError::MissingRetainedMaterial
-                | InitError::NonExecutableRole
-                | InitError::Manifest(_)
-                | InitError::ZeroBootGeneration
-                | InitError::ArtifactIdentityMismatch(_)
-                | InitError::Native(_)
-                | InitError::Capability(_)
-                | InitError::Mapping(_)
-                | InitError::Launch(_)
-                | InitError::LaunchProtocol(_)
-                | InitError::Loader(_)
-                | InitError::Supervision
-                | InitError::Cleanup
-                | InitError::Accounting
-                | InitError::GateConfig(_)
-                | InitError::Evidence(_)
-                | InitError::Wyr1BGateConfig(_)
-                | InitError::RegistryProtocol(_)
-                | InitError::Wyr1BGateProtocol(_)
-                | InitError::Wyr1BGateMismatch
-                | InitError::Wyr1BModel(_)
-                | InitError::Wyr1BEvidence(_)
-                | InitError::AbsentState(_)
-                | InitError::RegistryAbandoned(_)
-                | InitError::SessionShutdown(_)
-                | InitError::RecoveryTransition { .. }
-                | InitError::R1Probe(_)
-                | InitError::R1Relay(_)
-                | InitError::R1RelayGap(_)
-                | InitError::BootstrapRetirement(_) => 1,
-            }
-        }
-        let witnesses = [
-            InitError::WrongManifestProfile,
-            InitError::UnlaunchableRole,
-            InitError::WrongActivationOrder,
-            InitError::MissingAttemptResources,
-            InitError::ResourcesAlreadyInstalled,
-            InitError::ResourceIdentityMismatch,
-            InitError::InvalidResourceHandle,
-            InitError::Restart(RestartTransitionError::InvalidPolicy),
-            InitError::Bootfs(ParseError::TruncatedHeader { offset: 0 }),
-            InitError::MissingRetainedMaterial,
-            InitError::NonExecutableRole,
-            InitError::Manifest(ManifestParseError::TruncatedHeader),
-            InitError::ZeroBootGeneration,
-            InitError::ArtifactIdentityMismatch(RoleId::Registryd),
-            InitError::Native(NativeError::Status(deepwyrm_syscall::DwStatus(-13))),
-            InitError::Capability(CapabilityValidationError::InvalidBootstrapChannel),
-            InitError::Mapping(MappingPlanError::EmptyArchive),
-            InitError::Launch(wyrmroot_loader::launch::LaunchError::BufferSize),
-            InitError::LaunchProtocol(wyrmroot_launch_proto::Error::WrongSize),
-            InitError::Loader(LoadError::Launch(
-                wyrmroot_loader::launch::LaunchError::BufferSize,
-            )),
-            InitError::Supervision,
-            InitError::Cleanup,
-            InitError::Accounting,
-            InitError::GateConfig(GateConfigError::InvalidUtf8),
-            InitError::Evidence(EvidenceError::ZeroNonce),
-            InitError::Wyr1BGateConfig(wyr1b_gate::GateError::InvalidUtf8),
-            InitError::RegistryProtocol(wyrmroot_registry_proto::Error::WrongSize),
-            InitError::Wyr1BGateProtocol(wyrmroot_wyr1b_gate_proto::Error::WrongSize),
-            InitError::Wyr1BGateMismatch,
-            InitError::Wyr1BModel(wyr1b::JobError::ZeroIdentity),
-            InitError::Wyr1BEvidence(wyr1b_gate::GateError::InvalidUtf8),
-            InitError::AbsentState(0x8c),
-            InitError::RegistryAbandoned(1),
-            InitError::SessionShutdown(1),
-            InitError::RecoveryTransition {
-                operation: 1,
-                initiating_kind: 1,
-                payload: 0,
-                emergency_cleanup: EmergencyCleanup::NotRun,
-            },
-            InitError::R1Probe(R1ProbeFailure::ExitCode(0x8100_0007)),
-            InitError::R1Probe(R1ProbeFailure::ReadyUnattributed),
-            InitError::R1Probe(R1ProbeFailure::DrainUnattributed),
-            InitError::R1Probe(R1ProbeFailure::DrainQueryFailed),
-            InitError::R1Relay(RelayError::Full),
-            InitError::R1RelayGap(RelayGapCensus {
-                expected: 3,
-                observed: 5,
-                further: 1,
-                further_gaps: 0,
-            }),
-            InitError::BootstrapRetirement(BootstrapRetirementFailure::Wait(NativeError::Status(
-                deepwyrm_syscall::DwStatus(-1),
-            ))),
-            InitError::BootstrapRetirement(BootstrapRetirementFailure::WrongResult {
-                index: 1,
-                observed: 2,
-            }),
-        ];
-        for witness in &witnesses {
-            assert_eq!(named(witness), 1);
-        }
-        witnesses
-    }
-
-    #[test]
-    fn the_r1_bases_cannot_be_confused_with_another_selectors() {
-        // Deepwyrm reports selector 34's code unsummarized, so a base shared
-        // with another selector would be genuinely ambiguous in a transcript.
-        for existing in [
-            0xAF01_0000_u32,
-            0xAF11_0000,
-            0xAF18_0000,
-            0xAF1B_0000,
-            0xAF1C_0000,
-            0xAF1D_0000,
-        ] {
-            for mine in R1_BASES {
-                assert_ne!(existing, mine);
-            }
-        }
-        for (index, mine) in R1_BASES.iter().enumerate() {
-            for other in &R1_BASES[index + 1..] {
-                assert_ne!(mine, other, "two selector-34 bases collide");
-            }
-        }
-        // The guarded list must match what the encoders produce, in both
-        // directions, so it cannot drift from the code it describes: every
-        // base a witness produces is guarded, and every guarded base is
-        // produced. A lower bound was tried first and was useless, because a
-        // base dropped from R1_BASES still satisfied it.
-        let mut produced = [false; R1_BASES.len()];
-        let mut record = |status: u32| {
-            let base = status & 0xffff_0000;
-            let index = R1_BASES
-                .iter()
-                .position(|guarded| *guarded == base)
-                .unwrap_or_else(|| panic!("{base:#010x} is produced but not guarded"));
-            produced[index] = true;
-        };
-        for witness in witnesses() {
-            record(r1_test_failure_application_status(&witness));
-            record(resident_tick_failure_application_status(&witness));
-        }
-        for (base, produced) in R1_BASES.iter().zip(produced) {
-            assert!(produced, "{base:#010x} is guarded but no longer produced");
-        }
-        // And the coarse production value must no longer be reachable here.
-        assert_ne!(
-            r1_test_failure_application_status(&InitError::Supervision),
-            InitApplicationStatus::FatalRebootRequired as u32
-        );
-    }
-
-    #[test]
-    fn a_fatal_resident_tick_also_keeps_its_category() {
-        assert_eq!(
-            resident_tick_failure_application_status(&InitError::Supervision),
-            0xAF36_0014
-        );
-        assert_ne!(
-            resident_tick_failure_application_status(&InitError::Cleanup),
-            0xAF01_0006
-        );
-    }
-}
-
-/// Card R1's third repetition of one defect, gated instead of patched again.
-///
-/// Three runs of this card failed with a status that proved something had gone
-/// wrong and nothing about where:
-///
-/// - run 2 (`0xAF010002`): `fatal_application_status(_error)` discarded its
-///   argument, collapsing every `InitError` category into one value;
-/// - run 5 (`0xAF340014`): two unrelated driver sites returned
-///   `InitError::Supervision`, both discarding the probe's own exit code;
-/// - run 6 (`0xAF340001`): `InitError::WrongManifestProfile`, returned from
-///   fourteen sites in `r1_driver.rs` alone, one of which
-///   (`Err(RelayFailure::Refused(_))`) threw away a `RelayError` carrying the
-///   exact expected and observed sequence numbers.
-///
-/// Each of the first two was fixed correctly at its own site, and the next run
-/// was undiagnosable anyway. `CLAUDE.md` §1 requires that the third occurrence of
-/// one failure class be classified rather than patched a third time, so this
-/// module states the class as an invariant over the source of the terminal-status
-/// path: **a cause that was carried to a boundary must not be dropped at it.**
-///
-/// The rules read source text for the same reason
-/// `selector_class_membership.rs` does: the defect is an *absence* — a payload
-/// that is never read — so nothing about a correct build fails, and no type can
-/// express "this discard was not deliberate".
-///
-/// # What this module is, and is not
-///
-/// The §12 architecture review in `DW1_WYR1_RESET_CAUSE_ERASURE_REVIEW.md`
-/// examined this module after the class reached five occurrences, and found that
-/// it does not guard the class. It reads four files. `system-init` alone has
-/// around 142 discarding sites, most in files not listed here, and `devmgr`
-/// carries run 6's own shape at twenty-seven sites in a crate this module has
-/// never opened. Its checks also run on trimmed single lines, so splitting a
-/// call across two defeats them.
-///
-/// So read it as what it is: **a bounded ratchet over four files on selector
-/// 34's terminal-status path**, which is useful where its scope matches the code
-/// — the probe especially — and is not evidence about the class anywhere else. It
-/// was widened twice after escapes; the review's conclusion is that it should not
-/// be widened a third time, because a source-text check cannot tell a legitimate
-/// collapse from a defect and ends up parking instances as "known" instead.
-///
-/// The class's actual rule now lives in `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md`,
-/// and its enforceable core is §3.4: no wildcard arm over an error type at a
-/// status boundary, so the compiler refuses a new variant that would silently
-/// join a category. `the_selector34_encoder_has_no_wildcard_arm` holds that one
-/// property here and replaced a list of five instances that described nothing
-/// about variants added later.
-#[cfg(all(test, feature = "r1-selector34"))]
-mod r1_cause_preservation {
-    /// The files a selector-34 terminal status can be produced from. `lib.rs`
-    /// carries the encoders, the other two the driver and its relay.
-    const SOURCES: [(&str, &str); 3] = [
-        ("r1_driver.rs", include_str!("r1_driver.rs")),
-        ("r1_relay.rs", include_str!("r1_relay.rs")),
-        ("lib.rs", include_str!("lib.rs")),
-    ];
-
-    /// Spells each name as the type it names, so the list cannot outlive one.
-    ///
-    /// Every entry is a type path the compiler resolves, and the string the
-    /// scan matches is that path's own last segment. A type renamed out from
-    /// under the list therefore fails to compile here, rather than leaving a
-    /// name the rule silently stops recognising.
-    macro_rules! payload_bearing {
-        ($($name:ident $(<$generic:ty>)?),* $(,)?) => {
-            [$({
-                let _ = core::marker::PhantomData::<$name $(<$generic>)?>;
-                stringify!($name)
-            }),*]
-        };
-    }
-
-    use crate::r1_relay::{RelayError, RelayFailure};
-    use wyrmroot_loader::process::LoadError;
-    use wyrmroot_runtime::{ExitValidationError, ObservedSupervisionError, SupervisionError};
-
-    /// Error types on this path whose variants carry a cause worth keeping.
-    ///
-    /// Curated rather than derived: the rule needs to know that discarding a
-    /// `RelayFailure` loses `OutOfOrder { expected, observed }` while discarding
-    /// a unit-like marker loses nothing. Each entry is checked by the compiler
-    /// (see `payload_bearing!`), so a rename fails to build.
-    const PAYLOAD_BEARING: [&str; 6] = payload_bearing![
-        RelayFailure,
-        RelayError,
-        ObservedSupervisionError<()>,
-        SupervisionError<()>,
-        LoadError<()>,
-        ExitValidationError,
-    ];
-
-    /// Sites that drop a carried cause and are not yet fixed.
-    ///
-    /// Keyed on the exact trimmed source line so the entry rots visibly when the
-    /// line changes, rather than drifting with line numbers. This list may
-    /// **shrink and never grow**: a new discard is the fourth occurrence of the
-    /// class, which is precisely what this module exists to refuse.
-    ///
-    /// Every entry is a live defect, not an exemption. Each would erase the cause
-    /// of a future run exactly as runs 2, 5 and 6 did.
-    const KNOWN_DISCARDS: [(&str, &str); 4] = [
-        (
-            ".map_err(|_| InitError::WrongManifestProfile)?;",
-            "gate lookup: the bootfs error naming which entry is missing is lost",
-        ),
-        (
-            ".map_err(|_| InitError::WrongManifestProfile)",
-            "argv encoding: loses which field would not fit",
-        ),
-        (
-            "let configuration = parse_gate(gate.data()).map_err(|_| InitError::WrongManifestProfile)?;",
-            "gate parse: loses the WRR1 field that failed validation",
-        ),
-        (
-            "system.close_handle(group).map_err(|_| InitError::Cleanup)?;",
-            "teardown: loses the native status of the refused close",
-        ),
-    ];
-
-    /// The probe binary, on the other side of the channel this module's driver
-    /// reads. It is a different crate, which is exactly why run 7 escaped the
-    /// rules above: the gate was scoped to selector 34's terminal-status path
-    /// *inside system-init*, and the probe's own reporting was not in it.
-    ///
-    /// Run 7 exited `0x81000030`, which named `Reporter::emit` precisely and said
-    /// nothing about why its send refused. So the probe's discards are a milder
-    /// form of the same class than system-init's were: every site here already
-    /// carries a distinct ordinal, so the *site* survives and only the native
-    /// status is lost. That is still the difference between "the send refused"
-    /// and "the handle lacked a right".
-    const PROBE_SOURCE: (&str, &str) = (
-        "r1-saturation/src/bin/probe.rs",
-        include_str!("../../r1-saturation/src/bin/probe.rs"),
-    );
-
-    /// Probe sites that keep their ordinal but discard the native status.
-    ///
-    /// Shrinks and never grows, like `KNOWN_DISCARDS`. `Reporter::emit` is absent
-    /// because it is fixed: it was the one that actually fired, and it is the only
-    /// path every record takes.
-    const PROBE_DISCARDS: [(&str, &str); 15] = [
-        (
-            "query_capability_info(parent).map_err(|_| PROBE_ERROR_BASE + 0x0001)?,",
-            "parent handle query",
-        ),
-        (
-            ".map_err(|_| PROBE_ERROR_BASE + 0x0002)?;",
-            "bootstrap channel validation",
-        ),
-        (
-            "receive_channel(parent, &mut init, &mut handles).map_err(|_| PROBE_ERROR_BASE + 0x0004)?;",
-            "startup INIT receive",
-        ),
-        (
-            ".map_err(|_| PROBE_ERROR_BASE + 0x000E)",
-            "READY send to the parent",
-        ),
-        (
-            "parse_correlation_environment(&entries).map_err(|_| PROBE_ERROR_BASE + 0x000F)?;",
-            "correlation environment parse",
-        ),
-        (
-            ".map_err(|_| PROBE_ERROR_BASE + 0x0017)?;",
-            "hog launch encode",
-        ),
-        (
-            ".map_err(|_| PROBE_ERROR_BASE + 0x0018)?;",
-            "hog launch send",
-        ),
-        (
-            ".map_err(|_| PROBE_ERROR_BASE + 0x0020)?;",
-            "progress launch encode",
-        ),
-        (
-            "send_channel(session.channel, &bytes[..size], &[]).map_err(|_| PROBE_ERROR_BASE + 0x0021)?;",
-            "progress launch send",
-        ),
-        (
-            ".map_err(|_| PROBE_ERROR_BASE + 0x0023)?;",
-            "job message encode",
-        ),
-        (
-            "send_channel(session.channel, &bytes[..size], &[]).map_err(|_| PROBE_ERROR_BASE + 0x0024)?;",
-            "job message send",
-        ),
-        (
-            ".map_err(|_| PROBE_ERROR_BASE + 0x0026)?;",
-            "session reply receive",
-        ),
-        (
-            "let parsed = parse_message(&bytes[..counts.bytes], 0).map_err(|_| PROBE_ERROR_BASE + 0x0028)?;",
-            "session reply parse",
-        ),
-        (
-            "let deadline = monotonic_deadline_after(timeout).map_err(|_| code)?;",
-            "deadline arithmetic; keeps the caller's site, loses the status",
-        ),
-        (
-            "let observed = query_capability_info(info.handle).map_err(|_| ())?;",
-            "received-handle check; discards into unit, keeping nothing",
-        ),
-    ];
-
-    /// The probe's real code, with comments dropped.
-    fn probe_code_lines() -> impl Iterator<Item = &'static str> {
-        PROBE_SOURCE
-            .1
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.starts_with("//") && !line.starts_with('"'))
-    }
-
-    fn probe_offending_lines() -> impl Iterator<Item = &'static str> {
-        PROBE_SOURCE
-            .1
-            .lines()
-            .map(str::trim)
-            .filter(|line| discards_a_cause(line))
-    }
-
-    #[test]
-    fn no_new_probe_site_discards_its_native_status() {
-        let seen = probe_offending_lines().count();
-        assert_eq!(
-            seen,
-            PROBE_DISCARDS.len(),
-            "the probe has {seen} status-discarding lines and {} are declared. \
-             More means a new one; fewer means one was fixed without shrinking \
-             PROBE_DISCARDS, or the include no longer reaches the probe",
-            PROBE_DISCARDS.len()
-        );
-        for line in probe_offending_lines() {
-            assert!(
-                PROBE_DISCARDS.iter().any(|(known, _)| *known == line),
-                "{} discards a native status at a site this gate does not know:\n  \
-                 {line}\nThe probe's exit code is the only thing the host sees \
-                 once its record send has failed; carry the status into it.",
-                PROBE_SOURCE.0
-            );
-        }
-    }
-
-    #[test]
-    fn the_probe_discard_list_shrinks_rather_than_rots() {
-        for (known, reason) in PROBE_DISCARDS {
-            assert!(
-                probe_offending_lines().any(|line| line == known),
-                "PROBE_DISCARDS lists a site that no longer exists: {known} ({reason})"
-            );
-            assert!(
-                !reason.is_empty(),
-                "every declared probe discard names its site"
-            );
-        }
-    }
-
-    #[test]
-    fn the_probes_only_record_send_carries_why_it_refused() {
-        // This is run 7's site. Every record the probe emits goes through it, so
-        // a discard here loses the cause of every possible transcript at once --
-        // which is why it is fixed rather than declared.
-        // The property, not one spelling: the send's error must reach
-        // `report_send_failure`, however `emit` is written. An earlier version of
-        // this assertion pinned the exact `map_err(report_send_failure)` line and
-        // failed when `emit` legitimately grew a match arm to rewind the sequence
-        // -- a gate that breaks on correct refactoring gets weakened rather than
-        // obeyed.
-        assert!(
-            PROBE_SOURCE.1.contains("report_send_failure"),
-            "the probe's record send no longer carries its native status, so a \
-             refused send is once again indistinguishable from any other"
-        );
-        assert!(
-            !PROBE_SOURCE
-                .1
-                .contains("map_err(|_| PROBE_ERROR_BASE + 0x0030)"),
-            "run 7's discarding form is back at the probe's record send"
-        );
-        // A refused send must also put the sequence back. Runs 9 and 11 reported
-        // `expected 6, observed 7` because a burned number reads to the collector
-        // as a lost record, which is what sent this card hunting a kernel defect
-        // that did not exist.
-        // On a non-comment line. A plain `contains` passed when the rollback was
-        // commented out -- the comment still contained the text -- which is the
-        // same blindness `discards_a_cause` already had to be taught to avoid.
-        assert!(
-            probe_code_lines().any(|line| line.contains("self.sequence -= 1")),
-            "the probe no longer rewinds the sequence a refused send consumed, so \
-             a refusal will again be reported as a gap in the transcript"
-        );
-        // And the scenario loop must not swallow it. `is_err()` with a bare break
-        // is the form that lost the code for runs 9 and 11.
-        assert!(
-            !probe_code_lines()
-                .any(|line| line.contains("if advance(probe, session, reporter, step).is_err()")),
-            "the probe's scenario loop is discarding its own failure code again"
-        );
-    }
-
-    /// Payload-free `InitError` variants returned from more than one site in the
-    /// driver, with the count at the time this gate was written.
-    ///
-    /// A payload-free variant returned from many sites is the run-6 defect
-    /// directly: fourteen distinct causes arriving as `0xAF340001`. The counts
-    /// may only fall.
-    const KNOWN_COLLAPSING: [(&str, &str, usize); 2] = [
-        (
-            "WrongManifestProfile",
-            "InitError::WrongManifestProfile",
-            13,
-        ),
-        ("Cleanup", "InitError::Cleanup", 7),
-    ];
-
-    /// Lines that convert one error into another while discarding the original.
-    ///
-    /// Two forms, both taken from real defects on this card:
-    /// `map_err(|_| …)` (runs 2 and 5) and a match arm that discards a
-    /// payload-bearing variant and produces an `InitError` (run 6).
-    fn discards_a_cause(line: &str) -> bool {
-        let trimmed = line.trim();
-        // Comments, and string literals -- which is what this module's own
-        // fixtures and its KNOWN_DISCARDS entries are. Without the literal skip
-        // the gate reports its own test data as defects, and a finding could be
-        // silenced by editing a fixture rather than by fixing the code.
-        if trimmed.starts_with("//") || trimmed.starts_with('"') {
-            return false;
-        }
-        if trimmed.contains("map_err(|_|") {
-            return true;
-        }
-        discards_a_binding(trimmed)
-            && trimmed.contains("InitError::")
-            && PAYLOAD_BEARING.iter().any(|name| trimmed.contains(name))
-    }
-
-    /// Whether a line binds a payload only to throw it away.
-    ///
-    /// Both spellings count. `(_)` is run 6's form; `(_error)` is run 2's -- the
-    /// `fatal_application_status(_error)` that started this class, and which an
-    /// earlier draft of this rule missed because it looked only for `(_)`. A
-    /// leading underscore on a bound payload means the compiler was told to stop
-    /// asking, which is the whole defect.
-    fn discards_a_binding(line: &str) -> bool {
-        let bytes = line.as_bytes();
-        for (at, window) in bytes.windows(2).enumerate() {
-            if window != b"(_" {
-                continue;
-            }
-            match bytes.get(at + 2) {
-                Some(b')') => return true,
-                Some(next) if next.is_ascii_alphanumeric() || *next == b'_' => return true,
-                _ => {}
-            }
-        }
-        false
-    }
-
-    /// Source with its test modules removed.
-    ///
-    /// Tests legitimately construct and match errors they do not care about, and
-    /// counting those would make the collapse budget meaningless. This module's
-    /// own fixtures are the sharper reason: they quote real defect lines
-    /// verbatim, so scanning them would report the gate's own test data as
-    /// defects -- and would let someone silence a finding by editing a fixture.
-    fn without_tests(source: &str) -> &str {
-        // Only a trailing `mod tests` block is cut. Truncating at the first
-        // `#[cfg(test)]` was tried and was wrong: `lib.rs` carries inline test
-        // modules throughout, so it hid every real site below the first one --
-        // including the `activate_retained_bootfs_state` discard this gate found.
-        match source.find("\nmod tests {") {
-            Some(at) => &source[..at],
-            None => source,
-        }
-    }
-
-    /// Every discarding line across the scanned sources, as an iterator: this
-    /// crate is `no_std` with no allocator, so the scan cannot collect.
-    /// This module's own marker in `lib.rs`. Everything from here down is the
-    /// gate itself, whose detector literals and declared defect lines are not
-    /// code under test.
-    const SELF_MARKER: &str = "\nmod r1_cause_preservation {";
-
-    /// `lib.rs` with this module removed.
-    ///
-    /// Skipping comments and quoted fixtures was not enough: the detector's own
-    /// `contains("map_err(|_|")` sits mid-line in ordinary code and matched
-    /// itself. A gate that reads the file it lives in has to excise itself, and
-    /// `the_self_exclusion_is_real` fails if the marker stops matching.
-    fn without_self(source: &str) -> &str {
-        match source.find(SELF_MARKER) {
-            Some(at) => &source[..at],
-            None => source,
-        }
-    }
-
-    fn offending_lines() -> impl Iterator<Item = (&'static str, &'static str)> {
-        SOURCES.into_iter().flat_map(|(name, source)| {
-            without_tests(without_self(source))
-                .lines()
-                .map(str::trim)
-                .filter(|line| discards_a_cause(line))
-                .map(move |line| (name, line))
-        })
-    }
-
-    /// The rule itself, proven against the real defect rather than only against
-    /// the current tree: if this ever stops firing on run 6's own line, the gate
-    /// has been disabled whatever else it reports.
-    #[test]
-    fn the_rule_fires_on_the_defects_it_was_written_for() {
-        for line in [
-            "            Err(RelayFailure::Refused(_)) => return Err(InitError::WrongManifestProfile),",
-            "        .map_err(|_| InitError::Supervision)",
-            "            .map_err(|_| InitError::WrongManifestProfile)?;",
-            "        ObservedSupervisionError::Supervision(_) => return Err(InitError::Supervision),",
-            // Run 2's spelling: a bound payload silenced with a leading
-            // underscore. An earlier draft of this rule missed it.
-            "            Err(RelayFailure::Refused(_error)) => Err(InitError::WrongManifestProfile),",
-            "        Err(LoadError::Native(_e)) => Err(InitError::WrongManifestProfile),",
-        ] {
-            assert!(
-                discards_a_cause(line),
-                "the cause-preservation rule does not fire on a known defect: {line}"
-            );
-        }
-        // And it must not fire on the shapes that keep the cause, or the gate
-        // would be unusable and would be switched off rather than obeyed.
-        for line in [
-            "        .map_err(InitError::Native)?;",
-            "            .map_err(|error| InitError::R1Probe(probe_failure_before_ready(&error)))",
-            "                    Ok(_) => R1ProbeFailure::DrainUnattributed,",
-            "            // map_err(|_| InitError::Cleanup) is what this forbids",
-        ] {
-            assert!(
-                !discards_a_cause(line),
-                "the rule fires on a shape that preserves its cause: {line}"
-            );
-        }
-    }
-
-    #[test]
-    fn no_new_site_drops_a_carried_cause() {
-        // Self-check: the scan must actually be reading source. A rename or an
-        // emptied include would otherwise make this pass by finding nothing.
-        // Exact, not a lower bound. Keying the allowlist on line text means a
-        // second copy of an allowed line would otherwise be admitted for free --
-        // which is how a fourteen-site collapse grows one paste at a time. Too
-        // few, and the scan has stopped reading the sources it names.
-        let seen = offending_lines().count();
-        assert_eq!(
-            seen,
-            KNOWN_DISCARDS.len(),
-            "the scan found {seen} cause-discarding lines and {} are declared. \
-             More means a new discard, or a second copy of a declared one; fewer \
-             means the scan is no longer reading these sources, or a site was \
-             fixed without shrinking KNOWN_DISCARDS",
-            KNOWN_DISCARDS.len()
-        );
-        for (file, line) in offending_lines() {
-            assert!(
-                KNOWN_DISCARDS.iter().any(|(known, _)| *known == line),
-                "{file} drops a carried cause at a site this gate does not know:\n  \
-                 {line}\nThis is the fourth occurrence of card R1's recurring \
-                 defect class. Carry the cause into the status instead of \
-                 declaring it here."
-            );
-        }
-    }
-
-    #[test]
-    fn the_discard_list_shrinks_rather_than_rots() {
-        for (known, reason) in KNOWN_DISCARDS {
-            assert!(
-                offending_lines().any(|(_, line)| line == known),
-                "KNOWN_DISCARDS still lists a site that no longer exists, so the \
-                 list describes a tree that is gone: {known} ({reason})"
-            );
-            assert!(
-                !reason.is_empty(),
-                "every declared discard states what cause it loses"
-            );
-        }
-    }
-
-    #[test]
-    fn the_self_exclusion_is_real() {
-        let lib = include_str!("lib.rs");
-        assert!(
-            lib.contains(SELF_MARKER),
-            "this module's own marker no longer matches, so the gate is either \
-             scanning itself or excising the wrong region"
-        );
-        // The excision must remove this module and nothing above it: the
-        // `activate_retained_bootfs_state` discard lives far earlier in the file
-        // and must still be scanned. Losing it is how the first attempt at this
-        // exclusion silently hid every real site in `lib.rs`.
-        let scanned = without_self(lib);
-        assert!(
-            scanned.contains("fn activate_retained_bootfs_state"),
-            "the self-exclusion cut away real code above this module"
-        );
-        assert!(
-            !scanned.contains("fn discards_a_cause"),
-            "the self-exclusion did not remove this module's own detector"
-        );
-    }
-
-    #[test]
-    fn the_collapse_budget_only_falls() {
-        let driver = without_tests(include_str!("r1_driver.rs"));
-        for (variant, pattern, recorded) in KNOWN_COLLAPSING {
-            let count = driver.matches(pattern).count();
-            assert!(
-                count > 0,
-                "{variant} is recorded as collapsing but is never returned; \
-                 remove it from KNOWN_COLLAPSING"
-            );
-            assert!(
-                count <= recorded,
-                "{variant} is now returned from {count} driver sites, up from \
-                 {recorded}. A payload-free variant returned from many sites is \
-                 run 6's defect: fourteen causes arriving as one status. Give it \
-                 a payload or reuse an existing site."
-            );
-        }
-    }
-
-    /// The encoder's code lines, comments dropped. Allocation-free, like the
-    /// rest of this module.
-    fn selector34_encoder_lines() -> impl Iterator<Item = &'static str> {
-        include_str!("lib.rs")
-            .split("pub const fn r1_test_failure_application_status(")
-            .nth(1)
-            .expect("selector 34 still has one terminal status encoder")
-            .split("\n}\n")
-            .next()
-            .expect("the encoder is still a bounded function body")
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.starts_with("//"))
-    }
-
-    #[test]
-    fn the_selector34_encoder_has_no_wildcard_arm() {
-        // This replaced a list of five variants whose payload the encoder did
-        // not surface. The list described instances; this describes the
-        // property, and covers every variant added after it was written.
-        //
-        // `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4: a match converting an
-        // error type into a status must be exhaustive over it. The compiler
-        // enforces that as long as no wildcard is reintroduced, and a wildcard
-        // is one token rather than a spelling a grep can miss -- which is the
-        // one shape a source check can hold reliably.
-        for forbidden in ["_ =>", "_ if"] {
-            assert!(
-                !selector34_encoder_lines().any(|line| line.contains(forbidden)),
-                "the selector-34 encoder has a `{forbidden}` arm again. A variant \
-                 added to InitError now reaches the host as a bare category \
-                 instead of failing to compile here."
-            );
-        }
-
-        let lib = include_str!("lib.rs");
-        // The bases the encoder does surface. If one stopped being special-cased,
-        // a cause that used to survive would collapse into its category.
-        for surfaced in [
-            "InitError::Native(error) => 0xAF35_0000",
-            "R1ProbeFailure::ExitCode(code)) => 0xAF37_0000",
-            "InitError::R1Relay(error) => 0xAF38_0000",
-        ] {
-            assert!(
-                lib.contains(surfaced),
-                "the selector-34 encoder no longer surfaces a cause it used to: \
-                 {surfaced}"
-            );
-        }
-    }
-
-    /// The body of the probe's sole send path, comments removed.
-    fn send_with_room_body() -> &'static str {
-        PROBE_SOURCE
-            .1
-            .split("fn send_with_room(")
-            .nth(1)
-            .expect("the probe still routes every record through one send path")
-            .split("\n    }")
-            .next()
-            .expect("the send path is still a bounded function body")
-    }
-
-    #[test]
-    fn the_probes_only_record_send_waits_for_room() {
-        // Run 13's site. `send_channel` is non-blocking by contract -- WouldBlock
-        // means "no room at this instant", not "something is wrong" -- and this
-        // path had no back-pressure at all, so the first time the probe outran
-        // permanent init's drain it reported the refusal as a fatal RunStopped.
-        // Runs 12 and 13 stopped at different hogs for that reason alone, with
-        // every launch and accept in them succeeding.
-        assert!(
-            probe_code_lines().any(|line| line.contains("self.send_with_room(&record)")),
-            "the probe's record send no longer routes through the waiting path, \
-             so a momentarily full channel is fatal again"
-        );
-        let body = send_with_room_body();
-        assert!(
-            body.contains("DW_SIGNAL_WRITABLE"),
-            "the send path no longer waits for room before retrying"
-        );
-        assert!(
-            body.contains("is_would_block(error)"),
-            "the send path no longer separates \"no room right now\" from a real \
-             refusal, so either it retries errors it must not or it fails on the \
-             one it must not"
-        );
-        // Bounded. An unbounded wait would turn a stopped init into a hang, and
-        // the harness only snapshots on timeout -- trading a named failure for
-        // the least informative outcome this card has.
-        assert!(
-            body.contains("monotonic_deadline_after(REPORT_ROOM_TIMEOUT_NANOSECONDS)"),
-            "the wait for room is no longer bounded by a deadline"
-        );
-        // And the give-up must still be the channel's own refusal, not a probe
-        // -invented ordinal: the host needs to see WOULD_BLOCK at this site.
-        assert!(
-            body.contains("return Err(report_send_failure(error));"),
-            "running out of room must be reported as the refusal it was"
-        );
-    }
-
-    /// The terminal record carries every word of its failure.
-    ///
-    /// Occurrence five of this class was in the probe *library*, not its
-    /// binary: `encode_terminal` took the failure ordinal and wrote the other
-    /// two words as zeros, so run 12 reported `FAIL_RUN_STOPPED` and dropped the
-    /// probe's exit code -- the entire reason it stopped. The terminal record is
-    /// the last thing a run produces, so what it drops is unrecoverable even
-    /// from a complete capture. This drives the real encoder with every failure
-    /// variant, each carrying index and detail values no other field shares, and
-    /// reads all three words back from the offsets a `KIND_FAILED` record uses.
-    #[test]
-    fn the_terminal_record_carries_every_word_of_its_failure() {
-        use wyrmroot_r1_saturation::record::{
-            FAIL_RUN_STOPPED, KIND_TERMINAL, encode_terminal, failure_fields,
-        };
-        use wyrmroot_r1_saturation::{ProbeFailure, ProbeOutcome, ProbePlan};
-
-        let word32 = |record: &[u8], at: usize| {
-            u32::from_le_bytes(record[at..at + 4].try_into().expect("four bytes"))
-        };
-        let word64 = |record: &[u8], at: usize| {
-            u64::from_le_bytes(record[at..at + 8].try_into().expect("eight bytes"))
-        };
-        // Every variant, with an index and a detail that differ from each other
-        // and from every other field the record carries, so a word written to
-        // the wrong offset, or not written at all, reads back wrong.
-        let failures = [
-            ProbeFailure::HogAcceptTimeout { index: 0x31 },
-            ProbeFailure::HogRejected {
-                index: 0x32,
-                status: 0x5132,
-            },
-            ProbeFailure::ProgressResultTimeout { after_hog: 0x33 },
-            ProbeFailure::ProgressRejected {
-                after_hog: 0x34,
-                status: 0x5134,
-            },
-            ProbeFailure::ProgressAcceptTimeout { after_hog: 0x35 },
-            ProbeFailure::ProgressNotNormalZero {
-                after_hog: 0x36,
-                code: 0x5136,
-            },
-            ProbeFailure::CleanupIncomplete { index: 0x37 },
-            ProbeFailure::Uncorrelated {
-                expected: 0x38,
-                observed: 0x5138_0000_0001,
-            },
-            ProbeFailure::RunStopped { code: 0x8100_0030 },
-        ];
-        for failure in failures {
-            let record =
-                encode_terminal(9, 1, ProbePlan::CONTROL, ProbeOutcome::Failed(failure), 5);
-            assert_eq!(word32(&record, 8), KIND_TERMINAL);
-            let (ordinal, index, detail) = failure_fields(failure);
-            assert_ne!(ordinal, 0, "{failure:?} has no failure ordinal");
-            assert_eq!(word32(&record, 56), ordinal, "{failure:?}: the ordinal");
-            assert_eq!(word32(&record, 44), index, "{failure:?}: the index word");
-            assert_eq!(word64(&record, 48), detail, "{failure:?}: the detail word");
-        }
-        // Run 12's own shape, by value: the exit code is the detail word.
-        let stopped = encode_terminal(
-            9,
-            1,
-            ProbePlan::CONTROL,
-            ProbeOutcome::Failed(ProbeFailure::RunStopped { code: 0x8100_0030 }),
-            5,
-        );
-        assert_eq!(word32(&stopped, 56), FAIL_RUN_STOPPED);
-        assert_eq!(word64(&stopped, 48), 0x8100_0030);
     }
 }

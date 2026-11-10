@@ -307,7 +307,6 @@ version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-bootfs",
- "wyrmroot-dw1b-preemption",
  "wyrmroot-i-capability",
  "wyrmroot-loader",
  "wyrmroot-runtime",
@@ -330,18 +329,6 @@ name = "wyrmroot-loader-smoke"
 version = "0.0.0"
 dependencies = [
  "wyrmroot-loader",
- "wyrmroot-runtime",
-]
-
-[[package]]
-name = "wyrmroot-r1-saturation"
-version = "0.0.0"
-dependencies = [
- "deepwyrm-syscall",
- "wyrmroot-dw1b-preemption",
- "wyrmroot-launch-proto",
- "wyrmroot-loader",
- "wyrmroot-registry-proto",
  "wyrmroot-runtime",
 ]
 
@@ -391,7 +378,6 @@ dependencies = [
  "wyrmroot-dw1e3-com2-test",
  "wyrmroot-launch-proto",
  "wyrmroot-loader",
- "wyrmroot-r1-saturation",
  "wyrmroot-registry-proto",
  "wyrmroot-registryd",
  "wyrmroot-rrc-manifest",

@@ -126,8 +126,8 @@ mod tests {
                 .into()
         );
         // `dep:` and `package/feature` entries are not features of this package.
-        let r1 = features.closure("wyrmroot-system-init", "r1-selector34");
-        assert!(r1.iter().all(|feature| !feature.contains(['/', ':'])));
+        let probe = features.closure("wyrmroot-system-init", "dw1e3-selector31");
+        assert!(probe.iter().all(|feature| !feature.contains(['/', ':'])));
         assert!(
             features
                 .declared("wyrmroot-devmgr")

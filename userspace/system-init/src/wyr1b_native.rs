@@ -9421,10 +9421,7 @@ mod tests {
     /// independent and is checked in every build; only the encoding of it is
     /// not, so only the encoding is gated.
     fn assert_tick_status(error: &InitError, expected: u32) {
-        #[cfg(not(feature = "r1-selector34"))]
         assert_eq!(resident_tick_failure_application_status(error), expected);
-        #[cfg(feature = "r1-selector34")]
-        let _ = (error, expected);
     }
 
     #[test]

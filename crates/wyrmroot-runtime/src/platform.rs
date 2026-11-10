@@ -322,22 +322,6 @@ pub trait EvidencePlatform: sealed::Sealed {
         &mut self,
         record: &[u8; crate::WYR1E8_EVIDENCE_RECORD_BYTES],
     ) -> Result<(), NativeError>;
-    /// [`crate::submit_r1_evidence`].
-    #[cfg(feature = "r1-test-evidence")]
-    fn submit_r1_evidence(
-        &mut self,
-        record: &[u8; crate::R1_EVIDENCE_RECORD_BYTES],
-    ) -> Result<(), NativeError>;
-    /// [`crate::arm_dw1b_preemption`].
-    #[cfg(feature = "dw1b-test-evidence")]
-    fn arm_dw1b_preemption(
-        &mut self,
-        hog_process: DwHandle,
-        progress_process: DwHandle,
-    ) -> Result<(), NativeError>;
-    /// [`crate::submit_dw1b_progress`].
-    #[cfg(feature = "dw1b-test-evidence")]
-    fn submit_dw1b_progress(&mut self, digest: u64) -> Result<(), NativeError>;
     /// [`crate::arm_dw1c_preemption`].
     #[cfg(feature = "dw1c-test-evidence")]
     fn arm_dw1c_preemption(
@@ -783,28 +767,6 @@ impl EvidencePlatform for NativePlatform {
         record: &[u8; crate::WYR1E8_EVIDENCE_RECORD_BYTES],
     ) -> Result<(), NativeError> {
         crate::submit_wyr1e8_evidence(record)
-    }
-
-    #[cfg(feature = "r1-test-evidence")]
-    fn submit_r1_evidence(
-        &mut self,
-        record: &[u8; crate::R1_EVIDENCE_RECORD_BYTES],
-    ) -> Result<(), NativeError> {
-        crate::submit_r1_evidence(record)
-    }
-
-    #[cfg(feature = "dw1b-test-evidence")]
-    fn arm_dw1b_preemption(
-        &mut self,
-        hog_process: DwHandle,
-        progress_process: DwHandle,
-    ) -> Result<(), NativeError> {
-        crate::arm_dw1b_preemption(hog_process, progress_process)
-    }
-
-    #[cfg(feature = "dw1b-test-evidence")]
-    fn submit_dw1b_progress(&mut self, digest: u64) -> Result<(), NativeError> {
-        crate::submit_dw1b_progress(digest)
     }
 
     #[cfg(feature = "dw1c-test-evidence")]

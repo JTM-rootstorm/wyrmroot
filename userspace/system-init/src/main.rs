@@ -15,8 +15,6 @@ use wyrmroot_device_proto as _;
 use wyrmroot_dw1e3_com2_test as _;
 use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
-#[cfg(feature = "r1-selector34")]
-use wyrmroot_r1_saturation as _;
 use wyrmroot_registry_proto as _;
 use wyrmroot_rrc_manifest as _;
 use wyrmroot_runtime::{
@@ -32,12 +30,9 @@ use wyrmroot_system_init::continue_system_init_resource_product;
 #[cfg(not(any(
     feature = "wyr1-test-evidence",
     feature = "wyr1b-test-evidence",
-    feature = "wyr1c6-selector29",
-    feature = "r1-selector34"
+    feature = "wyr1c6-selector29"
 )))]
 use wyrmroot_system_init::fatal_application_status;
-#[cfg(feature = "r1-selector34")]
-use wyrmroot_system_init::r1_test_failure_application_status;
 use wyrmroot_system_init::validate_wait_until_completion;
 #[cfg(feature = "wyr1-test-evidence")]
 use wyrmroot_system_init::wyr1_test_failure_application_status;
@@ -200,19 +195,6 @@ impl resident_loop::ResidentLoopPlatform for NativeSystem {
     }
 }
 
-/// Reset card R1's evidence seam. The whole native side of the relay is this
-/// one call: the decision to forward, and every refusal, lives in
-/// `r1_relay` where it is host tested against a capturing double.
-#[cfg(feature = "r1-selector34")]
-impl wyrmroot_system_init::r1_relay::R1EvidenceSink for NativeSystem {
-    fn submit_r1_evidence(
-        &mut self,
-        record: &[u8; wyrmroot_runtime::R1_EVIDENCE_RECORD_BYTES],
-    ) -> Result<(), NativeError> {
-        wyrmroot_runtime::submit_r1_evidence(record)
-    }
-}
-
 fn native_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
     let mut loader = NativeLoaderPlatform;
@@ -242,13 +224,10 @@ fn native_main(startup: StartupBlock<'_>) -> u32 {
             return wyr1b_test_failure_application_status(&error);
             #[cfg(all(feature = "wyr1-test-evidence", not(feature = "wyr1b-test-evidence")))]
             return wyr1_test_failure_application_status(&error);
-            #[cfg(feature = "r1-selector34")]
-            return r1_test_failure_application_status(&error);
             #[cfg(not(any(
                 feature = "wyr1-test-evidence",
                 feature = "wyr1b-test-evidence",
-                feature = "wyr1c6-selector29",
-                feature = "r1-selector34"
+                feature = "wyr1c6-selector29"
             )))]
             return fatal_application_status(&error) as u32;
         }

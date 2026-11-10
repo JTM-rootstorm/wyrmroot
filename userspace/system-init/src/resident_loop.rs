@@ -8,17 +8,10 @@
 
 use super::*;
 
-/// Selector 34's evidence sink, which the loop's platform must provide only in
-/// the build that relays R1 records.
-#[cfg(feature = "r1-selector34")]
-pub use crate::r1_relay::R1EvidenceSink as ResidentR1Sink;
-
 /// Selector 34's evidence sink, which every platform trivially provides in a
 /// build that relays no R1 records.
-#[cfg(not(feature = "r1-selector34"))]
 pub trait ResidentR1Sink {}
 
-#[cfg(not(feature = "r1-selector34"))]
 impl<T: ?Sized> ResidentR1Sink for T {}
 
 /// The resident loop's platform: the WYR1-B operations, plus the evidence
@@ -101,11 +94,6 @@ where
             index += 1;
         }
     }
-    // Card R1's scenario driver. Its state lives here rather than in
-    // ResidentSystemInit because the probe, its launch session and its relay are
-    // one selector's scenario, and no production product has a field for them.
-    #[cfg(feature = "r1-selector34")]
-    let mut r1 = None;
     #[cfg(feature = "wyr1-test-evidence")]
     let mut evidence_submitted = false;
     #[cfg(feature = "wyr1c6-selector29")]
@@ -144,14 +132,6 @@ where
                 }
             }
             return resident_tick_failure_application_status(&error);
-        }
-        // The probe named by the staged `WRR1` gate is launched on the first tick
-        // and pumped on every later one. Its records are relayed through this
-        // process because the kernel accepts R1 evidence only from permanent
-        // init; `r1_driver` holds the paths and the sequence.
-        #[cfg(feature = "r1-selector34")]
-        if let Err(error) = crate::r1_driver::drive(resident, &mut r1, system, loader, waits, now) {
-            return r1_test_failure_application_status(&error);
         }
         #[cfg(feature = "wyr1c6-selector29")]
         if !c6_evidence_submitted {

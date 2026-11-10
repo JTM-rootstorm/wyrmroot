@@ -8,14 +8,10 @@ use core::panic::PanicInfo;
 use deepwyrm_syscall::{DwDeadline, DwHandleTransferV1};
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs as _;
-#[cfg(feature = "dw1b-preemption-integration")]
-use wyrmroot_dw1b_preemption as _;
 #[cfg(feature = "i-capability-integration")]
 use wyrmroot_i_capability as _;
 use wyrmroot_init0::{CHILD_SUPERVISION_DEADLINE_NS, Init0System, run_init0};
 use wyrmroot_loader as _;
-#[cfg(feature = "dw1b-preemption-integration")]
-use wyrmroot_runtime::arm_dw1b_preemption;
 use wyrmroot_runtime::{
     CapabilityInfo, MappingPlan, NativeError, NativeLoaderPlatform, NativeSupervisionPlatform,
     ReceiveCounts, StartupBlock, close_handle, create_channel, map_bootfs_read_only,
@@ -98,15 +94,6 @@ impl Init0System for NativeSystem {
         interval_nanoseconds: u64,
     ) -> Result<DwDeadline, NativeError> {
         monotonic_deadline_after(interval_nanoseconds)
-    }
-
-    #[cfg(feature = "dw1b-preemption-integration")]
-    fn arm_dw1b_preemption(
-        &mut self,
-        hog_process: DwHandle,
-        progress_process: DwHandle,
-    ) -> Result<(), NativeError> {
-        arm_dw1b_preemption(hog_process, progress_process)
     }
 
     #[cfg(feature = "dw1c-preemption-integration")]
