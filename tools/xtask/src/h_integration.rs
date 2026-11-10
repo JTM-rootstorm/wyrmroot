@@ -4497,7 +4497,12 @@ mod tests {
             schema_version: 2,
             deepwyrm_revision: revision(&workspace.join("deepwyrm"), "Deepwyrm"),
             wyrmroot_revision: revision(&repository, "Wyrmroot"),
-            rust_revision: revision(&workspace.join("rust"), "Rust"),
+            // The accepted toolchain's revision, not the live rust/ HEAD: rust/
+            // moves on (e.g. a .gitmodules-only commit) without changing the
+            // toolchain the request is built with (root CLAUDE.md §9).
+            rust_revision: crate::metadata::BuildManifest::load(&repository)
+                .and_then(|manifest| manifest.rust_revision().map(str::to_owned))
+                .expect("accepted Rust revision"),
             selector: "primordial-bootstrap".into(),
             test_id: 18,
             expected_outcome: ExpectedOutcome::Pass,
