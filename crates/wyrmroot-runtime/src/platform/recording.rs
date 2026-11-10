@@ -735,9 +735,7 @@ impl DevicePlatform for RecordingPlatform {
     }
 }
 
-impl EvidencePlatform for RecordingPlatform {
-
-}
+impl EvidencePlatform for RecordingPlatform {}
 
 #[cfg(test)]
 mod tests {

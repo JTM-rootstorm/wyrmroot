@@ -1077,8 +1077,8 @@ where
     e6.awaiting_ready = false;
     e6.bootstrap_released = false;
     e6.console_transaction = 0;
-    let result = retire_console_product(system, waits, &mut e6.jobs, peer, true);
-    result
+
+    retire_console_product(system, waits, &mut e6.jobs, peer, true)
 }
 
 /// Releases what the job dispatcher still holds, for a session that ended.
@@ -1140,11 +1140,7 @@ where
         .take()
         .is_some_and(|observer| system.close_handle(observer.client).is_err());
     let Some(peer) = e6.console.take() else {
-        return if observer_failed || {
-            {
-                false
-            }
-        } {
+        return if observer_failed || { false } {
             Err(InitError::Cleanup)
         } else {
             Ok(())
@@ -1154,11 +1150,7 @@ where
     e6.bootstrap_released = false;
     e6.console_transaction = 0;
     let console_result = retire_console_product(system, waits, &mut e6.jobs, peer, true);
-    if observer_failed || console_result.is_err() || {
-        {
-            false
-        }
-    } {
+    if observer_failed || console_result.is_err() || { false } {
         Err(InitError::Cleanup)
     } else {
         Ok(())
@@ -1905,5 +1897,4 @@ mod tests {
         assert_eq!(platform.closed[..platform.close_count], [observed.client]);
         assert!(e6.publication_observer.is_none());
     }
-
 }

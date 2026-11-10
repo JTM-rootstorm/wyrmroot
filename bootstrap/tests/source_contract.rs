@@ -78,51 +78,6 @@ fn i2_bootstrap_watchdog_contains_the_init0_i2_deadline() {
 }
 
 #[test]
-fn d6_bootstrap_is_feature_gated_v3_and_keeps_actors_out_of_production_init() {
-    assert!(LIB_SOURCE.contains("terminate_d6_replacement(system, replacement.process)"));
-    assert!(LIB_SOURCE.contains("status == DW_STATUS_WOULD_BLOCK"));
-    assert!(LIB_SOURCE.contains("D6_TERMINATE_REGISTRATION_RETRIES"));
-    assert!(LIB_SOURCE.contains("BootstrapMessage::InitV3"));
-    assert!(LIB_SOURCE.contains("validate_init_capabilities_v3"));
-    assert!(LIB_SOURCE.contains("load_d6_resource_owner_process"));
-    assert!(LIB_SOURCE.contains("LaunchProfile::Hello"));
-    assert!(!LIB_SOURCE.contains("continue_system_init_product"));
-
-    let transaction = LIB_SOURCE
-        .split("pub fn run_d6_synthetic_bootstrap")
-        .nth(1)
-        .expect("D6 bootstrap transaction");
-    let first_arm = transaction
-        .find("d6_arm(owner.process")
-        .expect("first-owner ARM");
-    let denied = transaction
-        .find("BootstrapOutsideDomainClaimRejected")
-        .expect("outside-domain denial report");
-    let first_start = transaction
-        .find("owner_start_permit()")
-        .expect("first-owner start permit");
-    let first_bound = transaction
-        .find("MessageKind::FirstOwnerBound")
-        .expect("first-owner bound report");
-    assert!(first_arm < denied && denied < first_start && first_start < first_bound);
-
-    let replacement_load = transaction
-        .find("let replacement = load_d6_resource_owner")
-        .expect("replacement owner load");
-    let replacement = &transaction[replacement_load..];
-    let replacement_arm = replacement
-        .find("d6_arm(replacement.process")
-        .expect("replacement ARM");
-    let replacement_start = replacement
-        .find("owner_start_permit()")
-        .expect("replacement start permit");
-    let replacement_bound = replacement
-        .find("MessageKind::ReplacementBound")
-        .expect("replacement bound report");
-    assert!(replacement_arm < replacement_start && replacement_start < replacement_bound);
-}
-
-#[test]
 fn c4_bootstrap_is_a_distinct_production_v3_transaction() {
     assert!(MANIFEST.contains("wyr1c4-production = [\"native-bootstrap\"]"));
     assert!(MAIN_SOURCE.contains("run_supervisor_resource_domain_bootstrap"));
@@ -135,14 +90,7 @@ fn c4_bootstrap_is_a_distinct_production_v3_transaction() {
         "the WYR1-C4 production bootstrap is mutually exclusive with historical and test variants"
     ));
 
-    let production = LIB_SOURCE
-        .split("pub fn run_supervisor_resource_domain_bootstrap")
-        .nth(1)
-        .expect("C4 production bootstrap");
-    let d6 = production
-        .find("pub fn run_d6_synthetic_bootstrap")
-        .expect("D6 remains a later private transaction");
-    assert!(!production[..d6].contains("d6_"));
+    assert!(!LIB_SOURCE.contains("d6_"));
 }
 
 #[test]

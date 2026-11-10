@@ -36,9 +36,7 @@ impl LaunchSessionScope {
             Self::ConsoleLauncher => false,
             Self::ShellJobs => {
                 let production = matches!(path, "bin/hello" | "bin/cpu-hog");
-                {
-                    production
-                }
+                production
             }
         }
     }

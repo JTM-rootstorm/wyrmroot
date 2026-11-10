@@ -284,4 +284,3 @@ fn primordial_test_support_uses_generated_ids_and_is_feature_isolated() {
     assert!(!TEST_SUPPORT_SOURCE.contains("libc"));
     assert!(!TEST_SUPPORT_SOURCE.contains("std::"));
 }
-

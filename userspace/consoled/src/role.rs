@@ -1662,8 +1662,7 @@ fn event_loop<P: ConsoledPlatform>(
             }
         }
 
-        if recovery_index == Some(observed_index) {
-        }
+        if recovery_index == Some(observed_index) {}
 
         match observed.index {
             // Registry retirement and raw close invalidate the serial tuple

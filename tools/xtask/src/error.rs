@@ -1,9 +1,5 @@
-const FUTURE_PHASE_MESSAGE: &str =
-    "is unavailable in the current WYR0-H surface; it requires a later phase";
-
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum FailureKind {
-    Unavailable,
     TaskFailed,
     Usage,
 }
@@ -15,13 +11,6 @@ pub(crate) struct Failure {
 }
 
 impl Failure {
-    pub(crate) fn unavailable(command: &str) -> Self {
-        Self {
-            kind: FailureKind::Unavailable,
-            message: format!("'{command}' {FUTURE_PHASE_MESSAGE}"),
-        }
-    }
-
     pub(crate) fn task(message: impl Into<String>) -> Self {
         Self {
             kind: FailureKind::TaskFailed,
@@ -38,7 +27,7 @@ impl Failure {
 
     pub(crate) const fn exit_code(&self) -> u8 {
         match self.kind {
-            FailureKind::Unavailable | FailureKind::TaskFailed => 1,
+            FailureKind::TaskFailed => 1,
             FailureKind::Usage => 2,
         }
     }

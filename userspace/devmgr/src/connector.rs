@@ -1217,5 +1217,4 @@ mod tests {
         assert_eq!(broker.current(), Some(published));
         assert_eq!(broker.slot(), before_slot);
     }
-
 }

@@ -30,56 +30,15 @@ struct ArtifactComponent {
 
 pub(crate) struct AcceptedToolchain {
     pub(crate) rustc: PathBuf,
-    pub(crate) rustc_sha256: String,
     pub(crate) cargo: PathBuf,
     pub(crate) rust_lld: PathBuf,
     pub(crate) sysroot: PathBuf,
-    pub(crate) manifest_sha256: String,
-    pub(crate) cargo_sha256: String,
-    pub(crate) rust_lld_sha256: String,
-    pub(crate) uefi_core_sha256: String,
-    pub(crate) uefi_alloc_sha256: String,
-    pub(crate) uefi_builtins_sha256: String,
-    pub(crate) rustc_driver_sha256: String,
-    pub(crate) llvm_sha256: String,
-    pub(crate) toolchain_tree_sha256: String,
     root: PathBuf,
     manifest: ArtifactComponent,
     components: Vec<ArtifactComponent>,
 }
 
 impl AcceptedToolchain {
-    /// A toolchain whose identity fields are fixed labels, for testing code
-    /// that only renders them. `rustc` must be a readable file: renderers hash
-    /// it. Nothing here was validated, so it must never reach a build.
-    #[cfg(test)]
-    pub(crate) fn test_identity(rustc: PathBuf) -> Self {
-        let label = |name: &str| format!("fixture-{name}");
-        Self {
-            rustc: rustc.clone(),
-            rustc_sha256: label("rustc"),
-            cargo: rustc.clone(),
-            rust_lld: rustc.clone(),
-            sysroot: rustc.clone(),
-            manifest_sha256: label("manifest"),
-            cargo_sha256: label("cargo"),
-            rust_lld_sha256: label("rust-lld"),
-            uefi_core_sha256: label("uefi-core"),
-            uefi_alloc_sha256: label("uefi-alloc"),
-            uefi_builtins_sha256: label("uefi-builtins"),
-            rustc_driver_sha256: label("rustc-driver"),
-            llvm_sha256: label("llvm"),
-            toolchain_tree_sha256: label("tree"),
-            root: rustc.clone(),
-            manifest: ArtifactComponent {
-                label: "fixture manifest",
-                path: rustc,
-                sha256: label("manifest"),
-            },
-            components: Vec::new(),
-        }
-    }
-
     pub(crate) fn verify_unchanged(&self) -> Result<(), Failure> {
         validate_component(&self.root, &self.manifest)?;
         for component in &self.components {
@@ -307,19 +266,9 @@ pub(crate) fn prepare(
     ];
     let accepted = AcceptedToolchain {
         rustc: rustc.path.clone(),
-        rustc_sha256: rustc.sha256.clone(),
         cargo: cargo.path.clone(),
         rust_lld: rust_lld.path.clone(),
         sysroot,
-        manifest_sha256: actual_manifest_sha,
-        cargo_sha256: cargo.sha256.clone(),
-        rust_lld_sha256: rust_lld.sha256.clone(),
-        uefi_core_sha256: uefi_core.sha256.clone(),
-        uefi_alloc_sha256: uefi_alloc.sha256.clone(),
-        uefi_builtins_sha256: uefi_builtins.sha256.clone(),
-        rustc_driver_sha256: rustc_driver.sha256.clone(),
-        llvm_sha256: llvm.sha256.clone(),
-        toolchain_tree_sha256,
         root,
         manifest: manifest_component,
         components,

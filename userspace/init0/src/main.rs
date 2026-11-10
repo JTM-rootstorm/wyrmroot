@@ -60,7 +60,6 @@ impl Init0System for NativeSystem {
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
         close_handle(handle)
     }
-
 }
 
 fn init0_main(startup: StartupBlock<'_>) -> u32 {

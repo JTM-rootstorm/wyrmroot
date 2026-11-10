@@ -64,15 +64,24 @@ pub const CHILD_SUPERVISION_DEADLINE_NS: u64 = if cfg!(feature = "i2-stress-inte
 // Retained by the native linker as a candidate-assembly attestation. Each
 // selector build has exactly one marker, so host tooling can reject a stale
 // Cargo output from a different init0 feature set before constructing media.
-#[cfg(not(any(feature = "i2-stress-integration", feature = "i-capability-integration")))]
+#[cfg(not(any(
+    feature = "i2-stress-integration",
+    feature = "i-capability-integration"
+)))]
 #[used]
 static INIT0_PROFILE_MARKER: [u8; 29] = *b"WYRMINIT0-PROFILE-V1:ordinary";
 
-#[cfg(all(feature = "i2-stress-integration", not(feature = "i-capability-integration")))]
+#[cfg(all(
+    feature = "i2-stress-integration",
+    not(feature = "i-capability-integration")
+))]
 #[used]
 static INIT0_PROFILE_MARKER: [u8; 30] = *b"WYRMINIT0-PROFILE-V1:i2-stress";
 
-#[cfg(all(feature = "i-capability-integration", not(feature = "i2-stress-integration")))]
+#[cfg(all(
+    feature = "i-capability-integration",
+    not(feature = "i2-stress-integration")
+))]
 #[used]
 static INIT0_PROFILE_MARKER: [u8; 33] = *b"WYRMINIT0-PROFILE-V1:i-capability";
 
@@ -109,7 +118,6 @@ pub trait Init0System {
 
     /// Closes one caller-local handle.
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError>;
-
 }
 
 /// Why the WYR0-G `init0` descendant transaction failed.
@@ -554,7 +562,10 @@ const fn selected_profile() -> LaunchProfile {
     }
 }
 
-#[cfg(all(feature = "i2-stress-integration", feature = "i-capability-integration"))]
+#[cfg(all(
+    feature = "i2-stress-integration",
+    feature = "i-capability-integration"
+))]
 compile_error!("init0 selector integrations are mutually exclusive");
 
 #[cfg(feature = "i-capability-integration")]

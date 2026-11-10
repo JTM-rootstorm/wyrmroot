@@ -40,4 +40,3 @@ fn malformed_intake_and_retire_both_close_the_two_authority_handles() {
     assert!(c5.contains("ControlMessage::Retire"));
     assert!(c5.contains("let result = probe.and_then(|()| hold_until_retire(control, ready))"));
 }
-

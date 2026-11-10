@@ -543,4 +543,3 @@ mod resident {
         platform.assert_script_consumed();
     }
 }
-

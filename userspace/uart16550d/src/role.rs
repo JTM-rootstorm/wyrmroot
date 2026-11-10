@@ -332,12 +332,7 @@ pub fn run<P: UartPlatform, D: DevicePlatform>(
     if send_control(platform, control, ready).is_err() {
         return fail_driver(platform, &mut driver, control, 34);
     }
-    run_event_loop(
-        platform,
-        &mut driver,
-        control,
-        &pio_failed,
-    )
+    run_event_loop(platform, &mut driver, control, &pio_failed)
 }
 
 fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
@@ -374,13 +369,8 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
             if control_signals.0 & DW_SIGNAL_READABLE.0 != 0 {
                 return fail_driver(platform, driver, control, 114);
             }
-            let completed = service_graceful_retire_drain(
-                platform,
-                driver,
-                control,
-                pio_failed,
-                drain,
-            );
+            let completed =
+                service_graceful_retire_drain(platform, driver, control, pio_failed, drain);
             match completed {
                 Ok(true) => return complete_graceful_retire(platform, driver, control, pio_failed),
                 Ok(false) => {}
@@ -543,12 +533,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
             }
             if peer_close_drain.is_pending() {
                 while driver.wants_stream_readable() {
-                    let stream_result = service_stream_read(
-                        platform,
-                        driver,
-                        control,
-                        pio_failed,
-                    );
+                    let stream_result = service_stream_read(platform, driver, control, pio_failed);
                     match stream_result {
                         Ok(StreamReadOutcome::Accepted) => {}
                         Ok(StreamReadOutcome::WouldBlock | StreamReadOutcome::PeerClosed) => {
@@ -571,12 +556,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                 continue;
             }
             if readable {
-                let stream_result = service_stream_read(
-                    platform,
-                    driver,
-                    control,
-                    pio_failed,
-                );
+                let stream_result = service_stream_read(platform, driver, control, pio_failed);
                 match stream_result {
                     Ok(StreamReadOutcome::Accepted | StreamReadOutcome::WouldBlock) => {}
                     Ok(StreamReadOutcome::PeerClosed | StreamReadOutcome::Detached) => {
@@ -614,12 +594,7 @@ fn service_graceful_retire_drain<P: UartPlatform, I: ByteRegisterIo>(
     drain: &mut GracefulRetireDrain,
 ) -> Result<bool, u32> {
     while driver.wants_stream_readable() {
-        let result = service_stream_read(
-            platform,
-            driver,
-            control,
-            pio_failed,
-        );
+        let result = service_stream_read(platform, driver, control, pio_failed);
         match result {
             Ok(StreamReadOutcome::Accepted) => drain.observe_stream_record(),
             Ok(StreamReadOutcome::WouldBlock) => {

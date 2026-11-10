@@ -33,7 +33,9 @@ use deepwyrm_abi::{
     DwBootDeviceResourceV1, DwBootDeviceTableV1,
 };
 use wyrmroot_bootfs::{
-    launch_policy::{JOB_V2_PROFILE_ID, LaunchPolicyEntry, WYRMSH_PATH, WYRMSH_PROFILE_ID, encode_wyrmsh},
+    launch_policy::{
+        JOB_V2_PROFILE_ID, LaunchPolicyEntry, WYRMSH_PATH, WYRMSH_PROFILE_ID, encode_wyrmsh,
+    },
     wyr1::{Product, ProductC1, ProductF, WYR1_C1_MARKER, build_f},
 };
 use wyrmroot_device_proto::manifest::{
@@ -63,12 +65,48 @@ const GATE_CONFIG: &[u8] =
 
 /// The product's native roles, in bootfs assembly order.
 pub(crate) const NATIVES: [NativeSpec; 8] = [
-    native("system-init", "wyrmroot-system-init", "system-init", "wyr1e-production", "system-init"),
-    native("registryd", "wyrmroot-registryd", "registryd", "native-registryd", "registryd"),
-    native("devmgr", "wyrmroot-devmgr", "devmgr", "wyr1e8-production", "devmgr"),
-    native("uart16550d", "wyrmroot-uart16550d", "uart16550d", "native-uart16550d", "uart16550d"),
-    native("consoled", "wyrmroot-consoled", "consoled", "native-consoled,wyr1e-wyrmsh", "consoled"),
-    native("wyrmsh", "wyrmroot-wyrmsh", "wyrmsh", "native-wyrmsh", "wyrmsh"),
+    native(
+        "system-init",
+        "wyrmroot-system-init",
+        "system-init",
+        "wyr1e-production",
+        "system-init",
+    ),
+    native(
+        "registryd",
+        "wyrmroot-registryd",
+        "registryd",
+        "native-registryd",
+        "registryd",
+    ),
+    native(
+        "devmgr",
+        "wyrmroot-devmgr",
+        "devmgr",
+        "wyr1e8-production",
+        "devmgr",
+    ),
+    native(
+        "uart16550d",
+        "wyrmroot-uart16550d",
+        "uart16550d",
+        "native-uart16550d",
+        "uart16550d",
+    ),
+    native(
+        "consoled",
+        "wyrmroot-consoled",
+        "consoled",
+        "native-consoled,wyr1e-wyrmsh",
+        "consoled",
+    ),
+    native(
+        "wyrmsh",
+        "wyrmroot-wyrmsh",
+        "wyrmsh",
+        "native-wyrmsh",
+        "wyrmsh",
+    ),
     native(
         "hello",
         "wyrmroot-hello",
@@ -179,8 +217,10 @@ pub(crate) fn build(output: &Path, deep_repository: &Path) -> Result<(), Failure
         fs::create_dir(&artifacts)
             .map_err(|error| Failure::task(format!("could not create artifacts: {error}")))?;
         let native_bytes = |label: &str| natives[label].as_slice();
-        let ovmf_code = read_regular_bounded(Path::new(OVMF_CODE_PATH), MAX_FIRMWARE_BYTES, "OVMF code")?;
-        let ovmf_vars = read_regular_bounded(Path::new(OVMF_VARS_PATH), MAX_FIRMWARE_BYTES, "OVMF vars")?;
+        let ovmf_code =
+            read_regular_bounded(Path::new(OVMF_CODE_PATH), MAX_FIRMWARE_BYTES, "OVMF code")?;
+        let ovmf_vars =
+            read_regular_bounded(Path::new(OVMF_VARS_PATH), MAX_FIRMWARE_BYTES, "OVMF vars")?;
         let device_table = boot_device_table();
         for (name, bytes) in [
             ("loader.efi", uefi.loader_bytes.as_slice()),
@@ -283,7 +323,10 @@ fn build_native(
         return Err(Failure::task(format!("{} build failed", spec.label)));
     }
     read_build_output(
-        &target.join(NATIVE_TARGET).join("release").join(spec.artifact),
+        &target
+            .join(NATIVE_TARGET)
+            .join("release")
+            .join(spec.artifact),
         MAX_ARTIFACT_BYTES as u64,
         spec.label,
     )
@@ -436,7 +479,10 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
 }
 
 /// The recovery-root closure: five roles, each ready-gated on the one before.
-fn rrc_builder(generation: &[u8; 32], role_hashes: [[u8; 32]; 5]) -> Result<Builder<'static>, Failure> {
+fn rrc_builder(
+    generation: &[u8; 32],
+    role_hashes: [[u8; 32]; 5],
+) -> Result<Builder<'static>, Failure> {
     let mut builder = Builder::new(*generation);
     let roles = [
         (
@@ -515,26 +561,71 @@ fn boot_device_table() -> Vec<u8> {
     let stride = DW_BOOT_DEVICE_TABLE_RECORD_STRIDE as usize;
     let total = header + stride;
     let mut table = vec![0; total];
-    let mut put = |offset: usize, value: &[u8]| table[offset..offset + value.len()].copy_from_slice(value);
-    put(core::mem::offset_of!(DwBootDeviceTableV1, size), &DW_BOOT_DEVICE_TABLE_V1_SIZE.to_le_bytes());
-    put(core::mem::offset_of!(DwBootDeviceTableV1, version), &DW_BOOT_DEVICE_TABLE_V1_VERSION.to_le_bytes());
-    put(core::mem::offset_of!(DwBootDeviceTableV1, resource_count), &1u32.to_le_bytes());
-    put(core::mem::offset_of!(DwBootDeviceTableV1, flags), &DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK.to_le_bytes());
-    put(core::mem::offset_of!(DwBootDeviceTableV1, record_stride), &DW_BOOT_DEVICE_TABLE_RECORD_STRIDE.to_le_bytes());
-    put(core::mem::offset_of!(DwBootDeviceTableV1, total_byte_len), &(total as u64).to_le_bytes());
+    let mut put =
+        |offset: usize, value: &[u8]| table[offset..offset + value.len()].copy_from_slice(value);
+    put(
+        core::mem::offset_of!(DwBootDeviceTableV1, size),
+        &DW_BOOT_DEVICE_TABLE_V1_SIZE.to_le_bytes(),
+    );
+    put(
+        core::mem::offset_of!(DwBootDeviceTableV1, version),
+        &DW_BOOT_DEVICE_TABLE_V1_VERSION.to_le_bytes(),
+    );
+    put(
+        core::mem::offset_of!(DwBootDeviceTableV1, resource_count),
+        &1u32.to_le_bytes(),
+    );
+    put(
+        core::mem::offset_of!(DwBootDeviceTableV1, flags),
+        &DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK.to_le_bytes(),
+    );
+    put(
+        core::mem::offset_of!(DwBootDeviceTableV1, record_stride),
+        &DW_BOOT_DEVICE_TABLE_RECORD_STRIDE.to_le_bytes(),
+    );
+    put(
+        core::mem::offset_of!(DwBootDeviceTableV1, total_byte_len),
+        &(total as u64).to_le_bytes(),
+    );
     let record = header;
-    put(record + core::mem::offset_of!(DwBootDeviceResourceV1, size), &DW_BOOT_DEVICE_RESOURCE_V1_SIZE.to_le_bytes());
-    put(record + core::mem::offset_of!(DwBootDeviceResourceV1, version), &DW_BOOT_DEVICE_RESOURCE_V1_VERSION.to_le_bytes());
+    put(
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, size),
+        &DW_BOOT_DEVICE_RESOURCE_V1_SIZE.to_le_bytes(),
+    );
+    put(
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, version),
+        &DW_BOOT_DEVICE_RESOURCE_V1_VERSION.to_le_bytes(),
+    );
     put(
         record + core::mem::offset_of!(DwBootDeviceResourceV1, kind),
-        &DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT.0.to_le_bytes(),
+        &DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT
+            .0
+            .to_le_bytes(),
     );
-    put(record + core::mem::offset_of!(DwBootDeviceResourceV1, flags), &DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK.to_le_bytes());
-    put(record + core::mem::offset_of!(DwBootDeviceResourceV1, resource_id), &1u64.to_le_bytes());
-    put(record + core::mem::offset_of!(DwBootDeviceResourceV1, device_correlation_id), &1u64.to_le_bytes());
-    put(record + core::mem::offset_of!(DwBootDeviceResourceV1, pio_base), &0x02f8u16.to_le_bytes());
-    put(record + core::mem::offset_of!(DwBootDeviceResourceV1, pio_length), &8u16.to_le_bytes());
-    put(record + core::mem::offset_of!(DwBootDeviceResourceV1, interrupt_source), &3u32.to_le_bytes());
+    put(
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, flags),
+        &DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK.to_le_bytes(),
+    );
+    put(
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, resource_id),
+        &1u64.to_le_bytes(),
+    );
+    put(
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, device_correlation_id),
+        &1u64.to_le_bytes(),
+    );
+    put(
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, pio_base),
+        &0x02f8u16.to_le_bytes(),
+    );
+    put(
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, pio_length),
+        &8u16.to_le_bytes(),
+    );
+    put(
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, interrupt_source),
+        &3u32.to_le_bytes(),
+    );
     table
 }
 
@@ -556,11 +647,21 @@ fn git_head(repository: &Path) -> Result<String, Failure> {
 }
 
 /// Reads a regular, single-link, non-empty file of at most `maximum` bytes.
-pub(crate) fn read_regular_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, Failure> {
+pub(crate) fn read_regular_bounded(
+    path: &Path,
+    maximum: u64,
+    label: &str,
+) -> Result<Vec<u8>, Failure> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
-    if !metadata.file_type().is_file() || metadata.nlink() != 1 || metadata.len() == 0 || metadata.len() > maximum {
-        return Err(Failure::task(format!("{label} is not a bounded regular file")));
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > maximum
+    {
+        return Err(Failure::task(format!(
+            "{label} is not a bounded regular file"
+        )));
     }
     fs::read(path).map_err(|error| Failure::task(format!("could not read {label}: {error}")))
 }
@@ -571,7 +672,9 @@ fn read_build_output(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, 
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
     if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > maximum {
-        return Err(Failure::task(format!("{label} is not a bounded regular file")));
+        return Err(Failure::task(format!(
+            "{label} is not a bounded regular file"
+        )));
     }
     fs::read(path).map_err(|error| Failure::task(format!("could not read {label}: {error}")))
 }
@@ -586,4 +689,3 @@ fn write_new(path: &Path, bytes: &[u8], label: &str) -> Result<(), Failure> {
     file.write_all(bytes)
         .map_err(|error| Failure::task(format!("could not write {label}: {error}")))
 }
-

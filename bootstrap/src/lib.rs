@@ -123,7 +123,22 @@ compile_error!(
 ))]
 compile_error!("the WYR0-I capability relay is mutually exclusive with other bootstrap variants");
 
-#[cfg(all(feature = "wyr1c4-production", any(feature = "wyr0-init0-integration", feature = "native-loader-smoke-integration", feature = "primordial-blocking-cleanup", feature = "primordial-user-exception", feature = "primordial-invalid-return", feature = "i0-negative-malformed-elf", feature = "i0-negative-malformed-startup", feature = "i0-negative-capability-count", feature = "i0-negative-capability-type", feature = "i0-negative-capability-rights", feature = "i-capability-integration")))]
+#[cfg(all(
+    feature = "wyr1c4-production",
+    any(
+        feature = "wyr0-init0-integration",
+        feature = "native-loader-smoke-integration",
+        feature = "primordial-blocking-cleanup",
+        feature = "primordial-user-exception",
+        feature = "primordial-invalid-return",
+        feature = "i0-negative-malformed-elf",
+        feature = "i0-negative-malformed-startup",
+        feature = "i0-negative-capability-count",
+        feature = "i0-negative-capability-type",
+        feature = "i0-negative-capability-rights",
+        feature = "i-capability-integration"
+    )
+))]
 compile_error!(
     "the WYR1-C4 production bootstrap is mutually exclusive with historical and test variants"
 );

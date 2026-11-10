@@ -144,12 +144,9 @@ impl Wyr1BPlatform for NativeSystem {
     ) -> Result<DwHandle, NativeError> {
         wyrmroot_runtime::materialize_read_only_memory(root, bytes, rights)
     }
-
 }
 
-impl resident_loop::ResidentLoopPlatform for NativeSystem {
-
-}
+impl resident_loop::ResidentLoopPlatform for NativeSystem {}
 
 fn native_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
@@ -173,9 +170,7 @@ fn native_main(startup: StartupBlock<'_>) -> u32 {
     );
     match result {
         Ok(status) => status,
-        Err(error) => {
-            return fatal_application_status(&error) as u32;
-        }
+        Err(error) => fatal_application_status(&error) as u32,
     }
 }
 

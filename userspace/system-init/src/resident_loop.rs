@@ -16,9 +16,7 @@ impl<T: ?Sized> ResidentR1Sink for T {}
 
 /// The resident loop's platform: the WYR1-B operations, plus the evidence
 /// submission each selector's drain makes.
-pub trait ResidentLoopPlatform: Wyr1BPlatform + ResidentR1Sink {
-
-}
+pub trait ResidentLoopPlatform: Wyr1BPlatform + ResidentR1Sink {}
 
 /// The period of the resident loop's tick.
 #[cfg(feature = "wyr1e-production")]

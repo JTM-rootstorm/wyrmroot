@@ -148,10 +148,6 @@ struct FileLayout<'a> {
     clusters: u32,
 }
 
-pub(crate) fn build(arguments: &G3ImageArguments) -> Result<String, Failure> {
-    build_in_root(arguments, None)
-}
-
 /// Build the selector-30 ESP with its separate immutable boot-device table.
 /// Ordinary callers cannot accidentally gain this fifth artifact.
 pub(crate) fn build_d6(
@@ -164,13 +160,6 @@ pub(crate) fn build_d6(
         None,
         Some(boot_device_table),
     )
-}
-
-pub(crate) fn build_in_root(
-    arguments: &G3ImageArguments,
-    output_root: Option<&Path>,
-) -> Result<String, Failure> {
-    build_with_inputs(arguments, Inputs::load(arguments)?, output_root, None)
 }
 
 fn build_with_inputs(
@@ -211,46 +200,6 @@ fn build_with_inputs(
         return Err(error);
     }
     report
-}
-
-#[cfg(test)]
-fn inspect_created_or_remove(
-    arguments: &G3ImageArguments,
-    output_path: &Path,
-) -> Result<String, Failure> {
-    match inspect(arguments) {
-        Ok(report) => Ok(report),
-        Err(error) => {
-            let _ = fs::remove_file(output_path);
-            Err(error)
-        }
-    }
-}
-
-pub(crate) fn inspect(arguments: &G3ImageArguments) -> Result<String, Failure> {
-    let inputs = Inputs::load(arguments)?;
-    inspect_with_inputs(arguments, inputs)
-}
-
-/// Inspect the selector-30/C6 ESP while binding the separate immutable
-/// boot-device table. Historical callers retain the exact no-table rule.
-pub(crate) fn inspect_d6(
-    arguments: &G3ImageArguments,
-    boot_device_table: &str,
-) -> Result<String, Failure> {
-    inspect_with_inputs(
-        arguments,
-        Inputs::load_with_boot_device_table(arguments, boot_device_table)?,
-    )
-}
-
-fn inspect_with_inputs(arguments: &G3ImageArguments, inputs: Inputs) -> Result<String, Failure> {
-    let mut image = OpenOptions::new()
-        .read(true)
-        .custom_flags(0o400000)
-        .open(&arguments.image)
-        .map_err(|error| Failure::task(format!("could not open G3 ESP: {error}")))?;
-    inspect_loaded(&mut image, &inputs).map(|value| value.render())
 }
 
 fn build_loaded(
@@ -875,36 +824,6 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    fn fixture() -> (PathBuf, G3ImageArguments) {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!(
-                "g3-image-test-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-        fs::create_dir_all(&root).expect("create G3 image fixture");
-        for (name, bytes) in [
-            ("loader.efi", b"loader".as_slice()),
-            ("deepwyrm.elf", b"kernel".as_slice()),
-            ("bootstrap.elf", b"bootstrap".as_slice()),
-            ("bootfs.img", b"bootfs".as_slice()),
-        ] {
-            fs::write(root.join(name), bytes).expect("write G3 image fixture");
-        }
-        let arguments = G3ImageArguments {
-            image: root.join("esp.img").display().to_string(),
-            loader: root.join("loader.efi").display().to_string(),
-            kernel: root.join("deepwyrm.elf").display().to_string(),
-            bootstrap: root.join("bootstrap.elf").display().to_string(),
-            bootfs: root.join("bootfs.img").display().to_string(),
-        };
-        (root, arguments)
-    }
 
     #[test]
     fn fixed_geometry_is_fat32_and_directory_names_are_canonical() {
@@ -915,84 +834,5 @@ mod tests {
             0x41
         );
         assert_eq!(IMAGE_BYTES, 128 * 1024 * 1024);
-    }
-
-    #[test]
-    fn build_and_inspect_bind_every_guest_consumed_byte() {
-        let (root, arguments) = fixture();
-        let report = build(&arguments).expect("build and inspect G3 image");
-        assert!(report.contains("\"phase\":\"WYR0-G3\""));
-        assert_eq!(inspect(&arguments).unwrap(), report);
-        let error = build(&arguments).expect_err("existing image was overwritten");
-        assert!(error.message.contains("already exists"));
-        fs::remove_dir_all(root).expect("remove G3 image fixture");
-    }
-
-    #[test]
-    fn d6_image_places_and_inspects_the_separate_boot_device_table() {
-        let (root, arguments) = fixture();
-        let table = root.join("boot-device-table.bin");
-        fs::write(&table, b"exact immutable table bytes").expect("write table fixture");
-        let report = build_d6(&arguments, &table.display().to_string()).expect("build D6 image");
-        assert!(report.contains("\"phase\":\"WYR0-G3\""));
-        assert_eq!(
-            inspect_d6(&arguments, &table.display().to_string()).expect("inspect D6 image"),
-            report
-        );
-        let inputs = Inputs::load_with_boot_device_table(&arguments, &table.display().to_string())
-            .expect("reload D6 inputs");
-        let mut image = OpenOptions::new()
-            .read(true)
-            .open(&arguments.image)
-            .expect("open D6 image");
-        assert_eq!(
-            inspect_loaded(&mut image, &inputs)
-                .expect("inspect D6 image")
-                .render(),
-            report
-        );
-        fs::remove_dir_all(root).expect("remove G3 image fixture");
-    }
-
-    #[test]
-    fn failed_post_build_inspection_removes_the_new_output() {
-        let (root, arguments) = fixture();
-        build(&arguments).expect("build initial G3 image");
-        OpenOptions::new()
-            .write(true)
-            .open(&arguments.image)
-            .expect("open G3 image for corruption")
-            .set_len(1)
-            .expect("truncate G3 image");
-        let image = Path::new(&arguments.image);
-        let error = inspect_created_or_remove(&arguments, image)
-            .expect_err("corrupt post-build image unexpectedly passed inspection");
-        assert!(error.message.contains("wrong type or fixed byte length"));
-        assert!(
-            !image.exists(),
-            "failed inspection left a poisoned G3 output"
-        );
-        fs::remove_dir_all(root).expect("remove G3 image fixture");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn build_in_root_rejects_an_escaping_output_parent() {
-        use std::os::unix::fs::symlink;
-
-        let (root, mut arguments) = fixture();
-        let outside = std::env::temp_dir().join(format!(
-            "g3-image-outside-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&outside).expect("create outside directory");
-        symlink(&outside, root.join("escape")).expect("create escaping parent link");
-        arguments.image = root.join("escape/esp.img").display().to_string();
-        let error = build_in_root(&arguments, Some(&root))
-            .expect_err("escaping request-root output accepted");
-        assert!(error.message.contains("escapes the WYR0-H request root"));
-        fs::remove_dir_all(root).expect("remove G3 image fixture");
-        fs::remove_dir_all(outside).expect("remove outside directory");
     }
 }

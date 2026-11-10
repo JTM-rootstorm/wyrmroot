@@ -59,7 +59,19 @@ use wyrmroot_runtime::{
     map_bootfs_read_only, panic_abort, query_capability_info, query_memory_object_size,
     receive_channel, send_channel, unmap_bootfs,
 };
-#[cfg(any(feature = "native-loader-smoke-integration", feature = "i0-negative-malformed-elf", feature = "i0-negative-malformed-startup", feature = "i0-negative-capability-count", feature = "i0-negative-capability-type", feature = "i0-negative-capability-rights", not(any(feature = "primordial-blocking-cleanup", feature = "primordial-user-exception", feature = "primordial-invalid-return"))))]
+#[cfg(any(
+    feature = "native-loader-smoke-integration",
+    feature = "i0-negative-malformed-elf",
+    feature = "i0-negative-malformed-startup",
+    feature = "i0-negative-capability-count",
+    feature = "i0-negative-capability-type",
+    feature = "i0-negative-capability-rights",
+    not(any(
+        feature = "primordial-blocking-cleanup",
+        feature = "primordial-user-exception",
+        feature = "primordial-invalid-return"
+    ))
+))]
 use wyrmroot_runtime::{NativeLoaderPlatform, NativeSupervisionPlatform, monotonic_deadline_after};
 
 #[cfg(any(
@@ -219,7 +231,20 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     panic_abort()
 }
 
-#[cfg(not(any(feature = "primordial-blocking-cleanup", feature = "primordial-user-exception", feature = "primordial-invalid-return", feature = "native-loader-smoke-integration", feature = "i0-negative-malformed-elf", feature = "i0-negative-malformed-startup", feature = "i0-negative-capability-count", feature = "i0-negative-capability-type", feature = "i0-negative-capability-rights", any(feature = "wyr1c4-production", feature = "wyr1c5-production"), feature = "i-capability-integration", feature = "wyr0-init0-integration")))]
+#[cfg(not(any(
+    feature = "primordial-blocking-cleanup",
+    feature = "primordial-user-exception",
+    feature = "primordial-invalid-return",
+    feature = "native-loader-smoke-integration",
+    feature = "i0-negative-malformed-elf",
+    feature = "i0-negative-malformed-startup",
+    feature = "i0-negative-capability-count",
+    feature = "i0-negative-capability-type",
+    feature = "i0-negative-capability-rights",
+    any(feature = "wyr1c4-production", feature = "wyr1c5-production"),
+    feature = "i-capability-integration",
+    feature = "wyr0-init0-integration"
+)))]
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
         Ok(deadline) => deadline,

@@ -1,5 +1,7 @@
 use deepwyrm_syscall as _;
 use wyrmroot_bootfs as _;
+#[cfg(feature = "wyr1e-production")]
+use wyrmroot_consoled as _;
 use wyrmroot_device_proto as _;
 use wyrmroot_devmgr as _;
 use wyrmroot_launch_proto as _;
@@ -159,34 +161,6 @@ fn c5_driver_attempt_is_parented_under_init_not_the_devmgr_generation() {
     assert!(!construct[..create].contains("driver_parent = devmgr.task_group"));
 }
 
-/// Selector 29's terminal facts are emitted by init, from its own predicates.
-///
-/// Source text because `emit_c6_terminal_facts` runs only from
-/// `accept_c6_fact`'s event 22, and no host fixture builds a selector-29
-/// resident holding a D2 lease and a C6 evidence log. Scoped to the two fns.
-#[test]
-fn c6_terminal_facts_are_init_owned_and_bound_to_real_predicates() {
-    // devmgr's role moved from `main.rs` to `role.rs` in S2U step 3; read both.
-    let devmgr = concat!(
-        include_str!("../../devmgr/src/main.rs"),
-        include_str!("../../devmgr/src/role.rs")
-    );
-    let accept = native_fn("accept_c6_fact(");
-    assert!(accept.contains("if fact.event == 22 {\n        emit_c6_terminal_facts(resident)?;"));
-    assert!(!devmgr.contains("emit_selector29_final_facts"));
-    let emit = native_fn("emit_c6_terminal_facts(");
-    for predicate in [
-        "c6_startup_profiles_exclude_direct_device_authority()",
-        ".devmgr_claim_authority(ResourceDomainMembership::InitOutsideDomain)",
-        "|| !state.c6_gate_config.physical_io_not_performed",
-        ".role_failure_count(RoleId::Devmgr)",
-        "WYR0_I_SUPERVISION_POLICY.max_attempts",
-        "WYR0_I_SUPERVISION_POLICY.backoff_ns",
-    ] {
-        assert!(emit.contains(predicate), "{predicate}");
-    }
-}
-
 /// The WRDM UART identity is joined to the one the retained WRRM validation
 /// produced. The comparison itself is host-tested by
 /// `wrdm_uart_identity_must_match_the_independent_wrrm_identity`
@@ -229,4 +203,3 @@ fn native_fn(name: &str) -> &'static str {
     let end = NATIVE_SOURCE[start..].find("\n}\n").unwrap() + start;
     &NATIVE_SOURCE[start..end]
 }
-

@@ -1988,7 +1988,6 @@ pub trait Wyr1BPlatform: InitPlatform {
         bytes: &[u8],
         rights: DwRights,
     ) -> Result<DwHandle, NativeError>;
-
 }
 
 /// Runs the native selected-generation activation through NORMAL or DEGRADED.
@@ -3945,9 +3944,7 @@ mod native_cleanup_tests {
     /// The resident loop's own platform for `MockNative`. Selectors 29 and 34
     /// drive their own scenario from the loop on every tick, which this fixture
     /// does not carry, so the loop tests below run in every other shape.
-    impl resident_loop::ResidentLoopPlatform for MockNative {
-
-    }
+    impl resident_loop::ResidentLoopPlatform for MockNative {}
 
     /// F3A.7g, the last step: a completed session ends permanent init's
     /// process with success, on the tick that observed it.

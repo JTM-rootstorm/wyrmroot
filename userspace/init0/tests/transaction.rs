@@ -289,7 +289,6 @@ impl Init0System for Fixture {
             Ok(())
         }
     }
-
 }
 
 struct Loader {

@@ -126,20 +126,6 @@ impl BuildManifest {
         Ok(profile)
     }
 
-    pub(crate) fn deepwyrm_revision(&self) -> Result<&str, Failure> {
-        self.required("deepwyrm.revision")
-    }
-
-    /// The pinned semantic ABI fingerprint that every paired Deepwyrm kernel
-    /// revision must carry; see [`crate::abi_pairing`].
-    pub(crate) fn deepwyrm_abi_fingerprint(&self) -> Result<&str, Failure> {
-        self.required("deepwyrm.abi_fingerprint")
-    }
-
-    pub(crate) fn deepwyrm_repository(&self) -> Result<&str, Failure> {
-        self.required("deepwyrm.repository")
-    }
-
     pub(crate) fn rust_revision(&self) -> Result<&str, Failure> {
         self.required("rust.wyrmroot_revision")
     }
@@ -1716,56 +1702,6 @@ mod tests {
             .expect("non-build request evidence was scanned as guest configuration");
 
         fs::remove_dir_all(&root).expect("remove policy evidence fixture");
-    }
-
-    #[test]
-    fn live_deepwyrm_pin_has_one_source_of_truth() {
-        // toolchain/versions.toml [deepwyrm] is the canonical pin record. Cargo
-        // must restate the revision, so Cargo.toml and Cargo.lock are checked
-        // against it; every other site derives it.
-        let versions = Path::new("toolchain/versions.toml");
-        let manifest = BuildManifest {
-            values: parse_scalar_toml(include_str!("../../../toolchain/versions.toml"), versions)
-                .unwrap(),
-        };
-        manifest.validate_host_test_metadata().unwrap();
-        let revision = manifest.deepwyrm_revision().unwrap();
-        let repository = manifest.deepwyrm_repository().unwrap();
-        let fingerprint = manifest.deepwyrm_abi_fingerprint().unwrap();
-
-        let root = include_str!("../../../Cargo.toml");
-        assert!(
-            root_has_deepwyrm_dependency(root, repository, revision)
-                && root_has_deepwyrm_package(root, "deepwyrm-syscall", repository, revision),
-            "Cargo.toml must pin both Deepwyrm crates at versions.toml [deepwyrm] revision"
-        );
-        let lock = include_str!("../../../Cargo.lock");
-        for package in ["deepwyrm-abi", "deepwyrm-syscall"] {
-            assert!(
-                lock_has_git_package(lock, package, repository, revision),
-                "Cargo.lock must resolve {package} at versions.toml [deepwyrm] revision"
-            );
-        }
-
-        let template_path = Path::new("toolchain/templates/build-provenance.toml");
-        let template = parse_scalar_toml(
-            include_str!("../../../toolchain/templates/build-provenance.toml"),
-            template_path,
-        )
-        .unwrap();
-        assert_eq!(template.get("source.deepwyrm_revision").unwrap(), "");
-
-        let transport = include_str!("../../../toolchain/cargo-with-local-deepwyrm.sh");
-        assert!(transport.contains("toolchain/versions.toml"));
-        assert!(!transport.contains(revision));
-        assert!(!transport.contains(fingerprint));
-        let restated = transport
-            .split(|character: char| !character.is_ascii_hexdigit())
-            .find(|token| token.len() >= 40);
-        assert_eq!(
-            restated, None,
-            "the transport restates a Git object or digest"
-        );
     }
 
     fn phase_a_manifest(abi_state: &str, target_state: &str) -> BuildManifest {

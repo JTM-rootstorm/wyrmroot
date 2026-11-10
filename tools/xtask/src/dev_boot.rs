@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{error::Failure, h_integration, product, tasks};
+use crate::{error::Failure, product, tasks};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DevBoot {
@@ -90,15 +90,35 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
 }
 
 fn qemu_arguments(smp: bool, product: &Path, vars: &Path, com1: &Path) -> Vec<String> {
-    let mut args = h_integration::canonical_qemu_arguments(
-        if smp { SMP_VCPUS } else { 1 },
-        MEMORY_MIB,
-        &product.join("artifacts/OVMF_CODE.fd"),
-        vars,
-        &product.join("artifacts").join(product::ESP_NAME),
-        com1,
-        None,
-    );
+    let vcpus = if smp { SMP_VCPUS } else { 1 };
+    let mut args: Vec<String> = vec![
+        "-machine".into(),
+        "q35".into(),
+        "-m".into(),
+        format!("{MEMORY_MIB}M"),
+        "-smp".into(),
+        vcpus.to_string(),
+        "-nodefaults".into(),
+        "-display".into(),
+        "none".into(),
+        "-monitor".into(),
+        "none".into(),
+        "-no-reboot".into(),
+        "-drive".into(),
+        format!(
+            "if=pflash,format=raw,readonly=on,file={}",
+            product.join("artifacts/OVMF_CODE.fd").display()
+        ),
+        "-drive".into(),
+        format!("if=pflash,format=raw,file={}", vars.display()),
+        "-drive".into(),
+        format!(
+            "if=virtio,format=raw,readonly=on,file={}",
+            product.join("artifacts").join(product::ESP_NAME).display()
+        ),
+        "-serial".into(),
+        format!("file:{}", com1.display()),
+    ];
     // The second ISA serial port is COM2, where the product runs `wyrmsh`.
     args.extend(["-serial".into(), "stdio".into()]);
     args
@@ -214,10 +234,7 @@ mod tests {
             .map(|pair| pair[1].as_str())
             .collect();
         assert_eq!(serials, ["file:/c1.log", "stdio"]);
-        assert!(
-            args.iter()
-                .any(|arg| arg.ends_with("/p/artifacts/wyr1f-normal-esp.img"))
-        );
+        assert!(args.iter().any(|arg| arg.ends_with("/p/artifacts/esp.img")));
         assert!(!args.iter().any(|arg| arg.contains("isa-debug-exit")));
     }
 

@@ -77,4 +77,3 @@ fn e8_intentional_terminal_preserves_failure_validation_and_cleanup_state() {
     let rebind = driver_branch.find("let rebind_deadline =").unwrap();
     assert!(retired < clear && clear < rebind);
 }
-

@@ -171,11 +171,7 @@ fn classify_resident_poll(
     registry_present: bool,
     driver_present: bool,
 ) -> Result<ResidentPollEvent, InitError> {
-    let item_count = 2 + usize::from(registry_present) * 2 + usize::from(driver_present) + {
-        {
-            0
-        }
-    };
+    let item_count = 2 + usize::from(registry_present) * 2 + usize::from(driver_present);
     if result.index >= item_count as u32 {
         return Err(InitError::Supervision);
     }
@@ -1636,11 +1632,7 @@ where
         Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {}
         Err(error) => return Err(InitError::Native(error)),
         Ok(result) => {
-            let event = classify_resident_poll(
-                result,
-                registry_present,
-                driver_present,
-            )?;
+            let event = classify_resident_poll(result, registry_present, driver_present)?;
             let size = system
                 .query_memory_object_size(resident.authority.bootfs)
                 .map_err(InitError::Native)?;
@@ -1730,9 +1722,7 @@ where
                                         start_wyr1e_or_recover_registry(
                                             resident, system, loader, waits, bootfs,
                                         )?;
-                                        {
-                                            Ok(())
-                                        }
+                                        Ok(())
                                     }
                                 }
                                 Ok(DevmgrControlInput::DriverRetired { bytes }) => {
@@ -2320,6 +2310,7 @@ pub(crate) const E8_REGISTRY_FIXTURE_DEVMGR_CONTROL: DwHandle = DwHandle(0xE8B5_
 pub(crate) const E8_REGISTRY_FIXTURE_DRIVER_PROCESS: DwHandle = DwHandle(0xE8B5_0030);
 
 #[cfg(all(test, feature = "wyr1e-production"))]
+#[allow(clippy::too_many_arguments)]
 fn install_e8_registry_fixture_role(
     controller: &mut SystemInit,
     role: RoleId,

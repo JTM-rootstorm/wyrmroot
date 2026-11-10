@@ -593,8 +593,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
             }
             #[cfg(feature = "wyr1c5-production")]
             if action == ControllerAction::InitialPublicationBound
-                && (true
-                    || resident.status().supervisor_generation.0 == 1)
+                && (true || resident.status().supervisor_generation.0 == 1)
             {
                 let parent = device_resource.ok_or(failure(53))?;
                 let launched = launch_driver_with_bundle(
@@ -1068,8 +1067,7 @@ fn service_connector_offer<P: DevmgrPlatform>(
     driver_control: DwHandle,
     resident: &crate::ResidentController,
     broker: &mut ConnectorBroker,
-    #[cfg(feature = "wyr1e-production")]
-    witness: &mut Option<ProductionClientWitness>,
+    #[cfg(feature = "wyr1e-production")] witness: &mut Option<ProductionClientWitness>,
 ) -> Result<(), u32> {
     let mut offer_bytes = [0u8; 256];
     let mut offer_handles = [DwReceivedHandleInfoV1::default(); 1];
@@ -2370,10 +2368,9 @@ fn send_bootstrap_channel<P: DevmgrPlatform>(
     transfers: &[DwHandleTransferV1],
     stage: u32,
 ) -> Result<(), u32> {
-    return platform
+    platform
         .send_channel(bootstrap, bytes, transfers)
-        .map_err(|_| failure(stage));
-
+        .map_err(|_| failure(stage))
 }
 
 fn validate_fresh<P: DevmgrPlatform>(

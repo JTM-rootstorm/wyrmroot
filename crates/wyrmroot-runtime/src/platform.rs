@@ -285,8 +285,7 @@ mod sealed {
 /// depends on features, the trait is sealed: only [`NativePlatform`] and the
 /// recording fake implement it, so enabling a feature can never break an
 /// implementation elsewhere.
-pub trait EvidencePlatform: sealed::Sealed {
-}
+pub trait EvidencePlatform: sealed::Sealed {}
 
 /// Any Channel, handle, and wait platform is a [`StreamSystem`] with an
 /// infinite endpoint wait.
@@ -591,6 +590,4 @@ impl DevicePlatform for NativePlatform {
     }
 }
 
-impl EvidencePlatform for NativePlatform {
-
-}
+impl EvidencePlatform for NativePlatform {}

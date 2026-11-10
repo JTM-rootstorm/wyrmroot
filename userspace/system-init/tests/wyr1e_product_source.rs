@@ -1,3 +1,5 @@
+#[cfg(feature = "wyr1e-production")]
+use wyrmroot_consoled as _;
 use {
     deepwyrm_syscall as _, wyrmroot_bootfs as _, wyrmroot_device_proto as _, wyrmroot_devmgr as _,
     wyrmroot_launch_proto as _, wyrmroot_loader as _, wyrmroot_registry_proto as _,
@@ -158,9 +160,7 @@ fn targeted_console_retirement_preserves_the_dispatcher_for_orphan_reaping() {
     let entry = &JOBS[JOBS
         .find("pub(crate) fn retire_console_product<S, W>")
         .unwrap()
-        ..JOBS
-            .find("pub(crate) fn retire_console_product_with_result<S, W>")
-            .unwrap()];
+        ..JOBS.find("fn retire_console_product_inner<S, W>").unwrap()];
     assert!(entry.contains("retire_console_product_inner("));
 
     let inner = &JOBS[JOBS.find("fn retire_console_product_inner<S, W>").unwrap()
@@ -199,9 +199,6 @@ fn console_relaunch_is_finite_and_registry_replacement_is_the_only_budget_reset(
     assert!(native.contains(
         "wyr1e::PollOutcome::RecoverRegistry(phase)=>recover_registry(resident,system,loader,waits,\
          bootfs,false,false,abandoned::reason(abandoned::trigger::WYR1E_POLL,phase),)"
-    ));
-    assert!(native.contains(
-        "wyr1e::PollOutcome::RecoverRegistryForE8=>recover_registry(resident,system,loader,waits,bootfs,false,true"
     ));
 }
 

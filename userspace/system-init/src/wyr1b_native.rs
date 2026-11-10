@@ -2498,33 +2498,20 @@ where
     .map_err(|_| InitError::Accounting)?;
     if let Err(error) = system.send_channel(session, &response[..size]) {
         jobs.jobs.restore_launch_channel(release);
-        let cleanup_failed = force_cleanup_job_before(
-            system,
-            waits,
-            jobs,
-            loaded,
-            None,
-        )
-        .is_err();
+        let cleanup_failed = force_cleanup_job_before(system, waits, jobs, loaded, None).is_err();
         return Err(if cleanup_failed {
             InitError::Cleanup
         } else {
             InitError::Native(error)
         });
     }
-    Ok((
-        release,
-        SentLaunchAccepted {
-        },
-    ))
+    Ok((release, SentLaunchAccepted {}))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SentLaunchAccepted {
-}
+struct SentLaunchAccepted {}
 
 impl SentLaunchAccepted {
-
     fn as_bytes(&self) -> &[u8] {
         &[]
     }
@@ -2650,12 +2637,7 @@ where
         received,
         handle_count,
     )?;
-    finish_constructed_launch(
-        system,
-        waits,
-        jobs,
-        constructed,
-    )
+    finish_constructed_launch(system, waits, jobs, constructed)
 }
 
 /// Validates, reserves, loads and arms the READY deadline, and stops there.
@@ -2838,15 +2820,8 @@ where
         .jobs
         .release_launch_channel(loaded.job_id, loaded.loaded.launch_channel.0)
         .map_err(InitError::Wyr1BModel)?;
-    let (release, sent_response) = publish_launch_accepted(
-        system,
-        waits,
-        jobs,
-        session,
-        reservation,
-        loaded,
-        release,
-    )?;
+    let (release, sent_response) =
+        publish_launch_accepted(system, waits, jobs, session, reservation, loaded, release)?;
     if system.close_handle(loaded.loaded.launch_channel).is_err() {
         jobs.jobs.restore_launch_channel(release);
         jobs.jobs
@@ -3286,12 +3261,7 @@ where
             };
         }
     };
-    if let Err(error) = park_constructed_launch(
-        jobs,
-        grant,
-        scope,
-        constructed,
-    ) {
+    if let Err(error) = park_constructed_launch(jobs, grant, scope, constructed) {
         let cleanup_failed =
             rollback_prepared_job(system, waits, jobs, constructed.prepared).is_err();
         send_observed_job_error(
@@ -3401,14 +3371,7 @@ fn send_observed_job_error<S: Wyr1BPlatform>(
     system
         .send_channel(session, &response[..size])
         .map_err(InitError::Native)?;
-    observe_e7_response(
-        system,
-        scope,
-        state,
-        request,
-        &response[..size],
-        handles,
-    )
+    observe_e7_response(system, scope, state, request, &response[..size], handles)
 }
 
 fn send_shell_v1_error<S: InitPlatform>(
@@ -3887,12 +3850,7 @@ where
             | jobs.jobs.abort_launch(ticket).is_err();
         if failed { InitError::Cleanup } else { original }
     };
-    if let Err(error) = preflight_wyrmsh_registry(
-        system,
-        registry_client,
-        registry_grant,
-        None,
-    ) {
+    if let Err(error) = preflight_wyrmsh_registry(system, registry_client, registry_grant, None) {
         return Err(fail_after_install(system, jobs, context, error, true));
     }
     let shell_grant = match context.topology.issue(
@@ -4015,9 +3973,7 @@ where
         });
     }
     let ready_deadline = match report_deadline(system) {
-        Ok(deadline) => {
-            deadline
-        }
+        Ok(deadline) => deadline,
         Err(error) => {
             let failed = cleanup_shell_before_publication(system, waits, jobs, loaded_job).is_err();
             context.state.poison(registry_grant.registry_generation);
@@ -4729,35 +4685,22 @@ where
         reservation,
     };
     let outcome = match disposition {
-        ParkedLaunch::Signalled => finish_constructed_launch(
-            system,
-            waits,
-            jobs,
-            constructed,
-        ),
+        ParkedLaunch::Signalled => finish_constructed_launch(system, waits, jobs, constructed),
         // Out of budget, and nothing to observe. This is the disposition the
         // one-frame path reached when its `wait_many` hit the deadline, and the
         // rollback is the same one: the child is not published, and whether the
         // teardown itself failed is what decides between `Cleanup` and
         // `Supervision`.
-        ParkedLaunch::Waiting | ParkedLaunch::Expired => {
-            Err(
-                if rollback_prepared_job(system, waits, jobs, constructed.prepared).is_err() {
-                    InitError::Cleanup
-                } else {
-                    InitError::Supervision
-                },
-            )
-        }
+        ParkedLaunch::Waiting | ParkedLaunch::Expired => Err(
+            if rollback_prepared_job(system, waits, jobs, constructed.prepared).is_err() {
+                InitError::Cleanup
+            } else {
+                InitError::Supervision
+            },
+        ),
     };
     let published = match outcome {
-        Ok((_, response)) => {
-            let recorded = {
-                let _ = &response;
-                Ok(())
-            };
-            recorded
-        }
+        Ok(_) => Ok(()),
         Err(error) => {
             // Best-effort, and deliberately not `?`. The reply is owed to a
             // session that may already be gone -- peer close, or an emergency
@@ -4766,12 +4709,8 @@ where
             // best-effort is emptying the slot below: a transaction left open
             // here would be handed back by `awaiting_ready_from` on every
             // subsequent tick, for ever, holding a child nothing else can name.
-            let reply = send_deferred_launch_error(
-                system,
-                session,
-                reservation,
-                launch_error_code(&error),
-            );
+            let reply =
+                send_deferred_launch_error(system, session, reservation, launch_error_code(&error));
             Err(match reply {
                 Ok(()) => error,
                 // A failed reply does not relabel the launch's own failure, for
@@ -5212,14 +5151,7 @@ where
         });
     }
     let request = &[];
-    observe_e7_response(
-        system,
-        scope,
-        evidence,
-        request,
-        &response[..size],
-        &[],
-    )?;
+    observe_e7_response(system, scope, evidence, request, &response[..size], &[])?;
     jobs.finish_pending_wait(pending)
         .map_err(InitError::Wyr1BModel)
 }
@@ -6686,7 +6618,6 @@ mod tests {
         ) -> Result<DwHandle, NativeError> {
             Err(FAILURE)
         }
-
     }
 
     struct ShellWaits {
