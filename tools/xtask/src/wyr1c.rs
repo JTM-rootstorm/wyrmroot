@@ -4047,12 +4047,49 @@ fn validate_wyrmsh_stack_report(
     let shell = artifacts
         .get("wyrmsh")
         .ok_or_else(|| Failure::task(format!("{phase} lacks wyrmsh")))?;
-    if wyrmsh_stack_report(repository, shell)? != expected_stack_report {
+    let reproduced = wyrmsh_stack_report(repository, shell)?;
+    if !stack_reports_match_apart_from_analyzer(&reproduced, expected_stack_report) {
         return Err(Failure::task(format!(
             "{phase} stack proof was not reproduced byte-for-byte"
         )));
     }
     Ok(())
+}
+
+/// Compares two Wyrmsh stack reports byte for byte, except for the one
+/// `"analyzer_sha256"` value: the hash of `tools/wyrmsh-native-stack.py`
+/// itself. An accepted product's report keeps the analyzer hash of the
+/// revision that froze it, and an edit to the script that leaves the
+/// analysis unchanged (e5497c9 removed its LLVM tool pins) must not orphan
+/// it. Everything else, including the recorded LLVM tool hashes, must match.
+fn stack_reports_match_apart_from_analyzer(reproduced: &[u8], expected: &[u8]) -> bool {
+    fn without_analyzer(report: &[u8]) -> Option<Vec<u8>> {
+        const KEY: &[u8] = b"\"analyzer_sha256\": \"";
+        let mut found = report
+            .windows(KEY.len())
+            .enumerate()
+            .filter(|(_, w)| *w == KEY);
+        let (start, _) = found.next()?;
+        if found.next().is_some() {
+            return None;
+        }
+        let value = start + KEY.len();
+        let digest = report.get(value..value + 64)?;
+        if !digest
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+            || report.get(value + 64) != Some(&b'"')
+        {
+            return None;
+        }
+        let mut stripped = report[..value].to_vec();
+        stripped.extend_from_slice(&report[value + 64..]);
+        Some(stripped)
+    }
+    match (without_analyzer(reproduced), without_analyzer(expected)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Runs the native stack proof over one shell ELF and returns its report.
@@ -5808,6 +5845,40 @@ mod tests {
 
     /// F1A.2. `system-init` stays on the production feature.
     ///
+    #[test]
+    fn a_stack_report_may_differ_from_the_accepted_one_only_in_the_analyzer_hash() {
+        let report = |analyzer: &str, depth: u32| {
+            format!(
+                "{{\n  \"analysis\": {{\"maximum_stack_bytes\": {depth}}},\n  \"analyzer_sha256\": \"{analyzer}\",\n  \"tools\": [{{\"sha256\": \"{}\"}}]\n}}\n",
+                "c".repeat(64)
+            )
+            .into_bytes()
+        };
+        let accepted = report(&"a".repeat(64), 69496);
+        assert!(stack_reports_match_apart_from_analyzer(
+            &report(&"b".repeat(64), 69496),
+            &accepted
+        ));
+        // Any other difference still fails.
+        assert!(!stack_reports_match_apart_from_analyzer(
+            &report(&"b".repeat(64), 69504),
+            &accepted
+        ));
+        let mut tool_changed = report(&"a".repeat(64), 69496);
+        let last_c = tool_changed.iter().rposition(|b| *b == b'c').unwrap();
+        tool_changed[last_c] = b'd';
+        assert!(!stack_reports_match_apart_from_analyzer(
+            &tool_changed,
+            &accepted
+        ));
+        // A report without exactly one well-formed analyzer hash fails.
+        let missing = String::from_utf8(accepted.clone())
+            .unwrap()
+            .replace("analyzer_sha256", "analyzer_digest")
+            .into_bytes();
+        assert!(!stack_reports_match_apart_from_analyzer(&missing, &missing));
+    }
+
     /// `wyr1e8-selector33` pulls `dep:wyrmroot-wyr1e-test-actors` and
     /// `wyrmroot-runtime/wyr1e8-test-evidence`, so selecting it here would
     /// compile the test-actor crate into the permanent supervisor.
