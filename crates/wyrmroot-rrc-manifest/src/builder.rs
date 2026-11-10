@@ -6,8 +6,8 @@ use alloc::vec::Vec;
 
 use crate::{
     Activation, DependencyKind, EDGE_RECORD_SIZE, HEADER_SIZE, MAX_EDGES, MAX_ROLES,
-    MAX_STRING_BYTES, MAX_TOTAL_BYTES, Manifest, ParseError, ProductError, ROLE_RECORD_SIZE,
-    RoleId, StartupProfile, Wyr1aProductProfile, Wyr1eProductProfile,
+    MAX_STRING_BYTES, MAX_TOTAL_BYTES, Manifest, ParseError, ROLE_RECORD_SIZE, RoleId,
+    StartupProfile,
 };
 
 /// Caller-provided role declaration. Residency and restart policy are fixed by
@@ -72,9 +72,7 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// Encodes structurally valid WRRM v1 bytes without claiming that they
-    /// satisfy either exact WYR1 product profile or retained closure.
-    /// Production image construction must use [`Self::build_wyr1a_product`].
+    /// Encodes structurally valid WRRM v1 bytes.
     pub fn build_structural(&self) -> Result<Vec<u8>, BuildError> {
         let mut roles = Vec::new();
         roles
@@ -205,62 +203,6 @@ impl<'a> Builder<'a> {
             .map_err(BuildError::InvalidManifest)?;
         Ok(output)
     }
-
-    /// Encodes only after the exact initial product graph and canonical
-    /// retained-material closure validate successfully.
-    pub fn build_wyr1a_product(
-        &self,
-        profile: Wyr1aProductProfile<'_>,
-    ) -> Result<Vec<u8>, BuildError> {
-        let output = self.build_structural()?;
-        let manifest = Manifest::parse_structural(&output, &self.boot_generation_identity)
-            .map_err(BuildError::InvalidManifest)?;
-        manifest
-            .validate_wyr1a_product(profile)
-            .map_err(BuildError::InvalidProduct)?;
-        Ok(output)
-    }
-
-    pub fn build_wyr1b_product(
-        &self,
-        profile: crate::Wyr1bProductProfile<'_>,
-    ) -> Result<Vec<u8>, BuildError> {
-        let output = self.build_structural()?;
-        let manifest = Manifest::parse_structural(&output, &self.boot_generation_identity)
-            .map_err(BuildError::InvalidManifest)?;
-        manifest
-            .validate_wyr1b_product(profile)
-            .map_err(BuildError::InvalidProduct)?;
-        Ok(output)
-    }
-
-    pub fn build_wyr1c_product(
-        &self,
-        profile: crate::Wyr1cProductProfile<'_>,
-    ) -> Result<Vec<u8>, BuildError> {
-        let output = self.build_structural()?;
-        let manifest = Manifest::parse_structural(&output, &self.boot_generation_identity)
-            .map_err(BuildError::InvalidManifest)?;
-        manifest
-            .validate_wyr1c_product(profile)
-            .map_err(BuildError::InvalidProduct)?;
-        Ok(output)
-    }
-
-    /// Encodes only after the exact WYR1-E selected-product graph, production
-    /// shell identity, and retained-material closure validate successfully.
-    pub fn build_wyr1e_product(
-        &self,
-        profile: Wyr1eProductProfile<'_>,
-    ) -> Result<Vec<u8>, BuildError> {
-        let output = self.build_structural()?;
-        let manifest = Manifest::parse_structural(&output, &self.boot_generation_identity)
-            .map_err(BuildError::InvalidManifest)?;
-        manifest
-            .validate_wyr1e_product(profile)
-            .map_err(BuildError::InvalidProduct)?;
-        Ok(output)
-    }
 }
 
 /// Why deterministic host construction failed.
@@ -271,7 +213,6 @@ pub enum BuildError {
     ManifestTooLarge,
     AllocationFailure,
     InvalidManifest(ParseError),
-    InvalidProduct(ProductError),
 }
 
 fn edge_key<'a>(

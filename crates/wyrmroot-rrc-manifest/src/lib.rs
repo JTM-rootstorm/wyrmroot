@@ -10,16 +10,9 @@
 #[cfg(feature = "builder")]
 pub mod builder;
 mod format;
-mod product;
 
 pub use format::{
     Activation, DependencyEdge, DependencyEdges, DependencyKind, EDGE_RECORD_SIZE, HEADER_SIZE,
     MANIFEST_PATH, MAX_EDGES, MAX_JUSTIFICATION_BYTES, MAX_PATH_BYTES, MAX_ROLES, MAX_STRING_BYTES,
     MAX_TOTAL_BYTES, Manifest, ParseError, ROLE_RECORD_SIZE, Role, RoleId, Roles, StartupProfile,
-};
-pub use product::{
-    ExpectedClosureEntry, ExpectedClosureUse, ExpectedObservedIdentity, ImmutableDependencyKind,
-    MaterialResidence, ObservedRetainedMaterial, ProductError, ProductReceiptIdentities,
-    R1ProductProfile, Wyr1aProductProfile, Wyr1bProductProfile, Wyr1cProductProfile,
-    Wyr1eProductProfile,
 };

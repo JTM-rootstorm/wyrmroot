@@ -243,11 +243,6 @@ impl<'a> Manifest<'a> {
         Ok(manifest)
     }
 
-    /// Exact selected-boot-generation identity encoded by this manifest.
-    pub fn boot_generation_identity(self) -> &'a [u8; 32] {
-        array_32(self.bytes, 48)
-    }
-
     /// Number of validated role records.
     pub const fn role_count(self) -> usize {
         self.role_count
