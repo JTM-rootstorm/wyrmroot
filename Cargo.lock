@@ -403,7 +403,11 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-channel-model",
  "wyrmroot-fs-proto",
+ "wyrmroot-loader",
+ "wyrmroot-registry-proto",
  "wyrmroot-runtime",
+ "wyrmroot-service",
+ "wyrmroot-service-proto",
 ]
 
 [[package]]

@@ -21,21 +21,23 @@
 //!   connection, node or mount.
 //! - Every table is fixed-size; a full table answers NO_RESOURCES.
 //!
-//! The service's launch, registry publication and admin wiring come with
-//! its first live use (storage W6).
+//! As a service role ([`role`], storage W6) init stages vfsd its mounts as
+//! labelled Channels and a publication for `system.vfs`; it has no
+//! administrative connection yet, so its mounts are the boot generation's.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
-use deepwyrm_syscall::{
-    DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DwRights,
-};
-
 pub mod mounts;
+pub mod role;
 pub mod server;
+
+pub use wyrmroot_service::{OPEN_CHANNEL_RIGHTS, ROOT_CHANNEL_RIGHTS};
 
 #[cfg(test)]
 extern crate std;
+#[cfg(any(test, feature = "native-vfsd"))]
+use wyrmroot_loader as _;
 
 /// The most WRNS client connections served at once.
 pub const MAX_CLIENTS: usize = 8;
@@ -43,16 +45,6 @@ pub const MAX_CLIENTS: usize = 8;
 pub const MAX_NODES: usize = 8;
 /// The most caller wait items [`server::Vfs::step`] adds to its own.
 pub const MAX_EXTRA_WAITS: usize = 4;
-
-/// The rights a node Channel's server end carries in every OPEN, WRNS or
-/// WRFS: a Channel endpoint's rights plus TRANSFER, so that whoever receives
-/// it can pass it on unchanged. A forwarder requests exactly these again.
-pub const OPEN_CHANNEL_RIGHTS: DwRights = DwRights(
-    DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_TRANSFER.0,
-);
-/// The rights of a filesystem root Channel that MOUNT carries; vfsd keeps it.
-pub const ROOT_CHANNEL_RIGHTS: DwRights =
-    DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0);
 
 #[cfg(test)]
 mod tests;

@@ -9,13 +9,29 @@ description = "VFS namespace core: mount table, path opens and synthetic directo
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "vfsd"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-vfsd"]
+
+[features]
+default = []
+native-vfsd = ["dep:wyrmroot-loader"]
+
 [dependencies]
 deepwyrm-syscall.workspace = true
 wyrmroot-fs-proto = { path = "../../crates/wyrmroot-fs-proto" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+wyrmroot-service = { path = "../../crates/wyrmroot-service" }
+wyrmroot-service-proto = { path = "../../crates/wyrmroot-service-proto" }
 
 [dev-dependencies]
 wyrmroot-channel-model = { path = "../../crates/wyrmroot-channel-model" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
 
 [lints.rust]
 unsafe_code = "forbid"

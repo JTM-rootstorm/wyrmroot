@@ -637,3 +637,175 @@ fn a_wrong_type_handle_in_open_is_closed_with_the_connection() {
     // vfsd's ends of the client and the received event are both gone.
     assert_eq!(h.world.live_handles(), before - 2);
 }
+
+mod role {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::vec;
+    use std::vec::Vec;
+
+    use deepwyrm_syscall::DwHandle;
+    use wyrmroot_channel_model::World;
+    use wyrmroot_channel_model::fakes::{FakeRegistry, launch, stage};
+    use wyrmroot_fs_proto::namespace;
+    use wyrmroot_fs_proto::node::{self, ACCESS_READ, Attr, Body, Kind};
+    use wyrmroot_fs_proto::{OPEN_READ, OPEN_WRITE, Status};
+    use wyrmroot_registry_proto::{Header, Lookup, MessageType, ProtocolVersion, encode_lookup};
+    use wyrmroot_runtime::HandlePlatform;
+    use wyrmroot_service_proto::CHANNEL_READ_ONLY;
+    use wyrmroot_service_proto::roles::{SLOT_MOUNT, SYSTEM_VFS, VFSD_ROLE_ID};
+
+    use crate::role::{FAILURE_BASE, vfsd_main};
+
+    #[derive(Default)]
+    struct Seen {
+        forwarded: Vec<(u32, Vec<u8>)>,
+        opened: Vec<Status>,
+    }
+
+    fn ns(world: &mut World, channel: DwHandle, body: namespace::Body<'_>, handle: DwHandle) {
+        let mut out = [0u8; namespace::MAX_BYTES];
+        let size = namespace::encode(
+            &namespace::Message {
+                transaction_id: 4,
+                body,
+            },
+            &mut out,
+        )
+        .unwrap();
+        world.send(channel, &out[..size], &[handle]);
+    }
+
+    #[test]
+    fn vfsd_mounts_what_init_stages_publishes_and_forwards_opens() {
+        let mut world = World::new();
+        let registry = FakeRegistry::install(&mut world);
+        let launched = launch(&mut world, VFSD_ROLE_ID, 1);
+        let publication = registry.publication(&mut world, SYSTEM_VFS);
+        let (fs_root, mount_end) = world.pair();
+        stage(
+            &mut world,
+            &launched,
+            Some(publication),
+            None,
+            &[(SLOT_MOUNT, CHANNEL_READ_ONLY, b"/boot", mount_end)],
+        );
+        let seen = Rc::new(RefCell::new(Seen::default()));
+
+        // The filesystem behind /boot answers every forwarded open.
+        let fs_seen = seen.clone();
+        world.add_peer(move |world| {
+            if !world.readable(fs_root) {
+                return false;
+            }
+            let (bytes, handles) = world.receive(fs_root);
+            let message = node::parse(&bytes, handles.len()).unwrap();
+            let Body::Open { flags, path } = message.body else {
+                panic!("vfsd sends only OPEN on a root");
+            };
+            fs_seen.borrow_mut().forwarded.push((flags, path.to_vec()));
+            let mut out = [0u8; node::MAX_BYTES];
+            let size = node::encode(
+                &node::Message {
+                    transaction_id: message.transaction_id,
+                    body: Body::OnOpen {
+                        status: Status::Ok,
+                        attr: Some(Attr {
+                            kind: Kind::File,
+                            access: ACCESS_READ,
+                            size: 1,
+                            id: 2,
+                        }),
+                    },
+                },
+                &mut out,
+            )
+            .unwrap();
+            world.send(handles[0].handle, &out[..size], &[]);
+            true
+        });
+
+        // A client: connect, open /boot/x, try a write, then retire vfsd.
+        let (endpoint, _) = registry.client(&mut world);
+        let control = launched.control;
+        let client_seen = seen.clone();
+        let mut step = 0;
+        let mut direct = DwHandle(0);
+        let mut nodes = vec![];
+        world.add_peer(move |world| {
+            let mut seen = client_seen.borrow_mut();
+            match step {
+                0 if registry.state.borrow().published(SYSTEM_VFS.name) => {
+                    let (ours, theirs) = world.pair();
+                    direct = ours;
+                    let mut out = [0u8; 256];
+                    let size = encode_lookup(
+                        Header {
+                            message_type: MessageType::LookupConnect,
+                            registry_generation: 3,
+                            endpoint_id: 1,
+                            endpoint_generation: 1,
+                            transaction_id: 1,
+                        },
+                        Lookup {
+                            protocol_id: SYSTEM_VFS.protocol_id,
+                            version: ProtocolVersion { major: 1, minor: 0 },
+                            service_name: SYSTEM_VFS.name,
+                        },
+                        &mut out,
+                    )
+                    .unwrap();
+                    world.send(endpoint, &out[..size], &[theirs]);
+                }
+                1 if world.readable(endpoint) => {
+                    world.receive(endpoint);
+                    for (flags, path) in [
+                        (OPEN_READ, &b"/boot/x"[..]),
+                        (OPEN_READ | OPEN_WRITE, b"/boot/x"),
+                    ] {
+                        let (node, server) = world.pair();
+                        nodes.push(node);
+                        ns(world, direct, namespace::Body::Open { flags, path }, server);
+                    }
+                }
+                2 if nodes.iter().all(|&node| world.readable(node)) => {
+                    for &node in &nodes {
+                        let (bytes, _) = world.receive(node);
+                        let Body::OnOpen { status, .. } = node::parse(&bytes, 0).unwrap().body
+                        else {
+                            panic!()
+                        };
+                        seen.opened.push(status);
+                    }
+                    let _ = world.close_handle(control);
+                }
+                _ => return false,
+            }
+            step += 1;
+            true
+        });
+
+        assert_eq!(vfsd_main(&mut world, launched.bootstrap), 0);
+        let seen = seen.borrow();
+        assert_eq!(seen.forwarded, [(OPEN_READ, b"x".to_vec())]);
+        assert_eq!(seen.opened, [Status::Ok, Status::ReadOnly]);
+    }
+
+    #[test]
+    fn a_mount_label_that_is_not_an_absolute_path_is_refused() {
+        let mut world = World::new();
+        let registry = FakeRegistry::install(&mut world);
+        let launched = launch(&mut world, VFSD_ROLE_ID, 1);
+        let publication = registry.publication(&mut world, SYSTEM_VFS);
+        let (_fs_root, mount_end) = world.pair();
+        stage(
+            &mut world,
+            &launched,
+            Some(publication),
+            None,
+            &[(SLOT_MOUNT, 0, b"boot", mount_end)],
+        );
+        assert_eq!(vfsd_main(&mut world, launched.bootstrap), FAILURE_BASE | 17);
+        assert!(!registry.state.borrow().published(SYSTEM_VFS.name));
+    }
+}

@@ -73,6 +73,13 @@ impl Vfs {
         &self.mounts
     }
 
+    /// Mounts the filesystem root `root` at the checked absolute `path`;
+    /// on refusal the caller still owns `root`.
+    pub fn mount(&mut self, path: &[u8], root: DwHandle, read_only: bool) -> Result<(), Status> {
+        wyrmroot_fs_proto::check_absolute(path).map_err(|_| Status::InvalidPath)?;
+        self.mounts.add(path, root, read_only).map(|_| ())
+    }
+
     /// Adds one WRNS client connection, a Channel the caller admitted. With
     /// every slot taken the Channel is closed and `false` returned.
     pub fn accept_client<P: VfsPlatform>(&mut self, platform: &mut P, channel: DwHandle) -> bool {
