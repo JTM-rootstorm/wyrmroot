@@ -12,6 +12,7 @@
 //! [`World::memory`].
 
 pub mod fakes;
+pub mod fat_image;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};

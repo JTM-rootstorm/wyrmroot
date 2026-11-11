@@ -1,0 +1,40 @@
+[package]
+name = "wyrmroot-fat32d"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Read-only FAT32 filesystem service over WRBD, serving WRFS (storage W6)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fat32d"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-fat32d"]
+
+[features]
+default = []
+native-fat32d = ["dep:wyrmroot-loader"]
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-block-proto = { path = "../../crates/wyrmroot-block-proto" }
+wyrmroot-fat = { path = "../../crates/wyrmroot-fat" }
+wyrmroot-fs-proto = { path = "../../crates/wyrmroot-fs-proto" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+wyrmroot-service = { path = "../../crates/wyrmroot-service" }
+wyrmroot-service-proto = { path = "../../crates/wyrmroot-service-proto" }
+
+[dev-dependencies]
+wyrmroot-channel-model = { path = "../../crates/wyrmroot-channel-model" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("wyrmroot"))'] }

@@ -266,6 +266,21 @@ name = "wyrmroot-fat"
 version = "0.0.0"
 
 [[package]]
+name = "wyrmroot-fat32d"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-block-proto",
+ "wyrmroot-channel-model",
+ "wyrmroot-fat",
+ "wyrmroot-fs-proto",
+ "wyrmroot-loader",
+ "wyrmroot-runtime",
+ "wyrmroot-service",
+ "wyrmroot-service-proto",
+]
+
+[[package]]
 name = "wyrmroot-fs-proto"
 version = "0.0.0"
 

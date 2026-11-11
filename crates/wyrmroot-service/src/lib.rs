@@ -56,6 +56,12 @@ fn lookup(service: &ServiceName) -> Lookup<'static> {
 /// The rights a lookup's Channel end carries to the registry, which moves
 /// it on once more to the publisher with [`CHILD_CHANNEL_RIGHTS`].
 pub const CONNECT_RIGHTS: DwRights = DwRights(CHILD_CHANNEL_RIGHTS.0 | DW_RIGHT_TRANSFER.0);
+/// The rights a node Channel's server end carries in every WRFS or WRNS
+/// OPEN: a Channel endpoint's rights plus TRANSFER, so whoever receives it
+/// can pass it on unchanged (vfsd forwards it to a filesystem).
+pub const OPEN_CHANNEL_RIGHTS: DwRights = CONNECT_RIGHTS;
+/// The rights of a filesystem root Channel vfsd keeps for a mount.
+pub const ROOT_CHANNEL_RIGHTS: DwRights = CHILD_CHANNEL_RIGHTS;
 const READABLE_OR_CLOSED: DwSignals = DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0);
 const REGISTRY_MESSAGE_BYTES: usize = 512;
 
