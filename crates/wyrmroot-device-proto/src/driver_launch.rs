@@ -10,10 +10,22 @@ use crate::{
         AttemptGeneration, EndpointGeneration, EndpointId, LaunchSessionGeneration,
         SupervisorGeneration,
     },
-    manifest::{ContentIdentity, RoleId, UART16550D_PATH},
+    manifest::{BOOT_DISK_ROLE_ID, COM2_ROLE_ID, ContentIdentity, RoleId},
 };
 
 pub const DEVICE_DRIVER_PATH: &str = "/system/uart16550d";
+/// The boot-disk driver (root `STORAGE_PLAN.md` W2).
+pub const BLOCK_DRIVER_PATH: &str = "/system/virtio-blkd";
+
+/// The one driver each device role may launch. Init looks the executable up
+/// through the role's WRDM record; this is its display path.
+pub const fn driver_path_for_role(role_id: RoleId) -> Option<&'static str> {
+    match role_id {
+        COM2_ROLE_ID => Some(DEVICE_DRIVER_PATH),
+        BOOT_DISK_ROLE_ID => Some(BLOCK_DRIVER_PATH),
+        _ => None,
+    }
+}
 pub const LAUNCH_REQUEST_BYTES: usize = 128;
 pub const LAUNCH_REQUEST_HANDLE_COUNT: u32 = 1;
 pub const LAUNCH_RESPONSE_BYTES: usize = 80;
@@ -393,7 +405,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<DriverLaunchRequest, DriverLaunchEr
             generation: EndpointGeneration(get(64)),
         },
         transaction_id: get(72),
-        driver_path: DEVICE_DRIVER_PATH,
+        driver_path: driver_path_for_role(RoleId(get(32))).ok_or(DriverLaunchError::WrongPath)?,
         actor_identity: ContentIdentity(identity),
         child_is_channel: true,
         child_rights: DirectControlRights::ExactReduced,
@@ -424,7 +436,7 @@ impl DriverLaunch {
         {
             return Err(DriverLaunchError::ZeroIdentity);
         }
-        if request.driver_path != DEVICE_DRIVER_PATH || UART16550D_PATH != b"system/uart16550d" {
+        if Some(request.driver_path) != driver_path_for_role(request.role_id) {
             return Err(DriverLaunchError::WrongPath);
         }
         if !request.child_is_channel {
@@ -553,7 +565,7 @@ mod tests {
                 generation: EndpointGeneration(6),
             },
             transaction_id: 7,
-            driver_path: DEVICE_DRIVER_PATH,
+            driver_path: BLOCK_DRIVER_PATH,
             actor_identity: ContentIdentity([8; 32]),
             child_is_channel: true,
             child_rights: DirectControlRights::ExactReduced,
@@ -660,6 +672,43 @@ mod tests {
         assert_eq!(parsed.endpoint, request.endpoint);
         bytes[20] = 0;
         assert_eq!(parse_request(&bytes), Err(DriverLaunchError::WrongMessage));
+    }
+    #[test]
+    fn each_role_launches_only_its_own_driver() {
+        for (role, path) in [
+            (COM2_ROLE_ID, DEVICE_DRIVER_PATH),
+            (BOOT_DISK_ROLE_ID, BLOCK_DRIVER_PATH),
+        ] {
+            let request = DriverLaunchRequest {
+                role_id: role,
+                driver_path: path,
+                ..request()
+            };
+            let mut bytes = [0; LAUNCH_REQUEST_BYTES];
+            encode_request(request, &mut bytes).unwrap();
+            assert_eq!(parse_request(&bytes), Ok(request));
+        }
+        let swapped = DriverLaunchRequest {
+            role_id: COM2_ROLE_ID,
+            driver_path: BLOCK_DRIVER_PATH,
+            ..request()
+        };
+        assert_eq!(
+            DriverLaunch::new(swapped),
+            Err(DriverLaunchError::WrongPath)
+        );
+        let unknown = DriverLaunchRequest {
+            role_id: RoleId(3),
+            ..request()
+        };
+        assert_eq!(
+            DriverLaunch::new(unknown),
+            Err(DriverLaunchError::WrongPath)
+        );
+        let mut bytes = [0; LAUNCH_REQUEST_BYTES];
+        encode_request(request(), &mut bytes).unwrap();
+        bytes[32..40].copy_from_slice(&3u64.to_le_bytes());
+        assert_eq!(parse_request(&bytes), Err(DriverLaunchError::WrongPath));
     }
     #[test]
     fn construction_ack_is_not_direct_ready_and_is_correlation_exact() {

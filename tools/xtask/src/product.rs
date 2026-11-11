@@ -42,7 +42,7 @@ use wyrmroot_bootfs::{
 };
 use wyrmroot_device_proto::manifest::{
     ContentIdentity, HEADER_BYTES as WRDM_HEADER_BYTES, RECORD_BYTES as WRDM_RECORD_BYTES,
-    encode_com2_manifest,
+    encode_product_manifest,
 };
 use wyrmroot_rrc_manifest::{
     Activation, DependencyKind, RoleId, StartupProfile,
@@ -60,7 +60,7 @@ pub(crate) const ESP_NAME: &str = "esp.img";
 const WYRMSH_FLAGS: [&str; 2] = ["-Cjump-tables=no", "-Zemit-stack-sizes"];
 
 /// The product's native roles, in bootfs assembly order.
-pub(crate) const NATIVES: [NativeSpec; 8] = [
+pub(crate) const NATIVES: [NativeSpec; 9] = [
     native(
         "system-init",
         "wyrmroot-system-init",
@@ -88,6 +88,13 @@ pub(crate) const NATIVES: [NativeSpec; 8] = [
         "uart16550d",
         "native-uart16550d",
         "uart16550d",
+    ),
+    native(
+        "virtio-blkd",
+        "wyrmroot-virtio-blkd",
+        "virtio-blkd",
+        "native-virtio-blkd",
+        "virtio-blkd",
     ),
     native(
         "consoled",
@@ -226,6 +233,7 @@ pub(crate) fn build(output: &Path, deep_repository: &Path) -> Result<(), Failure
             ("registryd.elf", native_bytes("registryd")),
             ("devmgr.elf", native_bytes("devmgr")),
             ("uart16550d.elf", native_bytes("uart16550d")),
+            ("virtio-blkd.elf", native_bytes("virtio-blkd")),
             ("consoled.elf", native_bytes("consoled")),
             ("wyrmsh.elf", native_bytes("wyrmsh")),
             ("hello.elf", native_bytes("hello")),
@@ -396,9 +404,16 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
         .build_structural()
         .map_err(|error| Failure::task(format!("RRC manifest build failed: {error:?}")))?;
 
-    let mut wrdm = [0u8; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES];
-    let wrdm_size = encode_com2_manifest(ContentIdentity(role_hashes[2]), &mut wrdm)
-        .map_err(|error| Failure::task(format!("device manifest build failed: {error:?}")))?;
+    // COM2, then the boot disk (root `STORAGE_PLAN.md` W2). The boot-disk
+    // driver is not a recovery-root role, so WRDM alone names its identity.
+    let block_identity = identity("virtio-blkd");
+    let mut wrdm = [0u8; WRDM_HEADER_BYTES + 2 * WRDM_RECORD_BYTES];
+    let wrdm_size = encode_product_manifest(
+        ContentIdentity(role_hashes[2]),
+        ContentIdentity(block_identity),
+        &mut wrdm,
+    )
+    .map_err(|error| Failure::task(format!("device manifest build failed: {error:?}")))?;
     let device_manifest = wrdm[..wrdm_size].to_vec();
 
     let hello = identity("hello");
@@ -444,6 +459,7 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
         registryd: &natives["registryd"],
         devmgr: &natives["devmgr"],
         uart16550d: &natives["uart16550d"],
+        virtio_blkd: &natives["virtio-blkd"],
         consoled: &natives["consoled"],
         wyrmsh: &natives["wyrmsh"],
         hello: &natives["hello"],
@@ -452,6 +468,7 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
         device_manifest: &device_manifest,
         launch_policy: &launch_policy,
         uart16550d_identity: role_hashes[2],
+        virtio_blkd_identity: block_identity,
         wyrmsh_identity: role_hashes[4],
         hello_identity: hello,
         cpu_hog_identity: cpu_hog,
@@ -546,10 +563,11 @@ fn rrc_builder(
 }
 
 /// The q35 PCI address of the boot disk: bus 0, device 1, function 0.
-/// `dev-boot` and the VM gate pin the disk to this slot.
-pub(crate) const BOOT_DISK_PCI_ADDRESS: u32 = 1 << 3;
+/// `dev-boot` and the VM gate pin the disk to this slot. The device table and
+/// WRDM's boot-disk role share these values.
+pub(crate) use wyrmroot_device_proto::manifest::BOOT_DISK_PCI_ADDRESS;
 /// A modern (non-transitional) virtio block device, 1af4:1042.
-const VIRTIO_BLOCK_PCI_IDS: u32 = 0x1af4 | 0x1042 << 16;
+use wyrmroot_device_proto::manifest::VIRTIO_BLOCK_PCI_IDS;
 
 /// One boot device-table record. Fields of the other kind stay zero.
 #[derive(Clone, Copy)]
@@ -578,7 +596,7 @@ fn boot_device_table() -> Vec<u8> {
         },
         DeviceRecord {
             kind: DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION,
-            resource_id: 2,
+            resource_id: wyrmroot_device_proto::manifest::BOOT_DISK_RESOURCE_ID,
             pio_base: 0,
             pio_length: 0,
             interrupt_source: 0,

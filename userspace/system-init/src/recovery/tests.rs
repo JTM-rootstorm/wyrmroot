@@ -694,6 +694,7 @@ fn resident_poll_distinguishes_devmgr_and_registry_failures() {
             },
             true,
             false,
+            false,
         )
         .unwrap()
     };
@@ -1016,6 +1017,7 @@ fn resident_poll_observes_driver_exit_separately_from_registry_exit() {
             },
             true,
             true,
+            false,
         ),
         Ok(ResidentPollEvent::DriverExited)
     );
@@ -1028,9 +1030,64 @@ fn resident_poll_observes_driver_exit_separately_from_registry_exit() {
             },
             false,
             true,
+            false,
         ),
         Ok(ResidentPollEvent::DriverExited)
     );
+}
+
+/// Every device role init may construct names a driver the loader will
+/// build. W2 first shipped with the loader admitting only the console's
+/// driver, so every boot-disk construction failed at the loader.
+#[test]
+fn every_device_role_driver_path_is_one_the_loader_constructs() {
+    for role in [
+        COM2_ROLE_ID,
+        wyrmroot_device_proto::manifest::BOOT_DISK_ROLE_ID,
+    ] {
+        let path = wyrmroot_device_proto::driver_path_for_role(role)
+            .unwrap_or_else(|| panic!("role {role:?} has no driver path"));
+        assert!(
+            wyrmroot_loader::process::DEVICE_DRIVER_PATHS.contains(&path),
+            "{path}"
+        );
+    }
+}
+
+/// The boot-disk driver's exit is its own event, at the slot after the
+/// console driver's, and only when a boot-disk driver is present.
+#[test]
+fn resident_poll_observes_the_storage_driver_after_the_console_driver() {
+    let event = |index, registry, driver, storage| {
+        classify_resident_poll(
+            DwWaitResultV1 {
+                index,
+                observed: DW_SIGNAL_EXITED,
+                ..DwWaitResultV1::default()
+            },
+            registry,
+            driver,
+            storage,
+        )
+    };
+    assert_eq!(
+        event(5, true, true, true),
+        Ok(ResidentPollEvent::StorageDriverExited)
+    );
+    assert_eq!(
+        event(4, true, true, true),
+        Ok(ResidentPollEvent::DriverExited)
+    );
+    assert_eq!(
+        event(4, true, false, true),
+        Ok(ResidentPollEvent::StorageDriverExited)
+    );
+    assert_eq!(
+        event(2, false, false, true),
+        Ok(ResidentPollEvent::StorageDriverExited)
+    );
+    assert_eq!(event(5, true, true, false), Err(InitError::Supervision));
+    assert_eq!(event(6, true, true, true), Err(InitError::Supervision));
 }
 
 /// The session teardown retires each role once. `active[0]` and

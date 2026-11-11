@@ -1177,6 +1177,61 @@ fn device_driver_moves_only_self_root_and_direct_child_endpoint() {
 }
 
 #[test]
+fn device_driver_loads_each_admitted_driver_path_and_refuses_any_other() {
+    let request = |display_path| DeviceDriverLoadRequest {
+        image: &[],
+        display_path,
+        control_endpoint: DwHandle(0x932),
+        supervisor_generation: 1,
+        role_id: 2,
+        attempt_generation: 3,
+        launch_session: 4,
+        endpoint_id: 5,
+        endpoint_generation: 6,
+        transaction_id: 7,
+    };
+    let image = executable();
+    for path in wyrmroot_loader::process::DEVICE_DRIVER_PATHS {
+        let mut platform = Mock::new(None);
+        load_device_driver_process(
+            &mut platform,
+            authority(),
+            DeviceDriverLoadRequest {
+                image: &image,
+                ..request(path)
+            },
+        )
+        .unwrap_or_else(|error| panic!("{path}: {error:?}"));
+        assert_eq!(platform.sent_transfers.len(), 2);
+    }
+    for path in [
+        "/system/devmgr",
+        "/system/uart16550",
+        "system/virtio-blkd",
+        "",
+    ] {
+        let mut platform = Mock::new(None);
+        let error = load_device_driver_process(
+            &mut platform,
+            authority(),
+            DeviceDriverLoadRequest {
+                image: &image,
+                ..request(path)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            DeviceDriverLoadError {
+                error: LoadError::Launch(wyrmroot_loader::launch::LaunchError::HandleCount),
+                control_endpoint_consumed: false,
+            }
+        );
+        assert!(platform.sent_transfers.is_empty());
+    }
+}
+
+#[test]
 fn device_driver_failed_init_move_retains_direct_endpoint() {
     let mut platform = Mock::new(Some("send"));
     let image = executable();

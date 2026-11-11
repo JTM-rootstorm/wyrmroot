@@ -5,6 +5,8 @@ pub const INIT_PATH: &str = "system/init";
 pub const REGISTRYD_PATH: &str = "system/registryd";
 pub const DEVMGR_PATH: &str = "system/devmgr";
 pub const UART16550D_PATH: &str = "system/uart16550d";
+/// The boot-disk driver (root `STORAGE_PLAN.md` W2).
+pub const VIRTIO_BLKD_PATH: &str = "system/virtio-blkd";
 pub const CONSOLED_PATH: &str = "system/consoled";
 pub const WYRMSH_PATH: &str = "system/wyrmsh";
 pub const HELLO_PATH: &str = "bin/hello";

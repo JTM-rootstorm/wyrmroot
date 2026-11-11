@@ -22,6 +22,7 @@ members = [
     "userspace/registryd",
     "userspace/devmgr",
     "userspace/uart16550d",
+    "userspace/virtio-blkd",
     "userspace/consoled",
     "userspace/wyrmsh",
     "userspace/cpu-hog",

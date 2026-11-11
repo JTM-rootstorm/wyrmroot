@@ -90,6 +90,58 @@ the exact WYR1-C role set fails before devmgr reports operational readiness.
 Matching is equality over the complete record. Names and payload bytes cannot
 manufacture kernel authority and no fallback driver selection exists.
 
+### 3.1 Amendment (storage W2, 2026-11-11): the boot disk is a second role
+
+Root `STORAGE_PLAN.md` W2. The role set grows from exactly COM2 to COM2 then,
+optionally, one boot disk. Everything in §3 still holds for COM2; the boot-disk
+role is fixed the same way:
+
+| Field | Required value |
+| --- | --- |
+| logical role | boot disk block transport |
+| device-role ID | 2 |
+| resource kind | PCI function (`DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION`), boot device resource 2 |
+| PCI function | segment 0, bus 0, device 1, function 0 |
+| vendor and device | `1af4:1042`, a modern-only virtio block device |
+| expected driver | `system/virtio-blkd` |
+| driver identity | exact nonzero content identity, named by WRDM alone (it is not a recovery-root role, so WRRM does not name it) |
+| publication | `device.block.virtio0`, protocol `WRBD` 1.0, published by the driver itself |
+
+1. **WRDM 1.1.** The format's minor version is now 1. A PCI-function record
+   keeps the port, length and interrupt fields zero and carries the function
+   address and vendor/device IDs in record bytes 64..72, which a port-I/O
+   record must keep zero. Records are canonical: COM2 first, the boot disk
+   second. Duplicate-interrupt and overlapping-port checks apply between
+   port-I/O records only.
+2. **Launch.** WRDL is unchanged on the wire. The driver path follows from the
+   role ID (`driver_path_for_role`); init validates the executable through the
+   role's WRDM record, and the loader constructs only the two named driver
+   paths. Storage launch correlations come from the same supervisor-owned
+   high-water marks as the console driver's, so init's freshness check holds
+   across both. devmgr brings the disk up *before* the console's driver, while
+   the generation has no live connection: the bring-up blocks devmgr's loop on
+   init and the driver, and a loop blocked after the console's connector broker
+   is active misses that broker's connection and cleanup deadlines and takes
+   the console down. A failing disk therefore delays the console by at most the
+   ready timeout, and never ends it.
+3. **Bring-up is one MOVE.** A PCI function has no platform interrupt to stage
+   and needs no quiescence handshake: its bus mastering stays off until its
+   driver enables it, and the IOMMU blocks its DMA until that driver maps
+   memory. devmgr moves the reduced resource (`READ`, `WRITE`, `MAP`, `MODIFY`,
+   `INSPECT`; never `DUPLICATE` or `TRANSFER`) with one WRDP `STAGE`, under its
+   own transaction, and accepts only the exact `READY`.
+4. **Publication by the driver (a §1 deviation).** devmgr does not broker the
+   block service. Init installs the registry publication when it constructs the
+   driver and sends the endpoint over the driver's launch Channel as one `WRPG`
+   grant; the driver publishes after its `READY`. A dead driver's publication
+   retires with its endpoint.
+5. **Containment.** The lane is not part of the recovery root. A refused claim,
+   construction or stage closes only the lane, never devmgr or the console. A
+   boot-disk driver exit is reaped without a restart, and a devmgr recovery or
+   shutdown retires the driver first, so the replacement's claim never meets a
+   live lease. Restart policy and re-publication after a registry replacement
+   are later work.
+
 ## 4. Immutable device-role manifest
 
 The guest format is the allocation-free canonical binary `WRDM` version 1.

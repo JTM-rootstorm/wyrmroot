@@ -325,6 +325,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrmroot-virtio-blkd"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-device-proto",
+ "wyrmroot-devmgr",
+ "wyrmroot-loader",
+ "wyrmroot-registry-proto",
+ "wyrmroot-runtime",
+]
+
+[[package]]
 name = "wyrmroot-wyrmsh"
 version = "0.0.0"
 dependencies = [

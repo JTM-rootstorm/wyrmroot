@@ -6,9 +6,10 @@
 //! to a file; COM2 (the `wyrmsh` console) is the terminal, so the system can be
 //! used directly. Ctrl-D at an empty prompt shuts the system down.
 //!
-//! `--check` drives COM2 instead: it waits for the prompt, runs `bin/hello`
-//! (a shell job under its TaskGroup limits) to its output and the next
-//! prompt, sends Ctrl-D, and
+//! `--check` drives COM2 instead: it waits for the prompt, lists `services`
+//! until the boot-disk driver's `device.block.virtio0` is published (root
+//! `STORAGE_PLAN.md` W2), runs `bin/hello` (a shell job under its TaskGroup
+//! limits) to its output and the next prompt, sends Ctrl-D, and
 //! requires the kernel's power-off line on COM1. That is the smoke check for
 //! development commits.
 //!
@@ -43,6 +44,11 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(180);
 const PROMPT: &[u8] = b"wyrmsh> ";
 const END_OF_INPUT: u8 = 0x04;
 const POWER_OFF: &[u8] = b"no process remains; powering off";
+/// Lists the registry; the boot-disk driver publishes once it is up.
+const SERVICES_COMMAND: &[u8] = b"services\r";
+const BLOCK_SERVICE: &[u8] = b"service name=device.block.virtio0 ";
+/// The driver comes up beside the shell, so the list is retried a few times.
+const SERVICES_ATTEMPTS: usize = 20;
 /// One shell job, run under its TaskGroup limits, before shutting down.
 const JOB_COMMAND: &[u8] = b"run bin/hello\r";
 const JOB_OUTPUT: &[u8] = b"hello from native stdout";
@@ -146,10 +152,15 @@ fn check(args: &[String], com1: &Path, root: &Path) -> Result<String, Failure> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| Failure::task(format!("could not launch QEMU: {error}")))?;
-    let result = drive(&mut child, com1);
+    let com2 = Arc::new(Mutex::new(Vec::new()));
+    let result = drive(&mut child, com1, &com2);
     if result.is_err() {
         let _ = child.kill();
         let _ = child.wait();
+    }
+    // Keep the shell transcript beside COM1 so a failed check can be read.
+    if let Ok(com2) = com2.lock() {
+        let _ = fs::write(root.join("com2.log"), &*com2);
     }
     result.map(|elapsed| {
         format!(
@@ -160,15 +171,14 @@ fn check(args: &[String], com1: &Path, root: &Path) -> Result<String, Failure> {
     })
 }
 
-fn drive(child: &mut Child, com1: &Path) -> Result<Duration, Failure> {
+fn drive(child: &mut Child, com1: &Path, com2: &Arc<Mutex<Vec<u8>>>) -> Result<Duration, Failure> {
     let started = Instant::now();
     let deadline = started + CHECK_TIMEOUT;
-    let com2 = Arc::new(Mutex::new(Vec::new()));
     let mut stdout = child
         .stdout
         .take()
         .ok_or_else(|| Failure::task("QEMU COM2 is not piped"))?;
-    let sink = Arc::clone(&com2);
+    let sink = Arc::clone(com2);
     thread::spawn(move || {
         let mut buffer = [0_u8; 4096];
         while let Ok(read) = stdout.read(&mut buffer) {
@@ -181,7 +191,7 @@ fn drive(child: &mut Child, com1: &Path) -> Result<Duration, Failure> {
         }
     });
     let seen = |needle: &'static [u8], after: usize| {
-        let com2 = Arc::clone(&com2);
+        let com2 = Arc::clone(com2);
         move || {
             Ok(com2
                 .lock()
@@ -195,6 +205,32 @@ fn drive(child: &mut Child, com1: &Path) -> Result<Duration, Failure> {
         .stdin
         .as_mut()
         .ok_or_else(|| Failure::task("QEMU COM2 input is not piped"))?;
+    let mut attempts = 0;
+    loop {
+        let before = length();
+        input.write_all(SERVICES_COMMAND).map_err(|error| {
+            Failure::task(format!("could not send the services command: {error}"))
+        })?;
+        wait_until(deadline, "the prompt after services", || {
+            Ok(com2
+                .lock()
+                .map(|com2| {
+                    com2.get(before..)
+                        .is_some_and(|tail| contains(tail, b"services") && ends_with_prompt(tail))
+                })
+                .unwrap_or(false))
+        })?;
+        if seen(BLOCK_SERVICE, before)()? {
+            break;
+        }
+        attempts += 1;
+        if attempts == SERVICES_ATTEMPTS || Instant::now() >= deadline {
+            return Err(Failure::task(
+                "dev-boot check: the boot-disk driver never published device.block.virtio0",
+            ));
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
     let before_job = length();
     input
         .write_all(JOB_COMMAND)
@@ -243,6 +279,11 @@ fn wait_until(
         thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+/// Whether `output` ends at a fresh prompt.
+fn ends_with_prompt(output: &[u8]) -> bool {
+    output.ends_with(PROMPT)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

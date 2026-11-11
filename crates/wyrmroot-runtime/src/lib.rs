@@ -60,8 +60,9 @@ pub(crate) use capability_native::{
 };
 pub(crate) use device::abi_info;
 pub use device::{
-    claim_device_resource, create_interrupt, device_pio_read, device_pio_write,
-    device_resource_info, interrupt_ack, interrupt_info, require_device_resource_interrupt_feature,
+    claim_device_resource, create_interrupt, device_pci_config_read, device_pio_read,
+    device_pio_write, device_resource_info, interrupt_ack, interrupt_info,
+    require_device_resource_interrupt_feature,
 };
 pub use loader_native::{LOADER_ABORT_CODE, NativeLoaderPlatform};
 pub(crate) use native::exit_thread;

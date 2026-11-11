@@ -2,7 +2,7 @@
 //!
 //! Callers supply the exact immutable bytes of every entry; the builder checks
 //! the device manifest and launch policy against the identities the producer
-//! computed, then emits the twelve entries in the existing `cpio newc`
+//! computed, then emits the thirteen entries in the existing `cpio newc`
 //! format. Content admission for arbitrary archives stays in
 //! [`crate::content`].
 
@@ -30,6 +30,7 @@ pub struct Product<'a> {
     pub registryd: &'a [u8],
     pub devmgr: &'a [u8],
     pub uart16550d: &'a [u8],
+    pub virtio_blkd: &'a [u8],
     pub consoled: &'a [u8],
     pub wyrmsh: &'a [u8],
     pub hello: &'a [u8],
@@ -41,19 +42,22 @@ pub struct Product<'a> {
     /// name. Bootfs does not parse WRRM (that crate depends on this one), so
     /// the producer supplies the identity it also wrote into WRRM.
     pub uart16550d_identity: [u8; 32],
+    /// Identity of `virtio-blkd`, which the boot-disk role must name.
+    pub virtio_blkd_identity: [u8; 32],
     pub wyrmsh_identity: [u8; 32],
     pub hello_identity: [u8; 32],
     pub cpu_hog_identity: [u8; 32],
 }
 
 impl Product<'_> {
-    fn entries(&self) -> [(&'static str, &[u8], FileMode); 12] {
+    fn entries(&self) -> [(&'static str, &[u8], FileMode); 13] {
         use FileMode::{Executable, ReadOnly};
         [
             (INIT_PATH, self.init, Executable),
             (REGISTRYD_PATH, self.registryd, Executable),
             (DEVMGR_PATH, self.devmgr, Executable),
             (UART16550D_PATH, self.uart16550d, Executable),
+            (VIRTIO_BLKD_PATH, self.virtio_blkd, Executable),
             (CONSOLED_PATH, self.consoled, Executable),
             (WYRMSH_PATH, self.wyrmsh, Executable),
             (HELLO_PATH, self.hello, Executable),
@@ -80,18 +84,23 @@ pub fn build(product: Product<'_>) -> Result<Vec<u8>, BuildError> {
 }
 
 fn validate(product: &Product<'_>) -> Result<(), BuildError> {
-    if product.uart16550d_identity == [0; 32] {
+    if product.uart16550d_identity == [0; 32] || product.virtio_blkd_identity == [0; 32] {
         return Err(BuildError::DriverIdentityMismatch);
     }
-    DeviceManifest::parse(product.device_manifest)
-        .map_err(|_| BuildError::InvalidDeviceManifest)?
+    let manifest_error = |error| match error {
+        wyrmroot_device_proto::ManifestError::WrongContentIdentity => {
+            BuildError::DriverIdentityMismatch
+        }
+        _ => BuildError::InvalidDeviceManifest,
+    };
+    let manifest = DeviceManifest::parse(product.device_manifest)
+        .map_err(|_| BuildError::InvalidDeviceManifest)?;
+    manifest
         .match_com2(ContentIdentity(product.uart16550d_identity))
-        .map_err(|error| match error {
-            wyrmroot_device_proto::ManifestError::WrongContentIdentity => {
-                BuildError::DriverIdentityMismatch
-            }
-            _ => BuildError::InvalidDeviceManifest,
-        })?;
+        .map_err(manifest_error)?;
+    manifest
+        .match_boot_disk(ContentIdentity(product.virtio_blkd_identity))
+        .map_err(manifest_error)?;
 
     if product.wyrmsh_identity == [0; 32]
         || product.hello_identity == [0; 32]
@@ -149,27 +158,17 @@ mod tests {
     const HELLO: [u8; 32] = [0xf2; 32];
     const HOG: [u8; 32] = [0xf3; 32];
 
-    fn wrdm(identity: [u8; 32]) -> [u8; 176] {
-        let mut bytes = [0u8; 176];
-        bytes[..4].copy_from_slice(b"WRDM");
-        bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
-        bytes[8..12].copy_from_slice(&176u32.to_le_bytes());
-        bytes[12..14].copy_from_slice(&1u16.to_le_bytes());
-        bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
-        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
-        let record = 32;
-        bytes[record..record + 8].copy_from_slice(&1u64.to_le_bytes());
-        bytes[record + 8..record + 12].copy_from_slice(&2u32.to_le_bytes());
-        bytes[record + 12..record + 16].copy_from_slice(&1u32.to_le_bytes());
-        bytes[record + 16..record + 18].copy_from_slice(&0x2f8u16.to_le_bytes());
-        bytes[record + 18..record + 20].copy_from_slice(&8u16.to_le_bytes());
-        bytes[record + 20..record + 24].copy_from_slice(&3u32.to_le_bytes());
-        bytes[record + 24..record + 26]
-            .copy_from_slice(&(b"system/uart16550d".len() as u16).to_le_bytes());
-        bytes[record + 28..record + 60].copy_from_slice(&identity);
-        bytes[record + 60..record + 64].copy_from_slice(&1u32.to_le_bytes());
-        bytes[record + 72..record + 72 + b"system/uart16550d".len()]
-            .copy_from_slice(b"system/uart16550d");
+    const BLOCK: [u8; 32] = [0xb1; 32];
+    const WRDM_BYTES: usize = 32 + 2 * 144;
+
+    fn wrdm(identity: [u8; 32]) -> [u8; WRDM_BYTES] {
+        let mut bytes = [0u8; WRDM_BYTES];
+        wyrmroot_device_proto::encode_product_manifest(
+            ContentIdentity(identity),
+            ContentIdentity(BLOCK),
+            &mut bytes,
+        )
+        .unwrap();
         bytes
     }
 
@@ -215,6 +214,7 @@ mod tests {
             registryd: b"registry",
             devmgr: b"devmgr",
             uart16550d: b"uart",
+            virtio_blkd: b"blk",
             consoled: b"console",
             wyrmsh: b"shell",
             hello: b"hello-elf",
@@ -223,6 +223,7 @@ mod tests {
             device_manifest,
             launch_policy,
             uart16550d_identity: UART,
+            virtio_blkd_identity: BLOCK,
             wyrmsh_identity: SHELL,
             hello_identity: HELLO,
             cpu_hog_identity: HOG,
@@ -230,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_the_twelve_entry_product_deterministically() {
+    fn builds_the_thirteen_entry_product_deterministically() {
         let manifest = wrdm(UART);
         let policy = policy(false, true);
         let product = product(&manifest, &policy);
@@ -252,6 +253,7 @@ mod tests {
                 b"system/init".as_slice(),
                 b"system/registryd".as_slice(),
                 b"system/uart16550d".as_slice(),
+                b"system/virtio-blkd".as_slice(),
                 b"system/wyrmsh".as_slice(),
             ]
         );
@@ -260,7 +262,7 @@ mod tests {
                 .entries()
                 .filter(|entry| entry.is_executable())
                 .count(),
-            8
+            9
         );
         assert_eq!(
             archive.lookup(MARKER_PATH.as_bytes()).unwrap().data(),
@@ -296,6 +298,16 @@ mod tests {
         assert_eq!(build(other), Err(BuildError::DriverIdentityMismatch));
         other.uart16550d_identity = [0; 32];
         assert_eq!(build(other), Err(BuildError::DriverIdentityMismatch));
+        let mut other = product(&manifest, &policy);
+        other.virtio_blkd_identity = [0xb2; 32];
+        assert_eq!(build(other), Err(BuildError::DriverIdentityMismatch));
+        // A manifest without the boot disk is not this product.
+        let mut com2_only = [0u8; 176];
+        wyrmroot_device_proto::encode_com2_manifest(ContentIdentity(UART), &mut com2_only).unwrap();
+        assert_eq!(
+            build(product(&com2_only, &policy)),
+            Err(BuildError::InvalidDeviceManifest)
+        );
     }
 
     #[test]

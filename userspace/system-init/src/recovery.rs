@@ -84,12 +84,21 @@ where
         };
         item_count += 1;
     }
+    let storage_present = state.storage_driver.is_some();
+    if let Some(driver) = state.storage_driver {
+        items[item_count] = DwWaitItemV1 {
+            handle: driver.loaded.process,
+            signals: DW_SIGNAL_EXITED,
+        };
+        item_count += 1;
+    }
     let observed = system.wait_many(&items[..item_count], DwDeadline(now_ns));
     match observed {
         Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {}
         Err(error) => return Err(InitError::Native(error)),
         Ok(result) => {
-            let event = classify_resident_poll(result, registry_present, driver_present)?;
+            let event =
+                classify_resident_poll(result, registry_present, driver_present, storage_present)?;
             let size = system
                 .query_memory_object_size(resident.authority.bootfs)
                 .map_err(InitError::Native)?;
@@ -153,6 +162,39 @@ where
                                             .ok_or(InitError::AbsentState(0x43))?
                                             .waiting_registry_observed = true;
                                         Ok(())
+                                    }
+                                }
+                                Ok(DevmgrControlInput::DriverLaunch {
+                                    request,
+                                    child_endpoint,
+                                }) if request.role_id
+                                    == wyrmroot_device_proto::manifest::BOOT_DISK_ROLE_ID =>
+                                {
+                                    // The boot disk has no console behind it,
+                                    // so nothing else starts with it, and a
+                                    // refused construction is contained: the
+                                    // attempt is already cleaned up and devmgr
+                                    // times out waiting for CONSTRUCTED. Only
+                                    // a failed cleanup still recovers devmgr.
+                                    match construct_driver(
+                                        resident,
+                                        system,
+                                        loader,
+                                        waits,
+                                        bootfs,
+                                        devmgr,
+                                        request,
+                                        child_endpoint,
+                                    ) {
+                                        Err(InitError::Cleanup) => recover_devmgr_after_error(
+                                            resident,
+                                            system,
+                                            loader,
+                                            waits,
+                                            bootfs,
+                                            InitError::Cleanup,
+                                        ),
+                                        Ok(()) | Err(_) => Ok(()),
                                     }
                                 }
                                 Ok(DevmgrControlInput::DriverLaunch {
@@ -232,6 +274,13 @@ where
                             false,
                             false,
                             abandoned::reason(abandoned::trigger::EXITED, abandoned::phase::NONE),
+                        ),
+                        // No restart yet (root `STORAGE_PLAN.md` W2): the
+                        // exited boot-disk driver is reaped, and its device
+                        // stays unserved until devmgr is recovered.
+                        ResidentPollEvent::StorageDriverExited => attribute_failure(
+                            RecoveryOperation::ReapDriver,
+                            reap_storage_driver(resident, system, waits, false),
                         ),
                         ResidentPollEvent::DriverExited => {
                             let dependent_retirement =
@@ -404,6 +453,9 @@ where
     let mut failed = 0_u8;
     if crate::drain_jobs_for_shutdown(resident, system, waits).is_err() {
         failed |= JOBS;
+    }
+    if reap_storage_driver(resident, system, waits, true).is_err() {
+        failed |= DRIVER;
     }
     if let Some(state) = resident.product.as_mut() {
         if let Some(driver) = state.driver.take()
@@ -858,6 +910,7 @@ pub(crate) fn recovery_fixture_resident(
             last_controller_transaction: LAST_CONTROLLER_TRANSACTION,
             next_controller_transaction: NEXT_CONTROLLER_TRANSACTION,
             driver,
+            storage_driver: None,
             last_reaped_driver: None,
             last_driver_attempt: driver_request.map_or(0, |request| request.attempt_generation.0),
             last_driver_session: driver_request.map_or(0, |request| request.launch_session.0),
@@ -948,6 +1001,12 @@ where
     // With no console product installed there is no consumer, the retention is
     // false, and everything below runs exactly as it always has.
     let retained_device_topology = crate::console_depends_on_driver(resident);
+    // The boot-disk driver is not retained: no console depends on it, and its
+    // live DeviceResource would make the replacement's claim fail.
+    if reap_storage_driver(resident, system, waits, true).is_err() {
+        resident.result = RecoveryResult::Degraded;
+        return Err(InitError::Cleanup);
+    }
     if !retained_device_topology
         && crate::retire_dependents(resident, system, waits, false).is_err()
     {

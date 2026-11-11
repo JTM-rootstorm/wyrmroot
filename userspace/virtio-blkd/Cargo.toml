@@ -1,0 +1,38 @@
+[package]
+name = "wyrmroot-virtio-blkd"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Boot-disk virtio block driver (storage W2/W3)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "virtio-blkd"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-virtio-blkd"]
+
+[features]
+default = []
+native-virtio-blkd = ["dep:wyrmroot-loader", "dep:wyrmroot-runtime"]
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
+wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
+
+[dev-dependencies]
+wyrmroot-devmgr = { path = "../devmgr" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", features = ["platform-recording"] }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("wyrmroot"))'] }

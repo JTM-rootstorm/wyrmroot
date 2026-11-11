@@ -1042,3 +1042,82 @@ fn connector_broker_activation_publishes_the_ready_driver_once() {
         Some(current)
     );
 }
+
+fn product_manifest() -> [u8; HEADER_BYTES + 2 * RECORD_BYTES] {
+    let mut bytes = [0; HEADER_BYTES + 2 * RECORD_BYTES];
+    wyrmroot_device_proto::encode_product_manifest(
+        ContentIdentity([0x5a; 32]),
+        ContentIdentity([0x6b; 32]),
+        &mut bytes,
+    )
+    .unwrap();
+    bytes
+}
+
+/// The boot-disk role's identity reaches the resident status only from a
+/// manifest that has the role (root `STORAGE_PLAN.md` W2).
+#[test]
+fn the_boot_disk_identity_comes_from_the_manifest_role() {
+    let product = prepare_operational(&product_manifest(), 7).unwrap();
+    assert_eq!(
+        product.boot_disk_identity,
+        Some(ContentIdentity([0x6b; 32]))
+    );
+    assert_eq!(product.driver_identity, ContentIdentity([0x5a; 32]));
+    assert_eq!(
+        prepare_operational(&manifest(), 7)
+            .unwrap()
+            .boot_disk_identity,
+        None
+    );
+}
+
+/// The boot disk's launch and STAGE correlations come from the same
+/// high-water marks as the console driver's, before and after it, so init's
+/// freshness check holds for every launch and no identity is reused.
+#[test]
+fn storage_launch_correlations_never_reuse_a_console_driver_identity() {
+    let mut resident =
+        ResidentController::new(prepare_operational(&product_manifest(), 7).unwrap(), 41).unwrap();
+    assert_eq!(
+        resident.issue_storage_launch(),
+        Err(DevmgrError::ControllerPrecondition)
+    );
+    resident.accept(install(binding(1, 7), 41), 0).unwrap();
+    let console = resident
+        .issue_driver_launch(true, DirectControlRights::ExactReduced)
+        .unwrap();
+    let (storage, stage) = resident.issue_storage_launch().unwrap();
+    assert_eq!(
+        storage.role_id,
+        wyrmroot_device_proto::manifest::BOOT_DISK_ROLE_ID
+    );
+    assert_eq!(
+        storage.driver_path,
+        wyrmroot_device_proto::BLOCK_DRIVER_PATH
+    );
+    assert_eq!(storage.actor_identity, ContentIdentity([0x6b; 32]));
+    assert_eq!(storage.supervisor_generation, SupervisorGeneration(7));
+    assert!(storage.attempt_generation.0 > console.attempt_generation.0);
+    assert!(storage.launch_session.0 > console.launch_session.0);
+    assert!(storage.endpoint.id.0 > console.endpoint.id.0);
+    assert!(storage.transaction_id > console.transaction_id);
+    assert!(stage > storage.transaction_id);
+    // The console driver's attempt is untouched by the storage launch.
+    assert_eq!(resident.active_driver_request(), Some(console));
+    let (second, second_stage) = resident.issue_storage_launch().unwrap();
+    assert!(second.attempt_generation.0 > storage.attempt_generation.0);
+    assert!(second.transaction_id > stage);
+    assert!(second_stage > second.transaction_id);
+}
+
+#[test]
+fn a_product_without_the_boot_disk_issues_no_storage_launch() {
+    let mut resident =
+        ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+    resident.accept(install(binding(1, 7), 41), 0).unwrap();
+    assert_eq!(
+        resident.issue_storage_launch(),
+        Err(DevmgrError::MissingRole)
+    );
+}

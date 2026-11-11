@@ -20,7 +20,11 @@ use wyrmroot_device_proto::{
         DRIVER_RETIRED_BYTES, LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES, encode_constructed,
         parse_request,
     },
-    manifest::{COM2_ROLE_ID, ContentIdentity, Manifest as DeviceManifest},
+    manifest::{
+        BOOT_DISK_PUBLICATION_POLICY, BOOT_DISK_ROLE_ID, COM2_ROLE_ID, ContentIdentity,
+        Manifest as DeviceManifest, PublicationPolicy,
+    },
+    pci_driver::{GRANT_BYTES, PublicationGrant, encode_grant},
 };
 use wyrmroot_loader::launch::CHILD_CHANNEL_TRANSFER_RIGHTS;
 use wyrmroot_loader::{
@@ -110,6 +114,11 @@ pub(crate) struct ResidentState {
     pub(crate) last_controller_transaction: u64,
     pub(crate) next_controller_transaction: u64,
     pub(crate) driver: Option<DriverNativeAttempt>,
+    /// The boot-disk driver (root `STORAGE_PLAN.md` W2). It is not part of the
+    /// recovery root: nothing the console needs depends on it, its exit is
+    /// reaped without a restart, and devmgr recovery and shutdown retire it
+    /// first.
+    pub(crate) storage_driver: Option<DriverNativeAttempt>,
     pub(crate) last_reaped_driver: Option<DriverLaunchRequest>,
     pub(crate) last_driver_attempt: u64,
     pub(crate) last_driver_session: u64,
@@ -136,14 +145,18 @@ pub(crate) enum ResidentPollEvent {
     /// The registry's process exited.
     RegistryExited,
     DriverExited,
+    /// The boot-disk driver's process exited.
+    StorageDriverExited,
 }
 
 pub(crate) fn classify_resident_poll(
     result: DwWaitResultV1,
     registry_present: bool,
     driver_present: bool,
+    storage_present: bool,
 ) -> Result<ResidentPollEvent, InitError> {
-    let item_count = 2 + usize::from(registry_present) * 2 + usize::from(driver_present);
+    let storage_index = 2 + u32::from(registry_present) * 2 + u32::from(driver_present);
+    let item_count = storage_index as usize + usize::from(storage_present);
     if result.index >= item_count as u32 {
         return Err(InitError::Supervision);
     }
@@ -173,6 +186,13 @@ pub(crate) fn classify_resident_poll(
                 && result.observed.0 & DW_SIGNAL_EXITED.0 != 0 =>
         {
             Ok(ResidentPollEvent::DriverExited)
+        }
+        index
+            if storage_present
+                && index == storage_index
+                && result.observed.0 & DW_SIGNAL_EXITED.0 != 0 =>
+        {
+            Ok(ResidentPollEvent::StorageDriverExited)
         }
         _ => Err(InitError::Supervision),
     }
@@ -415,6 +435,7 @@ where
         last_controller_transaction: devmgr.last_controller_transaction,
         next_controller_transaction: devmgr.next_controller_transaction,
         driver: None,
+        storage_driver: None,
         last_reaped_driver: None,
         last_driver_attempt: 0,
         last_driver_session: 0,
@@ -882,8 +903,25 @@ pub(crate) fn install_publication<S: ResidentPlatform>(
     correlation: PublicationCorrelation,
     endpoint: DwHandle,
 ) -> Result<(), InitError> {
+    install_publication_with_policy(
+        system,
+        control,
+        grant,
+        correlation,
+        endpoint,
+        SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY,
+    )
+}
+
+pub(crate) fn install_publication_with_policy<S: ResidentPlatform>(
+    system: &mut S,
+    control: DwHandle,
+    grant: crate::jobs::EndpointGrant,
+    correlation: PublicationCorrelation,
+    endpoint: DwHandle,
+    policy: PublicationPolicy,
+) -> Result<(), InitError> {
     let mut bytes = [0u8; 256];
-    let policy = SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
     let size = encode_install_publication(
         RegistryHeader {
             message_type: RegistryMessageType::InstallPublication,
@@ -1177,20 +1215,32 @@ pub(crate) fn validate_driver_actor(
     if device_manifest.is_executable() {
         return Err(InitError::WrongManifestProfile);
     }
-    let role = DeviceManifest::parse(device_manifest.data())
-        .map_err(|_| InitError::WrongManifestProfile)?
-        .match_com2(request.actor_identity)
+    let manifest = DeviceManifest::parse(device_manifest.data())
         .map_err(|_| InitError::WrongManifestProfile)?;
-    if request.role_id != COM2_ROLE_ID || role.role_id != request.role_id {
+    let (role, path, mismatch) = match request.role_id {
+        COM2_ROLE_ID => (
+            manifest.match_com2(request.actor_identity),
+            wyrmroot_device_proto::manifest::UART16550D_PATH,
+            InitError::ArtifactIdentityMismatch(RoleId::Uart16550d),
+        ),
+        // The boot disk is not a WRRM role, so its executable identity comes
+        // from WRDM alone (root `STORAGE_PLAN.md` W2).
+        BOOT_DISK_ROLE_ID => (
+            manifest.match_boot_disk(request.actor_identity),
+            wyrmroot_device_proto::manifest::VIRTIO_BLKD_PATH,
+            InitError::BlockDriverIdentityMismatch,
+        ),
+        _ => return Err(InitError::WrongManifestProfile),
+    };
+    let role = role.map_err(|_| InitError::WrongManifestProfile)?;
+    if role.role_id != request.role_id || role.driver_path != path {
         return Err(InitError::WrongManifestProfile);
     }
-    let actor = archive
-        .lookup(wyrmroot_device_proto::manifest::UART16550D_PATH)
-        .map_err(map_lookup)?;
+    let actor = archive.lookup(path).map_err(map_lookup)?;
     if !actor.is_executable()
         || wyrmroot_runtime::sha256::digest(actor.data()) != request.actor_identity.0
     {
-        return Err(InitError::ArtifactIdentityMismatch(RoleId::Uart16550d));
+        return Err(mismatch);
     }
     Ok(actor.data())
 }
@@ -1249,7 +1299,15 @@ where
         state.last_driver_transaction,
         request,
     );
-    if !correlation_valid || state.driver.is_some() {
+    // The boot disk has its own slot: it is not the console's driver, and the
+    // two may run at once (root `STORAGE_PLAN.md` W2).
+    let storage = request.role_id == BOOT_DISK_ROLE_ID;
+    let slot_taken = if storage {
+        state.storage_driver.is_some()
+    } else {
+        state.driver.is_some()
+    };
+    if !correlation_valid || slot_taken {
         system
             .close_handle(child_endpoint)
             .map_err(|_| InitError::Cleanup)?;
@@ -1301,7 +1359,7 @@ where
         },
         DeviceDriverLoadRequest {
             image: actor,
-            display_path: wyrmroot_device_proto::DEVICE_DRIVER_PATH,
+            display_path: request.driver_path,
             control_endpoint: child_endpoint,
             supervisor_generation: request.supervisor_generation.0,
             role_id: request.role_id.0,
@@ -1344,11 +1402,16 @@ where
             .product
             .as_mut()
             .ok_or(InitError::AbsentState(0x1f))?;
-        state.driver = Some(DriverNativeAttempt {
+        let attempt = Some(DriverNativeAttempt {
             loaded,
             task_group,
             request,
         });
+        if storage {
+            state.storage_driver = attempt;
+        } else {
+            state.driver = attempt;
+        }
         state.last_driver_attempt = request.attempt_generation.0;
         state.last_driver_session = request.launch_session.0;
         state.last_driver_endpoint = request.endpoint.id.0;
@@ -1356,11 +1419,33 @@ where
     }
     let mut ack = [0u8; LAUNCH_RESPONSE_BYTES];
     encode_constructed(request, &mut ack).map_err(|_| InitError::WrongManifestProfile)?;
-    if let Err(error) = system.send_channel(devmgr.loaded.launch_channel, &ack) {
+    let granted = if storage {
+        grant_driver_publication(
+            resident,
+            system,
+            devmgr,
+            loaded.launch_channel,
+            request,
+            BOOT_DISK_PUBLICATION_POLICY,
+        )
+    } else {
+        Ok(())
+    };
+    if let Err(error) = granted.and_then(|()| {
+        system
+            .send_channel(devmgr.loaded.launch_channel, &ack)
+            .map_err(InitError::Native)
+    }) {
         let attempt = resident
             .product
             .as_ref()
-            .and_then(|state| state.driver)
+            .and_then(|state| {
+                if storage {
+                    state.storage_driver
+                } else {
+                    state.driver
+                }
+            })
             .ok_or(InitError::AbsentState(0x20))?;
         let cleanup_failed = cleanup_loaded_before(
             system,
@@ -1372,16 +1457,20 @@ where
         )
         .is_err();
         if !cleanup_failed {
-            resident
+            let state = resident
                 .product
                 .as_mut()
-                .ok_or(InitError::AbsentState(0x21))?
-                .driver = None;
+                .ok_or(InitError::AbsentState(0x21))?;
+            if storage {
+                state.storage_driver = None;
+            } else {
+                state.driver = None;
+            }
         }
         return Err(if cleanup_failed {
             InitError::Cleanup
         } else {
-            InitError::Native(error)
+            error
         });
     }
     if action_deadline.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
@@ -1439,6 +1528,99 @@ where
         state.last_reaped_driver = Some(request);
     }
     Ok(request)
+}
+
+/// Installs `policy`'s registry publication for a PCI driver and sends the
+/// driver its endpoint over its launch Channel as one WRPG grant (root
+/// `STORAGE_PLAN.md` W2). The driver publishes after devmgr accepts its READY.
+pub(crate) fn grant_driver_publication<S: ResidentPlatform>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    devmgr: ActiveNativeRole,
+    driver_launch_channel: DwHandle,
+    request: DriverLaunchRequest,
+    policy: PublicationPolicy,
+) -> Result<(), InitError> {
+    let state = resident
+        .product
+        .as_mut()
+        .ok_or(InitError::AbsentState(0x24))?;
+    let registry = state.registry.ok_or(InitError::AbsentState(0x25))?;
+    let grant = state
+        .topology
+        .issue(devmgr.generation, EndpointKind::Publication)
+        .map_err(InitError::Jobs)?;
+    let correlation = state.publication_allocator.issue()?;
+    let mut bytes = [0u8; GRANT_BYTES];
+    encode_grant(
+        PublicationGrant {
+            registry_generation: grant.registry_generation,
+            endpoint_id: grant.endpoint_id,
+            endpoint_generation: grant.endpoint_generation,
+            transaction_id: request.transaction_id,
+            service_generation: correlation.service_generation,
+        },
+        &mut bytes,
+    )
+    .map_err(|_| InitError::WrongManifestProfile)?;
+    let (registry_endpoint, driver_endpoint) = create_controller_channel_pair(system)?;
+    if let Err(error) = install_publication_with_policy(
+        system,
+        registry.control_channel,
+        grant,
+        correlation,
+        registry_endpoint,
+        policy,
+    ) {
+        let cleanup_failed = system.close_handle(registry_endpoint).is_err()
+            | system.close_handle(driver_endpoint).is_err();
+        return Err(if cleanup_failed {
+            InitError::Cleanup
+        } else {
+            error
+        });
+    }
+    let transfer = DwHandleTransferV1 {
+        handle: driver_endpoint,
+        requested_rights: wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS,
+        operation: DW_HANDLE_TRANSFER_MOVE,
+        reserved0: 0,
+        reserved: [0; 2],
+    };
+    if let Err(error) = system.send_channel_with_handles(
+        driver_launch_channel,
+        &bytes,
+        core::slice::from_ref(&transfer),
+    ) {
+        return Err(if system.close_handle(driver_endpoint).is_err() {
+            InitError::Cleanup
+        } else {
+            InitError::Native(error)
+        });
+    }
+    Ok(())
+}
+
+/// Reaps the boot-disk driver: terminates it first when `terminate`, then
+/// waits for it and closes its process, launch Channel and TaskGroup.
+pub(crate) fn reap_storage_driver<S, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    waits: &mut W,
+    terminate: bool,
+) -> Result<(), InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let Some(attempt) = resident
+        .product
+        .as_mut()
+        .and_then(|state| state.storage_driver.take())
+    else {
+        return Ok(());
+    };
+    cleanup_loaded(system, waits, attempt.loaded, attempt.task_group, terminate)
 }
 
 pub(crate) fn acknowledge_driver_reaped<S: InitPlatform>(

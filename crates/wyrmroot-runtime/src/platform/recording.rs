@@ -166,6 +166,11 @@ pub enum Call {
         offset: u32,
         width: u32,
     },
+    DevicePciConfigRead {
+        resource: DwHandle,
+        offset: u32,
+        width: u32,
+    },
     DevicePioWrite {
         resource: DwHandle,
         offset: u32,
@@ -665,6 +670,23 @@ impl DevicePlatform for RecordingPlatform {
         width: u32,
     ) -> Result<u32, NativeError> {
         let reply = self.next(Call::DevicePioRead {
+            resource,
+            offset,
+            width,
+        });
+        let Reply::Pio(result) = reply else {
+            self.mismatch("Pio", &reply)
+        };
+        result
+    }
+
+    fn device_pci_config_read(
+        &mut self,
+        resource: DwHandle,
+        offset: u32,
+        width: u32,
+    ) -> Result<u32, NativeError> {
+        let reply = self.next(Call::DevicePciConfigRead {
             resource,
             offset,
             width,

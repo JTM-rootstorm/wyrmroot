@@ -59,6 +59,9 @@ pub struct OperationalStatus {
     pub irq: u32,
     pub driver_identity: ContentIdentity,
     pub metadata_policy: MetadataPolicyId,
+    /// The WRDM boot-disk role's driver identity, when the product has one
+    /// (root `STORAGE_PLAN.md` W2).
+    pub boot_disk_identity: Option<ContentIdentity>,
 }
 
 pub const COM2_RESOURCE_ID: u64 = 1;
@@ -179,6 +182,7 @@ pub fn prepare_operational(
     let mut coordinator = Coordinator::new(SupervisorGeneration(supervisor_generation))?;
     coordinator.intake_manifest(manifest, candidate.content_identity)?;
     let role = coordinator.role().ok_or(DevmgrError::MissingRole)?;
+    let boot_disk_identity = manifest.boot_disk()?.map(|role| role.content_identity);
     Ok(OperationalStatus {
         supervisor_generation: coordinator.supervisor_generation(),
         state: coordinator.state(),
@@ -189,6 +193,7 @@ pub fn prepare_operational(
         irq: role.irq,
         driver_identity: role.content_identity,
         metadata_policy: role.metadata_policy,
+        boot_disk_identity,
     })
 }
 
@@ -413,6 +418,65 @@ impl ResidentController {
                     ControllerLifecycleFault::Exhausted(ControllerCounter::DriverTransaction),
                 ))?;
         Ok(request)
+    }
+
+    /// Issues the boot-disk driver's launch correlation and its STAGE
+    /// transaction (root `STORAGE_PLAN.md` W2). They come from the same
+    /// monotonic counters as the console driver's, so init's freshness check
+    /// holds across both; the console driver's attempt state is untouched.
+    pub fn issue_storage_launch(&mut self) -> Result<(DriverLaunchRequest, u64), DevmgrError> {
+        if self.active_binding.is_none() {
+            return Err(DevmgrError::ControllerPrecondition);
+        }
+        let identity = self
+            .status
+            .boot_disk_identity
+            .ok_or(DevmgrError::MissingRole)?;
+        let stage_transaction =
+            self.next_driver_transaction
+                .checked_add(1)
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::DriverTransaction),
+                ))?;
+        let request = DriverLaunchRequest {
+            supervisor_generation: self.status.supervisor_generation,
+            role_id: wyrmroot_device_proto::manifest::BOOT_DISK_ROLE_ID,
+            attempt_generation: AttemptGeneration(self.next_driver_attempt),
+            launch_session: LaunchSessionGeneration(self.next_driver_session),
+            endpoint: ControlEndpoint {
+                id: EndpointId(self.next_driver_endpoint),
+                generation: EndpointGeneration(1),
+            },
+            transaction_id: self.next_driver_transaction,
+            driver_path: wyrmroot_device_proto::BLOCK_DRIVER_PATH,
+            actor_identity: identity,
+            child_is_channel: true,
+            child_rights: DirectControlRights::ExactReduced,
+        };
+        DriverLaunch::new(request)?;
+        let exhausted = |counter| {
+            DevmgrError::ControllerLifecycle(ControllerLifecycleFault::Exhausted(counter))
+        };
+        let next_attempt = self
+            .next_driver_attempt
+            .checked_add(1)
+            .ok_or(exhausted(ControllerCounter::DriverAttempt))?;
+        let next_session = self
+            .next_driver_session
+            .checked_add(1)
+            .ok_or(exhausted(ControllerCounter::DriverSession))?;
+        let next_endpoint = self
+            .next_driver_endpoint
+            .checked_add(1)
+            .ok_or(exhausted(ControllerCounter::DriverEndpoint))?;
+        let next_transaction = stage_transaction
+            .checked_add(1)
+            .ok_or(exhausted(ControllerCounter::DriverTransaction))?;
+        self.next_driver_attempt = next_attempt;
+        self.next_driver_session = next_session;
+        self.next_driver_endpoint = next_endpoint;
+        self.next_driver_transaction = next_transaction;
+        Ok((request, stage_transaction))
     }
 
     /// C5 entry point: construction is impossible until the exact broad

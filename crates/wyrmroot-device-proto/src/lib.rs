@@ -15,6 +15,7 @@ pub mod controller_v1_1;
 pub mod coordinator;
 pub mod driver_launch;
 pub mod manifest;
+pub mod pci_driver;
 
 pub use connector::{ConnectorErrorCode, ConnectorIdentity, ConnectorMessage, ConnectorParseError};
 pub use control::{
@@ -28,12 +29,13 @@ pub use coordinator::{
     Coordinator, CoordinatorError, CoordinatorState, RegistryBinding, RegistryEndpoint,
 };
 pub use driver_launch::{
-    C6_FACT_BYTES, C6Fact, DEVICE_DRIVER_PATH, DRIVER_RETIRED_BYTES, DirectControlRights,
-    DriverLaunch, DriverLaunchError, DriverLaunchRequest, DriverLaunchState, LAUNCH_REQUEST_BYTES,
-    LAUNCH_RESPONSE_BYTES, REAPED_RESPONSE_BYTES, SELECTOR29_FAILURE_ATTEMPT_GENERATION,
-    SELECTOR29_FAILURE_SUPERVISOR_GENERATION, encode_c6_fact, encode_constructed,
-    encode_driver_retired, encode_reaped, encode_request, parse_c6_fact, parse_constructed,
-    parse_driver_retired, parse_reaped, parse_request, selector29_should_fail,
+    BLOCK_DRIVER_PATH, C6_FACT_BYTES, C6Fact, DEVICE_DRIVER_PATH, DRIVER_RETIRED_BYTES,
+    DirectControlRights, DriverLaunch, DriverLaunchError, DriverLaunchRequest, DriverLaunchState,
+    LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES, REAPED_RESPONSE_BYTES,
+    SELECTOR29_FAILURE_ATTEMPT_GENERATION, SELECTOR29_FAILURE_SUPERVISOR_GENERATION,
+    driver_path_for_role, encode_c6_fact, encode_constructed, encode_driver_retired, encode_reaped,
+    encode_request, parse_c6_fact, parse_constructed, parse_driver_retired, parse_reaped,
+    parse_request, selector29_should_fail,
 };
 pub use manifest::{
     COM2_POLICY, COM2_ROLE_ID, DeviceRole, Manifest, ManifestError, PioRange, ProfileId,
@@ -42,4 +44,5 @@ pub use manifest::{
     SERIAL_CONSOLE_PROTOCOL_MAJOR, SERIAL_CONSOLE_PROTOCOL_MINOR,
     SERIAL_CONSOLE_PUBLICATION_POLICY, SERIAL_CONSOLE_SERVICE_NAME,
     SERIAL_CONSOLE_SUPERVISOR_ROLE_ID, UART16550D_PATH, encode_com2_manifest,
+    encode_product_manifest,
 };

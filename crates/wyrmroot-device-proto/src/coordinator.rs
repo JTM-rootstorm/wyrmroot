@@ -420,6 +420,7 @@ mod tests {
         let mut out = [0; HEADER_BYTES + RECORD_BYTES];
         out[..4].copy_from_slice(b"WRDM");
         out[4..6].copy_from_slice(&1u16.to_le_bytes());
+        out[6..8].copy_from_slice(&manifest::MINOR.to_le_bytes());
         let total = out.len() as u32;
         out[8..12].copy_from_slice(&total.to_le_bytes());
         out[12..14].copy_from_slice(&1u16.to_le_bytes());

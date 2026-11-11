@@ -172,6 +172,7 @@ pub(crate) const fn failure_kind(error: &InitError) -> u8 {
         | InitError::NonExecutableRole
         | InitError::Manifest(_)
         | InitError::ArtifactIdentityMismatch(_)
+        | InitError::BlockDriverIdentityMismatch
         | InitError::Mapping(_)
         | InitError::Launch(_)
         | InitError::Loader(_) => 0x07,
@@ -345,6 +346,9 @@ pub enum InitError {
     Manifest(ManifestParseError),
     ZeroBootGeneration,
     ArtifactIdentityMismatch(RoleId),
+    /// `system/virtio-blkd` is not the executable WRDM's boot-disk role names.
+    /// It has no WRRM role, so it has its own variant.
+    BlockDriverIdentityMismatch,
     Native(NativeError),
     Capability(CapabilityValidationError),
     Mapping(MappingPlanError),

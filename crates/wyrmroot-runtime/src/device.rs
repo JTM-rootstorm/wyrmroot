@@ -94,6 +94,28 @@ pub fn device_pio_read(resource: DwHandle, offset: u32, width: u32) -> Result<u3
     Ok(value)
 }
 
+/// Reads 1, 2 or 4 bytes of a PCI_FUNCTION DeviceResource's standard config
+/// space, at an aligned offset below 256.
+pub fn device_pci_config_read(
+    resource: DwHandle,
+    offset: u32,
+    width: u32,
+) -> Result<u32, NativeError> {
+    let mut value = 0_u32;
+    require_success(generated_raw_call(
+        deepwyrm_syscall::DW_SYSCALL_DEVICE_PCI_CONFIG_READ,
+        [
+            resource.0,
+            u64::from(offset),
+            u64::from(width),
+            core::ptr::from_mut(&mut value) as u64,
+            0,
+            0,
+        ],
+    ))?;
+    Ok(value)
+}
+
 /// Writes one checked scalar to a generated DeviceResource PIO range.
 pub fn device_pio_write(
     resource: DwHandle,

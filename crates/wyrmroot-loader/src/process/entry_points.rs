@@ -519,6 +519,11 @@ pub fn load_device_coordinator_resource_process<P: LoaderPlatform>(
     })
 }
 
+/// The device-driver executables this loader constructs: the console's
+/// serial driver and the boot disk's block driver (root `STORAGE_PLAN.md` W2).
+/// A request for any other path is refused before anything is created.
+pub const DEVICE_DRIVER_PATHS: [&str; 2] = ["/system/uart16550d", "/system/virtio-blkd"];
+
 /// Constructs only the acceptance driver's process and transfers only its
 /// reduced direct control endpoint. The caller supplies sender-side staging
 /// authority because the loader must MOVE the endpoint once; the driver still
@@ -529,7 +534,7 @@ pub fn load_device_driver_process<P: LoaderPlatform>(
     authority: LoadAuthority,
     request: DeviceDriverLoadRequest<'_>,
 ) -> Result<LoadedProcess, DeviceDriverLoadError<P::Error>> {
-    if request.display_path != "/system/uart16550d"
+    if !DEVICE_DRIVER_PATHS.contains(&request.display_path)
         || request.supervisor_generation == 0
         || request.role_id == 0
         || request.attempt_generation == 0

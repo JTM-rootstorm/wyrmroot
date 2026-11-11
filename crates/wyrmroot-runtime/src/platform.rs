@@ -222,6 +222,13 @@ pub trait DevicePlatform {
         offset: u32,
         width: u32,
     ) -> Result<u32, NativeError>;
+    /// [`crate::device_pci_config_read`].
+    fn device_pci_config_read(
+        &mut self,
+        resource: DwHandle,
+        offset: u32,
+        width: u32,
+    ) -> Result<u32, NativeError>;
     /// [`crate::device_pio_write`].
     fn device_pio_write(
         &mut self,
@@ -554,6 +561,15 @@ impl DevicePlatform for NativePlatform {
         width: u32,
     ) -> Result<u32, NativeError> {
         crate::device_pio_read(resource, offset, width)
+    }
+
+    fn device_pci_config_read(
+        &mut self,
+        resource: DwHandle,
+        offset: u32,
+        width: u32,
+    ) -> Result<u32, NativeError> {
+        crate::device_pci_config_read(resource, offset, width)
     }
 
     fn device_pio_write(
