@@ -33,8 +33,8 @@ license = "GPL-2.0-or-later"
 repository = "https://github.com/JTM-rootstorm/wyrmroot"
 
 [workspace.dependencies]
-deepwyrm-abi = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "c7d7aaef7ddc5363ac84d2435e62c1f192753c3c" }
-deepwyrm-syscall = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "c7d7aaef7ddc5363ac84d2435e62c1f192753c3c" }
+deepwyrm-abi = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "8964ed8cc19973c5b92c30170ad3ae4dad5303fb" }
+deepwyrm-syscall = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "8964ed8cc19973c5b92c30170ad3ae4dad5303fb" }
 uefi = { version = "=0.39.0", default-features = false, features = ["alloc", "global_allocator", "panic_handler"] }
 
 # Host tooling hashes multi-GB toolchains and images. Unoptimized, xtask's

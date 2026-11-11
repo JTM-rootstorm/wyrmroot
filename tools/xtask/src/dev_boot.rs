@@ -126,7 +126,10 @@ fn qemu_arguments(smp: bool, product: &Path, vars: &Path, com1: &Path) -> Vec<St
             product.join("artifacts").join(product::ESP_NAME).display()
         ),
         "-device".into(),
-        "virtio-blk-pci,drive=esp,disable-legacy=on,iommu_platform=on".into(),
+        format!(
+            "virtio-blk-pci,drive=esp,addr={:#x},disable-legacy=on,iommu_platform=on",
+            product::BOOT_DISK_PCI_ADDRESS >> 3
+        ),
         "-serial".into(),
         format!("file:{}", com1.display()),
     ];
@@ -282,7 +285,7 @@ mod tests {
             devices,
             [
                 "intel-iommu",
-                "virtio-blk-pci,drive=esp,disable-legacy=on,iommu_platform=on"
+                "virtio-blk-pci,drive=esp,addr=0x1,disable-legacy=on,iommu_platform=on"
             ]
         );
         assert!(!args.iter().any(|arg| arg.starts_with("if=virtio")));

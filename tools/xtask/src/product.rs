@@ -26,11 +26,12 @@ use crate::{
     sha256, tasks,
 };
 use deepwyrm_abi::{
-    DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK, DW_BOOT_DEVICE_RESOURCE_V1_SIZE,
-    DW_BOOT_DEVICE_RESOURCE_V1_VERSION, DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK,
-    DW_BOOT_DEVICE_TABLE_RECORD_STRIDE, DW_BOOT_DEVICE_TABLE_V1_SIZE,
-    DW_BOOT_DEVICE_TABLE_V1_VERSION, DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
-    DwBootDeviceResourceV1, DwBootDeviceTableV1,
+    DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK, DW_BOOT_DEVICE_RESOURCE_V2_SIZE,
+    DW_BOOT_DEVICE_RESOURCE_V2_VERSION, DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK,
+    DW_BOOT_DEVICE_TABLE_RECORD_STRIDE, DW_BOOT_DEVICE_TABLE_V2_SIZE,
+    DW_BOOT_DEVICE_TABLE_V2_VERSION, DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION,
+    DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT, DwBootDeviceResourceV2,
+    DwBootDeviceTableV2,
 };
 use wyrmroot_bootfs::{
     launch_policy::{
@@ -544,77 +545,131 @@ fn rrc_builder(
     Ok(builder)
 }
 
-/// The boot device table: one q35 COM2 resource (PIO 0x2f8, IRQ 3).
+/// The q35 PCI address of the boot disk: bus 0, device 1, function 0.
+/// `dev-boot` and the VM gate pin the disk to this slot.
+pub(crate) const BOOT_DISK_PCI_ADDRESS: u32 = 1 << 3;
+/// A modern (non-transitional) virtio block device, 1af4:1042.
+const VIRTIO_BLOCK_PCI_IDS: u32 = 0x1af4 | 0x1042 << 16;
+
+/// One boot device-table record. Fields of the other kind stay zero.
+#[derive(Clone, Copy)]
+struct DeviceRecord {
+    kind: deepwyrm_abi::DwDeviceResourceKind,
+    resource_id: u64,
+    pio_base: u16,
+    pio_length: u16,
+    interrupt_source: u32,
+    pci_address: u32,
+    pci_ids: u32,
+}
+
+/// The boot device table: q35 COM2 (PIO 0x2f8, IRQ 3), resource 1, and the
+/// boot disk's PCI function, resource 2 (root `STORAGE_PLAN.md` K1/W1).
 fn boot_device_table() -> Vec<u8> {
-    let header = DW_BOOT_DEVICE_TABLE_V1_SIZE as usize;
+    let records = [
+        DeviceRecord {
+            kind: DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+            resource_id: 1,
+            pio_base: 0x02f8,
+            pio_length: 8,
+            interrupt_source: 3,
+            pci_address: 0,
+            pci_ids: 0,
+        },
+        DeviceRecord {
+            kind: DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION,
+            resource_id: 2,
+            pio_base: 0,
+            pio_length: 0,
+            interrupt_source: 0,
+            pci_address: BOOT_DISK_PCI_ADDRESS,
+            pci_ids: VIRTIO_BLOCK_PCI_IDS,
+        },
+    ];
+    let header = DW_BOOT_DEVICE_TABLE_V2_SIZE as usize;
     let stride = DW_BOOT_DEVICE_TABLE_RECORD_STRIDE as usize;
-    let total = header + stride;
+    let total = header + stride * records.len();
     let mut table = vec![0; total];
     let mut put =
         |offset: usize, value: &[u8]| table[offset..offset + value.len()].copy_from_slice(value);
     put(
-        core::mem::offset_of!(DwBootDeviceTableV1, size),
-        &DW_BOOT_DEVICE_TABLE_V1_SIZE.to_le_bytes(),
+        core::mem::offset_of!(DwBootDeviceTableV2, size),
+        &DW_BOOT_DEVICE_TABLE_V2_SIZE.to_le_bytes(),
     );
     put(
-        core::mem::offset_of!(DwBootDeviceTableV1, version),
-        &DW_BOOT_DEVICE_TABLE_V1_VERSION.to_le_bytes(),
+        core::mem::offset_of!(DwBootDeviceTableV2, version),
+        &DW_BOOT_DEVICE_TABLE_V2_VERSION.to_le_bytes(),
     );
     put(
-        core::mem::offset_of!(DwBootDeviceTableV1, resource_count),
-        &1u32.to_le_bytes(),
+        core::mem::offset_of!(DwBootDeviceTableV2, resource_count),
+        &(records.len() as u32).to_le_bytes(),
     );
     put(
-        core::mem::offset_of!(DwBootDeviceTableV1, flags),
+        core::mem::offset_of!(DwBootDeviceTableV2, flags),
         &DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK.to_le_bytes(),
     );
     put(
-        core::mem::offset_of!(DwBootDeviceTableV1, record_stride),
+        core::mem::offset_of!(DwBootDeviceTableV2, record_stride),
         &DW_BOOT_DEVICE_TABLE_RECORD_STRIDE.to_le_bytes(),
     );
     put(
-        core::mem::offset_of!(DwBootDeviceTableV1, total_byte_len),
+        core::mem::offset_of!(DwBootDeviceTableV2, total_byte_len),
         &(total as u64).to_le_bytes(),
     );
-    let record = header;
-    put(
-        record + core::mem::offset_of!(DwBootDeviceResourceV1, size),
-        &DW_BOOT_DEVICE_RESOURCE_V1_SIZE.to_le_bytes(),
-    );
-    put(
-        record + core::mem::offset_of!(DwBootDeviceResourceV1, version),
-        &DW_BOOT_DEVICE_RESOURCE_V1_VERSION.to_le_bytes(),
-    );
-    put(
-        record + core::mem::offset_of!(DwBootDeviceResourceV1, kind),
-        &DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT
-            .0
-            .to_le_bytes(),
-    );
-    put(
-        record + core::mem::offset_of!(DwBootDeviceResourceV1, flags),
-        &DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK.to_le_bytes(),
-    );
-    put(
-        record + core::mem::offset_of!(DwBootDeviceResourceV1, resource_id),
-        &1u64.to_le_bytes(),
-    );
-    put(
-        record + core::mem::offset_of!(DwBootDeviceResourceV1, device_correlation_id),
-        &1u64.to_le_bytes(),
-    );
-    put(
-        record + core::mem::offset_of!(DwBootDeviceResourceV1, pio_base),
-        &0x02f8u16.to_le_bytes(),
-    );
-    put(
-        record + core::mem::offset_of!(DwBootDeviceResourceV1, pio_length),
-        &8u16.to_le_bytes(),
-    );
-    put(
-        record + core::mem::offset_of!(DwBootDeviceResourceV1, interrupt_source),
-        &3u32.to_le_bytes(),
-    );
+    for (index, item) in records.iter().enumerate() {
+        let record = header + index * stride;
+        let field = |name: usize| record + name;
+        put(
+            field(core::mem::offset_of!(DwBootDeviceResourceV2, size)),
+            &DW_BOOT_DEVICE_RESOURCE_V2_SIZE.to_le_bytes(),
+        );
+        put(
+            field(core::mem::offset_of!(DwBootDeviceResourceV2, version)),
+            &DW_BOOT_DEVICE_RESOURCE_V2_VERSION.to_le_bytes(),
+        );
+        put(
+            field(core::mem::offset_of!(DwBootDeviceResourceV2, kind)),
+            &item.kind.0.to_le_bytes(),
+        );
+        put(
+            field(core::mem::offset_of!(DwBootDeviceResourceV2, flags)),
+            &DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK.to_le_bytes(),
+        );
+        put(
+            field(core::mem::offset_of!(DwBootDeviceResourceV2, resource_id)),
+            &item.resource_id.to_le_bytes(),
+        );
+        put(
+            field(core::mem::offset_of!(
+                DwBootDeviceResourceV2,
+                device_correlation_id
+            )),
+            &item.resource_id.to_le_bytes(),
+        );
+        put(
+            field(core::mem::offset_of!(DwBootDeviceResourceV2, pio_base)),
+            &item.pio_base.to_le_bytes(),
+        );
+        put(
+            field(core::mem::offset_of!(DwBootDeviceResourceV2, pio_length)),
+            &item.pio_length.to_le_bytes(),
+        );
+        put(
+            field(core::mem::offset_of!(
+                DwBootDeviceResourceV2,
+                interrupt_source
+            )),
+            &item.interrupt_source.to_le_bytes(),
+        );
+        put(
+            field(core::mem::offset_of!(DwBootDeviceResourceV2, pci_address)),
+            &item.pci_address.to_le_bytes(),
+        );
+        put(
+            field(core::mem::offset_of!(DwBootDeviceResourceV2, pci_ids)),
+            &item.pci_ids.to_le_bytes(),
+        );
+    }
     table
 }
 

@@ -36,7 +36,7 @@ pub const MAX_BOOTFS_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
 
 /// The optional D6 table is bounded entirely by generated ABI capacities.
 #[allow(dead_code)]
-pub const MAX_BOOT_DEVICE_TABLE_ARTIFACT_BYTES: usize = deepwyrm_abi::DW_BOOT_DEVICE_TABLE_V1_SIZE
+pub const MAX_BOOT_DEVICE_TABLE_ARTIFACT_BYTES: usize = deepwyrm_abi::DW_BOOT_DEVICE_TABLE_V2_SIZE
     as usize
     + deepwyrm_abi::DW_BOOT_DEVICE_TABLE_MAX_RESOURCES as usize
         * deepwyrm_abi::DW_BOOT_DEVICE_TABLE_RECORD_STRIDE as usize;
