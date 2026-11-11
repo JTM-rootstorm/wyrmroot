@@ -234,6 +234,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrmroot-fat"
+version = "0.0.0"
+
+[[package]]
 name = "wyrmroot-fs-proto"
 version = "0.0.0"
 
