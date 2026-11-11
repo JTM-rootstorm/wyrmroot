@@ -5,10 +5,12 @@
 
 use deepwyrm_syscall as _;
 use wyrmroot_console_proto as _;
+use wyrmroot_fs_proto as _;
 use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
 use wyrmroot_registry_proto as _;
 use wyrmroot_runtime::{NativePlatform, StartupBlock};
+use wyrmroot_service_proto as _;
 use wyrmroot_wyrmsh::run_wyrmsh;
 use wyrmroot_wyrmsh_core as _;
 

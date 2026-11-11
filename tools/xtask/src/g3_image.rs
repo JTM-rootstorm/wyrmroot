@@ -77,6 +77,15 @@ struct Inputs {
     bootstrap: Vec<u8>,
     bootfs: Vec<u8>,
     boot_device_table: Option<Vec<u8>>,
+    /// Further files in `/EFI/WYRMROOT`, by 8.3 name (root `STORAGE_PLAN.md`
+    /// W6: what the running system reads back through its own FAT32).
+    extras: Vec<([u8; 11], Vec<u8>)>,
+}
+
+/// One extra ESP file: its 8.3 name and the artifact to copy.
+pub(crate) struct EspExtra<'a> {
+    pub(crate) short_name: [u8; 11],
+    pub(crate) path: &'a str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,6 +124,7 @@ impl Inputs {
             bootstrap: read_artifact(&arguments.bootstrap, "bootstrap")?,
             bootfs: read_artifact(&arguments.bootfs, "bootfs")?,
             boot_device_table: None,
+            extras: Vec::new(),
         })
     }
 
@@ -131,6 +141,7 @@ impl Inputs {
         [&self.loader, &self.kernel, &self.bootstrap, &self.bootfs]
             .into_iter()
             .chain(self.boot_device_table.iter())
+            .chain(self.extras.iter().map(|(_, bytes)| bytes))
             .try_fold(0_u32, |total, bytes| {
                 total
                     .checked_add(cluster_count(bytes.len())?)
@@ -153,13 +164,38 @@ struct FileLayout<'a> {
 pub(crate) fn build_d6(
     arguments: &G3ImageArguments,
     boot_device_table: &str,
+    extras: &[EspExtra<'_>],
 ) -> Result<String, Failure> {
-    build_with_inputs(
-        arguments,
-        Inputs::load_with_boot_device_table(arguments, boot_device_table)?,
-        None,
-        Some(boot_device_table),
-    )
+    let mut inputs = Inputs::load_with_boot_device_table(arguments, boot_device_table)?;
+    for extra in extras {
+        let reserved = [
+            LOADER_SHORT,
+            KERNEL_SHORT,
+            BOOTSTRAP_SHORT,
+            BOOTFS_SHORT,
+            BOOT_DEVICE_TABLE_SHORT,
+        ];
+        if reserved.contains(&extra.short_name)
+            || inputs
+                .extras
+                .iter()
+                .any(|(name, _)| *name == extra.short_name)
+            || !extra
+                .short_name
+                .iter()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b' ')
+            || extra.short_name[0] == b' '
+        {
+            return Err(Failure::task(
+                "ESP extra file has a bad or duplicate 8.3 name",
+            ));
+        }
+        inputs.extras.push((
+            extra.short_name,
+            read_artifact(extra.path, "ESP extra file")?,
+        ));
+    }
+    build_with_inputs(arguments, inputs, None, Some(boot_device_table))
 }
 
 fn build_with_inputs(
@@ -302,6 +338,13 @@ fn inspect_loaded(image: &mut File, inputs: &Inputs) -> Result<Inspection, Failu
         }
         None => {}
     }
+    for (short_name, expected) in &inputs.extras {
+        if extract_file(image, &geometry, &wyrmroot_directory, *short_name)? != *expected {
+            return Err(Failure::task(
+                "G3 ESP extra file bytes do not match the supplied input",
+            ));
+        }
+    }
     let image_sha256 = crate::secure_fs::hash_open_file_exact(image, IMAGE_BYTES, "G3 ESP")?;
     let after = image
         .metadata()
@@ -338,6 +381,9 @@ fn layouts(inputs: &Inputs) -> Result<Vec<FileLayout<'_>>, Failure> {
             None,
             boot_device_table,
         )?);
+    }
+    for (short_name, bytes) in &inputs.extras {
+        layouts.push(allocate_layout(&mut next, *short_name, None, bytes)?);
     }
     Ok(layouts)
 }
@@ -593,12 +639,17 @@ fn write_directories(
             layouts[3].bytes.len() as u32,
         ),
     ];
-    if let Some(table) = layouts.get(4) {
+    for file in layouts.iter().skip(4) {
         wyrmroot_entries.push(short_entry(
-            table.short_name,
+            file.short_name,
             0x20,
-            table.first_cluster,
-            table.bytes.len() as u32,
+            file.first_cluster,
+            file.bytes.len() as u32,
+        ));
+    }
+    if wyrmroot_entries.len() > CLUSTER_BYTES / 32 {
+        return Err(Failure::task(
+            "the ESP's WYRMROOT directory outgrew its cluster",
         ));
     }
     let wyrmroot = directory_bytes(&wyrmroot_entries);

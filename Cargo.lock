@@ -430,10 +430,12 @@ version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-console-proto",
+ "wyrmroot-fs-proto",
  "wyrmroot-launch-proto",
  "wyrmroot-loader",
  "wyrmroot-registry-proto",
  "wyrmroot-runtime",
+ "wyrmroot-service-proto",
  "wyrmroot-stream-proto",
  "wyrmroot-wyrmsh-core",
 ]

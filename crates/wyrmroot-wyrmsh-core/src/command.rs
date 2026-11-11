@@ -30,12 +30,17 @@ pub enum CommandName {
     Spawn,
     Wait,
     Terminate,
+    /// Lists a directory of the VFS namespace (root `STORAGE_PLAN.md` W6).
+    Ls,
+    /// Writes a file of the VFS namespace to stdout.
+    Cat,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Arity {
     Exact(usize),
     AtLeast(usize),
+    AtMost(usize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,7 +53,7 @@ pub struct CommandSpec {
 }
 
 /// The same fixed metadata supports classification and the future help builtin.
-pub const COMMANDS: [CommandSpec; 12] = [
+pub const COMMANDS: [CommandSpec; 14] = [
     CommandSpec {
         name: CommandName::Help,
         spelling: "help",
@@ -121,7 +126,63 @@ pub const COMMANDS: [CommandSpec; 12] = [
         usage: "terminate <job-id>",
         arity: Arity::Exact(1),
     },
+    CommandSpec {
+        name: CommandName::Ls,
+        spelling: "ls",
+        usage: "ls [/path]",
+        arity: Arity::AtMost(1),
+    },
+    CommandSpec {
+        name: CommandName::Cat,
+        spelling: "cat",
+        usage: "cat </path>",
+        arity: Arity::Exact(1),
+    },
 ];
+
+/// The longest VFS path the shell sends (WRNS `MAX_PATH_BYTES`).
+pub const MAX_FS_PATH_BYTES: usize = 1024;
+
+/// Normalizes an absolute VFS path lexically: empty and `.` components are
+/// dropped and `..` removes the one before it (staying at `/`). Writes the
+/// canonical result, `/` or `/a/b`, to `out` and returns its length. The
+/// shell has no working directory, so a relative path is refused.
+pub fn normalize_fs_path(
+    path: &str,
+    out: &mut [u8; MAX_FS_PATH_BYTES],
+) -> Result<usize, UsageError> {
+    let bytes = path.as_bytes();
+    if bytes.first() != Some(&b'/') || bytes.contains(&0) {
+        return Err(UsageError::InvalidPath);
+    }
+    let mut length = 0;
+    for component in bytes.split(|&byte| byte == b'/') {
+        match component {
+            b"" | b"." => {}
+            b".." => {
+                // Back to the slash before the last component.
+                while length > 0 && out[length - 1] != b'/' {
+                    length -= 1;
+                }
+                length = length.saturating_sub(1);
+            }
+            name => {
+                let end = length + 1 + name.len();
+                if end > out.len() || name.len() > 255 {
+                    return Err(UsageError::InvalidPath);
+                }
+                out[length] = b'/';
+                out[length + 1..end].copy_from_slice(name);
+                length = end;
+            }
+        }
+    }
+    if length == 0 {
+        out[0] = b'/';
+        length = 1;
+    }
+    Ok(length)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobIdError {
@@ -162,6 +223,9 @@ pub enum Command<'a> {
     },
     Wait(NonZeroU64),
     Terminate(NonZeroU64),
+    /// The path as typed; the adapter normalizes it. `ls` alone is `/`.
+    Ls(&'a str),
+    Cat(&'a str),
 }
 
 impl<'a> Arguments<'a> {
@@ -177,6 +241,7 @@ impl<'a> Arguments<'a> {
         let valid = match spec.arity {
             Arity::Exact(n) => operands.len() == n,
             Arity::AtLeast(n) => operands.len() >= n,
+            Arity::AtMost(n) => operands.len() <= n,
         };
         if !valid {
             return Err(UsageError::ArgumentCount {
@@ -208,6 +273,8 @@ impl<'a> Arguments<'a> {
                     }
                 }
             }
+            CommandName::Ls => Command::Ls(operands.get(0).unwrap_or("/")),
+            CommandName::Cat => Command::Cat(operands.get(0).ok_or(UsageError::InvalidPath)?),
             CommandName::Wait | CommandName::Terminate => {
                 let value = operands
                     .get(0)

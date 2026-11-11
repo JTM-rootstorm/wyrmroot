@@ -60,6 +60,10 @@ pub(crate) const ESP_NAME: &str = "esp.img";
 /// sections the native stack check reads.
 const WYRMSH_FLAGS: [&str; 2] = ["-Cjump-tables=no", "-Zemit-stack-sizes"];
 
+/// `/EFI/WYRMROOT/README.TXT` on the ESP, which the running system reads
+/// back through its own FAT32 (root `STORAGE_PLAN.md` W6).
+pub(crate) const ESP_README: &[u8] = b"This is the Wyrmroot EFI System Partition.\n";
+
 /// The product's native roles, in bootfs assembly order.
 pub(crate) const NATIVES: [NativeSpec; 12] = [
     native(
@@ -261,6 +265,7 @@ pub(crate) fn build(output: &Path, deep_repository: &Path) -> Result<(), Failure
             ("device-manifest.bin", assembled.device_manifest.as_slice()),
             ("launch-policy.bin", assembled.launch_policy.as_slice()),
             ("boot-device-table.bin", device_table.as_slice()),
+            ("esp-readme.txt", ESP_README),
             ("bootfs.img", assembled.bootfs.as_slice()),
             ("OVMF_CODE.fd", ovmf_code.as_slice()),
             ("OVMF_VARS.fd", ovmf_vars.as_slice()),
@@ -277,6 +282,16 @@ pub(crate) fn build(output: &Path, deep_repository: &Path) -> Result<(), Failure
                 bootfs: path("bootfs.img"),
             },
             &path("boot-device-table.bin"),
+            &[
+                g3_image::EspExtra {
+                    short_name: *b"README  TXT",
+                    path: &path("esp-readme.txt"),
+                },
+                g3_image::EspExtra {
+                    short_name: *b"HELLO   ELF",
+                    path: &path("hello.elf"),
+                },
+            ],
         )?;
         Ok(())
     })();

@@ -19,6 +19,8 @@ wyrmroot-wyrmsh-core = { path = "../../crates/wyrmroot-wyrmsh-core" }
 wyrmroot-console-proto = { path = "../../crates/wyrmroot-console-proto" }
 wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }
 wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
+wyrmroot-fs-proto = { path = "../../crates/wyrmroot-fs-proto" }
+wyrmroot-service-proto = { path = "../../crates/wyrmroot-service-proto" }
 
 [dev-dependencies]
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", features = ["platform-recording"] }

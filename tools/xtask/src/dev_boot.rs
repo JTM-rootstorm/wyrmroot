@@ -9,8 +9,10 @@
 //! `--check` drives COM2 instead: it waits for the prompt, lists `services`
 //! until the boot-disk driver's `device.block.virtio0` is published (root
 //! `STORAGE_PLAN.md` W2; since W3 the driver publishes only after a DMA read
-//! of block 0 through its virtqueue), runs `bin/hello` (a shell job under its TaskGroup
-//! limits) to its output and the next prompt, sends Ctrl-D, and
+//! of block 0 through its virtqueue) along with `volume.boot0` and
+//! `system.vfs` (W6), lists `/boot/EFI/WYRMROOT` and `cat`s its README
+//! through vfsd, fat32d and blockmgr, runs `bin/hello` (a shell job under its
+//! TaskGroup limits) to its output and the next prompt, sends Ctrl-D, and
 //! requires the kernel's power-off line on COM1. That is the smoke check for
 //! development commits.
 //!
@@ -48,6 +50,15 @@ const POWER_OFF: &[u8] = b"no process remains; powering off";
 /// Lists the registry; the boot-disk driver publishes once it is up.
 const SERVICES_COMMAND: &[u8] = b"services\r";
 const BLOCK_SERVICE: &[u8] = b"service name=device.block.virtio0 ";
+/// The storage services that must be published too (root `STORAGE_PLAN.md` W6).
+const STORAGE_SERVICES: [&[u8]; 2] = [b"service name=volume.boot0 ", b"service name=system.vfs "];
+/// The ESP read back through vfsd, fat32d and blockmgr.
+const LS_COMMAND: &[u8] = b"ls /boot/EFI/WYRMROOT\r";
+const LS_OUTPUT: [&[u8]; 2] = [b"bootstrap.elf\r\n", b"README.TXT\r\n"];
+const CAT_COMMAND: &[u8] = b"cat /boot/EFI/WYRMROOT/README.TXT\r";
+const CAT_OUTPUT: &[u8] = b"This is the Wyrmroot EFI System Partition.";
+/// fat32d mounts beside the shell, so `ls` is retried a few times too.
+const LS_ATTEMPTS: usize = 20;
 /// The driver comes up beside the shell, so the list is retried a few times.
 const SERVICES_ATTEMPTS: usize = 20;
 /// One shell job, run under its TaskGroup limits, before shutting down.
@@ -221,17 +232,60 @@ fn drive(child: &mut Child, com1: &Path, com2: &Arc<Mutex<Vec<u8>>>) -> Result<D
                 })
                 .unwrap_or(false))
         })?;
-        if seen(BLOCK_SERVICE, before)()? {
+        if seen(BLOCK_SERVICE, before)()?
+            && seen(STORAGE_SERVICES[0], before)()?
+            && seen(STORAGE_SERVICES[1], before)()?
+        {
             break;
         }
         attempts += 1;
         if attempts == SERVICES_ATTEMPTS || Instant::now() >= deadline {
             return Err(Failure::task(
-                "dev-boot check: the boot-disk driver never published device.block.virtio0",
+                "dev-boot check: device.block.virtio0, volume.boot0 and system.vfs were never all published",
             ));
         }
         thread::sleep(Duration::from_millis(500));
     }
+    let mut attempts = 0;
+    loop {
+        let before = length();
+        input
+            .write_all(LS_COMMAND)
+            .map_err(|error| Failure::task(format!("could not send ls: {error}")))?;
+        wait_until(deadline, "the prompt after ls", || {
+            Ok(com2
+                .lock()
+                .map(|com2| {
+                    com2.get(before..)
+                        .is_some_and(|tail| contains(tail, b"WYRMROOT") && ends_with_prompt(tail))
+                })
+                .unwrap_or(false))
+        })?;
+        if seen(LS_OUTPUT[0], before)()? && seen(LS_OUTPUT[1], before)()? {
+            break;
+        }
+        attempts += 1;
+        if attempts == LS_ATTEMPTS || Instant::now() >= deadline {
+            return Err(Failure::task(
+                "dev-boot check: ls /boot/EFI/WYRMROOT never listed the ESP",
+            ));
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let before_cat = length();
+    input
+        .write_all(CAT_COMMAND)
+        .map_err(|error| Failure::task(format!("could not send cat: {error}")))?;
+    // The README and the next prompt may arrive in one read.
+    wait_until(deadline, "the README and the prompt after cat", || {
+        Ok(com2
+            .lock()
+            .map(|com2| {
+                com2.get(before_cat..)
+                    .is_some_and(|tail| contains(tail, CAT_OUTPUT) && ends_with_prompt(tail))
+            })
+            .unwrap_or(false))
+    })?;
     let before_job = length();
     input
         .write_all(JOB_COMMAND)

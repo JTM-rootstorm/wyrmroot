@@ -15,8 +15,8 @@ mod parser;
 mod redraw;
 
 pub use command::{
-    Arity, COMMANDS, Command, CommandName, CommandSpec, JobIdError, MAX_PATH_BYTES, UsageError,
-    parse_job_id, validate_path,
+    Arity, COMMANDS, Command, CommandName, CommandSpec, JobIdError, MAX_FS_PATH_BYTES,
+    MAX_PATH_BYTES, UsageError, normalize_fs_path, parse_job_id, validate_path,
 };
 pub use editor::{EditError, EditOutcome, Editor};
 pub use input::{InputDecoder, InputError, InputEvent};

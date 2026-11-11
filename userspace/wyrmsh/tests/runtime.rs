@@ -13,6 +13,7 @@ use wyrmroot_console_proto::{
     ErrorCode as StatusErrorCode, Header as StatusHeader, LastFailure, Snapshot,
     State as StatusState, encode_error as encode_status_error, encode_snapshot,
 };
+use wyrmroot_fs_proto as _;
 use wyrmroot_launch_proto::{
     ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchMessageType,
     Reservation, TerminationClassification, TerminationResult, encode_error as encode_launch_error,
@@ -31,6 +32,7 @@ use wyrmroot_runtime::{
     STARTUP_ABI_V2, STARTUP_BLOCK_SIZE, STARTUP_BLOCK_V2_SIZE, StartupBlock, StartupRegisters,
     StreamSystem,
 };
+use wyrmroot_service_proto::roles::SYSTEM_VFS;
 use wyrmroot_stream_proto::{MAX_PAYLOAD_BYTES, MAX_RECORD_BYTES, decode_data, encode_data};
 use wyrmroot_wyrmsh::{EndpointRole, ShellError, Termination, WyrmshSystem, run_wyrmsh};
 use wyrmroot_wyrmsh_core::COMMANDS;
@@ -1429,6 +1431,50 @@ fn malformed_or_stale_control_replies_fail_without_partial_or_guessed_data() {
         run_v2(&mut shell, "system/wyrmsh", &[]),
         Err(ShellError::InspectionProtocol)
     );
+}
+
+#[test]
+fn ls_and_cat_report_an_absent_vfs_or_a_relative_path_and_carry_on() {
+    let mut fixture = Fixture::new(&[b"ls /boot\ncat boot/x\nexit\n"]);
+    fixture.queue_control(
+        REGISTRY,
+        &registry_error(2, RegistryErrorCode::NotPublished),
+    );
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
+    let stderr = fixture.output(STDERR);
+    for line in [
+        b"ls: /boot: system.vfs is not available\n".as_slice(),
+        b"cat: boot/x: not an absolute path\n".as_slice(),
+    ] {
+        assert!(
+            stderr.windows(line.len()).any(|window| window == line),
+            "{:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    // The one registry request was a lookup of system.vfs carrying the new
+    // connection's far end.
+    let lookups: Vec<_> = fixture
+        .control_requests
+        .iter()
+        .filter(|(channel, _)| *channel == REGISTRY)
+        .collect();
+    assert_eq!(lookups.len(), 1);
+    let parsed = parse_registry_message(&lookups[0].1, 1).unwrap();
+    let RegistryMessage::LookupConnect(lookup) = parsed.message else {
+        panic!("expected LOOKUP_CONNECT");
+    };
+    assert_eq!(lookup.service_name, SYSTEM_VFS.name);
+    assert_eq!(parsed.header.transaction_id, 2);
+    // One pair was made: its far end moved with the lookup and the shell's
+    // own end was closed after the refusal.
+    assert_eq!(fixture.created.len(), 2);
+    let (direct, remote) = (fixture.created[0].0, fixture.created[1].0);
+    assert_eq!(fixture.moved.last().unwrap()[0].handle, remote);
+    assert!(fixture.closed.contains(&direct));
 }
 
 #[test]

@@ -4,6 +4,7 @@
 
 //! Allocation-free WYR1-E shell startup and local-command runtime.
 
+mod files;
 mod inspection;
 mod jobs;
 
@@ -693,6 +694,18 @@ fn dispatch_local<System: WyrmshSystem>(
             jobs,
             job.get(),
         )?,
+        Command::Ls(path) | Command::Cat(path) => {
+            let console = files::Console {
+                stdout,
+                stderr,
+                controls,
+            };
+            if matches!(command, Command::Ls(_)) {
+                files::list(system, console, identity, transactions, path)?;
+            } else {
+                files::cat(system, console, identity, transactions, path)?;
+            }
+        }
         Command::Terminate(job) => jobs::terminate(
             system,
             stdout,

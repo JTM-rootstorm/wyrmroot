@@ -196,7 +196,7 @@ fn fixed_commands_and_usage_are_exact() {
             Err(UsageError::ArgumentCount { .. })
         ));
     }
-    assert_eq!(COMMANDS.len(), 12);
+    assert_eq!(COMMANDS.len(), 14);
     // The two terminators are separate entries with separate spellings. A
     // corpus that only counted them would pass if `shutdown` were an alias for
     // `exit`, which is the one thing it must not be.
@@ -292,5 +292,60 @@ fn canonical_nonzero_job_ids_and_checked_overflow() {
     assert_eq!(
         parser.parse(b"wait 00").unwrap().command(),
         Err(UsageError::InvalidJobId(JobIdError::Noncanonical))
+    );
+}
+
+#[test]
+fn ls_and_cat_take_vfs_paths_and_normalize_lexically() {
+    use wyrmroot_wyrmsh_core::{MAX_FS_PATH_BYTES, normalize_fs_path};
+    let mut parser = Parser::new();
+    assert_eq!(parser.parse(b"ls").unwrap().command(), Ok(Command::Ls("/")));
+    assert_eq!(
+        parser.parse(b"ls /boot").unwrap().command(),
+        Ok(Command::Ls("/boot"))
+    );
+    assert!(matches!(
+        parser.parse(b"ls /a /b").unwrap().command(),
+        Err(UsageError::ArgumentCount { .. })
+    ));
+    assert_eq!(
+        parser.parse(b"cat /boot/x").unwrap().command(),
+        Ok(Command::Cat("/boot/x"))
+    );
+    assert!(matches!(
+        parser.parse(b"cat").unwrap().command(),
+        Err(UsageError::ArgumentCount { .. })
+    ));
+
+    let mut out = [0u8; MAX_FS_PATH_BYTES];
+    for (input, expected) in [
+        ("/", "/"),
+        ("//", "/"),
+        ("/boot/", "/boot"),
+        ("/boot//EFI/./BOOT", "/boot/EFI/BOOT"),
+        ("/boot/EFI/..", "/boot"),
+        ("/..", "/"),
+        ("/a/b/../../..", "/"),
+        ("/a/../b/./c", "/b/c"),
+    ] {
+        let length = normalize_fs_path(input, &mut out).unwrap();
+        assert_eq!(&out[..length], expected.as_bytes(), "{input}");
+    }
+    for input in ["", "boot", "./boot", "/a\0b"] {
+        assert_eq!(
+            normalize_fs_path(input, &mut out),
+            Err(UsageError::InvalidPath),
+            "{input:?}"
+        );
+    }
+    let long = format!("/{}", "x".repeat(256));
+    assert_eq!(
+        normalize_fs_path(&long, &mut out),
+        Err(UsageError::InvalidPath)
+    );
+    let deep = "/abcdefgh".repeat(130);
+    assert_eq!(
+        normalize_fs_path(&deep, &mut out),
+        Err(UsageError::InvalidPath)
     );
 }
