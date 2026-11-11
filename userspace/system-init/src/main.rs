@@ -66,6 +66,12 @@ impl InitPlatform for NativeSystem {
     fn create_attempt_task_group(&mut self, parent: DwHandle) -> Result<DwHandle, NativeError> {
         create_task_group(parent, DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0))
     }
+    fn limit_job_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError> {
+        for (class, limit) in wyrmroot_system_init::JOB_TASK_GROUP_LIMITS {
+            wyrmroot_runtime::limit_task_group(task_group, class, limit)?;
+        }
+        Ok(())
+    }
     fn terminate_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError> {
         wyrmroot_runtime::terminate_task_group(
             task_group,

@@ -216,7 +216,7 @@ where
             return Err(if failed { InitError::Cleanup } else { error });
         }
     }
-    let ticket = match jobs.jobs.begin_reserved_launch(request_ticket) {
+    let ticket = match jobs.jobs.begin_reserved_launch(request_ticket, true) {
         Ok(ticket) => ticket,
         Err(error) => {
             let failed = close_received_reverse(system, received, handle_count);
@@ -243,6 +243,18 @@ where
             );
         }
     };
+    if let Err(error) = system.limit_job_task_group(task_group) {
+        return Err(
+            if system.close_handle(task_group).is_err()
+                | close_received_reverse(system, received, handle_count)
+                | jobs.jobs.abort_launch(ticket).is_err()
+            {
+                InitError::Cleanup
+            } else {
+                InitError::Native(error)
+            },
+        );
+    }
     let prepared = match prepare_reserved_job(
         &mut jobs.jobs,
         policy,

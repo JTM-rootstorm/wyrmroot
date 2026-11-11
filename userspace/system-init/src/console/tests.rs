@@ -119,6 +119,9 @@ impl InitPlatform for ObserverPlatform {
     fn create_attempt_task_group(&mut self, _parent: DwHandle) -> Result<DwHandle, NativeError> {
         Err(FAILURE)
     }
+    fn limit_job_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+        Ok(())
+    }
 
     fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
         Err(FAILURE)

@@ -24,9 +24,28 @@ pub(crate) const MAX_CONNECTIONS: usize = 16;
 /// replacements, so orphans can never stop a new shell from starting
 /// (F4 WYR1-F4-M1).
 pub(crate) const MAX_ORPHAN_CONNECTIONS: usize = 8;
+/// Concurrent shell jobs, orphans included. Deepwyrm's production geometry
+/// (`LIVE_SHELL_JOBS`) is sized for exactly this many, so a launch beyond it
+/// is refused here rather than draining a pool a service needs to restart
+/// (F4 DW1-F4-M1).
+pub(crate) const MAX_SHELL_JOBS: usize = 4;
 /// Live orphan jobs across every closed connection. The rest of
-/// `MAX_LIVE_JOBS` stays free for live sessions.
-pub(crate) const MAX_ORPHAN_JOBS: usize = MAX_LIVE_JOBS / 2;
+/// `MAX_SHELL_JOBS` stays free for the live shell.
+pub(crate) const MAX_ORPHAN_JOBS: usize = MAX_SHELL_JOBS / 2;
+/// Each job's own TaskGroup limits: a job creates no kernel objects of its
+/// own and registers at most one wait (deepwyrm's `JOB_OWN_WAITS`). Init
+/// creates the job's Process, Thread, memory and channels, so those are
+/// charged to init and bounded by `MAX_SHELL_JOBS`.
+pub const JOB_TASK_GROUP_LIMITS: [(u32, u32); 8] = [
+    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_CHANNEL, 0),
+    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_EVENT, 0),
+    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_TIMER, 0),
+    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_MEMORY_OBJECT, 0),
+    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_THREAD, 0),
+    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_PROCESS, 0),
+    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_TASK_GROUP, 0),
+    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_WAIT, 1),
+];
 const _: () = assert!(MAX_ORPHAN_CONNECTIONS + 4 <= MAX_CONNECTIONS);
 pub(crate) const REPLAY_RECORDS: usize = 32;
 
@@ -277,6 +296,8 @@ pub(crate) struct Job {
     pub(crate) owner: ConnectionIdentity,
     pub(crate) phase: JobPhase,
     pub(crate) orphaned: bool,
+    /// Launched through a ShellJobs session; counted by `MAX_SHELL_JOBS`.
+    pub(crate) shell_job: bool,
     pub(crate) process: u64,
     pub(crate) task_group: u64,
     pub(crate) launch_channel: u64,
@@ -495,7 +516,19 @@ impl JobController {
     pub(crate) fn begin_reserved_launch(
         &mut self,
         request: RequestTicket,
+        shell_job: bool,
     ) -> Result<LaunchTicket, JobError> {
+        if shell_job
+            && self
+                .jobs
+                .iter()
+                .flatten()
+                .filter(|job| job.shell_job)
+                .count()
+                >= MAX_SHELL_JOBS
+        {
+            return Err(JobError::Capacity);
+        }
         let slot = self
             .jobs
             .iter()
@@ -511,6 +544,7 @@ impl JobController {
             owner: request.owner,
             phase: JobPhase::Reserved,
             orphaned: false,
+            shell_job,
             process: 0,
             task_group: 0,
             launch_channel: 0,
@@ -963,8 +997,12 @@ impl JobController {
     /// (WYR1-B 9.4) keeps recent background jobs running; only the bound is
     /// new. Returns how many job IDs were written to `out`.
     pub(crate) fn orphans_to_retire(&self, out: &mut [u64; MAX_LIVE_JOBS]) -> usize {
-        let running =
-            |job: &&Job| job.orphaned && job.terminal.is_none() && job.phase == JobPhase::Running;
+        let running = |job: &&Job| {
+            job.shell_job
+                && job.orphaned
+                && job.terminal.is_none()
+                && job.phase == JobPhase::Running
+        };
         let holds = |identity: ConnectionIdentity| {
             self.jobs
                 .iter()
@@ -1416,6 +1454,7 @@ mod tests {
             owner,
             phase: JobPhase::Running,
             orphaned: false,
+            shell_job: true,
             process: 100 + id,
             task_group: 200 + id,
             launch_channel: 300 + id,
@@ -1425,42 +1464,42 @@ mod tests {
         });
     }
 
+    fn retire(controller: &mut JobController, ids: &[u64]) {
+        for &job_id in ids {
+            let job = controller
+                .jobs
+                .iter_mut()
+                .flatten()
+                .find(|job| job.id == job_id)
+                .unwrap();
+            assert!(job.orphaned && job.shell_job);
+            // The kernel ends the task group; the poll loop reaps it.
+            job.phase = JobPhase::Terminating;
+        }
+        for slot in &mut controller.jobs {
+            if slot.is_some_and(|job| job.phase == JobPhase::Terminating) {
+                *slot = None;
+            }
+        }
+    }
+
     /// F4 WYR1-F4-M1: repeated `spawn bin/cpu-hog; exit` keeps the newest
-    /// orphans running but never lets them hold more than the orphan bounds,
-    /// so a new shell connection can always open.
+    /// orphans running but never more than `MAX_ORPHAN_JOBS`, so the live
+    /// shell always keeps job capacity and a new connection can always open.
     #[test]
-    fn orphans_beyond_the_bounds_are_retired_oldest_first() {
+    fn orphans_beyond_the_bound_are_retired_oldest_first() {
         let mut controller = JobController::new();
         let mut out = [0; MAX_LIVE_JOBS];
         for shell in 1..=40_u64 {
             controller.reclaim_closed_sessions();
             controller.open_connection(shell, 1).unwrap();
-            let owner = identity(shell, 1).unwrap();
-            hog(&mut controller, owner, shell);
+            hog(&mut controller, identity(shell, 1).unwrap(), shell);
             controller.disconnect(shell, 1).unwrap();
             let count = controller.orphans_to_retire(&mut out);
-            for &job_id in &out[..count] {
-                let job = controller
-                    .jobs
-                    .iter_mut()
-                    .flatten()
-                    .find(|job| job.id == job_id)
-                    .unwrap();
-                assert!(job.orphaned);
-                // The kernel ends the task group; the poll loop reaps it.
-                job.phase = JobPhase::Terminating;
-            }
-            controller.jobs.iter_mut().for_each(|slot| {
-                if slot.is_some_and(|job| job.phase == JobPhase::Terminating) {
-                    *slot = None;
-                }
-            });
-            let held = controller.jobs.iter().flatten().count();
-            assert!(held <= MAX_ORPHAN_CONNECTIONS, "shell {shell}: {held}");
-            if shell > MAX_ORPHAN_CONNECTIONS as u64 {
-                // Exactly the oldest went; the newest eight are still running.
-                assert_eq!(count, 1);
-                assert_eq!(out[0], shell - MAX_ORPHAN_CONNECTIONS as u64);
+            retire(&mut controller, &out[..count]);
+            assert!(controller.jobs.iter().flatten().count() <= MAX_ORPHAN_JOBS);
+            if shell > MAX_ORPHAN_JOBS as u64 {
+                assert_eq!(out[..count], [shell - MAX_ORPHAN_JOBS as u64]);
             } else {
                 assert_eq!(count, 0);
             }
@@ -1468,27 +1507,24 @@ mod tests {
     }
 
     #[test]
-    fn many_orphans_of_one_connection_are_bounded_by_job_count() {
+    fn a_connection_over_the_bound_loses_all_its_orphans() {
         let mut controller = JobController::new();
         let mut out = [0; MAX_LIVE_JOBS];
         controller.open_connection(1, 1).unwrap();
         controller.open_connection(2, 1).unwrap();
-        for id in 1..=10 {
+        for id in 1..=3 {
             hog(&mut controller, identity(1, 1).unwrap(), id);
         }
-        for id in 11..=20 {
-            hog(&mut controller, identity(2, 1).unwrap(), id);
-        }
+        hog(&mut controller, identity(2, 1).unwrap(), 4);
         controller.disconnect(1, 1).unwrap();
-        assert_eq!(controller.orphans_to_retire(&mut out), 0);
-        controller.disconnect(2, 1).unwrap();
-        // Twenty orphans exceed the bound of sixteen: the older connection's
-        // ten go, the newer connection's ten stay.
-        assert_eq!(controller.orphans_to_retire(&mut out), 10);
-        let mut retired = [0; 10];
-        retired.copy_from_slice(&out[..10]);
+        let count = controller.orphans_to_retire(&mut out);
+        let mut retired = [0; 3];
+        retired.copy_from_slice(&out[..count]);
         retired.sort_unstable();
-        assert_eq!(retired, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(retired, [1, 2, 3]);
+        retire(&mut controller, &[1, 2, 3]);
+        controller.disconnect(2, 1).unwrap();
+        assert_eq!(controller.orphans_to_retire(&mut out), 0);
     }
 
     #[test]
@@ -1500,5 +1536,33 @@ mod tests {
             hog(&mut controller, identity(1, 1).unwrap(), id);
         }
         assert_eq!(controller.orphans_to_retire(&mut out), 0);
+    }
+
+    /// F4 DW1-F4-M1: a fifth concurrent shell job is refused; the kernel is
+    /// sized for four. The shell's own launch is not a shell job.
+    #[test]
+    fn shell_jobs_are_capped_at_the_kernel_geometry() {
+        let mut controller = JobController::new();
+        controller.open_connection(1, 1).unwrap();
+        let ticket = |controller: &mut JobController, transaction_id| {
+            controller
+                .reserve_request(Reservation {
+                    connection_id: 1,
+                    generation: 1,
+                    transaction_id,
+                })
+                .unwrap()
+        };
+        for transaction in 1..=MAX_SHELL_JOBS as u64 {
+            let request = ticket(&mut controller, transaction);
+            controller.begin_reserved_launch(request, true).unwrap();
+        }
+        let request = ticket(&mut controller, 100);
+        assert_eq!(
+            controller.begin_reserved_launch(request, true),
+            Err(JobError::Capacity)
+        );
+        let request = ticket(&mut controller, 101);
+        assert!(controller.begin_reserved_launch(request, false).is_ok());
     }
 }

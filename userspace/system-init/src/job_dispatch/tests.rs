@@ -421,6 +421,9 @@ impl InitPlatform for MockPlatform {
     fn create_attempt_task_group(&mut self, _parent: DwHandle) -> Result<DwHandle, NativeError> {
         self.task_group.ok_or(FAILURE)
     }
+    fn limit_job_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+        Ok(())
+    }
     fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
         self.terminate_count += 1;
         if self.fail_terminate {

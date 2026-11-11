@@ -19,6 +19,7 @@ mod job_dispatch;
 mod job_launch;
 mod job_sessions;
 mod jobs;
+pub use jobs::JOB_TASK_GROUP_LIMITS;
 mod launch_transaction;
 mod product;
 mod recovery;
@@ -223,6 +224,9 @@ pub trait InitPlatform {
     fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError>;
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError>;
     fn create_attempt_task_group(&mut self, parent: DwHandle) -> Result<DwHandle, NativeError>;
+    /// Applies [`JOB_TASK_GROUP_LIMITS`] to a fresh job TaskGroup
+    /// before anything runs in it (F4 DW1-F4-M1).
+    fn limit_job_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError>;
     fn terminate_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError>;
     fn now(&mut self) -> Result<u64, NativeError>;
     fn wait_until(&mut self, deadline_ns: u64) -> Result<(), NativeError>;
@@ -751,6 +755,10 @@ mod native_cleanup_tests {
             _parent: DwHandle,
         ) -> Result<DwHandle, NativeError> {
             Err(FAILURE)
+        }
+
+        fn limit_job_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+            Ok(())
         }
 
         fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {

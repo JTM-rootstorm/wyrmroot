@@ -6,7 +6,9 @@
 //! to a file; COM2 (the `wyrmsh` console) is the terminal, so the system can be
 //! used directly. Ctrl-D at an empty prompt shuts the system down.
 //!
-//! `--check` drives COM2 instead: it waits for the prompt, sends Ctrl-D, and
+//! `--check` drives COM2 instead: it waits for the prompt, runs `bin/hello`
+//! (a shell job under its TaskGroup limits) to its output and the next
+//! prompt, sends Ctrl-D, and
 //! requires the kernel's power-off line on COM1. That is the smoke check for
 //! development commits.
 //!
@@ -41,6 +43,9 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(180);
 const PROMPT: &[u8] = b"wyrmsh> ";
 const END_OF_INPUT: u8 = 0x04;
 const POWER_OFF: &[u8] = b"no process remains; powering off";
+/// One shell job, run under its TaskGroup limits, before shutting down.
+const JOB_COMMAND: &[u8] = b"run bin/hello\r";
+const JOB_OUTPUT: &[u8] = b"hello from native stdout";
 
 pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
     let repository = tasks::repository_root()?;
@@ -166,16 +171,37 @@ fn drive(child: &mut Child, com1: &Path) -> Result<Duration, Failure> {
             }
         }
     });
-    wait_until(deadline, "the wyrmsh prompt on COM2", || {
-        Ok(com2
-            .lock()
-            .map(|com2| contains(&com2, PROMPT))
-            .unwrap_or(false))
-    })?;
-    child
+    let seen = |needle: &'static [u8], after: usize| {
+        let com2 = Arc::clone(&com2);
+        move || {
+            Ok(com2
+                .lock()
+                .map(|com2| com2.get(after..).is_some_and(|tail| contains(tail, needle)))
+                .unwrap_or(false))
+        }
+    };
+    let length = || com2.lock().map(|com2| com2.len()).unwrap_or(0);
+    wait_until(deadline, "the wyrmsh prompt on COM2", seen(PROMPT, 0))?;
+    let input = child
         .stdin
         .as_mut()
-        .ok_or_else(|| Failure::task("QEMU COM2 input is not piped"))?
+        .ok_or_else(|| Failure::task("QEMU COM2 input is not piped"))?;
+    let before_job = length();
+    input
+        .write_all(JOB_COMMAND)
+        .map_err(|error| Failure::task(format!("could not send the job command: {error}")))?;
+    wait_until(
+        deadline,
+        "bin/hello output on COM2",
+        seen(JOB_OUTPUT, before_job),
+    )?;
+    let after_job = length();
+    wait_until(
+        deadline,
+        "the prompt after bin/hello",
+        seen(PROMPT, after_job),
+    )?;
+    input
         .write_all(&[END_OF_INPUT])
         .map_err(|error| Failure::task(format!("could not send Ctrl-D: {error}")))?;
     wait_until(deadline, "QEMU to exit after Ctrl-D", || {

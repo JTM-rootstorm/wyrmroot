@@ -331,6 +331,15 @@ pub fn terminate_process(
     require_success(deepwyrm_syscall::process_terminate(process, reason, detail))
 }
 
+/// `task_group_limit`: lowers one class's limit on a TaskGroup held with
+/// MODIFY. Limits only fall.
+pub fn limit_task_group(task_group: DwHandle, class: u32, limit: u32) -> Result<(), NativeError> {
+    require_success(raw::call(
+        deepwyrm_syscall::DW_SYSCALL_TASK_GROUP_LIMIT,
+        [task_group.0, u64::from(class), u64::from(limit), 0, 0, 0],
+    ))
+}
+
 pub fn create_task_group(parent: DwHandle, rights: DwRights) -> Result<DwHandle, NativeError> {
     let mut child = DwHandle(0);
     require_success(raw::call(
