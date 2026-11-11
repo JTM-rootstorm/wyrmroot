@@ -10,6 +10,7 @@ publish = false
 deepwyrm-abi.workspace = true
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }
 wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto" }
+wyrmroot-ext4 = { path = "../../crates/wyrmroot-ext4" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest", features = ["builder"] }
 

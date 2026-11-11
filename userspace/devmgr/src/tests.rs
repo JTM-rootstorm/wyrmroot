@@ -1043,8 +1043,8 @@ fn connector_broker_activation_publishes_the_ready_driver_once() {
     );
 }
 
-fn product_manifest() -> [u8; HEADER_BYTES + 2 * RECORD_BYTES] {
-    let mut bytes = [0; HEADER_BYTES + 2 * RECORD_BYTES];
+fn product_manifest() -> [u8; HEADER_BYTES + 3 * RECORD_BYTES] {
+    let mut bytes = [0; HEADER_BYTES + 3 * RECORD_BYTES];
     wyrmroot_device_proto::encode_product_manifest(
         ContentIdentity([0x5a; 32]),
         ContentIdentity([0x6b; 32]),
@@ -1063,13 +1063,14 @@ fn the_boot_disk_identity_comes_from_the_manifest_role() {
         product.boot_disk_identity,
         Some(ContentIdentity([0x6b; 32]))
     );
-    assert_eq!(product.driver_identity, ContentIdentity([0x5a; 32]));
     assert_eq!(
-        prepare_operational(&manifest(), 7)
-            .unwrap()
-            .boot_disk_identity,
-        None
+        product.data_disk_identity,
+        Some(ContentIdentity([0x6b; 32]))
     );
+    assert_eq!(product.driver_identity, ContentIdentity([0x5a; 32]));
+    let console_only = prepare_operational(&manifest(), 7).unwrap();
+    assert_eq!(console_only.boot_disk_identity, None);
+    assert_eq!(console_only.data_disk_identity, None);
 }
 
 /// The boot disk's launch and STAGE correlations come from the same
@@ -1079,15 +1080,16 @@ fn the_boot_disk_identity_comes_from_the_manifest_role() {
 fn storage_launch_correlations_never_reuse_a_console_driver_identity() {
     let mut resident =
         ResidentController::new(prepare_operational(&product_manifest(), 7).unwrap(), 41).unwrap();
+    use wyrmroot_device_proto::manifest::{BOOT_DISK_POLICY, DATA_DISK_POLICY};
     assert_eq!(
-        resident.issue_storage_launch(),
+        resident.issue_storage_launch(&BOOT_DISK_POLICY),
         Err(DevmgrError::ControllerPrecondition)
     );
     resident.accept(install(binding(1, 7), 41), 0).unwrap();
     let console = resident
         .issue_driver_launch(true, DirectControlRights::ExactReduced)
         .unwrap();
-    let (storage, stage) = resident.issue_storage_launch().unwrap();
+    let (storage, stage) = resident.issue_storage_launch(&BOOT_DISK_POLICY).unwrap();
     assert_eq!(
         storage.role_id,
         wyrmroot_device_proto::manifest::BOOT_DISK_ROLE_ID
@@ -1105,8 +1107,15 @@ fn storage_launch_correlations_never_reuse_a_console_driver_identity() {
     assert!(stage > storage.transaction_id);
     // The console driver's attempt is untouched by the storage launch.
     assert_eq!(resident.active_driver_request(), Some(console));
-    let (second, second_stage) = resident.issue_storage_launch().unwrap();
+    // The data disk's launch names its own role and continues the counters.
+    let (second, second_stage) = resident.issue_storage_launch(&DATA_DISK_POLICY).unwrap();
+    assert_eq!(
+        second.role_id,
+        wyrmroot_device_proto::manifest::DATA_DISK_ROLE_ID
+    );
+    assert_eq!(second.driver_path, wyrmroot_device_proto::BLOCK_DRIVER_PATH);
     assert!(second.attempt_generation.0 > storage.attempt_generation.0);
+    assert!(second.endpoint.id.0 > storage.endpoint.id.0);
     assert!(second.transaction_id > stage);
     assert!(second_stage > second.transaction_id);
 }
@@ -1116,8 +1125,10 @@ fn a_product_without_the_boot_disk_issues_no_storage_launch() {
     let mut resident =
         ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
     resident.accept(install(binding(1, 7), 41), 0).unwrap();
-    assert_eq!(
-        resident.issue_storage_launch(),
-        Err(DevmgrError::MissingRole)
-    );
+    for disk in wyrmroot_device_proto::manifest::DISK_POLICIES {
+        assert_eq!(
+            resident.issue_storage_launch(&disk),
+            Err(DevmgrError::MissingRole)
+        );
+    }
 }

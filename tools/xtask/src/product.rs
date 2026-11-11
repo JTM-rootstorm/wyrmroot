@@ -38,7 +38,7 @@ use wyrmroot_bootfs::{
         JOB_V2_PROFILE_ID, LaunchPolicyEntry, SERVICE_ROLE_PROFILE_ID, WYRMSH_PATH,
         WYRMSH_PROFILE_ID, encode as encode_policy,
     },
-    paths::{BLOCKMGR_PATH, FAT32D_PATH, VFSD_PATH},
+    paths::{BLOCKMGR_PATH, EXT4D_PATH, FAT32D_PATH, VFSD_PATH},
     product::{Product, ServiceArtifact, build as build_bootfs},
 };
 use wyrmroot_device_proto::manifest::{
@@ -65,7 +65,7 @@ const WYRMSH_FLAGS: [&str; 2] = ["-Cjump-tables=no", "-Zemit-stack-sizes"];
 pub(crate) const ESP_README: &[u8] = b"This is the Wyrmroot EFI System Partition.\n";
 
 /// The product's native roles, in bootfs assembly order.
-pub(crate) const NATIVES: [NativeSpec; 12] = [
+pub(crate) const NATIVES: [NativeSpec; 13] = [
     native(
         "system-init",
         "wyrmroot-system-init",
@@ -115,6 +115,7 @@ pub(crate) const NATIVES: [NativeSpec; 12] = [
         "native-fat32d",
         "fat32d",
     ),
+    native("ext4d", "wyrmroot-ext4d", "ext4d", "native-ext4d", "ext4d"),
     native("vfsd", "wyrmroot-vfsd", "vfsd", "native-vfsd", "vfsd"),
     native(
         "consoled",
@@ -256,6 +257,7 @@ pub(crate) fn build(output: &Path, deep_repository: &Path) -> Result<(), Failure
             ("virtio-blkd.elf", native_bytes("virtio-blkd")),
             ("blockmgr.elf", native_bytes("blockmgr")),
             ("fat32d.elf", native_bytes("fat32d")),
+            ("ext4d.elf", native_bytes("ext4d")),
             ("vfsd.elf", native_bytes("vfsd")),
             ("consoled.elf", native_bytes("consoled")),
             ("wyrmsh.elf", native_bytes("wyrmsh")),
@@ -438,10 +440,11 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
         .build_structural()
         .map_err(|error| Failure::task(format!("RRC manifest build failed: {error:?}")))?;
 
-    // COM2, then the boot disk (root `STORAGE_PLAN.md` W2). The boot-disk
-    // driver is not a recovery-root role, so WRDM alone names its identity.
+    // COM2, then the boot disk (root `STORAGE_PLAN.md` W2) and the data disk
+    // (W7). The disk driver is not a recovery-root role, so WRDM alone names
+    // its identity.
     let block_identity = identity("virtio-blkd");
-    let mut wrdm = [0u8; WRDM_HEADER_BYTES + 2 * WRDM_RECORD_BYTES];
+    let mut wrdm = [0u8; WRDM_HEADER_BYTES + 3 * WRDM_RECORD_BYTES];
     let wrdm_size = encode_product_manifest(
         ContentIdentity(role_hashes[2]),
         ContentIdentity(block_identity),
@@ -452,7 +455,7 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
 
     let hello = identity("hello");
     let cpu_hog = identity("cpu-hog");
-    let services = ["blockmgr", "fat32d", "vfsd"].map(identity);
+    let services = ["blockmgr", "fat32d", "ext4d", "vfsd"].map(identity);
     let service = |path, content_sha256| LaunchPolicyEntry {
         path,
         content_sha256,
@@ -483,10 +486,12 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
                 allow_no_streams: false,
                 allow_three_streams: true,
             },
-            // The storage service roles (root `STORAGE_PLAN.md` W6).
+            // The storage service roles (root `STORAGE_PLAN.md` W6, W7), in
+            // canonical path order.
             service(BLOCKMGR_PATH, services[0]),
+            service(EXT4D_PATH, services[2]),
             service(FAT32D_PATH, services[1]),
-            service(VFSD_PATH, services[2]),
+            service(VFSD_PATH, services[3]),
             LaunchPolicyEntry {
                 path: WYRMSH_PATH,
                 content_sha256: role_hashes[4],
@@ -529,8 +534,12 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
                 identity: services[1],
             },
             ServiceArtifact {
-                bytes: &natives["vfsd"],
+                bytes: &natives["ext4d"],
                 identity: services[2],
+            },
+            ServiceArtifact {
+                bytes: &natives["vfsd"],
+                identity: services[3],
             },
         ],
     })
@@ -623,12 +632,12 @@ fn rrc_builder(
     Ok(builder)
 }
 
-/// The q35 PCI address of the boot disk: bus 0, device 1, function 0.
-/// `dev-boot` and the VM gate pin the disk to this slot. The device table and
-/// WRDM's boot-disk role share these values.
-pub(crate) use wyrmroot_device_proto::manifest::BOOT_DISK_PCI_ADDRESS;
 /// A modern (non-transitional) virtio block device, 1af4:1042.
 use wyrmroot_device_proto::manifest::VIRTIO_BLOCK_PCI_IDS;
+/// The q35 PCI addresses of the boot disk (bus 0, device 1, function 0) and
+/// the data disk (device 2). `dev-boot` and the VM gate pin the disks to
+/// these slots. The device table and WRDM's disk roles share these values.
+pub(crate) use wyrmroot_device_proto::manifest::{BOOT_DISK_PCI_ADDRESS, DATA_DISK_PCI_ADDRESS};
 
 /// One boot device-table record. Fields of the other kind stay zero.
 #[derive(Clone, Copy)]
@@ -642,8 +651,10 @@ struct DeviceRecord {
     pci_ids: u32,
 }
 
-/// The boot device table: q35 COM2 (PIO 0x2f8, IRQ 3), resource 1, and the
-/// boot disk's PCI function, resource 2 (root `STORAGE_PLAN.md` K1/W1).
+/// The boot device table: q35 COM2 (PIO 0x2f8, IRQ 3), resource 1, the
+/// boot disk's PCI function, resource 2 (root `STORAGE_PLAN.md` K1/W1), and
+/// the data disk's, resource 3 (W7). A disk that is not attached is logged
+/// absent by the kernel and simply cannot be claimed.
 fn boot_device_table() -> Vec<u8> {
     let records = [
         DeviceRecord {
@@ -662,6 +673,15 @@ fn boot_device_table() -> Vec<u8> {
             pio_length: 0,
             interrupt_source: 0,
             pci_address: BOOT_DISK_PCI_ADDRESS,
+            pci_ids: VIRTIO_BLOCK_PCI_IDS,
+        },
+        DeviceRecord {
+            kind: DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION,
+            resource_id: wyrmroot_device_proto::manifest::DATA_DISK_RESOURCE_ID,
+            pio_base: 0,
+            pio_length: 0,
+            interrupt_source: 0,
+            pci_address: DATA_DISK_PCI_ADDRESS,
             pci_ids: VIRTIO_BLOCK_PCI_IDS,
         },
     ];

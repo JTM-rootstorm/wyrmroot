@@ -1,11 +1,18 @@
-//! blockmgr: finds the boot volume on the boot disk and serves it as the
-//! `volume.boot0` WRBD BlockDevice (root `STORAGE_PLAN.md` W6).
+//! blockmgr: finds one volume on one disk and serves it as a WRBD
+//! BlockDevice (root `STORAGE_PLAN.md` W6, W7). Init runs it twice, as two
+//! roles of the same executable:
 //!
-//! The boot volume is the EFI System Partition: the whole disk when it has
-//! no partition table and LBA 0 is a FAT boot sector (the product's ESP),
-//! the first EFI System partition of a GPT, or the first type-0xEF entry of
-//! an MBR. Discovery is `wyrmroot-partition` (W4) over one connection to the
-//! disk driver, which is closed again before serving.
+//! - the boot role serves `volume.boot0`, the EFI System Partition on the
+//!   boot disk: the whole disk when it has no partition table and LBA 0 is a
+//!   FAT boot sector (the product's ESP), the first EFI System partition of
+//!   a GPT, or the first type-0xEF entry of an MBR;
+//! - the root role serves `volume.root0`, the persistent root on the data
+//!   disk: the first Linux filesystem data partition of a GPT, the first
+//!   type-0x83 entry of an MBR, or the whole disk when it has no table. Which
+//!   filesystem it holds is the filesystem service's to check.
+//!
+//! Discovery is `wyrmroot-partition` (W4) over one connection to the disk
+//! driver, which is closed again before serving.
 //!
 //! Each client gets its own connection to the driver. Its ATTACH passes
 //! straight through, so the device reads and writes the client's buffer
@@ -30,7 +37,9 @@ use deepwyrm_syscall::{
     DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
 };
 use wyrmroot_block_proto::{self as wrbd, Body, Info, MAX_BYTES, Message, Status, Transfer};
-use wyrmroot_device_proto::manifest::BOOT_DISK_PUBLICATION_POLICY;
+use wyrmroot_device_proto::manifest::{
+    BOOT_DISK_PUBLICATION_POLICY, DATA_DISK_PUBLICATION_POLICY, PublicationPolicy,
+};
 use wyrmroot_partition::{
     BlockSource, DeviceError, PartitionTable, PartitionType, Scheme, discover,
 };
@@ -40,7 +49,9 @@ use wyrmroot_service::memory::{LEND_RIGHTS, Mapper, View, create_buffer};
 use wyrmroot_service::{
     Launch, Registry, ServiceName, ServicePlatform, accept_offer, publish, receive_stage, startup,
 };
-use wyrmroot_service_proto::roles::{BLOCKMGR_ROLE_ID, BOOT_VOLUME};
+use wyrmroot_service_proto::roles::{
+    BLOCKMGR_ROLE_ID, BOOT_VOLUME, ROOT_BLOCKMGR_ROLE_ID, ROOT_VOLUME,
+};
 
 pub const FAILURE_BASE: u32 = 0xB10C_0000;
 /// Clients served at once; the driver serves four connections, and
@@ -54,18 +65,52 @@ const DISCOVERY_BYTES: u64 = 4096;
 const DRIVER_ATTACH_RIGHTS: DwRights = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0);
 const READABLE_OR_CLOSED: DwSignals = DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0);
 const MBR_TYPE_EFI_SYSTEM: u8 = 0xef;
+const MBR_TYPE_LINUX: u8 = 0x83;
 
 pub trait BlockmgrPlatform: ServicePlatform + MemoryPlatform {}
 impl<P: ServicePlatform + MemoryPlatform + ?Sized> BlockmgrPlatform for P {}
 
+const fn disk_name(policy: PublicationPolicy) -> ServiceName {
+    ServiceName {
+        name: policy.service_name,
+        protocol_id: policy.protocol_id,
+        major: policy.protocol_major,
+        minor: policy.protocol_minor,
+        supervisor_role_id: policy.supervisor_role_id,
+    }
+}
+
 /// The boot disk as the registry names it.
-pub const BOOT_DISK: ServiceName = ServiceName {
-    name: BOOT_DISK_PUBLICATION_POLICY.service_name,
-    protocol_id: BOOT_DISK_PUBLICATION_POLICY.protocol_id,
-    major: BOOT_DISK_PUBLICATION_POLICY.protocol_major,
-    minor: BOOT_DISK_PUBLICATION_POLICY.protocol_minor,
-    supervisor_role_id: BOOT_DISK_PUBLICATION_POLICY.supervisor_role_id,
-};
+pub const BOOT_DISK: ServiceName = disk_name(BOOT_DISK_PUBLICATION_POLICY);
+/// The data disk as the registry names it.
+pub const DATA_DISK: ServiceName = disk_name(DATA_DISK_PUBLICATION_POLICY);
+
+/// What one blockmgr role serves.
+#[derive(Clone, Copy)]
+pub struct Duty {
+    pub role_id: u64,
+    /// The disk it connects to.
+    pub disk: ServiceName,
+    /// The volume service it publishes.
+    pub volume: ServiceName,
+    /// Picks the volume from the disk's table and size in blocks.
+    pub pick: fn(&PartitionTable, u64) -> Option<Volume>,
+}
+
+pub const DUTIES: [Duty; 2] = [
+    Duty {
+        role_id: BLOCKMGR_ROLE_ID,
+        disk: BOOT_DISK,
+        volume: BOOT_VOLUME,
+        pick: boot_volume,
+    },
+    Duty {
+        role_id: ROOT_BLOCKMGR_ROLE_ID,
+        disk: DATA_DISK,
+        volume: ROOT_VOLUME,
+        pick: root_volume,
+    },
+];
 
 /// A block range of the disk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +141,32 @@ pub fn boot_volume(table: &PartitionTable, disk_blocks: u64) -> Option<Volume> {
             .mbr_partitions()
             .iter()
             .find(|partition| partition.os_type() == MBR_TYPE_EFI_SYSTEM)
+            .map(|partition| Volume {
+                first_block: partition.first_lba(),
+                block_count: partition.block_count(),
+            }),
+    }
+}
+
+/// Picks the root volume out of a discovered table.
+pub fn root_volume(table: &PartitionTable, disk_blocks: u64) -> Option<Volume> {
+    match table.scheme() {
+        Scheme::None { .. } => Some(Volume {
+            first_block: 0,
+            block_count: disk_blocks,
+        }),
+        Scheme::Gpt(_) => table
+            .gpt_partitions()
+            .iter()
+            .find(|partition| partition.partition_type() == PartitionType::LinuxFilesystemData)
+            .map(|partition| Volume {
+                first_block: partition.first_lba(),
+                block_count: partition.block_count(),
+            }),
+        Scheme::Mbr => table
+            .mbr_partitions()
+            .iter()
+            .find(|partition| partition.os_type() == MBR_TYPE_LINUX)
             .map(|partition| Volume {
                 first_block: partition.first_lba(),
                 block_count: partition.block_count(),
@@ -150,9 +221,13 @@ fn run<P: BlockmgrPlatform, M: Mapper<P>>(
     bootstrap: DwHandle,
 ) -> Result<(), u32> {
     let launch = startup(platform, bootstrap)?;
-    if launch.role_id != BLOCKMGR_ROLE_ID {
+    let Some(duty) = DUTIES
+        .iter()
+        .find(|duty| duty.role_id == launch.role_id)
+        .copied()
+    else {
         return Err(6);
-    }
+    };
     let deadline = platform
         .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .map_err(|_| 7u32)?;
@@ -166,7 +241,7 @@ fn run<P: BlockmgrPlatform, M: Mapper<P>>(
         return Err(17);
     }
     let mut registry = Registry::new(client_endpoint, identity);
-    let (info, volume) = discover_volume(platform, mapper, &launch, &mut registry)?;
+    let (info, volume) = discover_volume(platform, mapper, &launch, &mut registry, duty)?;
     let deadline = platform
         .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .map_err(|_| 90u32)?;
@@ -177,6 +252,7 @@ fn run<P: BlockmgrPlatform, M: Mapper<P>>(
             ..info
         },
         volume,
+        duty,
         links: [None; MAX_LINKS],
     };
     let result = server.serve(platform, &launch, publication, grant, &mut registry);
@@ -184,18 +260,19 @@ fn run<P: BlockmgrPlatform, M: Mapper<P>>(
     result
 }
 
-/// Connects to the boot disk, discovers its boot volume and disconnects.
+/// Connects to the duty's disk, discovers its volume and disconnects.
 /// Steps 80..=89 (and the helpers' own).
 fn discover_volume<P: BlockmgrPlatform, M: Mapper<P>>(
     platform: &mut P,
     mapper: &mut M,
     launch: &Launch,
     registry: &mut Registry,
+    duty: Duty,
 ) -> Result<(Info, Volume), u32> {
     let deadline = platform
         .monotonic_deadline_after(DISK_TIMEOUT_NS)
         .map_err(|_| 80u32)?;
-    let channel = registry.connect(platform, BOOT_DISK, deadline)?;
+    let channel = registry.connect(platform, duty.disk, deadline)?;
     let result = (|| {
         let deadline = platform
             .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
@@ -224,7 +301,7 @@ fn discover_volume<P: BlockmgrPlatform, M: Mapper<P>>(
                         &mut table,
                     )
                     .map_err(|_| 84u32)?;
-                    boot_volume(&table, disk_blocks).ok_or(85u32)
+                    (duty.pick)(&table, disk_blocks).ok_or(85u32)
                 });
                 let unmapped = mapper.unmap(platform, view);
                 match found {
@@ -258,6 +335,7 @@ struct Link {
 struct Server {
     info: Info,
     volume: Volume,
+    duty: Duty,
     links: [Option<Link>; MAX_LINKS],
 }
 
@@ -322,7 +400,9 @@ impl Server {
                 // the ones we have.
                 Target::Publication if !readable => return Err(103),
                 Target::Publication => {
-                    if let Some(client) = accept_offer(platform, publication, grant, BOOT_VOLUME)? {
+                    if let Some(client) =
+                        accept_offer(platform, publication, grant, self.duty.volume)?
+                    {
                         self.add_link(platform, registry, client);
                     }
                 }
@@ -354,7 +434,7 @@ impl Server {
         let driver = platform
             .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
             .ok()
-            .and_then(|deadline| registry.connect(platform, BOOT_DISK, deadline).ok());
+            .and_then(|deadline| registry.connect(platform, self.duty.disk, deadline).ok());
         match driver {
             Some(driver) => {
                 self.links[slot] = Some(Link {

@@ -87,6 +87,44 @@ impl BlockClient {
         }
     }
 
+    /// Writes `block_count` blocks at `lba` from the attached buffer at
+    /// `buffer_offset`; the device's refusal or error is `Ok(status)`.
+    pub fn write<P: ServicePlatform + ?Sized>(
+        &mut self,
+        platform: &mut P,
+        lba: u64,
+        block_count: u32,
+        buffer_offset: u64,
+        deadline: DwDeadline,
+    ) -> Result<Status, u32> {
+        match self.request(
+            platform,
+            Body::Write(Transfer {
+                lba,
+                block_count,
+                buffer_offset,
+            }),
+            None,
+            deadline,
+        )? {
+            Body::Complete(status) => Ok(status),
+            _ => Err(68),
+        }
+    }
+
+    /// Makes every completed write durable; the device's answer is
+    /// `Ok(status)`.
+    pub fn flush<P: ServicePlatform + ?Sized>(
+        &mut self,
+        platform: &mut P,
+        deadline: DwDeadline,
+    ) -> Result<Status, u32> {
+        match self.request(platform, Body::Flush, None, deadline)? {
+            Body::Complete(status) => Ok(status),
+            _ => Err(68),
+        }
+    }
+
     /// Sends one request and returns the reply body. Steps 60..=65.
     fn request<P: ServicePlatform + ?Sized>(
         &mut self,

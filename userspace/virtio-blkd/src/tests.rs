@@ -108,6 +108,57 @@ fn admitted() -> AdmittedStage {
 }
 
 #[test]
+fn the_data_disk_role_stages_only_with_its_own_resource_and_function() {
+    use wyrmroot_device_proto::manifest::{COM2_ROLE_ID, DATA_DISK_POLICY};
+    let data_launch = LaunchCorrelation {
+        role_id: DATA_DISK_POLICY.role_id.0,
+        ..launch()
+    };
+    let data_identity = ControlIdentityV1_1 {
+        role_id: DATA_DISK_POLICY.role_id,
+        ..identity()
+    };
+    let stage = |resource_id, function| PciDriverMessage::Stage {
+        identity: data_identity,
+        resource_id,
+        function,
+    };
+    let admitted = admit_stage_message(
+        data_launch,
+        stage(DATA_DISK_POLICY.resource_id, DATA_DISK_POLICY.pci),
+    )
+    .unwrap();
+    assert_eq!(admitted.function, DATA_DISK_POLICY.pci);
+    // Either half of the boot disk's policy is refused for the data role.
+    for (resource_id, function) in [
+        (BOOT_DISK_POLICY.resource_id, DATA_DISK_POLICY.pci),
+        (DATA_DISK_POLICY.resource_id, BOOT_DISK_POLICY.pci),
+    ] {
+        assert_eq!(
+            admit_stage_message(data_launch, stage(resource_id, function)),
+            Err(StageError::WrongPolicy)
+        );
+    }
+    // A role that is not a disk never stages a block driver.
+    let com2_launch = LaunchCorrelation {
+        role_id: COM2_ROLE_ID.0,
+        ..launch()
+    };
+    let com2 = PciDriverMessage::Stage {
+        identity: ControlIdentityV1_1 {
+            role_id: COM2_ROLE_ID,
+            ..identity()
+        },
+        resource_id: BOOT_DISK_POLICY.resource_id,
+        function: BOOT_DISK_POLICY.pci,
+    };
+    assert_eq!(
+        admit_stage_message(com2_launch, com2),
+        Err(StageError::WrongPolicy)
+    );
+}
+
+#[test]
 fn a_stage_must_carry_this_attempt_and_the_boot_disk_policy() {
     assert_eq!(admitted().identity, identity());
     let refused = |change: fn(&mut ControlIdentityV1_1)| {
@@ -427,7 +478,8 @@ fn bring_up_replies() -> Vec<Reply> {
         Reply::Handle(Ok(DMA_OBJECT)),
         Reply::Value(Ok(MEM_IOVA)),
         Reply::Unit(Ok(())),
-        // The self-test read's deadline; the model completes at once.
+        // The two self-test reads' deadlines; the model completes at once.
+        Reply::Deadline(Ok(DwDeadline(1_000))),
         Reply::Deadline(Ok(DwDeadline(1_000))),
     ]);
     replies
@@ -613,8 +665,14 @@ fn the_driver_brings_up_the_disk_reads_block_zero_and_publishes_only_then() {
             },
         ]
     );
-    // One read of block 0, before the PUBLISH; the device was reset at exit.
-    assert_eq!(model.executed, [(crate::virtio::BLK_T_IN, 0, 512)]);
+    // Two reads of block 0, before the PUBLISH; the device was reset at exit.
+    assert_eq!(
+        model.executed,
+        [
+            (crate::virtio::BLK_T_IN, 0, 512),
+            (crate::virtio::BLK_T_IN, 0, 512)
+        ]
+    );
     assert_eq!(model.status, 0);
     let publish = calls
         .iter()
@@ -644,10 +702,27 @@ fn the_driver_brings_up_the_disk_reads_block_zero_and_publishes_only_then() {
     assert!(calls.ends_with(&retire_calls()));
 }
 
+/// Whatever block 0 holds, a blank data disk included, the driver
+/// publishes once its reads reach memory.
 #[test]
-fn a_disk_without_the_boot_signature_is_never_published() {
+fn a_blank_disk_is_published() {
     let mut model = Model::new();
-    model.disk[510] = 0;
+    model.disk.fill(0);
+    let mut script = startup_replies();
+    script.extend(stage_replies(BOOT_DISK_POLICY.pci.ids));
+    script.extend(bring_up_replies());
+    script.extend(publish_replies());
+    // The control Channel closes: the driver retires.
+    script.push(ready_wait(0, DW_SIGNAL_PEER_CLOSED));
+    script.extend(retire_replies(0));
+    let (_, calls, _) = run_with_model(script, model);
+    assert!(!sent_on(&calls, PUBLICATION).is_empty());
+}
+
+#[test]
+fn a_device_whose_reads_never_reach_memory_is_never_published() {
+    let mut model = Model::new();
+    model.drop_reads = true;
     let mut script = startup_replies();
     script.extend(stage_replies(BOOT_DISK_POLICY.pci.ids));
     script.extend(bring_up_replies());
@@ -666,7 +741,8 @@ fn a_device_without_iommu_translation_stops_the_driver_before_any_request() {
     let mut script = startup_replies();
     script.extend(stage_replies(BOOT_DISK_POLICY.pci.ids));
     let mut bring_up = bring_up_replies();
-    bring_up.pop();
+    // Neither self-test read is made.
+    bring_up.truncate(bring_up.len() - 2);
     script.extend(bring_up);
     script.extend(retire_replies(0));
     let (code, calls, model) = run_with_model(script, model);
@@ -844,8 +920,8 @@ fn bad_attachments_are_refused_and_their_handles_closed() {
     let (code, calls, model) = run_with_model(script, Model::new());
     assert_eq!(code, 0);
     assert!(
-        model.unwrap().executed.len() == 1,
-        "only the self-test read"
+        model.unwrap().executed.len() == 2,
+        "only the two self-test reads"
     );
     let statuses: Vec<_> = replies_to_client(&calls)
         .into_iter()
@@ -972,8 +1048,12 @@ fn a_hung_request_times_out_resets_the_device_and_stops_the_driver() {
     script.extend(retire);
     let mut platform = RecordingPlatform::scripted(script);
     let mut mapper = ModelMapper::new(Model::new());
-    // The self-test read completes; the model stalls from the flush on.
-    let code = role::blk_main(&mut platform, &mut StallAfterFirst(&mut mapper), BOOTSTRAP);
+    // The self-test reads complete; the model stalls from the flush on.
+    let code = role::blk_main(
+        &mut platform,
+        &mut StallAfterSelfTest(&mut mapper),
+        BOOTSTRAP,
+    );
     platform.assert_script_consumed();
     assert_eq!(code, role::FAILURE_BASE | 131);
     let calls = platform.take_calls();
@@ -988,7 +1068,7 @@ fn a_hung_request_times_out_resets_the_device_and_stops_the_driver() {
 }
 
 /// A mapper whose model stalls after the self-test read.
-struct StallAfterFirst<'m>(&'m mut ModelMapper);
+struct StallAfterSelfTest<'m>(&'m mut ModelMapper);
 
 struct Stalling(Model);
 
@@ -1008,7 +1088,7 @@ impl crate::virtio::Hardware for Stalling {
         value: u64,
     ) -> Result<(), crate::virtio::Fault> {
         let result = self.0.bar_write(offset, width, value);
-        if !self.0.executed.is_empty() {
+        if self.0.executed.len() >= 2 {
             self.0.stall = true;
         }
         result
@@ -1032,7 +1112,7 @@ impl crate::virtio::Hardware for Stalling {
     }
 }
 
-impl role::DeviceMapper<RecordingPlatform> for StallAfterFirst<'_> {
+impl role::DeviceMapper<RecordingPlatform> for StallAfterSelfTest<'_> {
     type Hardware = Stalling;
 
     fn map(

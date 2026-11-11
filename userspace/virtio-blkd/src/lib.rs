@@ -33,7 +33,7 @@ use deepwyrm_syscall::{
     DwReceivedHandleInfoV1, DwRights,
 };
 use wyrmroot_device_proto::control_v1_1::ControlIdentityV1_1;
-use wyrmroot_device_proto::manifest::{BOOT_DISK_POLICY, PciFunction};
+use wyrmroot_device_proto::manifest::{PciFunction, disk_policy};
 use wyrmroot_device_proto::pci_driver::PciDriverMessage;
 
 /// The rights a PCI driver holds on its function: config reads and command
@@ -89,7 +89,8 @@ pub struct AdmittedStage {
 }
 
 /// Checks a STAGE against this attempt's launch correlation and the fixed
-/// boot-disk policy, before the handle it carries is trusted for anything.
+/// policy of its disk role (the boot disk or the data disk), before the
+/// handle it carries is trusted for anything.
 ///
 /// The STAGE uses its own transaction, which must be later than the launch's;
 /// every other identity must equal the launch's, and the bundle generation is
@@ -114,10 +115,10 @@ pub fn admit_stage_message(
     {
         return Err(StageError::WrongIdentity);
     }
-    if identity.role_id != BOOT_DISK_POLICY.role_id
-        || resource_id != BOOT_DISK_POLICY.resource_id
-        || function != BOOT_DISK_POLICY.pci
-    {
+    let Some(policy) = disk_policy(identity.role_id) else {
+        return Err(StageError::WrongPolicy);
+    };
+    if resource_id != policy.resource_id || function != policy.pci {
         return Err(StageError::WrongPolicy);
     }
     Ok(AdmittedStage {

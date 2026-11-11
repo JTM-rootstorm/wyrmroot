@@ -62,11 +62,27 @@ pub struct OperationalStatus {
     /// The WRDM boot-disk role's driver identity, when the product has one
     /// (root `STORAGE_PLAN.md` W2).
     pub boot_disk_identity: Option<ContentIdentity>,
+    /// The data-disk role's driver identity, when the product has one (W7).
+    pub data_disk_identity: Option<ContentIdentity>,
 }
 
 pub const COM2_RESOURCE_ID: u64 = 1;
 
 impl OperationalStatus {
+    /// The driver identity of the disk role `disk`, if the product has it.
+    pub fn disk_identity(
+        &self,
+        disk: &wyrmroot_device_proto::manifest::DiskPolicy,
+    ) -> Option<ContentIdentity> {
+        if disk.role_id == wyrmroot_device_proto::manifest::BOOT_DISK_ROLE_ID {
+            self.boot_disk_identity
+        } else if disk.role_id == wyrmroot_device_proto::manifest::DATA_DISK_ROLE_ID {
+            self.data_disk_identity
+        } else {
+            None
+        }
+    }
+
     /// C1 cannot truthfully reach any device-bound phase.
     pub const fn is_device_bound(self) -> bool {
         matches!(
@@ -183,6 +199,9 @@ pub fn prepare_operational(
     coordinator.intake_manifest(manifest, candidate.content_identity)?;
     let role = coordinator.role().ok_or(DevmgrError::MissingRole)?;
     let boot_disk_identity = manifest.boot_disk()?.map(|role| role.content_identity);
+    let data_disk_identity = manifest
+        .disk(&wyrmroot_device_proto::manifest::DATA_DISK_POLICY)?
+        .map(|role| role.content_identity);
     Ok(OperationalStatus {
         supervisor_generation: coordinator.supervisor_generation(),
         state: coordinator.state(),
@@ -194,6 +213,7 @@ pub fn prepare_operational(
         driver_identity: role.content_identity,
         metadata_policy: role.metadata_policy,
         boot_disk_identity,
+        data_disk_identity,
     })
 }
 
@@ -420,17 +440,20 @@ impl ResidentController {
         Ok(request)
     }
 
-    /// Issues the boot-disk driver's launch correlation and its STAGE
-    /// transaction (root `STORAGE_PLAN.md` W2). They come from the same
-    /// monotonic counters as the console driver's, so init's freshness check
-    /// holds across both; the console driver's attempt state is untouched.
-    pub fn issue_storage_launch(&mut self) -> Result<(DriverLaunchRequest, u64), DevmgrError> {
+    /// Issues a disk driver's launch correlation and its STAGE transaction
+    /// (root `STORAGE_PLAN.md` W2, W7). They come from the same monotonic
+    /// counters as the console driver's, so init's freshness check holds
+    /// across all of them; the console driver's attempt state is untouched.
+    pub fn issue_storage_launch(
+        &mut self,
+        disk: &wyrmroot_device_proto::manifest::DiskPolicy,
+    ) -> Result<(DriverLaunchRequest, u64), DevmgrError> {
         if self.active_binding.is_none() {
             return Err(DevmgrError::ControllerPrecondition);
         }
         let identity = self
             .status
-            .boot_disk_identity
+            .disk_identity(disk)
             .ok_or(DevmgrError::MissingRole)?;
         let stage_transaction =
             self.next_driver_transaction
@@ -440,7 +463,7 @@ impl ResidentController {
                 ))?;
         let request = DriverLaunchRequest {
             supervisor_generation: self.status.supervisor_generation,
-            role_id: wyrmroot_device_proto::manifest::BOOT_DISK_ROLE_ID,
+            role_id: disk.role_id,
             attempt_generation: AttemptGeneration(self.next_driver_attempt),
             launch_session: LaunchSessionGeneration(self.next_driver_session),
             endpoint: ControlEndpoint {

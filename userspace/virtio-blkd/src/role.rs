@@ -16,7 +16,7 @@ use wyrmroot_block_proto::{
     self as wrbd, Body as WrbdBody, MAX_BYTES as WRBD_MAX_BYTES, Message as WrbdMessage,
     Status as WrbdStatus,
 };
-use wyrmroot_device_proto::manifest::BOOT_DISK_PUBLICATION_POLICY;
+use wyrmroot_device_proto::manifest::{PublicationPolicy, disk_policy};
 use wyrmroot_device_proto::pci_driver::{
     self, GRANT_BYTES, MAX_BYTES as WRDP_MAX_BYTES, PciDriverMessage, PublicationGrant, READY_BYTES,
 };
@@ -285,11 +285,11 @@ fn run<P: BlockPlatform, M: DeviceMapper<P>>(
     if !Owned::close(platform, &mut owned.bootstrap) {
         return Err(20);
     }
-    stage(platform, owned, launch)?;
+    let policy = stage(platform, owned, launch)?;
     bring_up(platform, mapper, owned, live)?;
     self_test(platform, live)?;
     publish(platform, owned.publication, grant)?;
-    serve(platform, owned, live, grant, connections)
+    serve(platform, owned, live, grant, policy, connections)
 }
 
 /// Receives the DeviceDriver INIT: the self root and the control Channel.
@@ -360,11 +360,12 @@ fn receive_grant<P: BlockPlatform>(
 }
 
 /// Receives devmgr's STAGE, admits the resource it carries, and answers READY.
+/// Returns the publication the staged disk role's driver serves.
 fn stage<P: BlockPlatform>(
     platform: &mut P,
     owned: &mut Owned,
     launch: LaunchCorrelation,
-) -> Result<(), u32> {
+) -> Result<PublicationPolicy, u32> {
     let deadline = platform
         .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .map_err(|_| 30u32)?;
@@ -401,7 +402,10 @@ fn stage<P: BlockPlatform>(
     .map_err(|_| 37u32)?;
     platform
         .send_channel(owned.control, &ready, &[])
-        .map_err(|_| 38u32)
+        .map_err(|_| 38u32)?;
+    disk_policy(admitted.identity.role_id)
+        .map(|policy| policy.publication)
+        .ok_or(39)
 }
 
 /// Publishes the installed service and waits for the registry's PUBLISHED.
@@ -521,6 +525,9 @@ fn virtio_code(error: crate::virtio::Error) -> u32 {
 
 /// The live DMA round trip: block 0 is read into the driver's scratch page
 /// and must end in the 0x55AA boot signature the boot disk (the ESP) carries.
+/// How much of block 0 the self-test compares: its first 512 bytes.
+const SELF_TEST_WORDS: usize = 64;
+
 fn self_test<P: BlockPlatform, H: Hardware>(
     platform: &mut P,
     live: &mut Live<H>,
@@ -530,22 +537,37 @@ fn self_test<P: BlockPlatform, H: Hardware>(
     else {
         return Err(120);
     };
+    // Block 0 is read twice, into scratch poisoned first with zeros and then
+    // with ones. Data that reaches memory reads the same both times whatever
+    // the disk holds; a read that never lands leaves the two poisons.
     let bytes = device.geometry().block_size;
-    let signature = SCRATCH_OFFSET + 510;
-    hardware
-        .mem_write(signature, Width::U16, 0)
-        .map_err(|Fault| 121u32)?;
-    let request = Request::Read {
-        sector: 0,
-        data_iova: iova + SCRATCH_OFFSET,
-        bytes,
-    };
-    let status = execute(platform, device, hardware, request).map_err(|step| 122 + step)?;
-    if status != BLK_S_OK {
-        return Err(125);
-    }
-    if hardware.mem_read(signature, Width::U16) != Ok(0xaa55) {
-        return Err(126);
+    let words = (u64::from(bytes) / 8).min(SELF_TEST_WORDS as u64) as usize;
+    let mut first = [0u64; SELF_TEST_WORDS];
+    for (pass, poison) in [0u64, u64::MAX].into_iter().enumerate() {
+        for word in 0..words {
+            hardware
+                .mem_write(SCRATCH_OFFSET + word as u64 * 8, Width::U64, poison)
+                .map_err(|Fault| 121u32)?;
+        }
+        let request = Request::Read {
+            sector: 0,
+            data_iova: iova + SCRATCH_OFFSET,
+            bytes,
+        };
+        let status = execute(platform, device, hardware, request).map_err(|step| 122 + step)?;
+        if status != BLK_S_OK {
+            return Err(125);
+        }
+        for (word, seen) in first.iter_mut().enumerate().take(words) {
+            let value = hardware
+                .mem_read(SCRATCH_OFFSET + word as u64 * 8, Width::U64)
+                .map_err(|Fault| 126u32)?;
+            if pass == 0 {
+                *seen = value;
+            } else if *seen != value {
+                return Err(126);
+            }
+        }
     }
     Ok(())
 }
@@ -635,6 +657,7 @@ fn serve<P: BlockPlatform, H: Hardware>(
     owned: &mut Owned,
     live: &mut Live<H>,
     grant: PublicationGrant,
+    policy: PublicationPolicy,
     connections: &mut [Option<Connection>; MAX_CONNECTIONS],
 ) -> Result<(), u32> {
     loop {
@@ -679,7 +702,7 @@ fn serve<P: BlockPlatform, H: Hardware>(
             (Target::Control, true, _) => return Err(71),
             (Target::Control, false, true) => return Ok(()),
             (Target::Publication, true, _) => {
-                serve_offer(platform, owned.publication, grant, connections)?;
+                serve_offer(platform, owned.publication, grant, policy, connections)?;
             }
             (Target::Publication, false, true) => {
                 if !Owned::close(platform, &mut owned.publication) {
@@ -713,6 +736,7 @@ fn serve_offer<P: BlockPlatform>(
     platform: &mut P,
     publication: DwHandle,
     grant: PublicationGrant,
+    policy: PublicationPolicy,
     connections: &mut [Option<Connection>; MAX_CONNECTIONS],
 ) -> Result<(), u32> {
     let mut bytes = [0u8; REGISTRY_MESSAGE_BYTES];
@@ -731,7 +755,6 @@ fn serve_offer<P: BlockPlatform>(
         close_received(platform, &handles, counts.handles);
         return Err(81);
     };
-    let policy = BOOT_DISK_PUBLICATION_POLICY;
     let ours = parsed.header.message_type == RegistryMessageType::ConnectOffer
         && parsed.header.registry_generation == grant.registry_generation
         && parsed.header.endpoint_id == grant.endpoint_id

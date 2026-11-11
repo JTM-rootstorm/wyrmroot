@@ -1,14 +1,18 @@
-//! The storage service roles (root `STORAGE_PLAN.md` W6): blockmgr, fat32d
-//! and vfsd, launched and staged by init after devmgr.
+//! The storage service roles (root `STORAGE_PLAN.md` W6, W7): blockmgr for
+//! each volume, fat32d, ext4d and vfsd, launched and staged by init after
+//! devmgr.
 //!
 //! Each role is a bootfs executable whose launch-policy entry carries the
 //! service-role profile and its identity. Init constructs it with the
 //! self-root-plus-control startup, installs the registry endpoints its role
-//! needs, and sends one WRSV STAGE on the control Channel: blockmgr gets a
-//! client (for the boot disk) and the `volume.boot0` publication, fat32d a
-//! client (for the volume) and the server end of its root directory, vfsd
-//! the `system.vfs` publication and that root's client end to mount
-//! read-only at `/boot`.
+//! needs, and sends one WRSV STAGE on the control Channel: each blockmgr
+//! gets a client (for its disk) and its volume's publication
+//! (`volume.boot0`, `volume.root0`), fat32d and ext4d a client (for their
+//! volume) and the server end of their root directory, and vfsd the
+//! `system.vfs` publication with both roots' client ends: ext4d's to mount
+//! read-write at `/`, fat32d's read-only at `/boot`. If ext4d cannot mount
+//! the root volume it exits, vfsd drops the closed mount, and `/` is vfsd's
+//! own directory with `/boot` beneath it.
 //!
 //! Storage is not part of the recovery root: nothing the console needs
 //! depends on it. A role that fails to launch is left out, one that exits
@@ -23,14 +27,22 @@ use wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS;
 use wyrmroot_loader::process::{ServiceRoleLoadRequest, load_service_role_process};
 use wyrmroot_runtime::sha256;
 use wyrmroot_service_proto::roles::{
-    BLOCKMGR_PATH, BLOCKMGR_ROLE_ID, BOOT_VOLUME, FAT32D_PATH, FAT32D_ROLE_ID, SLOT_FS_ROOT,
-    SLOT_MOUNT, SYSTEM_VFS, ServiceName, VFSD_PATH, VFSD_ROLE_ID,
+    BLOCKMGR_PATH, BLOCKMGR_ROLE_ID, BOOT_VOLUME, EXT4D_PATH, EXT4D_ROLE_ID, FAT32D_PATH,
+    FAT32D_ROLE_ID, ROOT_BLOCKMGR_ROLE_ID, ROOT_VOLUME, SLOT_FS_ROOT, SLOT_MOUNT, SYSTEM_VFS,
+    ServiceName, VFSD_PATH, VFSD_ROLE_ID,
 };
 use wyrmroot_service_proto::{self as wrsv, CHANNEL_READ_ONLY, Client, Publication, Stage};
 
-pub(crate) const SERVICE_COUNT: usize = 3;
+pub(crate) const SERVICE_COUNT: usize = 5;
 /// Where vfsd mounts the boot volume.
 pub(crate) const BOOT_MOUNT: &[u8] = b"/boot";
+/// Where vfsd mounts the persistent root.
+pub(crate) const ROOT_MOUNT: &[u8] = b"/";
+/// The most labelled Channels one STAGE carries here.
+const MAX_STAGED_CHANNELS: usize = 2;
+
+/// One labelled Channel for a STAGE: slot, flags, label and the handle.
+type StagedChannel<'a> = (u32, u32, &'a [u8], DwHandle);
 /// Correlation for the services' installs and stages, above every other
 /// init transaction range.
 const SERVICE_TRANSACTION_BASE: u64 = 0xC5_0000;
@@ -61,9 +73,23 @@ const SPECS: [Spec; SERVICE_COUNT] = [
         client: true,
     },
     Spec {
+        role_id: ROOT_BLOCKMGR_ROLE_ID,
+        path: BLOCKMGR_PATH,
+        display_path: "/system/blockmgr",
+        publication: Some(ROOT_VOLUME),
+        client: true,
+    },
+    Spec {
         role_id: FAT32D_ROLE_ID,
         path: FAT32D_PATH,
         display_path: "/system/fat32d",
+        publication: None,
+        client: true,
+    },
+    Spec {
+        role_id: EXT4D_ROLE_ID,
+        path: EXT4D_PATH,
+        display_path: "/system/ext4d",
         publication: None,
         client: true,
     },
@@ -118,22 +144,41 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     let mut attempts = [None; SERVICE_COUNT];
-    // The boot volume's root directory: fat32d serves one end, vfsd mounts
-    // the other. If either side fails, the survivor sees the closure.
-    let Ok((fs_server, fs_client)) = create_controller_channel_pair(system) else {
+    // Each filesystem's root directory: the filesystem serves one end, vfsd
+    // mounts the other. If either side fails, the survivor sees the closure.
+    let Ok((boot_server, boot_client)) = create_controller_channel_pair(system) else {
         return attempts;
     };
-    let mut ends = [Some(fs_server), Some(fs_client)];
+    let (root_server, root_client) = match create_controller_channel_pair(system) {
+        Ok(pair) => (Some(pair.0), Some(pair.1)),
+        Err(_) => (None, None),
+    };
+    let mut boot_ends = [Some(boot_server), Some(boot_client)];
+    let mut root_ends = [root_server, root_client];
     for (index, spec) in SPECS.iter().enumerate() {
-        let channel = match spec.role_id {
-            FAT32D_ROLE_ID => ends[0]
-                .take()
-                .map(|handle| (SLOT_FS_ROOT, 0, &b""[..], handle)),
-            VFSD_ROLE_ID => ends[1]
-                .take()
-                .map(|handle| (SLOT_MOUNT, CHANNEL_READ_ONLY, BOOT_MOUNT, handle)),
-            _ => None,
-        };
+        let mut channels: [Option<StagedChannel<'_>>; MAX_STAGED_CHANNELS] =
+            [None; MAX_STAGED_CHANNELS];
+        match spec.role_id {
+            FAT32D_ROLE_ID => {
+                channels[0] = boot_ends[0]
+                    .take()
+                    .map(|handle| (SLOT_FS_ROOT, 0, &b""[..], handle));
+            }
+            EXT4D_ROLE_ID => {
+                channels[0] = root_ends[0]
+                    .take()
+                    .map(|handle| (SLOT_FS_ROOT, 0, &b""[..], handle));
+            }
+            VFSD_ROLE_ID => {
+                channels[0] = root_ends[1]
+                    .take()
+                    .map(|handle| (SLOT_MOUNT, 0, ROOT_MOUNT, handle));
+                channels[1] = boot_ends[1]
+                    .take()
+                    .map(|handle| (SLOT_MOUNT, CHANNEL_READ_ONLY, BOOT_MOUNT, handle));
+            }
+            _ => {}
+        }
         attempts[index] = launch_service(
             system,
             loader,
@@ -145,14 +190,14 @@ where
             allocator,
             spec,
             index as u64,
-            channel,
+            channels,
         )
         .ok();
     }
     attempts
 }
 
-/// Launches one role and stages it. `channel` is moved into the stage, or
+/// Launches one role and stages it. `channels` are moved into the stage, or
 /// closed on any failure.
 #[allow(clippy::too_many_arguments)]
 fn launch_service<S, L, W>(
@@ -166,7 +211,7 @@ fn launch_service<S, L, W>(
     allocator: &mut PublicationAllocator,
     spec: &Spec,
     index: u64,
-    channel: Option<(u32, u32, &[u8], DwHandle)>,
+    channels: [Option<StagedChannel<'_>>; MAX_STAGED_CHANNELS],
 ) -> Result<ServiceAttempt, InitError>
 where
     S: ResidentPlatform,
@@ -174,7 +219,7 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     let close_channel = |system: &mut S| {
-        if let Some((_, _, _, handle)) = channel {
+        for (_, _, _, handle) in channels.into_iter().flatten() {
             let _ = system.close_handle(handle);
         }
     };
@@ -240,7 +285,7 @@ where
         spec,
         transaction_id,
         control,
-        channel,
+        channels,
     );
     match staged {
         Ok(()) => Ok(attempt),
@@ -262,9 +307,14 @@ fn stage_service<S: ResidentPlatform>(
     spec: &Spec,
     transaction_id: u64,
     control: DwHandle,
-    channel: Option<(u32, u32, &[u8], DwHandle)>,
+    channels: [Option<StagedChannel<'_>>; MAX_STAGED_CHANNELS],
 ) -> Result<(), InitError> {
-    let mut owned: [Option<DwHandle>; 3] = [None, None, channel.map(|(_, _, _, h)| h)];
+    let mut owned: [Option<DwHandle>; 2 + MAX_STAGED_CHANNELS] = [
+        None,
+        None,
+        channels[0].map(|(_, _, _, handle)| handle),
+        channels[1].map(|(_, _, _, handle)| handle),
+    ];
     let result = (|| {
         let role_generation = spec.role_id;
         let publication = match spec.publication {
@@ -326,7 +376,16 @@ fn stage_service<S: ResidentPlatform>(
         } else {
             None
         };
-        let channels = channel.map(|(slot, flags, label, _)| wrsv::Channel { slot, flags, label });
+        let mut staged = [wrsv::Channel {
+            slot: 0,
+            flags: 0,
+            label: &[],
+        }; MAX_STAGED_CHANNELS];
+        let mut staged_count = 0;
+        for (slot, flags, label, _) in channels.into_iter().flatten() {
+            staged[staged_count] = wrsv::Channel { slot, flags, label };
+            staged_count += 1;
+        }
         let mut bytes = [0u8; wrsv::MAX_BYTES];
         let size = wrsv::encode(
             &Stage {
@@ -335,7 +394,7 @@ fn stage_service<S: ResidentPlatform>(
                 attempt_generation: 1,
                 publication,
                 client,
-                channels: channels.as_slice(),
+                channels: &staged[..staged_count],
             },
             &mut bytes,
         )
@@ -346,7 +405,7 @@ fn stage_service<S: ResidentPlatform>(
             operation: DW_HANDLE_TRANSFER_MOVE,
             reserved0: 0,
             reserved: [0; 2],
-        }; 3];
+        }; 2 + MAX_STAGED_CHANNELS];
         let mut count = 0;
         for handle in owned.iter().flatten() {
             transfers[count].handle = *handle;
@@ -356,7 +415,7 @@ fn stage_service<S: ResidentPlatform>(
             .send_channel_with_handles(control, &bytes[..size], &transfers[..count])
             .map_err(InitError::Native)?;
         // Moved: nothing left to close.
-        owned = [None; 3];
+        owned = [None; 2 + MAX_STAGED_CHANNELS];
         Ok(())
     })();
     for handle in owned.into_iter().flatten() {

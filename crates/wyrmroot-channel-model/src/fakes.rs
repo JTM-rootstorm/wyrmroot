@@ -361,6 +361,8 @@ pub struct DiskState {
     published: bool,
     /// Every READ the disk served: (lba, blocks).
     pub reads: Vec<(u64, u32)>,
+    /// How many FLUSHes the disk answered.
+    pub flushes: usize,
     /// Rights each ATTACH's MemoryObject arrived with.
     pub attach_rights: Vec<DwRights>,
 }
@@ -384,6 +386,7 @@ pub fn serve_disk(
         service,
         published: false,
         reads: Vec::new(),
+        flushes: 0,
         attach_rights: Vec::new(),
     }));
     let peer_state = state.clone();
@@ -497,7 +500,10 @@ fn disk_request(
             }
             Body::Complete(Status::Ok)
         }
-        Body::Flush => Body::Complete(Status::Ok),
+        Body::Flush => {
+            disk.flushes += 1;
+            Body::Complete(Status::Ok)
+        }
         Body::Info(_) | Body::Complete(_) => Body::Complete(Status::Invalid),
     }
 }

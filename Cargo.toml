@@ -32,6 +32,7 @@ members = [
     "userspace/virtio-blkd",
     "userspace/blockmgr",
     "userspace/fat32d",
+    "userspace/ext4d",
     "userspace/vfsd",
     "userspace/consoled",
     "userspace/wyrmsh",

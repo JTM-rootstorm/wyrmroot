@@ -88,7 +88,8 @@ pub(crate) use controller::*;
 pub(crate) use driver::*;
 pub(crate) use io::*;
 pub use storage::PCI_DRIVER_RESOURCE_RIGHTS;
-use storage::{StorageLane, claim_boot_disk, launch_storage_driver};
+use storage::{StorageLane, claim_disk, launch_storage_driver};
+use wyrmroot_device_proto::manifest::DISK_POLICIES;
 
 /// The platform operations the devmgr role uses. [`wyrmroot_runtime::NativePlatform`]
 /// is the production implementation; host tests use the runtime's recording
@@ -251,7 +252,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
     let mut connector_cleanup_deadline: Option<u64> = None;
     let mut waiting_registry_status_sent = false;
     let mut device_resource = None;
-    let mut storage: Option<StorageLane> = None;
+    let mut storage: [Option<StorageLane>; DISK_POLICIES.len()] = [None, None];
     loop {
         let mut waits = [DwWaitItemV1::default(); 4];
         waits[0] = wait_item(bootstrap);
@@ -425,13 +426,16 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     let _ = platform.close_handle(bootstrap);
                     return Err(code);
                 }
-                // The boot disk is claimed with the same domain authority; a
-                // refusal leaves the disk unserved, not the console.
-                if let Ok(Some(resource)) = claim_boot_disk(platform, domain, &resident) {
-                    storage = Some(StorageLane {
-                        resource,
-                        control: None,
-                    });
+                // The disks are claimed with the same domain authority; a
+                // refusal, or a disk that is not there, leaves that disk
+                // unserved, not the console.
+                for (lane, disk) in storage.iter_mut().zip(DISK_POLICIES.iter()) {
+                    if let Ok(Some(resource)) = claim_disk(platform, domain, &resident, disk) {
+                        *lane = Some(StorageLane {
+                            resource,
+                            control: None,
+                        });
+                    }
                 }
                 if platform.close_handle(domain).is_err() {
                     close_optional(platform, device_resource.take());
@@ -451,19 +455,27 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
             if action == ControllerAction::InitialPublicationBound
                 && (true || resident.status().supervisor_generation.0 == 1)
             {
-                // The boot disk first, while this generation has no live
-                // connection: the bring-up blocks this loop on init and the
+                // The disks first, while this generation has no live
+                // connection: each bring-up blocks this loop on init and the
                 // driver, and once the console's connector broker is active a
                 // blocked loop misses its connection and cleanup deadlines.
-                // A failure closes only the disk's own lane.
-                if let Some(lane) = storage.as_mut()
-                    && lane.control.is_none()
-                {
-                    match launch_storage_driver(platform, bootstrap, lane.resource, &mut resident) {
-                        Ok(control) => lane.control = Some(control),
-                        Err(_) => {
-                            let _ = platform.close_handle(lane.resource);
-                            storage = None;
+                // A failure closes only that disk's own lane.
+                for (slot, disk) in storage.iter_mut().zip(DISK_POLICIES.iter()) {
+                    if let Some(lane) = slot.as_mut()
+                        && lane.control.is_none()
+                    {
+                        match launch_storage_driver(
+                            platform,
+                            bootstrap,
+                            lane.resource,
+                            &mut resident,
+                            disk,
+                        ) {
+                            Ok(control) => lane.control = Some(control),
+                            Err(_) => {
+                                let _ = platform.close_handle(lane.resource);
+                                *slot = None;
+                            }
                         }
                     }
                 }

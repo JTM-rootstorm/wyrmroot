@@ -6,16 +6,24 @@
 //! to a file; COM2 (the `wyrmsh` console) is the terminal, so the system can be
 //! used directly. Ctrl-D at an empty prompt shuts the system down.
 //!
-//! `--check` drives COM2 instead: it waits for the prompt, lists `services`
-//! until the boot-disk driver's `device.block.virtio0` is published (root
-//! `STORAGE_PLAN.md` W2; since W3 the driver publishes only after a DMA read
-//! of block 0 through its virtqueue) along with `volume.boot0` and
-//! `system.vfs` (W6), lists `/boot/EFI/WYRMROOT` and `cat`s its README
-//! through vfsd, fat32d and blockmgr, runs `bin/hello` (a shell job under its
-//! TaskGroup limits) to its output and the next prompt, runs the same ELF
-//! from the ESP the same way, sends Ctrl-D, and
-//! requires the kernel's power-off line on COM1. That is the smoke check for
-//! development commits.
+//! `--check` drives COM2 instead, over two boots of the same disks. The
+//! first waits for the prompt and lists `services` until the boot-disk
+//! driver's `device.block.virtio0` (root `STORAGE_PLAN.md` W2; it publishes
+//! only after DMA reads of block 0 through its virtqueue), the data disk's
+//! `device.block.virtio1`, `volume.boot0`, `volume.root0` and `system.vfs`
+//! (W6, W7) are all published; lists `/` until ext4d's root (with its
+//! `lost+found`) is mounted there; lists `/boot/EFI/WYRMROOT` and `cat`s its
+//! README through vfsd, fat32d and blockmgr; runs `bin/hello` (a shell job
+//! under its TaskGroup limits) and the same ELF from the ESP to their output
+//! and the next prompt; then writes a file and makes a directory on the root
+//! (W7) and shuts down with Ctrl-D. The second boot `cat`s the file back,
+//! removes it and shuts down. Each boot must end with the kernel's power-off
+//! line on its COM1 log. That is the smoke check for development commits.
+//!
+//! The persistent root is a second, writable virtio disk at 00:02.0: an
+//! ext4 volume made by `wyrmroot-ext4` with a `boot` mount point. `--check`
+//! makes a fresh one per run; an interactive run keeps one at
+//! `OS-Project/.tmp/dev-boot/root.img` across runs.
 //!
 //! Nothing here is milestone evidence. It writes no request, receipt or result
 //! a gate could consume, and its output under `OS-Project/.tmp/dev-boot/` is
@@ -33,6 +41,7 @@ use std::{
 };
 
 use crate::{error::Failure, product, tasks};
+use wyrmroot_ext4::{Device, DeviceError, FormatParams, Kind, ROOT_INODE, Volume};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DevBoot {
@@ -48,26 +57,26 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(180);
 const PROMPT: &[u8] = b"wyrmsh> ";
 const END_OF_INPUT: u8 = 0x04;
 const POWER_OFF: &[u8] = b"no process remains; powering off";
-/// Lists the registry; the boot-disk driver publishes once it is up.
-const SERVICES_COMMAND: &[u8] = b"services\r";
-const BLOCK_SERVICE: &[u8] = b"service name=device.block.virtio0 ";
-/// The storage services that must be published too (root `STORAGE_PLAN.md` W6).
-const STORAGE_SERVICES: [&[u8]; 2] = [b"service name=volume.boot0 ", b"service name=system.vfs "];
+/// Every service the storage spine publishes (root `STORAGE_PLAN.md` W2-W7).
+const SERVICES: [&[u8]; 5] = [
+    b"service name=device.block.virtio0 ",
+    b"service name=device.block.virtio1 ",
+    b"service name=volume.boot0 ",
+    b"service name=volume.root0 ",
+    b"service name=system.vfs ",
+];
+/// The root disk's size.
+const ROOT_DISK_BYTES: u64 = 64 << 20;
+/// The persistent root disk an interactive run keeps.
+const ROOT_DISK_NAME: &str = "root.img";
 /// The ESP read back through vfsd, fat32d and blockmgr.
-const LS_COMMAND: &[u8] = b"ls /boot/EFI/WYRMROOT\r";
-const LS_OUTPUT: [&[u8]; 2] = [b"bootstrap.elf\r\n", b"README.TXT\r\n"];
-const CAT_COMMAND: &[u8] = b"cat /boot/EFI/WYRMROOT/README.TXT\r";
-const CAT_OUTPUT: &[u8] = b"This is the Wyrmroot EFI System Partition.";
-/// The same `hello` run from the ESP: init reads the ELF through vfsd and
-/// fat32d instead of bootfs.
-const FILE_JOB_COMMAND: &[u8] = b"run /boot/EFI/WYRMROOT/HELLO.ELF\r";
-/// fat32d mounts beside the shell, so `ls` is retried a few times too.
-const LS_ATTEMPTS: usize = 20;
-/// The driver comes up beside the shell, so the list is retried a few times.
-const SERVICES_ATTEMPTS: usize = 20;
-/// One shell job, run under its TaskGroup limits, before shutting down.
-const JOB_COMMAND: &[u8] = b"run bin/hello\r";
+const ESP_LISTING: [&[u8]; 2] = [b"bootstrap.elf\r\n", b"README.TXT\r\n"];
+const ESP_README: &[u8] = b"This is the Wyrmroot EFI System Partition.";
 const JOB_OUTPUT: &[u8] = b"hello from native stdout";
+/// Services and mounts come up beside the shell, so their checks are retried.
+const ATTEMPTS: usize = 20;
+/// What the first boot writes and the second reads back.
+const PERSISTED_PATH: &str = "/persist.txt";
 
 pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
     let repository = tasks::repository_root()?;
@@ -96,10 +105,20 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
     fs::set_permissions(&vars, fs::Permissions::from_mode(0o600))
         .map_err(|error| Failure::task(format!("could not open OVMF vars copy: {error}")))?;
     let com1 = root.join("com1.log");
-    let args = qemu_arguments(boot.smp, &product, &vars, &com1);
+    let root_disk = if boot.check {
+        root.join(ROOT_DISK_NAME)
+    } else {
+        project.join(".tmp").join("dev-boot").join(ROOT_DISK_NAME)
+    };
+    if !root_disk.exists() {
+        create_root_disk(&root_disk)?;
+    }
+    let args = qemu_arguments(boot.smp, &product, &vars, &com1, &root_disk);
 
     if boot.check {
-        check(&args, &com1, &root)
+        let reboot = root.join("com1-reboot.log");
+        let second = qemu_arguments(boot.smp, &product, &vars, &reboot, &root_disk);
+        check(&[(&args, &com1), (&second, &reboot)], &root, unique)
     } else {
         eprintln!(
             "dev-boot: {} (Ctrl-D at the prompt shuts down)",
@@ -116,7 +135,60 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
     }
 }
 
-fn qemu_arguments(smp: bool, product: &Path, vars: &Path, com1: &Path) -> Vec<String> {
+/// Makes `path` an empty ext4 root with a `boot` mount point.
+fn create_root_disk(path: &Path) -> Result<(), Failure> {
+    struct File(fs::File);
+    impl Device for File {
+        fn read(&mut self, offset: u64, out: &mut [u8]) -> Result<(), DeviceError> {
+            std::os::unix::fs::FileExt::read_exact_at(&self.0, out, offset)
+                .map_err(|_| DeviceError(1))
+        }
+        fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), DeviceError> {
+            std::os::unix::fs::FileExt::write_all_at(&self.0, data, offset)
+                .map_err(|_| DeviceError(2))
+        }
+        fn flush(&mut self) -> Result<(), DeviceError> {
+            self.0.sync_data().map_err(|_| DeviceError(3))
+        }
+    }
+    let failed = |what: &str| {
+        Failure::task(format!(
+            "could not make the root disk {}: {what}",
+            path.display()
+        ))
+    };
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| failed(&error.to_string()))?;
+    file.set_len(ROOT_DISK_BYTES)
+        .map_err(|error| failed(&error.to_string()))?;
+    let mut disk = File(file);
+    let params = FormatParams {
+        block_size: 4096,
+        uuid: *b"wyrmroot-devroot",
+        label: *b"wyrmroot-root\0\0\0",
+        time: 1_700_000_000,
+    };
+    wyrmroot_ext4::format(&mut disk, ROOT_DISK_BYTES, &params)
+        .map_err(|error| failed(&format!("{error:?}")))?;
+    let mut volume = Volume::mount(&mut disk, ROOT_DISK_BYTES, true)
+        .map_err(|error| failed(&format!("{error:?}")))?;
+    volume
+        .create(&mut disk, ROOT_INODE, b"boot", Kind::Directory)
+        .and_then(|_| volume.sync(&mut disk))
+        .map_err(|error| failed(&format!("{error:?}")))
+}
+
+fn qemu_arguments(
+    smp: bool,
+    product: &Path,
+    vars: &Path,
+    com1: &Path,
+    root_disk: &Path,
+) -> Vec<String> {
     let vcpus = if smp { SMP_VCPUS } else { 1 };
     let mut args: Vec<String> = vec![
         "-machine".into(),
@@ -152,6 +224,14 @@ fn qemu_arguments(smp: bool, product: &Path, vars: &Path, com1: &Path) -> Vec<St
             "virtio-blk-pci,drive=esp,addr={:#x},disable-legacy=on,iommu_platform=on",
             product::BOOT_DISK_PCI_ADDRESS >> 3
         ),
+        // The writable data disk with the persistent root (W7).
+        "-drive".into(),
+        format!("if=none,id=root,format=raw,file={}", root_disk.display()),
+        "-device".into(),
+        format!(
+            "virtio-blk-pci,drive=root,addr={:#x},disable-legacy=on,iommu_platform=on",
+            product::DATA_DISK_PCI_ADDRESS >> 3
+        ),
         "-serial".into(),
         format!("file:{}", com1.display()),
     ];
@@ -160,7 +240,170 @@ fn qemu_arguments(smp: bool, product: &Path, vars: &Path, com1: &Path) -> Vec<St
     args
 }
 
-fn check(args: &[String], com1: &Path, root: &Path) -> Result<String, Failure> {
+/// Boots twice on the same disks: the first boot writes, the second reads.
+fn check(
+    boots: &[(&Vec<String>, &PathBuf); 2],
+    root: &Path,
+    unique: u128,
+) -> Result<String, Failure> {
+    let started = Instant::now();
+    let token = format!("dev-boot persisted {unique}");
+    let first = boot_once(boots[0].0, boots[0].1, &root.join("com2.log"), |shell| {
+        first_boot(shell, &token)
+    });
+    first?;
+    let second = boot_once(
+        boots[1].0,
+        boots[1].1,
+        &root.join("com2-reboot.log"),
+        |shell| second_boot(shell, &token),
+    );
+    second?;
+    Ok(format!(
+        "DEV_BOOT_CHECK_PASS seconds={} root={}\n",
+        started.elapsed().as_secs(),
+        root.display()
+    ))
+}
+
+/// Everything the first boot checks, ending with the persistent write.
+fn first_boot(shell: &mut Shell<'_>, token: &str) -> Result<(), Failure> {
+    shell.retry("services", "every storage service published", |output| {
+        SERVICES.iter().all(|service| contains(output, service))
+    })?;
+    shell.retry("ls /", "ext4d's root mounted at /", |output| {
+        contains(output, b"lost+found/\r\n") && contains(output, b"boot/\r\n")
+    })?;
+    shell.retry("ls /boot/EFI/WYRMROOT", "the ESP listed", |output| {
+        ESP_LISTING.iter().all(|line| contains(output, line))
+    })?;
+    shell.expect("cat /boot/EFI/WYRMROOT/README.TXT", ESP_README)?;
+    shell.expect("run bin/hello", JOB_OUTPUT)?;
+    // The same `hello` from the ESP: init reads the ELF through vfsd and
+    // fat32d instead of bootfs.
+    shell.expect("run /boot/EFI/WYRMROOT/HELLO.ELF", JOB_OUTPUT)?;
+    shell.quiet(&format!("write {PERSISTED_PATH} {token}"))?;
+    shell.quiet("mkdir /home")?;
+    shell.expect(&format!("cat {PERSISTED_PATH}"), token.as_bytes())?;
+    shell.expect("ls /", b"home/\r\n")
+}
+
+/// The second boot reads the first boot's file back and removes it.
+fn second_boot(shell: &mut Shell<'_>, token: &str) -> Result<(), Failure> {
+    let command = format!("cat {PERSISTED_PATH}");
+    shell.retry(&command, "the file written before the reboot", |output| {
+        contains(output, token.as_bytes())
+    })?;
+    shell.quiet(&format!("rm {PERSISTED_PATH}"))?;
+    let listing = shell.run("ls /")?;
+    if contains(&listing, b"persist.txt") || !contains(&listing, b"home/\r\n") {
+        return Err(Failure::task("dev-boot check: rm or mkdir did not persist"));
+    }
+    Ok(())
+}
+
+/// The shell console of one boot.
+struct Shell<'a> {
+    input: &'a mut std::process::ChildStdin,
+    com2: &'a Arc<Mutex<Vec<u8>>>,
+    deadline: Instant,
+}
+
+impl Shell<'_> {
+    fn length(&self) -> usize {
+        self.com2.lock().map(|com2| com2.len()).unwrap_or(0)
+    }
+
+    /// Sends `command` and returns everything up to the next prompt.
+    fn run(&mut self, command: &str) -> Result<Vec<u8>, Failure> {
+        let before = self.length();
+        self.input
+            .write_all(format!("{command}\r").as_bytes())
+            .map_err(|error| Failure::task(format!("could not send `{command}`: {error}")))?;
+        let echo = command.as_bytes().to_vec();
+        let com2 = Arc::clone(self.com2);
+        // The command's output and the next prompt may arrive in one read.
+        wait_until(
+            self.deadline,
+            &format!("the prompt after `{command}`"),
+            || {
+                Ok(com2
+                    .lock()
+                    .map(|com2| {
+                        com2.get(before..)
+                            .is_some_and(|tail| contains(tail, &echo) && ends_with_prompt(tail))
+                    })
+                    .unwrap_or(false))
+            },
+        )?;
+        Ok(self
+            .com2
+            .lock()
+            .map(|com2| com2.get(before..).unwrap_or_default().to_vec())
+            .unwrap_or_default())
+    }
+
+    /// Runs `command`, which must print `needle`.
+    fn expect(&mut self, command: &str, needle: &[u8]) -> Result<(), Failure> {
+        let output = self.run(command)?;
+        if contains(&output, needle) {
+            Ok(())
+        } else {
+            Err(Failure::task(format!(
+                "dev-boot check: `{command}` printed {:?}",
+                String::from_utf8_lossy(&output)
+            )))
+        }
+    }
+
+    /// Runs `command`, which must print nothing but its echo and the prompt.
+    fn quiet(&mut self, command: &str) -> Result<(), Failure> {
+        let output = self.run(command)?;
+        let echo = command.as_bytes();
+        let rest = output
+            .windows(echo.len())
+            .position(|window| window == echo)
+            .map_or(&output[..], |at| &output[at + echo.len()..]);
+        let text = String::from_utf8_lossy(&strip_escapes(rest)).into_owned();
+        if text.split_whitespace().collect::<Vec<_>>() != ["wyrmsh>"] {
+            return Err(Failure::task(format!(
+                "dev-boot check: `{command}` printed {text:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Runs `command` until `done` holds for its output.
+    fn retry(
+        &mut self,
+        command: &str,
+        what: &str,
+        done: impl Fn(&[u8]) -> bool,
+    ) -> Result<(), Failure> {
+        for _ in 0..ATTEMPTS {
+            if done(&self.run(command)?) {
+                return Ok(());
+            }
+            if Instant::now() >= self.deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        Err(Failure::task(format!(
+            "dev-boot check: `{command}` never showed {what}"
+        )))
+    }
+}
+
+/// One boot: waits for the prompt, runs `script`, shuts down with Ctrl-D and
+/// requires the power-off line on `com1`. The shell transcript is kept at
+/// `transcript`.
+fn boot_once(
+    args: &[String],
+    com1: &Path,
+    transcript: &Path,
+    script: impl FnOnce(&mut Shell<'_>) -> Result<(), Failure>,
+) -> Result<(), Failure> {
     let mut child = Command::new("qemu-system-x86_64")
         .args(args)
         .stdin(Stdio::piped())
@@ -169,27 +412,25 @@ fn check(args: &[String], com1: &Path, root: &Path) -> Result<String, Failure> {
         .spawn()
         .map_err(|error| Failure::task(format!("could not launch QEMU: {error}")))?;
     let com2 = Arc::new(Mutex::new(Vec::new()));
-    let result = drive(&mut child, com1, &com2);
+    let result = drive(&mut child, com1, &com2, script);
     if result.is_err() {
         let _ = child.kill();
         let _ = child.wait();
     }
     // Keep the shell transcript beside COM1 so a failed check can be read.
     if let Ok(com2) = com2.lock() {
-        let _ = fs::write(root.join("com2.log"), &*com2);
+        let _ = fs::write(transcript, &*com2);
     }
-    result.map(|elapsed| {
-        format!(
-            "DEV_BOOT_CHECK_PASS seconds={} root={}\n",
-            elapsed.as_secs(),
-            root.display()
-        )
-    })
+    result
 }
 
-fn drive(child: &mut Child, com1: &Path, com2: &Arc<Mutex<Vec<u8>>>) -> Result<Duration, Failure> {
-    let started = Instant::now();
-    let deadline = started + CHECK_TIMEOUT;
+fn drive(
+    child: &mut Child,
+    com1: &Path,
+    com2: &Arc<Mutex<Vec<u8>>>,
+    script: impl FnOnce(&mut Shell<'_>) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    let deadline = Instant::now() + CHECK_TIMEOUT;
     let mut stdout = child
         .stdout
         .take()
@@ -206,118 +447,26 @@ fn drive(child: &mut Child, com1: &Path, com2: &Arc<Mutex<Vec<u8>>>) -> Result<D
             }
         }
     });
-    let seen = |needle: &'static [u8], after: usize| {
-        let com2 = Arc::clone(com2);
-        move || {
-            Ok(com2
-                .lock()
-                .map(|com2| com2.get(after..).is_some_and(|tail| contains(tail, needle)))
-                .unwrap_or(false))
-        }
-    };
-    let length = || com2.lock().map(|com2| com2.len()).unwrap_or(0);
-    wait_until(deadline, "the wyrmsh prompt on COM2", seen(PROMPT, 0))?;
+    let prompt = Arc::clone(com2);
+    wait_until(deadline, "the wyrmsh prompt on COM2", || {
+        Ok(prompt
+            .lock()
+            .map(|com2| contains(&com2, PROMPT))
+            .unwrap_or(false))
+    })?;
     let input = child
         .stdin
         .as_mut()
         .ok_or_else(|| Failure::task("QEMU COM2 input is not piped"))?;
-    let mut attempts = 0;
-    loop {
-        let before = length();
-        input.write_all(SERVICES_COMMAND).map_err(|error| {
-            Failure::task(format!("could not send the services command: {error}"))
-        })?;
-        wait_until(deadline, "the prompt after services", || {
-            Ok(com2
-                .lock()
-                .map(|com2| {
-                    com2.get(before..)
-                        .is_some_and(|tail| contains(tail, b"services") && ends_with_prompt(tail))
-                })
-                .unwrap_or(false))
-        })?;
-        if seen(BLOCK_SERVICE, before)()?
-            && seen(STORAGE_SERVICES[0], before)()?
-            && seen(STORAGE_SERVICES[1], before)()?
-        {
-            break;
-        }
-        attempts += 1;
-        if attempts == SERVICES_ATTEMPTS || Instant::now() >= deadline {
-            return Err(Failure::task(
-                "dev-boot check: device.block.virtio0, volume.boot0 and system.vfs were never all published",
-            ));
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-    let mut attempts = 0;
-    loop {
-        let before = length();
-        input
-            .write_all(LS_COMMAND)
-            .map_err(|error| Failure::task(format!("could not send ls: {error}")))?;
-        wait_until(deadline, "the prompt after ls", || {
-            Ok(com2
-                .lock()
-                .map(|com2| {
-                    com2.get(before..)
-                        .is_some_and(|tail| contains(tail, b"WYRMROOT") && ends_with_prompt(tail))
-                })
-                .unwrap_or(false))
-        })?;
-        if seen(LS_OUTPUT[0], before)()? && seen(LS_OUTPUT[1], before)()? {
-            break;
-        }
-        attempts += 1;
-        if attempts == LS_ATTEMPTS || Instant::now() >= deadline {
-            return Err(Failure::task(
-                "dev-boot check: ls /boot/EFI/WYRMROOT never listed the ESP",
-            ));
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-    let before_cat = length();
-    input
-        .write_all(CAT_COMMAND)
-        .map_err(|error| Failure::task(format!("could not send cat: {error}")))?;
-    // The README and the next prompt may arrive in one read.
-    wait_until(deadline, "the README and the prompt after cat", || {
-        Ok(com2
-            .lock()
-            .map(|com2| {
-                com2.get(before_cat..)
-                    .is_some_and(|tail| contains(tail, CAT_OUTPUT) && ends_with_prompt(tail))
-            })
-            .unwrap_or(false))
-    })?;
-    let before_job = length();
-    input
-        .write_all(JOB_COMMAND)
-        .map_err(|error| Failure::task(format!("could not send the job command: {error}")))?;
-    wait_until(
+    script(&mut Shell {
+        input,
+        com2,
         deadline,
-        "bin/hello output on COM2",
-        seen(JOB_OUTPUT, before_job),
-    )?;
-    let after_job = length();
-    wait_until(
-        deadline,
-        "the prompt after bin/hello",
-        seen(PROMPT, after_job),
-    )?;
-    let before_file_job = length();
-    input
-        .write_all(FILE_JOB_COMMAND)
-        .map_err(|error| Failure::task(format!("could not send the file job: {error}")))?;
-    wait_until(deadline, "HELLO.ELF output and the prompt", || {
-        Ok(com2
-            .lock()
-            .map(|com2| {
-                com2.get(before_file_job..)
-                    .is_some_and(|tail| contains(tail, JOB_OUTPUT) && ends_with_prompt(tail))
-            })
-            .unwrap_or(false))
     })?;
+    let input = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| Failure::task("QEMU COM2 input is not piped"))?;
     input
         .write_all(&[END_OF_INPUT])
         .map_err(|error| Failure::task(format!("could not send Ctrl-D: {error}")))?;
@@ -334,7 +483,7 @@ fn drive(child: &mut Child, com1: &Path, com2: &Arc<Mutex<Vec<u8>>>) -> Result<D
             com1.display()
         )));
     }
-    Ok(started.elapsed())
+    Ok(())
 }
 
 fn wait_until(
@@ -353,15 +502,35 @@ fn wait_until(
     Ok(())
 }
 
+/// `bytes` without ANSI control sequences (`ESC [` ... final byte).
+fn strip_escapes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
+            index += 2;
+            while index < bytes.len() && !(0x40..=0x7e).contains(&bytes[index]) {
+                index += 1;
+            }
+            index += 1;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
 /// Whether `output` ends at a fresh prompt.
 fn ends_with_prompt(output: &[u8]) -> bool {
     output.ends_with(PROMPT)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -375,6 +544,7 @@ mod tests {
             Path::new("/p"),
             Path::new("/v.fd"),
             Path::new("/c1.log"),
+            Path::new("/r.img"),
         );
         let serials: Vec<&str> = args
             .windows(2)
@@ -388,7 +558,13 @@ mod tests {
 
     #[test]
     fn the_esp_is_a_modern_virtio_disk_behind_the_iommu() {
-        let args = qemu_arguments(false, Path::new("/p"), Path::new("/v"), Path::new("/c"));
+        let args = qemu_arguments(
+            false,
+            Path::new("/p"),
+            Path::new("/v"),
+            Path::new("/c"),
+            Path::new("/r.img"),
+        );
         let devices: Vec<&str> = args
             .windows(2)
             .filter(|pair| pair[0] == "-device")
@@ -398,15 +574,40 @@ mod tests {
             devices,
             [
                 "intel-iommu",
-                "virtio-blk-pci,drive=esp,addr=0x1,disable-legacy=on,iommu_platform=on"
+                "virtio-blk-pci,drive=esp,addr=0x1,disable-legacy=on,iommu_platform=on",
+                "virtio-blk-pci,drive=root,addr=0x2,disable-legacy=on,iommu_platform=on"
             ]
         );
         assert!(!args.iter().any(|arg| arg.starts_with("if=virtio")));
+        // The ESP is read-only; the root disk is not.
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("if=none,id=esp,format=raw,readonly=on,"))
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "if=none,id=root,format=raw,file=/r.img")
+        );
+    }
+
+    #[test]
+    fn escapes_are_stripped_from_the_transcript() {
+        assert_eq!(
+            strip_escapes(b"\r\n\x1b[2Kwyrmsh> "),
+            b"\r\nwyrmsh> ".to_vec()
+        );
+        assert_eq!(strip_escapes(b"a\x1b[1;31mb"), b"ab".to_vec());
     }
 
     #[test]
     fn smp_uses_the_f_matrix_cpu_count() {
-        let args = qemu_arguments(true, Path::new("/p"), Path::new("/v"), Path::new("/c"));
+        let args = qemu_arguments(
+            true,
+            Path::new("/p"),
+            Path::new("/v"),
+            Path::new("/c"),
+            Path::new("/r.img"),
+        );
         let smp = args
             .windows(2)
             .find(|pair| pair[0] == "-smp")

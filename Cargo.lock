@@ -266,6 +266,21 @@ name = "wyrmroot-ext4"
 version = "0.0.0"
 
 [[package]]
+name = "wyrmroot-ext4d"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-block-proto",
+ "wyrmroot-channel-model",
+ "wyrmroot-ext4",
+ "wyrmroot-fs-proto",
+ "wyrmroot-loader",
+ "wyrmroot-runtime",
+ "wyrmroot-service",
+ "wyrmroot-service-proto",
+]
+
+[[package]]
 name = "wyrmroot-fat"
 version = "0.0.0"
 
@@ -456,6 +471,7 @@ dependencies = [
  "deepwyrm-abi",
  "wyrmroot-bootfs",
  "wyrmroot-device-proto",
+ "wyrmroot-ext4",
  "wyrmroot-loader",
  "wyrmroot-rrc-manifest",
  "wyrmroot-system-init",

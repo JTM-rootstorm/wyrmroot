@@ -1,14 +1,17 @@
-//! Canonical, bounded WRDM v1.1 q35 device-role manifest.
+//! Canonical, bounded WRDM v1.2 q35 device-role manifest.
 //!
 //! Minor 1 (root `STORAGE_PLAN.md` W2) admits a second role after COM2: the
 //! boot disk, a PCI function whose address and vendor/device IDs occupy the
-//! record bytes 64..72 that a port-I/O record keeps zero.
+//! record bytes 64..72 that a port-I/O record keeps zero. Minor 2 (W7) admits
+//! a third: the data disk that holds the persistent root, served by the same
+//! driver. The roles are positional: COM2, then the boot disk, then the data
+//! disk.
 
 use core::ops::Range;
 
 pub const MAGIC: [u8; 4] = *b"WRDM";
 pub const MAJOR: u16 = 1;
-pub const MINOR: u16 = 1;
+pub const MINOR: u16 = 2;
 pub const HEADER_BYTES: usize = 32;
 pub const RECORD_BYTES: usize = 144;
 pub const MAX_RECORDS: usize = 4;
@@ -27,6 +30,11 @@ pub const BLOCK_DEVICE_METADATA_POLICY: MetadataPolicyId = MetadataPolicyId(2);
 pub const BOOT_DISK_RESOURCE_ID: u64 = 2;
 pub const BOOT_DISK_PCI_ADDRESS: u32 = 1 << 3;
 pub const VIRTIO_BLOCK_PCI_IDS: u32 = 0x1af4 | 0x1042 << 16;
+/// The data disk (root `STORAGE_PLAN.md` W7): q35 bus 0, device 2,
+/// function 0, the same kind of device as the boot disk.
+pub const DATA_DISK_ROLE_ID: RoleId = RoleId(3);
+pub const DATA_DISK_RESOURCE_ID: u64 = 3;
+pub const DATA_DISK_PCI_ADDRESS: u32 = 2 << 3;
 
 /// Stable WYR1-C publication metadata installed by the controller before any
 /// device binding exists.  This names a typed device-metadata/control service;
@@ -82,6 +90,19 @@ pub const BOOT_DISK_PUBLICATION_POLICY: PublicationPolicy = PublicationPolicy {
     supervisor_role_id: BLOCK_DEVICE_SUPERVISOR_ROLE_ID,
 };
 
+/// The data disk's BlockDevice service (root `STORAGE_PLAN.md` W7).
+pub const DATA_DISK_SERVICE_NAME: &[u8] = b"device.block.virtio1";
+/// Above the storage service roles' 4 and 5 (`wyrmroot-service-proto`).
+pub const DATA_DISK_SUPERVISOR_ROLE_ID: u32 = 6;
+
+pub const DATA_DISK_PUBLICATION_POLICY: PublicationPolicy = PublicationPolicy {
+    service_name: DATA_DISK_SERVICE_NAME,
+    protocol_id: BLOCK_DEVICE_PROTOCOL_ID,
+    protocol_major: 1,
+    protocol_minor: 0,
+    supervisor_role_id: DATA_DISK_SUPERVISOR_ROLE_ID,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProfileId(pub u32);
 
@@ -132,6 +153,7 @@ pub enum Hardware {
     Com1,
     Com2,
     BootDisk,
+    DataDisk,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,18 +171,26 @@ pub struct PciFunction {
     pub ids: u32,
 }
 
-/// The fixed boot-disk role (root `STORAGE_PLAN.md` W2).
+/// One fixed disk role: the boot disk (root `STORAGE_PLAN.md` W2) or the
+/// data disk (W7).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BootDiskPolicy {
+pub struct DiskPolicy {
     pub role_id: RoleId,
+    pub hardware: Hardware,
+    /// The role's position in the manifest.
+    pub record: usize,
     pub resource_id: u64,
     pub pci: PciFunction,
     pub driver_path: &'static [u8],
     pub metadata_policy: MetadataPolicyId,
+    /// The BlockDevice service its driver publishes.
+    pub publication: PublicationPolicy,
 }
 
-pub const BOOT_DISK_POLICY: BootDiskPolicy = BootDiskPolicy {
+pub const BOOT_DISK_POLICY: DiskPolicy = DiskPolicy {
     role_id: BOOT_DISK_ROLE_ID,
+    hardware: Hardware::BootDisk,
+    record: 1,
     resource_id: BOOT_DISK_RESOURCE_ID,
     pci: PciFunction {
         address: BOOT_DISK_PCI_ADDRESS,
@@ -168,7 +198,32 @@ pub const BOOT_DISK_POLICY: BootDiskPolicy = BootDiskPolicy {
     },
     driver_path: VIRTIO_BLKD_PATH,
     metadata_policy: BLOCK_DEVICE_METADATA_POLICY,
+    publication: BOOT_DISK_PUBLICATION_POLICY,
 };
+
+pub const DATA_DISK_POLICY: DiskPolicy = DiskPolicy {
+    role_id: DATA_DISK_ROLE_ID,
+    hardware: Hardware::DataDisk,
+    record: 2,
+    resource_id: DATA_DISK_RESOURCE_ID,
+    pci: PciFunction {
+        address: DATA_DISK_PCI_ADDRESS,
+        ids: VIRTIO_BLOCK_PCI_IDS,
+    },
+    driver_path: VIRTIO_BLKD_PATH,
+    metadata_policy: BLOCK_DEVICE_METADATA_POLICY,
+    publication: DATA_DISK_PUBLICATION_POLICY,
+};
+
+/// Every disk role, in manifest order.
+pub const DISK_POLICIES: [DiskPolicy; 2] = [BOOT_DISK_POLICY, DATA_DISK_POLICY];
+
+/// The disk role whose ID is `role_id`.
+pub fn disk_policy(role_id: RoleId) -> Option<&'static DiskPolicy> {
+    DISK_POLICIES
+        .iter()
+        .find(|policy| policy.role_id == role_id)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Com2Policy {
@@ -207,7 +262,8 @@ pub fn encode_com2_manifest(
 }
 
 /// Encode the product role set: COM2, then the boot disk (`STORAGE_PLAN.md`
-/// W2). As with [`encode_com2_manifest`], only the two driver identities come
+/// W2), then the data disk (W7), both disks served by the one block driver.
+/// As with [`encode_com2_manifest`], only the two driver identities come
 /// from the caller.
 pub fn encode_product_manifest(
     uart_identity: ContentIdentity,
@@ -222,7 +278,11 @@ fn encode_roles(
     block_identity: Option<ContentIdentity>,
     output: &mut [u8],
 ) -> Result<usize, ManifestError> {
-    let count = 1 + usize::from(block_identity.is_some());
+    let count = 1 + if block_identity.is_some() {
+        DISK_POLICIES.len()
+    } else {
+        0
+    };
     let total = HEADER_BYTES + count * RECORD_BYTES;
     if output.len() < total {
         return Err(ManifestError::WrongSize);
@@ -255,11 +315,11 @@ fn encode_roles(
     output[base + 72..base + 72 + COM2_POLICY.driver_path.len()]
         .copy_from_slice(COM2_POLICY.driver_path);
 
-    if let Some(identity) = block_identity {
-        let base = HEADER_BYTES + RECORD_BYTES;
-        let policy = BOOT_DISK_POLICY;
+    for policy in DISK_POLICIES.iter().filter(|_| block_identity.is_some()) {
+        let identity = block_identity.ok_or(ManifestError::ZeroContentIdentity)?;
+        let base = HEADER_BYTES + policy.record * RECORD_BYTES;
         output[base..base + 8].copy_from_slice(&policy.role_id.0.to_le_bytes());
-        output[base + 8..base + 12].copy_from_slice(&3u32.to_le_bytes());
+        output[base + 8..base + 12].copy_from_slice(&hardware_code(policy.hardware).to_le_bytes());
         output[base + 12..base + 16].copy_from_slice(&2u32.to_le_bytes());
         output[base + 24..base + 26]
             .copy_from_slice(&(policy.driver_path.len() as u16).to_le_bytes());
@@ -387,7 +447,7 @@ impl<'a> Manifest<'a> {
     }
 
     /// Admit the WYR1-C COM2 role, checking the complete fixed policy and the
-    /// exact role set: COM2 first, then at most the boot disk. The content
+    /// exact role set: COM2 first, then at most the boot and data disks. The content
     /// identity is supplied by the immutable product manifest rather than
     /// inferred from a path string.
     pub fn match_com2(
@@ -420,30 +480,9 @@ impl<'a> Manifest<'a> {
         Ok(role)
     }
 
-    /// The boot-disk role, if the manifest has one, checked against the
-    /// complete fixed [`BOOT_DISK_POLICY`]. The identity is not checked here:
-    /// [`Self::match_boot_disk`] does that for a caller that knows it.
+    /// The boot-disk role, if the manifest has one (see [`Self::disk`]).
     pub fn boot_disk(&self) -> Result<Option<DeviceRole<'a>>, ManifestError> {
-        self.check_role_set()?;
-        let Some(role) = self.records[1] else {
-            return Ok(None);
-        };
-        if role.role_id != BOOT_DISK_POLICY.role_id {
-            return Err(ManifestError::UnknownRole);
-        }
-        if role.hardware != Hardware::BootDisk
-            || role.resource_kind != ResourceKind::PciFunction
-            || role.pci != Some(BOOT_DISK_POLICY.pci)
-        {
-            return Err(ManifestError::WrongResource);
-        }
-        if role.driver_path != BOOT_DISK_POLICY.driver_path {
-            return Err(ManifestError::WrongDriverPath);
-        }
-        if role.metadata_policy != BOOT_DISK_POLICY.metadata_policy {
-            return Err(ManifestError::WrongMetadataPolicy);
-        }
-        Ok(Some(role))
+        self.disk(&BOOT_DISK_POLICY)
     }
 
     /// Admit the boot-disk role with exactly `expected_content`.
@@ -451,8 +490,43 @@ impl<'a> Manifest<'a> {
         &self,
         expected_content: ContentIdentity,
     ) -> Result<DeviceRole<'a>, ManifestError> {
+        self.match_disk(&BOOT_DISK_POLICY, expected_content)
+    }
+
+    /// The disk role `policy` names, if the manifest has one, checked
+    /// against the complete fixed policy. The identity is not checked here:
+    /// [`Self::match_disk`] does that for a caller that knows it.
+    pub fn disk(&self, policy: &DiskPolicy) -> Result<Option<DeviceRole<'a>>, ManifestError> {
+        self.check_role_set()?;
+        let Some(role) = self.records.get(policy.record).copied().flatten() else {
+            return Ok(None);
+        };
+        if role.role_id != policy.role_id {
+            return Err(ManifestError::UnknownRole);
+        }
+        if role.hardware != policy.hardware
+            || role.resource_kind != ResourceKind::PciFunction
+            || role.pci != Some(policy.pci)
+        {
+            return Err(ManifestError::WrongResource);
+        }
+        if role.driver_path != policy.driver_path {
+            return Err(ManifestError::WrongDriverPath);
+        }
+        if role.metadata_policy != policy.metadata_policy {
+            return Err(ManifestError::WrongMetadataPolicy);
+        }
+        Ok(Some(role))
+    }
+
+    /// Admit the disk role `policy` names with exactly `expected_content`.
+    pub fn match_disk(
+        &self,
+        policy: &DiskPolicy,
+        expected_content: ContentIdentity,
+    ) -> Result<DeviceRole<'a>, ManifestError> {
         let role = self
-            .boot_disk()?
+            .disk(policy)?
             .ok_or(ManifestError::UnexpectedRoleCount)?;
         if role.content_identity != expected_content {
             return Err(ManifestError::WrongContentIdentity);
@@ -470,7 +544,7 @@ impl<'a> Manifest<'a> {
     }
 
     fn check_role_set(&self) -> Result<(), ManifestError> {
-        if self.count != 1 && self.count != 2 {
+        if self.count == 0 || self.count > 1 + DISK_POLICIES.len() {
             return Err(ManifestError::UnexpectedRoleCount);
         }
         Ok(())
@@ -517,6 +591,7 @@ fn parse_record<'a>(bytes: &'a [u8], base: usize) -> Result<DeviceRole<'a>, Mani
         1 => Hardware::Com1,
         2 => Hardware::Com2,
         3 => Hardware::BootDisk,
+        4 => Hardware::DataDisk,
         _ => return Err(ManifestError::UnknownHardware),
     };
     let resource_kind = match get_u32(bytes, base + 12) {
@@ -604,6 +679,15 @@ fn parse_record<'a>(bytes: &'a [u8], base: usize) -> Result<DeviceRole<'a>, Mani
         content_identity,
         metadata_policy,
     })
+}
+
+const fn hardware_code(hardware: Hardware) -> u32 {
+    match hardware {
+        Hardware::Com1 => 1,
+        Hardware::Com2 => 2,
+        Hardware::BootDisk => 3,
+        Hardware::DataDisk => 4,
+    }
 }
 
 fn get_u16(bytes: &[u8], offset: usize) -> u16 {
@@ -798,7 +882,10 @@ mod tests {
     fn structural_header_and_record_failures_are_closed() {
         let baseline = manifest(1, 2, 0x2f8, 3, UART16550D_PATH, 9);
         let mut bad = baseline;
-        bad[6] = 2;
+        bad[6] = 3;
+        assert_eq!(Manifest::parse(&bad), Err(ManifestError::WrongVersion));
+        bad = baseline;
+        bad[6] = 1;
         assert_eq!(Manifest::parse(&bad), Err(ManifestError::WrongVersion));
         bad = baseline;
         bad[6] = 0;
@@ -854,8 +941,8 @@ mod tests {
         assert_eq!(Manifest::parse(&two), Err(ManifestError::OverlappingPio));
     }
 
-    fn product(block: u8) -> [u8; HEADER_BYTES + 2 * RECORD_BYTES] {
-        let mut bytes = [0u8; HEADER_BYTES + 2 * RECORD_BYTES];
+    fn product(block: u8) -> [u8; HEADER_BYTES + 3 * RECORD_BYTES] {
+        let mut bytes = [0u8; HEADER_BYTES + 3 * RECORD_BYTES];
         let size = encode_product_manifest(
             ContentIdentity([9; 32]),
             ContentIdentity([block; 32]),
@@ -867,10 +954,10 @@ mod tests {
     }
 
     #[test]
-    fn product_manifest_admits_com2_then_the_boot_disk() {
+    fn product_manifest_admits_com2_then_the_boot_and_data_disks() {
         let bytes = product(7);
         let parsed = Manifest::parse(&bytes).unwrap();
-        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.len(), 3);
         assert_eq!(
             parsed.match_com2(ContentIdentity([9; 32])).unwrap().role_id,
             COM2_ROLE_ID
@@ -885,7 +972,27 @@ mod tests {
             Err(ManifestError::WrongContentIdentity)
         );
         assert_eq!(parsed.role(BOOT_DISK_ROLE_ID), Some(disk));
-        assert_eq!(parsed.role(RoleId(3)), None);
+        let data = parsed
+            .match_disk(&DATA_DISK_POLICY, ContentIdentity([7; 32]))
+            .unwrap();
+        assert_eq!(data.role_id, DATA_DISK_ROLE_ID);
+        assert_eq!(data.hardware, Hardware::DataDisk);
+        assert_eq!(data.pci, Some(DATA_DISK_POLICY.pci));
+        assert_eq!(data.driver_path, VIRTIO_BLKD_PATH);
+        assert_eq!(parsed.role(DATA_DISK_ROLE_ID), Some(data));
+        assert_eq!(parsed.role(RoleId(4)), None);
+        assert_eq!(disk_policy(DATA_DISK_ROLE_ID), Some(&DATA_DISK_POLICY));
+        assert_eq!(disk_policy(COM2_ROLE_ID), None);
+        // The two disk records are not interchangeable.
+        let mut swapped = product(7);
+        let (boot, data) = swapped[HEADER_BYTES + RECORD_BYTES..].split_at_mut(RECORD_BYTES);
+        boot.swap_with_slice(data);
+        let parsed = Manifest::parse(&swapped).unwrap();
+        assert_eq!(parsed.boot_disk(), Err(ManifestError::UnknownRole));
+        assert_eq!(
+            parsed.disk(&DATA_DISK_POLICY),
+            Err(ManifestError::UnknownRole)
+        );
     }
 
     #[test]
@@ -929,9 +1036,16 @@ mod tests {
         // Another function, other IDs, segment 1, or no vendor.
         check(
             second + 64,
-            &(2u32 << 3).to_le_bytes(),
+            &(3u32 << 3).to_le_bytes(),
             ManifestError::WrongResource,
         );
+        // The data disk's own function or role is a duplicate.
+        check(
+            second + 64,
+            &(2u32 << 3).to_le_bytes(),
+            ManifestError::DuplicateRole,
+        );
+        check(second, &3u64.to_le_bytes(), ManifestError::DuplicateRole);
         check(
             second + 68,
             &0x1001_1af4u32.to_le_bytes(),
@@ -953,7 +1067,7 @@ mod tests {
             ManifestError::WrongResource,
         );
         // Another role, hardware, driver or metadata policy.
-        check(second, &3u64.to_le_bytes(), ManifestError::UnknownRole);
+        check(second, &4u64.to_le_bytes(), ManifestError::UnknownRole);
         check(
             second + 8,
             &2u32.to_le_bytes(),
@@ -988,7 +1102,7 @@ mod tests {
 
     #[test]
     fn product_encoder_refuses_a_zero_block_identity() {
-        let mut bytes = [0u8; HEADER_BYTES + 2 * RECORD_BYTES];
+        let mut bytes = [0u8; HEADER_BYTES + 3 * RECORD_BYTES];
         assert_eq!(
             encode_product_manifest(
                 ContentIdentity([9; 32]),

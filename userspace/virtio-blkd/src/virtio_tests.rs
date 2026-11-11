@@ -111,6 +111,8 @@ pub(crate) struct Model {
     pub(crate) wrong_id: Option<u32>,
     /// Advance the used index by this much per completion.
     pub(crate) used_step: u16,
+    /// Complete reads without writing their data to memory.
+    pub(crate) drop_reads: bool,
     /// Every request the device executed: (type, sector, bytes).
     pub(crate) executed: Vec<(u32, u64, u32)>,
     pub(crate) bar_writes: Vec<(u64, u64)>,
@@ -151,6 +153,7 @@ impl Model {
             stall: false,
             wrong_id: None,
             used_step: 1,
+            drop_reads: false,
             executed: Vec::new(),
             bar_writes: Vec::new(),
         }
@@ -251,7 +254,9 @@ impl Model {
                     } else if kind == BLK_T_IN {
                         assert_eq!(flags & 2, 2, "read data must be device-writable");
                         let block = self.disk[start..end].to_vec();
-                        self.write_iova(data, &block);
+                        if !self.drop_reads {
+                            self.write_iova(data, &block);
+                        }
                     } else {
                         assert_eq!(flags & 2, 0, "write data must be device-readable");
                         if self.offered & FEATURE_BLK_RO != 0 {
@@ -336,6 +341,7 @@ impl Model {
                         stall: self.stall,
                         wrong_id: self.wrong_id,
                         used_step: self.used_step,
+                        drop_reads: self.drop_reads,
                         queue_notify_off: self.queue_notify_off,
                         executed: core::mem::take(&mut self.executed),
                         bar_writes: core::mem::take(&mut self.bar_writes),

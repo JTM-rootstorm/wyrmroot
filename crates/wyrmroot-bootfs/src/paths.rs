@@ -8,11 +8,13 @@ pub const UART16550D_PATH: &str = "system/uart16550d";
 /// The boot-disk driver (root `STORAGE_PLAN.md` W2).
 pub const VIRTIO_BLKD_PATH: &str = "system/virtio-blkd";
 pub const CONSOLED_PATH: &str = "system/consoled";
-/// The storage service roles init stages (root `STORAGE_PLAN.md` W6).
+/// The storage service roles init stages (root `STORAGE_PLAN.md` W6, W7).
+/// blockmgr serves both volumes as two roles of one executable.
 pub const BLOCKMGR_PATH: &str = "system/blockmgr";
 pub const FAT32D_PATH: &str = "system/fat32d";
+pub const EXT4D_PATH: &str = "system/ext4d";
 pub const VFSD_PATH: &str = "system/vfsd";
-pub const SERVICE_ROLE_PATHS: [&str; 3] = [BLOCKMGR_PATH, FAT32D_PATH, VFSD_PATH];
+pub const SERVICE_ROLE_PATHS: [&str; 4] = [BLOCKMGR_PATH, FAT32D_PATH, EXT4D_PATH, VFSD_PATH];
 pub const WYRMSH_PATH: &str = "system/wyrmsh";
 pub const HELLO_PATH: &str = "bin/hello";
 pub const CPU_HOG_PATH: &str = "bin/cpu-hog";

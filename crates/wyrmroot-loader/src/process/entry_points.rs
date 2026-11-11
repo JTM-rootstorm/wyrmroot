@@ -524,8 +524,13 @@ pub fn load_device_coordinator_resource_process<P: LoaderPlatform>(
 /// A request for any other path is refused before anything is created.
 pub const DEVICE_DRIVER_PATHS: [&str; 2] = ["/system/uart16550d", "/system/virtio-blkd"];
 
-/// The bootfs service roles init stages itself (root `STORAGE_PLAN.md` W6).
-pub const SERVICE_ROLE_PATHS: [&str; 3] = ["/system/blockmgr", "/system/fat32d", "/system/vfsd"];
+/// The bootfs service roles init stages itself (root `STORAGE_PLAN.md` W6, W7).
+pub const SERVICE_ROLE_PATHS: [&str; 4] = [
+    "/system/blockmgr",
+    "/system/fat32d",
+    "/system/ext4d",
+    "/system/vfsd",
+];
 
 /// Constructs one service role with the device-driver startup shape: the
 /// self root and one control Channel, the child's end of init's WRSV stage

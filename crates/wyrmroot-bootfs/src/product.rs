@@ -50,7 +50,7 @@ pub struct Product<'a> {
     pub cpu_hog_identity: [u8; 32],
     /// The storage service roles, in [`SERVICE_ROLE_PATHS`] order, each with
     /// the identity its launch-policy entry must name.
-    pub services: [ServiceArtifact<'a>; 3],
+    pub services: [ServiceArtifact<'a>; 4],
 }
 
 /// One service role's executable and identity.
@@ -61,7 +61,7 @@ pub struct ServiceArtifact<'a> {
 }
 
 impl Product<'_> {
-    fn entries(&self) -> [(&'static str, &[u8], FileMode); 16] {
+    fn entries(&self) -> [(&'static str, &[u8], FileMode); 17] {
         use FileMode::{Executable, ReadOnly};
         [
             (INIT_PATH, self.init, Executable),
@@ -79,7 +79,8 @@ impl Product<'_> {
             (LAUNCH_POLICY_PATH, self.launch_policy, ReadOnly),
             (BLOCKMGR_PATH, self.services[0].bytes, Executable),
             (FAT32D_PATH, self.services[1].bytes, Executable),
-            (VFSD_PATH, self.services[2].bytes, Executable),
+            (EXT4D_PATH, self.services[2].bytes, Executable),
+            (VFSD_PATH, self.services[3].bytes, Executable),
         ]
     }
 }
@@ -112,9 +113,11 @@ fn validate(product: &Product<'_>) -> Result<(), BuildError> {
     manifest
         .match_com2(ContentIdentity(product.uart16550d_identity))
         .map_err(manifest_error)?;
-    manifest
-        .match_boot_disk(ContentIdentity(product.virtio_blkd_identity))
-        .map_err(manifest_error)?;
+    for disk in &wyrmroot_device_proto::manifest::DISK_POLICIES {
+        manifest
+            .match_disk(disk, ContentIdentity(product.virtio_blkd_identity))
+            .map_err(manifest_error)?;
+    }
 
     if product.wyrmsh_identity == [0; 32]
         || product.hello_identity == [0; 32]
@@ -182,8 +185,8 @@ mod tests {
     const HOG: [u8; 32] = [0xf3; 32];
 
     const BLOCK: [u8; 32] = [0xb1; 32];
-    const SERVICES: [[u8; 32]; 3] = [[0xc1; 32], [0xc2; 32], [0xc3; 32]];
-    const WRDM_BYTES: usize = 32 + 2 * 144;
+    const SERVICES: [[u8; 32]; 4] = [[0xc1; 32], [0xc2; 32], [0xc3; 32], [0xc4; 32]];
+    const WRDM_BYTES: usize = 32 + 3 * 144;
 
     fn wrdm(identity: [u8; 32]) -> [u8; WRDM_BYTES] {
         let mut bytes = [0u8; WRDM_BYTES];
@@ -232,13 +235,22 @@ mod tests {
         let services = [
             service(BLOCKMGR_PATH, SERVICES[0]),
             service(FAT32D_PATH, SERVICES[1]),
-            service(VFSD_PATH, SERVICES[2]),
+            service(EXT4D_PATH, SERVICES[2]),
+            service(VFSD_PATH, SERVICES[3]),
         ];
         let mut entries = vec![];
         if include_hog {
             entries.push(hog);
         }
-        entries.extend([hello, services[0], services[1], services[2], shell]);
+        // Canonical path order: blockmgr, ext4d, fat32d, vfsd.
+        entries.extend([
+            hello,
+            services[0],
+            services[2],
+            services[1],
+            services[3],
+            shell,
+        ]);
         let mut output = vec![0; 1024];
         let used = encode([0x42; 32], &entries, &mut output).unwrap();
         output.truncate(used);
@@ -274,15 +286,19 @@ mod tests {
                     identity: SERVICES[1],
                 },
                 ServiceArtifact {
-                    bytes: b"vfsd-elf",
+                    bytes: b"ext4d-elf",
                     identity: SERVICES[2],
+                },
+                ServiceArtifact {
+                    bytes: b"vfsd-elf",
+                    identity: SERVICES[3],
                 },
             ],
         }
     }
 
     #[test]
-    fn builds_the_sixteen_entry_product_deterministically() {
+    fn builds_the_seventeen_entry_product_deterministically() {
         let manifest = wrdm(UART);
         let policy = policy(false, true);
         let product = product(&manifest, &policy);
@@ -302,6 +318,7 @@ mod tests {
                 b"system/bootstrap/rrc-a-v1".as_slice(),
                 b"system/consoled".as_slice(),
                 b"system/devmgr".as_slice(),
+                b"system/ext4d".as_slice(),
                 b"system/fat32d".as_slice(),
                 b"system/init".as_slice(),
                 b"system/registryd".as_slice(),
@@ -316,7 +333,7 @@ mod tests {
                 .entries()
                 .filter(|entry| entry.is_executable())
                 .count(),
-            12
+            13
         );
         assert_eq!(
             archive.lookup(MARKER_PATH.as_bytes()).unwrap().data(),

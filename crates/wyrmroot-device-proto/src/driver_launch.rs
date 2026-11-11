@@ -10,7 +10,7 @@ use crate::{
         AttemptGeneration, EndpointGeneration, EndpointId, LaunchSessionGeneration,
         SupervisorGeneration,
     },
-    manifest::{BOOT_DISK_ROLE_ID, COM2_ROLE_ID, ContentIdentity, RoleId},
+    manifest::{BOOT_DISK_ROLE_ID, COM2_ROLE_ID, ContentIdentity, DATA_DISK_ROLE_ID, RoleId},
 };
 
 pub const DEVICE_DRIVER_PATH: &str = "/system/uart16550d";
@@ -22,7 +22,7 @@ pub const BLOCK_DRIVER_PATH: &str = "/system/virtio-blkd";
 pub const fn driver_path_for_role(role_id: RoleId) -> Option<&'static str> {
     match role_id {
         COM2_ROLE_ID => Some(DEVICE_DRIVER_PATH),
-        BOOT_DISK_ROLE_ID => Some(BLOCK_DRIVER_PATH),
+        BOOT_DISK_ROLE_ID | DATA_DISK_ROLE_ID => Some(BLOCK_DRIVER_PATH),
         _ => None,
     }
 }
@@ -678,6 +678,7 @@ mod tests {
         for (role, path) in [
             (COM2_ROLE_ID, DEVICE_DRIVER_PATH),
             (BOOT_DISK_ROLE_ID, BLOCK_DRIVER_PATH),
+            (DATA_DISK_ROLE_ID, BLOCK_DRIVER_PATH),
         ] {
             let request = DriverLaunchRequest {
                 role_id: role,
@@ -698,7 +699,7 @@ mod tests {
             Err(DriverLaunchError::WrongPath)
         );
         let unknown = DriverLaunchRequest {
-            role_id: RoleId(3),
+            role_id: RoleId(4),
             ..request()
         };
         assert_eq!(
@@ -707,7 +708,7 @@ mod tests {
         );
         let mut bytes = [0; LAUNCH_REQUEST_BYTES];
         encode_request(request(), &mut bytes).unwrap();
-        bytes[32..40].copy_from_slice(&3u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&4u64.to_le_bytes());
         assert_eq!(parse_request(&bytes), Err(DriverLaunchError::WrongPath));
     }
     #[test]

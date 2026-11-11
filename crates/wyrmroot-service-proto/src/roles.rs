@@ -1,5 +1,5 @@
 //! The storage service roles init launches after devmgr (root
-//! `STORAGE_PLAN.md` W6), and the registry services they publish.
+//! `STORAGE_PLAN.md` W6, W7), and the registry services they publish.
 //!
 //! Role identities are WRSV/loader correlation, not authority; they sit
 //! above the device roles' range so the two can never be confused.
@@ -29,6 +29,16 @@ pub const BOOT_VOLUME: ServiceName = ServiceName {
     supervisor_role_id: 4,
 };
 
+/// The root volume: the persistent root, as blockmgr finds it on the data
+/// disk (W7).
+pub const ROOT_VOLUME: ServiceName = ServiceName {
+    name: b"volume.root0",
+    protocol_id: BLOCK_DEVICE_PROTOCOL_ID,
+    major: 1,
+    minor: 0,
+    supervisor_role_id: 7,
+};
+
 /// The system namespace vfsd serves.
 pub const SYSTEM_VFS: ServiceName = ServiceName {
     name: b"system.vfs",
@@ -44,8 +54,12 @@ pub const FAT32D_ROLE_ID: u64 = 0x101;
 pub const FAT32D_PATH: &str = "system/fat32d";
 pub const VFSD_ROLE_ID: u64 = 0x102;
 pub const VFSD_PATH: &str = "system/vfsd";
+/// The same blockmgr executable, serving the root volume of the data disk.
+pub const ROOT_BLOCKMGR_ROLE_ID: u64 = 0x103;
+pub const EXT4D_ROLE_ID: u64 = 0x104;
+pub const EXT4D_PATH: &str = "system/ext4d";
 
-/// fat32d: the server end of its root directory's WRFS Channel.
+/// fat32d and ext4d: the server end of the root directory's WRFS Channel.
 pub const SLOT_FS_ROOT: u32 = 1;
 /// vfsd: a filesystem root to mount at the Channel's label, read-only with
 /// `CHANNEL_READ_ONLY`.

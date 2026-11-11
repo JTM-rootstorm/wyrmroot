@@ -53,7 +53,8 @@ where
         // tick has nothing to watch.
         return console_step(resident, system, loader, waits, now_ns, false);
     };
-    let mut items = [DwWaitItemV1::default(); 7 + SERVICE_COUNT];
+    let mut items = [DwWaitItemV1::default();
+        5 + wyrmroot_device_proto::manifest::DISK_POLICIES.len() + SERVICE_COUNT];
     items[0] = DwWaitItemV1 {
         handle: devmgr.loaded.process,
         signals: DW_SIGNAL_EXITED,
@@ -84,13 +85,18 @@ where
         };
         item_count += 1;
     }
-    let storage_present = state.storage_driver.is_some();
-    if let Some(driver) = state.storage_driver {
-        items[item_count] = DwWaitItemV1 {
-            handle: driver.loaded.process,
-            signals: DW_SIGNAL_EXITED,
-        };
-        item_count += 1;
+    let mut storage_slots = [0usize; wyrmroot_device_proto::manifest::DISK_POLICIES.len()];
+    let mut storage_count = 0;
+    for (slot, driver) in state.storage_drivers.iter().enumerate() {
+        if let Some(driver) = driver {
+            storage_slots[storage_count] = slot;
+            storage_count += 1;
+            items[item_count] = DwWaitItemV1 {
+                handle: driver.loaded.process,
+                signals: DW_SIGNAL_EXITED,
+            };
+            item_count += 1;
+        }
     }
     // The storage service roles (root `STORAGE_PLAN.md` W6) come last, so the
     // indices above keep their meaning.
@@ -129,7 +135,7 @@ where
         }
         Ok(result) => {
             let event =
-                classify_resident_poll(result, registry_present, driver_present, storage_present)?;
+                classify_resident_poll(result, registry_present, driver_present, storage_count)?;
             let size = system
                 .query_memory_object_size(resident.authority.bootfs)
                 .map_err(InitError::Native)?;
@@ -198,8 +204,10 @@ where
                                 Ok(DevmgrControlInput::DriverLaunch {
                                     request,
                                     child_endpoint,
-                                }) if request.role_id
-                                    == wyrmroot_device_proto::manifest::BOOT_DISK_ROLE_ID =>
+                                }) if wyrmroot_device_proto::manifest::disk_policy(
+                                    request.role_id,
+                                )
+                                .is_some() =>
                                 {
                                     // The boot disk has no console behind it,
                                     // so nothing else starts with it, and a
@@ -306,12 +314,18 @@ where
                             false,
                             abandoned::reason(abandoned::trigger::EXITED, abandoned::phase::NONE),
                         ),
-                        // No restart yet (root `STORAGE_PLAN.md` W2): the
-                        // exited boot-disk driver is reaped, and its device
-                        // stays unserved until devmgr is recovered.
-                        ResidentPollEvent::StorageDriverExited => attribute_failure(
+                        // No restart yet (root `STORAGE_PLAN.md` W2): an
+                        // exited disk driver is reaped, and its device stays
+                        // unserved until devmgr is recovered.
+                        ResidentPollEvent::StorageDriverExited(index) => attribute_failure(
                             RecoveryOperation::ReapDriver,
-                            reap_storage_driver(resident, system, waits, false),
+                            reap_storage_driver(
+                                resident,
+                                system,
+                                waits,
+                                storage_slots[index.min(storage_slots.len() - 1)],
+                                false,
+                            ),
                         ),
                         ResidentPollEvent::DriverExited => {
                             let dependent_retirement =
@@ -485,7 +499,7 @@ where
     if crate::drain_jobs_for_shutdown(resident, system, waits).is_err() {
         failed |= JOBS;
     }
-    if reap_storage_driver(resident, system, waits, true).is_err() {
+    if reap_storage_drivers(resident, system, waits).is_err() {
         failed |= DRIVER;
     }
     if retire_services(resident, system, waits).is_err() {
@@ -944,7 +958,7 @@ pub(crate) fn recovery_fixture_resident(
             last_controller_transaction: LAST_CONTROLLER_TRANSACTION,
             next_controller_transaction: NEXT_CONTROLLER_TRANSACTION,
             driver,
-            storage_driver: None,
+            storage_drivers: [None; wyrmroot_device_proto::manifest::DISK_POLICIES.len()],
             services: [None; SERVICE_COUNT],
             last_reaped_driver: None,
             last_driver_attempt: driver_request.map_or(0, |request| request.attempt_generation.0),
@@ -1038,7 +1052,7 @@ where
     let retained_device_topology = crate::console_depends_on_driver(resident);
     // The boot-disk driver is not retained: no console depends on it, and its
     // live DeviceResource would make the replacement's claim fail.
-    if reap_storage_driver(resident, system, waits, true).is_err() {
+    if reap_storage_drivers(resident, system, waits).is_err() {
         resident.result = RecoveryResult::Degraded;
         return Err(InitError::Cleanup);
     }

@@ -21,8 +21,8 @@ use wyrmroot_device_proto::{
         parse_request,
     },
     manifest::{
-        BOOT_DISK_PUBLICATION_POLICY, BOOT_DISK_ROLE_ID, COM2_ROLE_ID, ContentIdentity,
-        Manifest as DeviceManifest, PublicationPolicy,
+        COM2_ROLE_ID, ContentIdentity, DISK_POLICIES, Manifest as DeviceManifest,
+        PublicationPolicy, disk_policy,
     },
     pci_driver::{GRANT_BYTES, PublicationGrant, encode_grant},
 };
@@ -114,11 +114,12 @@ pub(crate) struct ResidentState {
     pub(crate) last_controller_transaction: u64,
     pub(crate) next_controller_transaction: u64,
     pub(crate) driver: Option<DriverNativeAttempt>,
-    /// The boot-disk driver (root `STORAGE_PLAN.md` W2). It is not part of the
-    /// recovery root: nothing the console needs depends on it, its exit is
-    /// reaped without a restart, and devmgr recovery and shutdown retire it
-    /// first.
-    pub(crate) storage_driver: Option<DriverNativeAttempt>,
+    /// The disk drivers (root `STORAGE_PLAN.md` W2, W7), by disk role in
+    /// manifest order: the boot disk, then the data disk. They are not part
+    /// of the recovery root: nothing the console needs depends on them, an
+    /// exit is reaped without a restart, and devmgr recovery and shutdown
+    /// retire them first.
+    pub(crate) storage_drivers: [Option<DriverNativeAttempt>; DISK_POLICIES.len()],
     /// The storage service roles (root `STORAGE_PLAN.md` W6), by `services`
     /// spec order. Like the boot-disk driver they are outside the recovery
     /// root: an exit is reaped without a restart.
@@ -149,18 +150,18 @@ pub(crate) enum ResidentPollEvent {
     /// The registry's process exited.
     RegistryExited,
     DriverExited,
-    /// The boot-disk driver's process exited.
-    StorageDriverExited,
+    /// The process of the `n`th live disk driver (in slot order) exited.
+    StorageDriverExited(usize),
 }
 
 pub(crate) fn classify_resident_poll(
     result: DwWaitResultV1,
     registry_present: bool,
     driver_present: bool,
-    storage_present: bool,
+    storage_count: usize,
 ) -> Result<ResidentPollEvent, InitError> {
     let storage_index = 2 + u32::from(registry_present) * 2 + u32::from(driver_present);
-    let item_count = storage_index as usize + usize::from(storage_present);
+    let item_count = storage_index as usize + storage_count;
     if result.index >= item_count as u32 {
         return Err(InitError::Supervision);
     }
@@ -191,13 +192,9 @@ pub(crate) fn classify_resident_poll(
         {
             Ok(ResidentPollEvent::DriverExited)
         }
-        index
-            if storage_present
-                && index == storage_index
-                && result.observed.0 & DW_SIGNAL_EXITED.0 != 0 =>
-        {
-            Ok(ResidentPollEvent::StorageDriverExited)
-        }
+        index if index >= storage_index && result.observed.0 & DW_SIGNAL_EXITED.0 != 0 => Ok(
+            ResidentPollEvent::StorageDriverExited((index - storage_index) as usize),
+        ),
         _ => Err(InitError::Supervision),
     }
 }
@@ -449,7 +446,7 @@ where
         last_controller_transaction: devmgr.last_controller_transaction,
         next_controller_transaction: devmgr.next_controller_transaction,
         driver: None,
-        storage_driver: None,
+        storage_drivers: [None; DISK_POLICIES.len()],
         services,
         last_reaped_driver: None,
         last_driver_attempt: 0,
@@ -1241,14 +1238,16 @@ pub(crate) fn validate_driver_actor(
             wyrmroot_device_proto::manifest::UART16550D_PATH,
             InitError::ArtifactIdentityMismatch(RoleId::Uart16550d),
         ),
-        // The boot disk is not a WRRM role, so its executable identity comes
-        // from WRDM alone (root `STORAGE_PLAN.md` W2).
-        BOOT_DISK_ROLE_ID => (
-            manifest.match_boot_disk(request.actor_identity),
-            wyrmroot_device_proto::manifest::VIRTIO_BLKD_PATH,
-            InitError::BlockDriverIdentityMismatch,
-        ),
-        _ => return Err(InitError::WrongManifestProfile),
+        // The disks are not WRRM roles, so their executable identity comes
+        // from WRDM alone (root `STORAGE_PLAN.md` W2, W7).
+        role_id => match disk_policy(role_id) {
+            Some(disk) => (
+                manifest.match_disk(disk, request.actor_identity),
+                disk.driver_path,
+                InitError::BlockDriverIdentityMismatch,
+            ),
+            None => return Err(InitError::WrongManifestProfile),
+        },
     };
     let role = role.map_err(|_| InitError::WrongManifestProfile)?;
     if role.role_id != request.role_id || role.driver_path != path {
@@ -1317,13 +1316,13 @@ where
         state.last_driver_transaction,
         request,
     );
-    // The boot disk has its own slot: it is not the console's driver, and the
-    // two may run at once (root `STORAGE_PLAN.md` W2).
-    let storage = request.role_id == BOOT_DISK_ROLE_ID;
-    let slot_taken = if storage {
-        state.storage_driver.is_some()
-    } else {
-        state.driver.is_some()
+    // Each disk has its own slot: neither is the console's driver, and all
+    // may run at once (root `STORAGE_PLAN.md` W2, W7).
+    let disk = disk_policy(request.role_id);
+    let disk_slot = disk.map(|disk| disk.record - 1);
+    let slot_taken = match disk_slot {
+        Some(slot) => state.storage_drivers[slot].is_some(),
+        None => state.driver.is_some(),
     };
     if !correlation_valid || slot_taken {
         system
@@ -1425,10 +1424,9 @@ where
             task_group,
             request,
         });
-        if storage {
-            state.storage_driver = attempt;
-        } else {
-            state.driver = attempt;
+        match disk_slot {
+            Some(slot) => state.storage_drivers[slot] = attempt,
+            None => state.driver = attempt,
         }
         state.last_driver_attempt = request.attempt_generation.0;
         state.last_driver_session = request.launch_session.0;
@@ -1437,17 +1435,16 @@ where
     }
     let mut ack = [0u8; LAUNCH_RESPONSE_BYTES];
     encode_constructed(request, &mut ack).map_err(|_| InitError::WrongManifestProfile)?;
-    let granted = if storage {
-        grant_driver_publication(
+    let granted = match disk {
+        Some(disk) => grant_driver_publication(
             resident,
             system,
             devmgr,
             loaded.launch_channel,
             request,
-            BOOT_DISK_PUBLICATION_POLICY,
-        )
-    } else {
-        Ok(())
+            disk.publication,
+        ),
+        None => Ok(()),
     };
     if let Err(error) = granted.and_then(|()| {
         system
@@ -1457,12 +1454,9 @@ where
         let attempt = resident
             .product
             .as_ref()
-            .and_then(|state| {
-                if storage {
-                    state.storage_driver
-                } else {
-                    state.driver
-                }
+            .and_then(|state| match disk_slot {
+                Some(slot) => state.storage_drivers[slot],
+                None => state.driver,
             })
             .ok_or(InitError::AbsentState(0x20))?;
         let cleanup_failed = cleanup_loaded_before(
@@ -1479,10 +1473,9 @@ where
                 .product
                 .as_mut()
                 .ok_or(InitError::AbsentState(0x21))?;
-            if storage {
-                state.storage_driver = None;
-            } else {
-                state.driver = None;
+            match disk_slot {
+                Some(slot) => state.storage_drivers[slot] = None,
+                None => state.driver = None,
             }
         }
         return Err(if cleanup_failed {
@@ -1619,12 +1612,13 @@ pub(crate) fn grant_driver_publication<S: ResidentPlatform>(
     Ok(())
 }
 
-/// Reaps the boot-disk driver: terminates it first when `terminate`, then
-/// waits for it and closes its process, launch Channel and TaskGroup.
+/// Reaps the disk driver in `slot`: terminates it first when `terminate`,
+/// then waits for it and closes its process, launch Channel and TaskGroup.
 pub(crate) fn reap_storage_driver<S, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
     waits: &mut W,
+    slot: usize,
     terminate: bool,
 ) -> Result<(), InitError>
 where
@@ -1634,11 +1628,30 @@ where
     let Some(attempt) = resident
         .product
         .as_mut()
-        .and_then(|state| state.storage_driver.take())
+        .and_then(|state| state.storage_drivers.get_mut(slot)?.take())
     else {
         return Ok(());
     };
     cleanup_loaded(system, waits, attempt.loaded, attempt.task_group, terminate)
+}
+
+/// Terminates and reaps every disk driver; each is tried even if one fails.
+pub(crate) fn reap_storage_drivers<S, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    waits: &mut W,
+) -> Result<(), InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let mut result = Ok(());
+    for slot in 0..DISK_POLICIES.len() {
+        if let Err(error) = reap_storage_driver(resident, system, waits, slot, true) {
+            result = Err(error);
+        }
+    }
+    result
 }
 
 pub(crate) fn acknowledge_driver_reaped<S: InitPlatform>(

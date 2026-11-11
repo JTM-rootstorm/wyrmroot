@@ -16,7 +16,7 @@ use wyrmroot_registry_proto::{
 };
 use wyrmroot_runtime::{HandlePlatform, NativeError};
 use wyrmroot_service::memory::{LEND_RIGHTS, Mapper, View};
-use wyrmroot_service_proto::roles::{BLOCKMGR_ROLE_ID, BOOT_VOLUME};
+use wyrmroot_service_proto::roles::{BOOT_VOLUME, ROOT_VOLUME, ServiceName};
 
 use crate::*;
 
@@ -110,14 +110,20 @@ struct System {
     registry: FakeRegistry,
     disk: Rc<RefCell<DiskState>>,
     launched: Launched,
+    volume: ServiceName,
 }
 
 fn system(image: Vec<u8>) -> System {
+    system_for(DUTIES[0], image)
+}
+
+/// blockmgr in the role `duty`, with its disk served by the fake driver.
+fn system_for(duty: Duty, image: Vec<u8>) -> System {
     let mut world = World::new();
     let registry = FakeRegistry::install(&mut world);
-    let disk = serve_disk(&mut world, &registry, BOOT_DISK, image, BLOCK as u32);
-    let launched = launch(&mut world, BLOCKMGR_ROLE_ID, 1);
-    let publication = registry.publication(&mut world, BOOT_VOLUME);
+    let disk = serve_disk(&mut world, &registry, duty.disk, image, BLOCK as u32);
+    let launched = launch(&mut world, duty.role_id, 1);
+    let publication = registry.publication(&mut world, duty.volume);
     let client = registry.client(&mut world);
     stage(&mut world, &launched, Some(publication), Some(client), &[]);
     System {
@@ -125,6 +131,7 @@ fn system(image: Vec<u8>) -> System {
         registry,
         disk,
         launched,
+        volume: duty.volume,
     }
 }
 
@@ -137,10 +144,11 @@ struct Seen {
     done: bool,
 }
 
-/// A client that connects to `volume.boot0`, reads `lba` and one block past
-/// the volume's end, then has init retire blockmgr.
+/// A client that connects to the system's volume, reads `lba` and one block
+/// past the volume's end, then has init retire blockmgr.
 fn client(system: &mut System, lba: u64, extra: Vec<Body>) -> Rc<RefCell<Seen>> {
     let seen = Rc::new(RefCell::new(Seen::default()));
+    let volume = system.volume;
     let (endpoint, _) = system.registry.client(&mut system.world);
     let registry = system.registry.clone();
     let control = system.launched.control;
@@ -171,7 +179,7 @@ fn client(system: &mut System, lba: u64, extra: Vec<Body>) -> Rc<RefCell<Seen>> 
             message.body
         };
         match step {
-            0 if registry.state.borrow().published(BOOT_VOLUME.name) => {
+            0 if registry.state.borrow().published(volume.name) => {
                 let (ours, theirs) = world.pair();
                 direct = ours;
                 let mut out = [0u8; 256];
@@ -184,9 +192,9 @@ fn client(system: &mut System, lba: u64, extra: Vec<Body>) -> Rc<RefCell<Seen>> 
                         transaction_id: 1,
                     },
                     Lookup {
-                        protocol_id: BOOT_VOLUME.protocol_id,
+                        protocol_id: volume.protocol_id,
                         version: ProtocolVersion { major: 1, minor: 0 },
-                        service_name: BOOT_VOLUME.name,
+                        service_name: volume.name,
                     },
                     &mut out,
                 )
@@ -346,4 +354,69 @@ fn a_misbehaving_client_loses_only_its_own_link() {
         !seen.borrow().done,
         "the dropped client never got an answer"
     );
+}
+
+/// The root role (root `STORAGE_PLAN.md` W7) serves the data disk's Linux
+/// partition as `volume.root0`, never the boot volume.
+#[test]
+fn the_root_role_serves_the_data_disks_linux_partition() {
+    let mut system = system_for(DUTIES[1], mbr(4096, 0x83, 2048, 1024));
+    let seen = client(&mut system, 10, vec![]);
+    let code = blockmgr_main(
+        &mut system.world,
+        &mut ModelMapper,
+        system.launched.bootstrap,
+    );
+    assert_eq!(code, 0);
+    let seen = seen.borrow();
+    assert_eq!(seen.info.unwrap().block_count, 1024);
+    assert_eq!(&seen.block.as_ref().unwrap()[..8], &2058u64.to_le_bytes());
+    assert_eq!(seen.statuses[2], Status::OutOfRange);
+    let registry = system.registry.state.borrow();
+    assert!(registry.published(ROOT_VOLUME.name));
+    assert!(!registry.published(BOOT_VOLUME.name));
+}
+
+/// With no partition table the whole data disk is the root volume, blank
+/// or not: the filesystem service decides whether it holds a filesystem.
+#[test]
+fn the_root_role_serves_a_disk_without_a_table_whole() {
+    let mut system = system_for(DUTIES[1], numbered(2048));
+    let seen = client(&mut system, 2047, vec![]);
+    let code = blockmgr_main(
+        &mut system.world,
+        &mut ModelMapper,
+        system.launched.bootstrap,
+    );
+    assert_eq!(code, 0);
+    let seen = seen.borrow();
+    assert_eq!(seen.info.unwrap().block_count, 2048);
+    assert_eq!(&seen.block.as_ref().unwrap()[..8], &2047u64.to_le_bytes());
+}
+
+#[test]
+fn the_root_role_ignores_an_efi_partition() {
+    let mut system = system_for(DUTIES[1], mbr(4096, 0xef, 2048, 1024));
+    let code = blockmgr_main(
+        &mut system.world,
+        &mut ModelMapper,
+        system.launched.bootstrap,
+    );
+    assert_eq!(code, FAILURE_BASE | 85);
+    assert!(!system.registry.state.borrow().published(ROOT_VOLUME.name));
+}
+
+#[test]
+fn a_role_that_is_neither_duty_exits_before_staging() {
+    let duty = Duty {
+        role_id: 0x1ff,
+        ..DUTIES[0]
+    };
+    let mut system = system_for(duty, superfloppy(2048));
+    let code = blockmgr_main(
+        &mut system.world,
+        &mut ModelMapper,
+        system.launched.bootstrap,
+    );
+    assert_eq!(code, FAILURE_BASE | 6);
 }
