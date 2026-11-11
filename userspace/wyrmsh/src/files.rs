@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `ls` and `cat` over the VFS namespace (root `STORAGE_PLAN.md` W6).
+//! `ls`, `cat` (root `STORAGE_PLAN.md` W6) and `write`, `mkdir`, `rm` (W7)
+//! over the VFS namespace. Each change is followed by SYNC, so it is durable
+//! when the prompt returns.
 //!
 //! Each command connects to `system.vfs` through the shell's registry
 //! client, opens its path with WRNS and then talks WRFS to whichever
@@ -11,13 +13,16 @@
 use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_TRANSFER, DW_STATUS_TIMED_OUT};
 use wyrmroot_fs_proto::namespace;
 use wyrmroot_fs_proto::node::{self, Attr, Body, Kind, MAX_IO_BYTES};
-use wyrmroot_fs_proto::{OPEN_FILE, OPEN_READ, Status};
+use wyrmroot_fs_proto::{
+    OPEN_CREATE, OPEN_DIRECTORY, OPEN_EXCLUSIVE, OPEN_FILE, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE,
+    Status,
+};
 use wyrmroot_registry_proto::{
     Header as RegistryHeader, Lookup, Message as RegistryMessage,
     MessageType as RegistryMessageType, ProtocolVersion, encode_lookup, parse as parse_registry,
 };
 use wyrmroot_service_proto::roles::SYSTEM_VFS;
-use wyrmroot_wyrmsh_core::{MAX_FS_PATH_BYTES, normalize_fs_path};
+use wyrmroot_wyrmsh_core::{Arguments, MAX_FS_PATH_BYTES, normalize_fs_path};
 
 use crate::*;
 
@@ -264,7 +269,7 @@ fn request<System: WyrmshSystem>(
     body: Body<'_>,
     reply: &mut [u8; node::MAX_BYTES],
 ) -> Result<Result<usize, Failure>, ShellError> {
-    let mut bytes = [0u8; 64];
+    let mut bytes = [0u8; node::MAX_BYTES];
     let Ok(size) = node::encode(
         &node::Message {
             transaction_id,
@@ -490,4 +495,183 @@ pub(crate) fn open_for_run<System: WyrmshSystem>(
         return Ok(None);
     }
     Ok(Some((node, length)))
+}
+
+/// Sends `body` and expects STATUS: its status and value.
+fn status_request<System: WyrmshSystem>(
+    system: &mut System,
+    channel: DwHandle,
+    transaction_id: u64,
+    body: Body<'_>,
+) -> Result<Result<(Status, u64), Failure>, ShellError> {
+    let mut reply = [0u8; node::MAX_BYTES];
+    let used = match request(system, channel, transaction_id, body, &mut reply)? {
+        Ok(used) => used,
+        Err(failure) => return Ok(Err(failure)),
+    };
+    Ok(match node::parse(&reply[..used], 0).map(|m| m.body) {
+        Ok(Body::Status { status, value }) => Ok((status, value)),
+        _ => Err(b"malformed reply"),
+    })
+}
+
+/// Makes the node's filesystem durable; a failure is reported.
+fn sync<System: WyrmshSystem>(
+    system: &mut System,
+    console: &mut Console<'_>,
+    command: &str,
+    node: DwHandle,
+    transaction_id: u64,
+    path: &[u8],
+) -> Result<(), ShellError> {
+    match status_request(system, node, transaction_id, Body::Sync)? {
+        Ok((Status::Ok, _)) => Ok(()),
+        Ok((status, _)) => console.fail(system, command, path, status_text(status)),
+        Err(failure) => console.fail(system, command, path, failure),
+    }
+}
+
+/// `write path [text...]`: replaces the file's contents with the text, its
+/// words joined by spaces and ended by a newline, creating the file if need
+/// be.
+pub(crate) fn write<System: WyrmshSystem>(
+    system: &mut System,
+    mut console: Console<'_>,
+    identity: ShellIdentity,
+    transactions: &mut TransactionIds,
+    typed: &str,
+    text: Arguments<'_>,
+) -> Result<(), ShellError> {
+    let mut contents = [0u8; MAX_IO_BYTES];
+    let mut used = 0;
+    for (index, word) in text.iter().enumerate() {
+        let separator = usize::from(index > 0);
+        if used + separator + word.len() + 1 > contents.len() {
+            return console.fail(system, "write", typed.as_bytes(), b"text too long");
+        }
+        if separator == 1 {
+            contents[used] = b' ';
+        }
+        contents[used + separator..used + separator + word.len()].copy_from_slice(word.as_bytes());
+        used += separator + word.len();
+    }
+    contents[used] = b'\n';
+    used += 1;
+    let mut canonical = [0u8; MAX_FS_PATH_BYTES];
+    let Some((node, _, length)) = open_path(
+        system,
+        &mut console,
+        identity,
+        transactions,
+        "write",
+        typed,
+        OPEN_WRITE | OPEN_FILE | OPEN_CREATE | OPEN_TRUNCATE,
+        &mut canonical,
+    )?
+    else {
+        return Ok(());
+    };
+    let path = &canonical[..length];
+    let result = (|| {
+        let body = Body::Write {
+            offset: 0,
+            data: &contents[..used],
+        };
+        match status_request(system, node, 1, body)? {
+            Ok((Status::Ok, written)) if written == used as u64 => {}
+            Ok((Status::Ok, _)) => return console.fail(system, "write", path, b"short write"),
+            Ok((status, _)) => return console.fail(system, "write", path, status_text(status)),
+            Err(failure) => return console.fail(system, "write", path, failure),
+        }
+        sync(system, &mut console, "write", node, 2, path)
+    })();
+    let _ = system.close_handle(node);
+    result
+}
+
+/// `mkdir path`: creates the directory; it must not exist.
+pub(crate) fn mkdir<System: WyrmshSystem>(
+    system: &mut System,
+    mut console: Console<'_>,
+    identity: ShellIdentity,
+    transactions: &mut TransactionIds,
+    typed: &str,
+) -> Result<(), ShellError> {
+    let mut canonical = [0u8; MAX_FS_PATH_BYTES];
+    let Some((node, _, length)) = open_path(
+        system,
+        &mut console,
+        identity,
+        transactions,
+        "mkdir",
+        typed,
+        OPEN_READ | OPEN_DIRECTORY | OPEN_CREATE | OPEN_EXCLUSIVE,
+        &mut canonical,
+    )?
+    else {
+        return Ok(());
+    };
+    let result = sync(system, &mut console, "mkdir", node, 1, &canonical[..length]);
+    let _ = system.close_handle(node);
+    result
+}
+
+/// `rm path`: removes a file, or a directory that is empty, through its
+/// parent directory.
+pub(crate) fn remove<System: WyrmshSystem>(
+    system: &mut System,
+    mut console: Console<'_>,
+    identity: ShellIdentity,
+    transactions: &mut TransactionIds,
+    typed: &str,
+) -> Result<(), ShellError> {
+    let mut canonical = [0u8; MAX_FS_PATH_BYTES];
+    let Ok(length) = normalize_fs_path(typed, &mut canonical) else {
+        return console.fail(system, "rm", typed.as_bytes(), b"not an absolute path");
+    };
+    if length == 1 {
+        return console.fail(system, "rm", b"/", b"cannot remove the root");
+    }
+    // The parent is everything before the last slash, or `/`.
+    let slash = canonical[..length]
+        .iter()
+        .rposition(|&byte| byte == b'/')
+        .unwrap_or(0);
+    let mut name = [0u8; 255];
+    let name_length = length - slash - 1;
+    name[..name_length].copy_from_slice(&canonical[slash + 1..length]);
+    let mut parent_text = [0u8; MAX_FS_PATH_BYTES];
+    let parent_length = slash.max(1);
+    parent_text[..parent_length].copy_from_slice(&canonical[..parent_length]);
+    let Ok(parent) = core::str::from_utf8(&parent_text[..parent_length]) else {
+        return console.fail(system, "rm", &canonical[..length], b"invalid path");
+    };
+    let mut parent_canonical = [0u8; MAX_FS_PATH_BYTES];
+    let Some((node, _, _)) = open_path(
+        system,
+        &mut console,
+        identity,
+        transactions,
+        "rm",
+        parent,
+        OPEN_READ | OPEN_WRITE | OPEN_DIRECTORY,
+        &mut parent_canonical,
+    )?
+    else {
+        return Ok(());
+    };
+    let path = &canonical[..length];
+    let result = (|| {
+        let body = Body::Unlink {
+            name: &name[..name_length],
+        };
+        match status_request(system, node, 1, body)? {
+            Ok((Status::Ok, _)) => {}
+            Ok((status, _)) => return console.fail(system, "rm", path, status_text(status)),
+            Err(failure) => return console.fail(system, "rm", path, failure),
+        }
+        sync(system, &mut console, "rm", node, 2, path)
+    })();
+    let _ = system.close_handle(node);
+    result
 }

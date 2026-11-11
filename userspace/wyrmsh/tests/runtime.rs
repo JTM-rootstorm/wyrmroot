@@ -1477,6 +1477,40 @@ fn ls_and_cat_report_an_absent_vfs_or_a_relative_path_and_carry_on() {
     assert!(fixture.closed.contains(&direct));
 }
 
+/// The W7 file commands report the same way, and `rm /` and relative
+/// paths are refused before any connection is made.
+#[test]
+fn write_mkdir_and_rm_report_an_absent_vfs_or_a_bad_path_and_carry_on() {
+    let mut fixture = Fixture::new(&[b"write /etc/motd hi\nmkdir home\nrm /\nrm x\nexit\n"]);
+    fixture.queue_control(
+        REGISTRY,
+        &registry_error(2, RegistryErrorCode::NotPublished),
+    );
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
+    let stderr = fixture.output(STDERR);
+    for line in [
+        b"write: /etc/motd: system.vfs is not available\n".as_slice(),
+        b"mkdir: home: not an absolute path\n".as_slice(),
+        b"rm: /: cannot remove the root\n".as_slice(),
+        b"rm: x: not an absolute path\n".as_slice(),
+    ] {
+        assert!(
+            stderr.windows(line.len()).any(|window| window == line),
+            "{:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    let lookups = fixture
+        .control_requests
+        .iter()
+        .filter(|(channel, _)| *channel == REGISTRY)
+        .count();
+    assert_eq!(lookups, 1, "only `write` reached the registry");
+}
+
 #[test]
 fn typed_control_errors_are_reported_and_fail_closed() {
     let cases = [

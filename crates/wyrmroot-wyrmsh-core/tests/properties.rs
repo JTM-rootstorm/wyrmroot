@@ -276,7 +276,7 @@ fn command_arity_is_bounded_at_every_public_shape() {
         }
     }
 
-    for verb in ["wait", "terminate"] {
+    for verb in ["wait", "terminate", "mkdir", "rm"] {
         for operands in [0, 2] {
             let line = core::iter::once(verb)
                 .chain(core::iter::repeat_n("1", operands))
@@ -296,7 +296,7 @@ fn command_arity_is_bounded_at_every_public_shape() {
         );
     }
 
-    assert_eq!(COMMANDS.len(), 14);
+    assert_eq!(COMMANDS.len(), 17);
 }
 
 #[test]

@@ -34,6 +34,12 @@ pub enum CommandName {
     Ls,
     /// Writes a file of the VFS namespace to stdout.
     Cat,
+    /// Replaces a file's contents with its operands, one line (W7).
+    Write,
+    /// Creates a directory.
+    Mkdir,
+    /// Removes a file or an empty directory.
+    Rm,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,7 +59,7 @@ pub struct CommandSpec {
 }
 
 /// The same fixed metadata supports classification and the future help builtin.
-pub const COMMANDS: [CommandSpec; 14] = [
+pub const COMMANDS: [CommandSpec; 17] = [
     CommandSpec {
         name: CommandName::Help,
         spelling: "help",
@@ -136,6 +142,24 @@ pub const COMMANDS: [CommandSpec; 14] = [
         name: CommandName::Cat,
         spelling: "cat",
         usage: "cat </path>",
+        arity: Arity::Exact(1),
+    },
+    CommandSpec {
+        name: CommandName::Write,
+        spelling: "write",
+        usage: "write </path> [text...]",
+        arity: Arity::AtLeast(1),
+    },
+    CommandSpec {
+        name: CommandName::Mkdir,
+        spelling: "mkdir",
+        usage: "mkdir </path>",
+        arity: Arity::Exact(1),
+    },
+    CommandSpec {
+        name: CommandName::Rm,
+        spelling: "rm",
+        usage: "rm </path>",
         arity: Arity::Exact(1),
     },
 ];
@@ -233,6 +257,13 @@ pub enum Command<'a> {
     /// The path as typed; the adapter normalizes it. `ls` alone is `/`.
     Ls(&'a str),
     Cat(&'a str),
+    /// The file's new contents are `text` joined by spaces, then a newline.
+    Write {
+        path: &'a str,
+        text: Arguments<'a>,
+    },
+    Mkdir(&'a str),
+    Rm(&'a str),
 }
 
 impl<'a> Arguments<'a> {
@@ -288,6 +319,12 @@ impl<'a> Arguments<'a> {
             }
             CommandName::Ls => Command::Ls(operands.get(0).unwrap_or("/")),
             CommandName::Cat => Command::Cat(operands.get(0).ok_or(UsageError::InvalidPath)?),
+            CommandName::Write => Command::Write {
+                path: operands.get(0).ok_or(UsageError::InvalidPath)?,
+                text: operands.tail(),
+            },
+            CommandName::Mkdir => Command::Mkdir(operands.get(0).ok_or(UsageError::InvalidPath)?),
+            CommandName::Rm => Command::Rm(operands.get(0).ok_or(UsageError::InvalidPath)?),
             CommandName::Wait | CommandName::Terminate => {
                 let value = operands
                     .get(0)

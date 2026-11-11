@@ -196,7 +196,38 @@ fn fixed_commands_and_usage_are_exact() {
             Err(UsageError::ArgumentCount { .. })
         ));
     }
-    assert_eq!(COMMANDS.len(), 14);
+    assert_eq!(COMMANDS.len(), 17);
+    // The W7 file commands: `write` takes the path and the rest as text.
+    let Ok(Command::Write { path, text }) = parser
+        .parse(b"write /etc/motd hello  world")
+        .unwrap()
+        .command()
+    else {
+        panic!("write")
+    };
+    assert_eq!(path, "/etc/motd");
+    assert_eq!(text.iter().collect::<Vec<_>>(), ["hello", "world"]);
+    assert!(matches!(
+        parser.parse(b"write /empty").unwrap().command(),
+        Ok(Command::Write { path: "/empty", text }) if text.is_empty()
+    ));
+    assert_eq!(
+        parser.parse(b"mkdir /home").unwrap().command(),
+        Ok(Command::Mkdir("/home"))
+    );
+    assert_eq!(
+        parser.parse(b"rm /tmp/x").unwrap().command(),
+        Ok(Command::Rm("/tmp/x"))
+    );
+    for line in ["write", "mkdir", "rm", "mkdir /a /b", "rm /a /b"] {
+        assert!(
+            matches!(
+                parser.parse(line.as_bytes()).unwrap().command(),
+                Err(UsageError::ArgumentCount { .. })
+            ),
+            "{line}"
+        );
+    }
     // The two terminators are separate entries with separate spellings. A
     // corpus that only counted them would pass if `shutdown` were an alias for
     // `exit`, which is the one thing it must not be.

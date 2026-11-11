@@ -739,6 +739,26 @@ fn dispatch_local<System: WyrmshSystem>(
                 files::cat(system, console, identity, transactions, path)?;
             }
         }
+        Command::Write { path, text } => {
+            let console = files::Console {
+                stdout,
+                stderr,
+                controls,
+            };
+            files::write(system, console, identity, transactions, path, text)?;
+        }
+        Command::Mkdir(path) | Command::Rm(path) => {
+            let console = files::Console {
+                stdout,
+                stderr,
+                controls,
+            };
+            if matches!(command, Command::Mkdir(_)) {
+                files::mkdir(system, console, identity, transactions, path)?;
+            } else {
+                files::remove(system, console, identity, transactions, path)?;
+            }
+        }
         Command::Terminate(job) => jobs::terminate(
             system,
             stdout,
