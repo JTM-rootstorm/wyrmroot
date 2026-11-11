@@ -116,11 +116,17 @@ fn qemu_arguments(smp: bool, product: &Path, vars: &Path, com1: &Path) -> Vec<St
         ),
         "-drive".into(),
         format!("if=pflash,format=raw,file={}", vars.display()),
+        // VT-d, so the kernel can confine device DMA (root `STORAGE_PLAN.md`).
+        "-device".into(),
+        "intel-iommu".into(),
+        // A modern-only virtio disk whose DMA goes through the IOMMU.
         "-drive".into(),
         format!(
-            "if=virtio,format=raw,readonly=on,file={}",
+            "if=none,id=esp,format=raw,readonly=on,file={}",
             product.join("artifacts").join(product::ESP_NAME).display()
         ),
+        "-device".into(),
+        "virtio-blk-pci,drive=esp,disable-legacy=on,iommu_platform=on".into(),
         "-serial".into(),
         format!("file:{}", com1.display()),
     ];
@@ -262,6 +268,24 @@ mod tests {
         assert_eq!(serials, ["file:/c1.log", "stdio"]);
         assert!(args.iter().any(|arg| arg.ends_with("/p/artifacts/esp.img")));
         assert!(!args.iter().any(|arg| arg.contains("isa-debug-exit")));
+    }
+
+    #[test]
+    fn the_esp_is_a_modern_virtio_disk_behind_the_iommu() {
+        let args = qemu_arguments(false, Path::new("/p"), Path::new("/v"), Path::new("/c"));
+        let devices: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-device")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(
+            devices,
+            [
+                "intel-iommu",
+                "virtio-blk-pci,drive=esp,disable-legacy=on,iommu_platform=on"
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.starts_with("if=virtio")));
     }
 
     #[test]
