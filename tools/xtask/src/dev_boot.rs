@@ -13,9 +13,11 @@
 //! `device.block.virtio1`, `volume.boot0`, `volume.root0` and `system.vfs`
 //! (W6, W7) are all published; lists `/` until ext4d's root (with its
 //! `lost+found`) is mounted there; lists `/boot/EFI/WYRMROOT` and `cat`s its
-//! README through vfsd, fat32d and blockmgr; runs `bin/hello` (a shell job
-//! under its TaskGroup limits) and the same ELF from the ESP to their output
-//! and the next prompt; then writes a file and makes a directory on the root
+//! README through vfsd, fat32d and blockmgr; spawns two `bin/cpu-hog` jobs,
+//! which hold their own FP registers and FS base while they preempt each
+//! other; runs `bin/hello` (a shell job under its TaskGroup limits) and the
+//! same ELF from the ESP to their output and the next prompt; terminates the
+//! hogs and requires each to have been still running; then writes a file and makes a directory on the root
 //! (W7) and shuts down with Ctrl-D. The second boot `cat`s the file back,
 //! removes it and shuts down. Each boot must end with the kernel's power-off
 //! line on its COM1 log. That is the smoke check for development commits.
@@ -280,10 +282,45 @@ fn first_boot(shell: &mut Shell<'_>, token: &str) -> Result<(), Failure> {
         ESP_LISTING.iter().all(|line| contains(output, line))
     })?;
     shell.expect("cat /boot/EFI/WYRMROOT/README.TXT", ESP_README)?;
+    // Two hogs hold their own FP registers and FS base and preempt each
+    // other (and everything else) until they are terminated; a hog that saw
+    // its state change, or did not start from the initial FP state, exits on
+    // its own instead (Deepwyrm D1, D2).
+    let hogs = [
+        spawn_job(shell, "bin/cpu-hog")?,
+        spawn_job(shell, "bin/cpu-hog")?,
+    ];
     shell.expect("run bin/hello", JOB_OUTPUT)?;
     // The same `hello` from the ESP: init reads the ELF through vfsd and
     // fat32d instead of bootfs.
     shell.expect("run /boot/EFI/WYRMROOT/HELLO.ELF", JOB_OUTPUT)?;
+    for job in hogs {
+        // A hog that already exited makes this `invalid-state`; `wait` then
+        // shows its exit code.
+        shell.run(&format!("terminate {job}"))?;
+        // Terminated from outside (the process, or its whole TaskGroup,
+        // depending on which the request reaches first): never a normal
+        // exit, which is how a hog reports a witness failure.
+        let output = shell.run(&format!("wait {job}"))?;
+        let ended = [b"authorized".as_slice(), b"task-group-teardown"]
+            .iter()
+            .any(|class| {
+                contains(
+                    &output,
+                    &[
+                        format!("job result job={job} classification=").as_bytes(),
+                        class,
+                    ]
+                    .concat(),
+                )
+            });
+        if !ended {
+            return Err(Failure::task(format!(
+                "dev-boot check: hog job {job} was not still running: {:?}",
+                String::from_utf8_lossy(&output)
+            )));
+        }
+    }
     shell.quiet(&format!("write {PERSISTED_PATH} {token}"))?;
     shell.quiet("mkdir /home")?;
     shell.expect(&format!("cat {PERSISTED_PATH}"), token.as_bytes())?;
@@ -528,6 +565,30 @@ fn ends_with_prompt(output: &[u8]) -> bool {
     output.ends_with(PROMPT)
 }
 
+/// Spawns a background job and returns the id the shell printed.
+fn spawn_job(shell: &mut Shell<'_>, path: &str) -> Result<u64, Failure> {
+    let output = shell.run(&format!("spawn {path}"))?;
+    spawned_job_id(&output).ok_or_else(|| {
+        Failure::task(format!(
+            "dev-boot check: `spawn {path}` printed {:?}",
+            String::from_utf8_lossy(&output)
+        ))
+    })
+}
+
+fn spawned_job_id(output: &[u8]) -> Option<u64> {
+    const PREFIX: &[u8] = b"spawn job=";
+    let at = output
+        .windows(PREFIX.len())
+        .position(|window| window == PREFIX)?;
+    let digits: Vec<u8> = output[at + PREFIX.len()..]
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
@@ -538,6 +599,16 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawned_job_ids_are_read_from_the_shell_echo() {
+        assert_eq!(
+            spawned_job_id(b"spawn bin/cpu-hog\r\nspawn job=12\r\nwyrmsh> "),
+            Some(12)
+        );
+        assert_eq!(spawned_job_id(b"spawn job=\r\n"), None);
+        assert_eq!(spawned_job_id(b"spawn: capacity\r\n"), None);
+    }
 
     #[test]
     fn the_shell_console_is_the_second_serial_port_after_the_kernel_log() {

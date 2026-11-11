@@ -2,8 +2,11 @@
 #![forbid(unsafe_code)]
 
 //! The `bin/cpu-hog` job: a no-yield CPU hog started as a JobV2 payload.
+//!
+//! While it spins it holds its own XMM registers, MXCSR and FS base and
+//! checks them on every pass, so two hogs preempting each other witness
+//! that the kernel saves and restores per-Thread user state.
 
-use core::convert::Infallible;
 use deepwyrm_syscall::{
     DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwHandle, DwObjectType, DwReceivedHandleInfoV1,
     DwRights, DwSignals,
@@ -134,11 +137,71 @@ pub fn prepare_job_cpu_hog<System: JobActorSystem>(
     }
 }
 
-/// Executes the no-yield CPU hog body.
-pub fn run_cpu_hog_body() -> Result<Infallible, u32> {
-    loop {
-        core::hint::spin_loop();
+/// Bytes of user register state the hog holds: xmm0 through xmm15.
+pub const WITNESS_BYTES: usize = 256;
+/// MXCSR the hog holds: every exception masked, round toward zero, so it
+/// differs from the initial 0x1F80 a fresh Thread must start with.
+pub const WITNESS_MXCSR: u32 = 0x7f80;
+/// The MXCSR and x87 control word a Thread that has never run must see.
+pub const INITIAL_MXCSR: u32 = 0x1f80;
+pub const INITIAL_FCW: u16 = 0x037f;
+
+/// Why the hog stopped spinning. The hog holds its own FP registers and FS
+/// base across every preemption; seeing either change means the kernel
+/// lost or leaked user state (Deepwyrm toolchain D1, D2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WitnessFailure {
+    /// The hog did not start from the initial FP state.
+    InitialState,
+    /// `thread_set_fs_base` refused the hog's anchor.
+    SetFsBase,
+    /// An XMM register or MXCSR changed while the hog was preempted.
+    FpState,
+    /// The FS base changed while the hog was preempted.
+    FsBase,
+}
+
+impl WitnessFailure {
+    #[must_use]
+    pub const fn exit_code(self) -> u32 {
+        0xD1B7_0010
+            | match self {
+                Self::InitialState => 0,
+                Self::SetFsBase => 1,
+                Self::FpState => 2,
+                Self::FsBase => 3,
+            }
     }
+}
+
+/// The register pattern one hog holds, distinct per launch `seed` and never
+/// all zero in any register (splitmix64).
+#[must_use]
+pub fn witness_pattern(seed: u64) -> [u8; WITNESS_BYTES] {
+    let mut state = seed;
+    let mut pattern = [0u8; WITNESS_BYTES];
+    for chunk in pattern.as_chunks_mut::<8>().0 {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        chunk.copy_from_slice(&(z | 1).to_le_bytes());
+    }
+    pattern
+}
+
+/// The value at the hog's FS base: its seed, folded so it is never zero.
+#[must_use]
+pub const fn fs_anchor_value(seed: u64) -> u64 {
+    seed ^ 0x5753_5f42_4153_4521 | 1
+}
+
+/// Checks the state a hog reads before it loads its own: every XMM
+/// register zero, MXCSR and FCW at their initial values.
+#[must_use]
+pub fn is_initial_state(xmm: &[u8; WITNESS_BYTES], mxcsr: u32, fcw: u16) -> bool {
+    mxcsr == INITIAL_MXCSR && fcw == INITIAL_FCW && xmm.iter().all(|byte| *byte == 0)
 }
 
 #[cfg(test)]
@@ -296,5 +359,51 @@ mod tests {
             Err(JobActorError::Release)
         );
         assert_eq!(readable.closes[..readable.close_count], [CHANNEL]);
+    }
+
+    #[test]
+    fn witness_patterns_differ_per_launch_and_never_zero_a_register() {
+        let first = witness_pattern(7);
+        let second = witness_pattern(8);
+        assert_ne!(first, second);
+        assert_eq!(first, witness_pattern(7));
+        for pattern in [first, second, witness_pattern(0)] {
+            for register in pattern.as_chunks::<16>().0 {
+                assert!(register.iter().any(|byte| *byte != 0));
+            }
+        }
+    }
+
+    #[test]
+    fn the_initial_state_is_zero_registers_and_reset_controls() {
+        let zero = [0u8; WITNESS_BYTES];
+        assert!(is_initial_state(&zero, 0x1f80, 0x037f));
+        assert!(!is_initial_state(&zero, WITNESS_MXCSR, 0x037f));
+        assert!(!is_initial_state(&zero, 0x1f80, 0x027f));
+        let mut dirty = zero;
+        dirty[255] = 1;
+        assert!(!is_initial_state(&dirty, 0x1f80, 0x037f));
+        assert_ne!(WITNESS_MXCSR, INITIAL_MXCSR);
+    }
+
+    #[test]
+    fn fs_anchors_are_never_zero_and_follow_the_seed() {
+        assert_ne!(fs_anchor_value(0), 0);
+        assert_ne!(fs_anchor_value(1), fs_anchor_value(2));
+    }
+
+    #[test]
+    fn witness_failures_have_distinct_exit_codes() {
+        let codes = [
+            WitnessFailure::InitialState,
+            WitnessFailure::SetFsBase,
+            WitnessFailure::FpState,
+            WitnessFailure::FsBase,
+        ]
+        .map(WitnessFailure::exit_code);
+        for (index, code) in codes.iter().enumerate() {
+            assert!(!codes[..index].contains(code));
+            assert_ne!(*code, 0);
+        }
     }
 }
