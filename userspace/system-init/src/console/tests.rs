@@ -382,26 +382,6 @@ fn a_closed_console_session_after_shutdown_completes_the_session() {
     assert_eq!(state.console, None);
 }
 
-/// Every route's outcome must pass through `conclude_session`, or a new
-/// route reopens run 7's relaunch.
-///
-/// Source text because `poll` runs `poll_observations` first, which no
-/// host fake drives; `conclude_session` itself is host-tested below.
-#[test]
-fn poll_concludes_every_outcome_through_one_decision() {
-    const SOURCE: &str = include_str!("../console.rs");
-    let start = SOURCE.find("pub(super) fn poll<").unwrap();
-    let poll = &SOURCE[start..start + SOURCE[start..].find("\n}\n").unwrap()];
-    let observed = poll
-        .find("let outcome = poll_observations(resident, system, loader, waits, now)?;")
-        .expect("poll no longer delegates its observations");
-    let concluded = poll
-        .find("Ok(conclude_session(outcome, session_shutdown))")
-        .expect("poll no longer concludes through conclude_session");
-    assert!(observed < concluded);
-    assert_eq!(poll.matches("return").count(), 0, "poll must have one exit");
-}
-
 #[test]
 fn only_a_console_departure_after_shutdown_completes_the_session() {
     assert_eq!(

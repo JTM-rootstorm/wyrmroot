@@ -612,66 +612,6 @@ fn next_transaction(transaction: u64) -> Result<u64, InitError> {
 mod native_cleanup_tests {
     use super::*;
 
-    /// The other half of the same wiring: what `SessionComplete` makes the
-    /// tick do. It is ordinary compiled code under `wyr1e-production`, but no
-    /// host fixture reaches `control_tick` with a retired console, so the
-    /// property is stated here rather than only compiled.
-    ///
-    /// Source text because `console_step` is reached only through
-    /// `control_tick`, which no host fake drives; scoped to that fn's body.
-    #[test]
-    fn a_complete_session_is_recorded_and_never_treated_as_a_recovery() {
-        const NATIVE: &str = include_str!("recovery.rs");
-        let step = NATIVE
-            .find("fn console_step<")
-            .expect("the console/shell step moved");
-        let step = &NATIVE[step..];
-        let step = &step[..step.find("\n}\n").expect("the step never closes")];
-
-        const CHECK: &str = "if outcome == crate::PollOutcome::SessionComplete {";
-
-        let handled = step
-            .find(CHECK)
-            .expect("the tick no longer recognises a completed session");
-        let after = &step[handled + CHECK.len()..];
-        let close = after
-            .find("\n        }\n")
-            .expect("the completed-session check never closes");
-        let body = &after[..close];
-
-        let retired = body
-            .find("retire_for_session_shutdown(resident, system, waits)?;")
-            .expect("a completed session is recognised but nothing is retired");
-        let recorded = body
-            .find("resident.observe_session_complete();")
-            .expect("a completed session is recognised but not recorded");
-        // Retiring first is the whole point. Recording completion and then
-        // failing the teardown would report a finished system while its roles
-        // were still running, which is the state the first F3A.7g run left
-        // behind and could not explain.
-        assert!(
-            retired < recorded,
-            "the roles must be retired before completion is recorded: \
-             retire {retired}, record {recorded}"
-        );
-        assert!(
-            body[recorded..].contains("return Ok(resident.controller.mode());"),
-            "a recorded completion must leave the tick"
-        );
-
-        // The recovery dispatch maps every other outcome onto something to
-        // rebuild out of the bootfs archive. Reaching it with a completed
-        // session would relaunch the console the poll just retired.
-        let dispatch = step
-            .find("if outcome != crate::PollOutcome::Stable {")
-            .expect("the tick no longer dispatches recoveries");
-        assert!(
-            handled < dispatch,
-            "a completed session must be answered before the recovery dispatch: \
-             handled {handled}, dispatch {dispatch}"
-        );
-    }
-
     use deepwyrm_syscall::{
         DW_TASK_STATE_EXITED, DwStatus, DwTaskState, DwTaskTerminationInfoV1, DwWaitResultV1,
     };

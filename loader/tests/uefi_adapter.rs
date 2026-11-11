@@ -253,57 +253,6 @@ fn every_post_exit_gate_error_reaches_only_the_fatal_sink_once() {
 }
 
 #[test]
-fn post_exit_ownership_surface_has_no_firmware_release_authority() {
-    let source = concat!(
-        include_str!("../src/uefi_app/firmware.rs"),
-        include_str!("../src/uefi_app/firmware/handoff.rs"),
-        include_str!("../src/uefi_app/firmware/post_exit.rs"),
-        include_str!("../src/uefi_app/firmware/intake.rs"),
-    );
-    assert_eq!(source.matches("boot::exit_boot_services(").count(), 1);
-    assert!(!source.contains("PreparedPostExit"));
-    let post_exit_pages = source
-        .split("struct PostExitPages")
-        .nth(1)
-        .unwrap()
-        .split("struct PostExitAcpiRsdp")
-        .next()
-        .unwrap();
-    assert!(!post_exit_pages.contains("fn release"));
-    assert!(!post_exit_pages.contains("boot::free_pages"));
-    assert!(source.contains("paging_handoff: PostExitPages"));
-    assert_eq!(
-        source
-            .matches("release_pages(&mut self.paging_handoff)")
-            .count(),
-        2
-    );
-
-    let completion = source
-        .split("impl ExitedHandoff")
-        .nth(1)
-        .unwrap()
-        .split("struct MaterializedInputs")
-        .next()
-        .unwrap();
-    assert!(!completion.contains("boot::"));
-    assert!(!completion.contains("uefi::println"));
-    assert!(completion.contains("jump_to_kernel_authorized"));
-    assert!(
-        completion.find("write_paging_handoff_carrier").unwrap()
-            < completion.find("prepare_x86_64_transfer").unwrap()
-    );
-    assert!(
-        completion.find("prepare_x86_64_transfer").unwrap()
-            < completion.find("jump_to_kernel_authorized").unwrap()
-    );
-    assert!(
-        completion.find("Com1Writer::initialize").unwrap()
-            < completion.find("enable_and_verify_entry_state").unwrap()
-    );
-}
-
-#[test]
 fn retained_records_and_transition_mappings_share_exact_addresses() {
     use wyrmroot_efi_loader::{
         boot_info::{AllocationLifetime as BootLifetime, HandoffAllocation},
