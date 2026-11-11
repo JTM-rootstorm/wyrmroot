@@ -966,9 +966,12 @@ pub(crate) fn install_publication_with_policy<S: ResidentPlatform>(
         reserved0: 0,
         reserved: [0; 2],
     };
-    system
-        .send_channel_with_handles(control, &bytes[..size], core::slice::from_ref(&transfer))
-        .map_err(InitError::Native)
+    crate::registry::send_registry_control(
+        system,
+        control,
+        &bytes[..size],
+        core::slice::from_ref(&transfer),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

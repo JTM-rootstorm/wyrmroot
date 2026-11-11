@@ -646,6 +646,13 @@ mod native_cleanup_tests {
         wake_now: Option<u64>,
         wait_deadline: Option<u64>,
         resident_calls: usize,
+        /// `Some(n)`: the next `n` sends find the queue full, then succeed.
+        full_sends: Option<u8>,
+        /// What a wait for queue space observes.
+        space_signals: u64,
+        sends: usize,
+        space_waits: [(u64, u64); 4],
+        space_wait_count: usize,
     }
 
     impl MockNative {
@@ -659,6 +666,11 @@ mod native_cleanup_tests {
                 wake_now: None,
                 wait_deadline: None,
                 resident_calls: 0,
+                full_sends: None,
+                space_signals: 0,
+                sends: 0,
+                space_waits: [(0, 0); 4],
+                space_wait_count: 0,
             }
         }
     }
@@ -759,16 +771,35 @@ mod native_cleanup_tests {
             _transfers: &[DwHandleTransferV1],
         ) -> Result<(), NativeError> {
             self.resident_calls += 1;
-            Err(FAILURE)
+            match self.full_sends.as_mut() {
+                None => Err(FAILURE),
+                Some(0) => {
+                    self.sends += 1;
+                    Ok(())
+                }
+                Some(full) => {
+                    *full -= 1;
+                    Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_WOULD_BLOCK))
+                }
+            }
         }
 
         fn wait_many(
             &mut self,
-            _items: &[DwWaitItemV1],
-            _deadline: DwDeadline,
+            items: &[DwWaitItemV1],
+            deadline: DwDeadline,
         ) -> Result<DwWaitResultV1, NativeError> {
             self.resident_calls += 1;
-            Err(FAILURE)
+            if self.full_sends.is_none() {
+                return Err(FAILURE);
+            }
+            self.space_waits[self.space_wait_count] = (items[0].signals.0, deadline.0);
+            self.space_wait_count += 1;
+            Ok(DwWaitResultV1 {
+                index: 0,
+                observed: deepwyrm_syscall::DwSignals(self.space_signals),
+                ..DwWaitResultV1::default()
+            })
         }
 
         fn materialize_read_only_memory(
@@ -1138,5 +1169,34 @@ mod native_cleanup_tests {
             wyrmroot_loader::elf::STACK_BYTES as usize - wyrmroot_runtime::STARTUP_BLOCK_V2_SIZE,
             108 * 1024
         );
+    }
+
+    /// A full registry control queue is backpressure: init waits for space
+    /// and retries the same install, keeping the moved handle until then.
+    #[test]
+    fn registry_install_waits_out_a_full_control_queue() {
+        let mut native = MockNative::new();
+        native.full_sends = Some(2);
+        native.space_signals = deepwyrm_syscall::DW_SIGNAL_WRITABLE.0;
+        registry::send_registry_control(&mut native, DwHandle(9), b"install", &[]).unwrap();
+        assert_eq!(native.sends, 1);
+        assert_eq!(native.space_wait_count, 2);
+        let deadline = native.now + WYR0_I_SUPERVISION_POLICY.ready_timeout_ns;
+        for (signals, wait_deadline) in &native.space_waits[..2] {
+            assert_ne!(signals & deepwyrm_syscall::DW_SIGNAL_WRITABLE.0, 0);
+            assert_ne!(signals & deepwyrm_syscall::DW_SIGNAL_PEER_CLOSED.0, 0);
+            assert_eq!(*wait_deadline, deadline);
+        }
+    }
+
+    #[test]
+    fn registry_install_fails_when_registryd_is_gone_while_full() {
+        let mut native = MockNative::new();
+        native.full_sends = Some(1);
+        native.space_signals = deepwyrm_syscall::DW_SIGNAL_PEER_CLOSED.0;
+        assert!(
+            registry::send_registry_control(&mut native, DwHandle(9), b"install", &[]).is_err()
+        );
+        assert_eq!(native.sends, 0);
     }
 }

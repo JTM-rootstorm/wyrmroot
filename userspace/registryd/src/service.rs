@@ -40,6 +40,8 @@ pub struct WaitEvent {
     pub endpoint_index: Option<usize>,
     pub readable: bool,
     pub peer_closed: bool,
+    /// Only for an endpoint the wait asked to watch for queue space.
+    pub writable: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -50,10 +52,12 @@ pub struct ProbeSignals {
 
 pub trait Transport {
     type Error;
+    /// `writable[n]` asks to also wake when `endpoints[n]`'s queue has room.
     fn wait(
         &mut self,
         control: u64,
         endpoints: &[InstalledEndpoint],
+        writable: &[bool],
     ) -> Result<WaitEvent, Self::Error>;
     /// Probe one exact installed endpoint with an immediate, nonblocking
     /// deadline. Both bits are returned so callers cannot let `READABLE` mask
@@ -71,6 +75,9 @@ pub trait Transport {
         rights: ChannelRights,
     ) -> Result<(), Self::Error>;
     fn send(&mut self, channel: u64, bytes: &[u8]) -> Result<(), Self::Error>;
+    /// Like `send`, but a full queue is `Ok(false)`: backpressure, not a
+    /// dead peer.
+    fn try_send(&mut self, channel: u64, bytes: &[u8]) -> Result<bool, Self::Error>;
     /// On failure the caller retains `moved_handle`; success consumes it.
     fn send_move(
         &mut self,
@@ -90,9 +97,21 @@ pub enum ServiceError<E> {
     InvalidWaitEvent,
 }
 
+/// An enumeration whose remaining pages wait for the client to drain its
+/// queue: a channel holds only a couple of datagrams, fewer than the pages a
+/// full catalog takes.
+#[derive(Clone, Copy, Debug)]
+struct PausedList {
+    endpoint: InstalledEndpoint,
+    header: Header,
+    ticket: EnumerationTicket,
+    next_page: u16,
+}
+
 pub struct RegistryService {
     control: u64,
     state: Option<RegistryState>,
+    paused: [Option<PausedList>; MAX_ENDPOINTS],
 }
 
 impl RegistryService {
@@ -100,6 +119,7 @@ impl RegistryService {
         Self {
             control,
             state: None,
+            paused: [None; MAX_ENDPOINTS],
         }
     }
     pub const fn state(&self) -> Option<&RegistryState> {
@@ -116,15 +136,17 @@ impl RegistryService {
             kind: EndpointKind::Client,
         };
         let mut endpoints = [placeholder; MAX_ENDPOINTS];
+        let mut writable = [false; MAX_ENDPOINTS];
         let mut count = 0;
         if let Some(state) = self.state.as_ref() {
             while let Some(endpoint) = state.installed_endpoint(count) {
                 endpoints[count] = endpoint;
+                writable[count] = self.paused_index(endpoint).is_some();
                 count += 1;
             }
         }
         let event = io
-            .wait(self.control, &endpoints[..count])
+            .wait(self.control, &endpoints[..count], &writable[..count])
             .map_err(ServiceError::Transport)?;
         if let Some(index) = event.endpoint_index {
             let endpoint = endpoints
@@ -137,6 +159,9 @@ impl RegistryService {
             }
             if event.peer_closed {
                 return self.retire_peer(io, endpoint);
+            }
+            if event.writable && writable[index] {
+                return self.resume_list(io, endpoint);
             }
             return Err(ServiceError::InvalidWaitEvent);
         }
@@ -444,6 +469,10 @@ impl RegistryService {
         endpoint: InstalledEndpoint,
         header: Header,
     ) -> Result<(), ServiceError<T::Error>> {
+        if self.paused_index(endpoint).is_some() {
+            // One listing at a time per client: its pages share one queue.
+            return self.complete_error(io, endpoint, header, ErrorCode::OutstandingLimit);
+        }
         let ticket = match self
             .state
             .as_mut()
@@ -456,43 +485,97 @@ impl RegistryService {
                 return Ok(());
             }
         };
-        for page in 0..ticket.page_count {
-            if !self.send_page(io, endpoint, header, ticket, page) {
-                self.remove(io, endpoint)?;
-                return Ok(());
+        self.send_pages(
+            io,
+            PausedList {
+                endpoint,
+                header,
+                ticket,
+                next_page: 0,
+            },
+        )
+    }
+
+    fn resume_list<T: Transport>(
+        &mut self,
+        io: &mut T,
+        endpoint: InstalledEndpoint,
+    ) -> Result<(), ServiceError<T::Error>> {
+        let Some(index) = self.paused_index(endpoint) else {
+            return Err(ServiceError::InvalidWaitEvent);
+        };
+        let list = self.paused[index].take().unwrap();
+        self.send_pages(io, list)
+    }
+
+    /// Sends pages until the listing ends or the client's queue is full; a
+    /// full queue parks the listing until the client drains it.
+    fn send_pages<T: Transport>(
+        &mut self,
+        io: &mut T,
+        mut list: PausedList,
+    ) -> Result<(), ServiceError<T::Error>> {
+        while list.next_page < list.ticket.page_count {
+            match self.send_page(io, list, list.next_page) {
+                Ok(true) => list.next_page += 1,
+                Ok(false) => {
+                    let Some(slot) = self.paused.iter_mut().find(|slot| slot.is_none()) else {
+                        // Cannot happen: one slot per installed endpoint.
+                        self.remove(io, list.endpoint)?;
+                        return Ok(());
+                    };
+                    *slot = Some(list);
+                    return Ok(());
+                }
+                Err(PageError::Transport) => {
+                    self.remove(io, list.endpoint)?;
+                    return Ok(());
+                }
+                Err(PageError::Catalog) => {
+                    // The published set changed while the listing was paused:
+                    // what was already sent can't be recalled, so fail it.
+                    self.state
+                        .as_mut()
+                        .unwrap()
+                        .enumeration_complete(list.ticket)
+                        .map_err(ServiceError::State)?;
+                    return self.send_error(
+                        io,
+                        list.endpoint,
+                        list.header,
+                        ErrorCode::InvalidState,
+                    );
+                }
             }
         }
         self.state
             .as_mut()
             .unwrap()
-            .enumeration_complete(ticket)
-            .unwrap();
-        Ok(())
+            .enumeration_complete(list.ticket)
+            .map_err(ServiceError::State)
+    }
+
+    fn paused_index(&self, endpoint: InstalledEndpoint) -> Option<usize> {
+        self.paused
+            .iter()
+            .position(|slot| slot.is_some_and(|list| list.endpoint.identity == endpoint.identity))
     }
 
     fn send_page<T: Transport>(
         &self,
         io: &mut T,
-        endpoint: InstalledEndpoint,
-        header: Header,
-        ticket: EnumerationTicket,
+        list: PausedList,
         page: u16,
-    ) -> bool {
+    ) -> Result<bool, PageError> {
+        let (header, ticket) = (list.header, list.ticket);
         let start = usize::from(page) * 2;
-        let first = self
-            .state
-            .as_ref()
-            .unwrap()
+        let state = self.state.as_ref().unwrap();
+        let first = state
             .enumeration_record(ticket, start)
-            .ok()
-            .flatten();
-        let second = self
-            .state
-            .as_ref()
-            .unwrap()
+            .map_err(|_| PageError::Catalog)?;
+        let second = state
             .enumeration_record(ticket, start + 1)
-            .ok()
-            .flatten();
+            .map_err(|_| PageError::Catalog)?;
         let mut bytes = [0u8; MAX_MESSAGE_BYTES];
         let reply = Header {
             message_type: MessageType::ServiceList,
@@ -526,7 +609,8 @@ impl RegistryService {
             _ => unreachable!(),
         }
         .unwrap();
-        io.send(endpoint.handle, &bytes[..size]).is_ok()
+        io.try_send(list.endpoint.handle, &bytes[..size])
+            .map_err(|_| PageError::Transport)
     }
 
     fn complete_error<T: Transport>(
@@ -668,6 +752,9 @@ impl RegistryService {
         io: &mut T,
         endpoint: InstalledEndpoint,
     ) -> Result<(), ServiceError<T::Error>> {
+        if let Some(index) = self.paused_index(endpoint) {
+            self.paused[index] = None;
+        }
         let outcome = self
             .state
             .as_mut()
@@ -677,6 +764,11 @@ impl RegistryService {
         io.close(outcome.handle).map_err(ServiceError::Transport)?;
         self.send_notifications(io, outcome.notifications)
     }
+}
+
+enum PageError {
+    Transport,
+    Catalog,
 }
 
 fn record(value: &ServiceMetadata) -> ServiceListRecord<'_> {

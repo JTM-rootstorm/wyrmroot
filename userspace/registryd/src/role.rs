@@ -15,8 +15,8 @@ use deepwyrm_syscall::{
     DW_CHANNEL_MAX_HANDLES, DW_DEADLINE_INFINITE, DW_HANDLE_TRANSFER_MOVE,
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ,
     DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
-    DW_STATUS_TIMED_OUT, DwDeadline, DwHandle, DwHandleTransferV1, DwReceivedHandleInfoV1,
-    DwRights, DwSignals, DwWaitItemV1,
+    DW_SIGNAL_WRITABLE, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwDeadline, DwHandle,
+    DwHandleTransferV1, DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
 };
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, HEADER_BYTES as WRLP_HEADER_BYTES, LaunchProfile,
@@ -161,11 +161,19 @@ struct NativeTransport<'a, P> {
 impl<P: HandlePlatform + ChannelPlatform + WaitPlatform> Transport for NativeTransport<'_, P> {
     type Error = u32;
 
-    fn wait(&mut self, control: u64, endpoints: &[InstalledEndpoint]) -> Result<WaitEvent, u32> {
+    fn wait(
+        &mut self,
+        control: u64,
+        endpoints: &[InstalledEndpoint],
+        writable: &[bool],
+    ) -> Result<WaitEvent, u32> {
         let mut items = [DwWaitItemV1::default(); 65];
         items[0] = wait_item(DwHandle(control));
         for (index, endpoint) in endpoints.iter().enumerate() {
             items[index + 1] = wait_item(DwHandle(endpoint.handle));
+            if writable.get(index).copied().unwrap_or(false) {
+                items[index + 1].signals.0 |= DW_SIGNAL_WRITABLE.0;
+            }
         }
         let observed = self
             .platform
@@ -179,6 +187,7 @@ impl<P: HandlePlatform + ChannelPlatform + WaitPlatform> Transport for NativeTra
             endpoint_index: index.checked_sub(1),
             readable: observed.observed.0 & DW_SIGNAL_READABLE.0 != 0,
             peer_closed: observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0,
+            writable: observed.observed.0 & DW_SIGNAL_WRITABLE.0 != 0,
         })
     }
 
@@ -251,6 +260,14 @@ impl<P: HandlePlatform + ChannelPlatform + WaitPlatform> Transport for NativeTra
         self.platform
             .send_channel(DwHandle(channel), bytes, &[])
             .map_err(|_| 0xB101_0017_u32)
+    }
+
+    fn try_send(&mut self, channel: u64, bytes: &[u8]) -> Result<bool, u32> {
+        match self.platform.send_channel(DwHandle(channel), bytes, &[]) {
+            Ok(()) => Ok(true),
+            Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => Ok(false),
+            Err(_) => Err(0xB101_0017_u32),
+        }
     }
 
     fn send_move(

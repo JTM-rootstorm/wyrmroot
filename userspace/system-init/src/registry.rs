@@ -6,6 +6,7 @@ use crate::*;
 use deepwyrm_syscall::{
     DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ,
     DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
+    DW_SIGNAL_WRITABLE, DW_STATUS_PEER_CLOSED, DW_STATUS_WOULD_BLOCK, DwDeadline,
     DwHandleTransferV1, DwRights,
 };
 use wyrmroot_loader::launch::{CHILD_CHANNEL_RIGHTS, LaunchProfile};
@@ -526,9 +527,47 @@ pub(crate) fn move_endpoint<S: ResidentPlatform>(
         reserved0: 0,
         reserved: [0; 2],
     };
-    system
-        .send_channel_with_handles(control, bytes, core::slice::from_ref(&transfer))
-        .map_err(InitError::Native)
+    send_registry_control(system, control, bytes, core::slice::from_ref(&transfer))
+}
+
+/// Sends one install on the registry control Channel, waiting out a full
+/// queue. The kernel queues two datagrams per direction, and init installs
+/// a publication and a client for each service before registryd next runs,
+/// so a full queue is backpressure; only a closed peer or the supervision
+/// deadline fails the install. A refused send keeps `transfers`' handles.
+pub(crate) fn send_registry_control<S: ResidentPlatform>(
+    system: &mut S,
+    control: DwHandle,
+    bytes: &[u8],
+    transfers: &[DwHandleTransferV1],
+) -> Result<(), InitError> {
+    let deadline = system
+        .now()
+        .map_err(InitError::Native)?
+        .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+        .ok_or(InitError::Accounting)?;
+    loop {
+        match system.send_channel_with_handles(control, bytes, transfers) {
+            Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {}
+            other => return other.map_err(InitError::Native),
+        }
+        let observed = system
+            .wait_many(
+                core::slice::from_ref(&DwWaitItemV1 {
+                    handle: control,
+                    signals: deepwyrm_syscall::DwSignals(
+                        DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0,
+                    ),
+                }),
+                DwDeadline(deadline),
+            )
+            .map_err(InitError::Native)?;
+        if observed.observed.0 & DW_SIGNAL_WRITABLE.0 == 0 {
+            return Err(InitError::Native(NativeError::Status(
+                DW_STATUS_PEER_CLOSED,
+            )));
+        }
+    }
 }
 
 pub(crate) fn validate_controller_channel<S: InitPlatform>(

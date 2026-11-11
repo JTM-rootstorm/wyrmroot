@@ -165,6 +165,9 @@ pub struct PeerCloseOutcome {
 pub struct EnumerationTicket {
     client: EndpointIdentity,
     transaction: u64,
+    /// The catalog revision the ticket lists; a paused enumeration (the
+    /// client's queue was full) cannot resume once publications change.
+    catalog: u64,
     pub total_count: u16,
     pub page_count: u16,
 }
@@ -328,6 +331,8 @@ pub struct RegistryState {
     issued_publication_count: usize,
     issued_client_ids: [u64; MAX_ISSUED_CLIENT_IDS],
     issued_client_count: usize,
+    /// Advances on every change to the published set.
+    catalog: u64,
 }
 
 impl RegistryState {
@@ -346,6 +351,7 @@ impl RegistryState {
             issued_publication_count: 0,
             issued_client_ids: [0; MAX_ISSUED_CLIENT_IDS],
             issued_client_count: 0,
+            catalog: 0,
         })
     }
 
@@ -726,6 +732,7 @@ impl RegistryState {
         Ok(EnumerationTicket {
             client,
             transaction,
+            catalog: self.catalog,
             total_count,
             page_count,
         })
@@ -744,6 +751,9 @@ impl RegistryState {
             .contains(&ticket.transaction)
         {
             return Err(RegistryError::UnknownTransaction);
+        }
+        if ticket.catalog != self.catalog {
+            return Err(RegistryError::InvalidState);
         }
         Ok(nth_canonical(&self.services, index).and_then(ServiceSlot::metadata))
     }
@@ -835,7 +845,9 @@ impl RegistryState {
             .unwrap_or(0)
     }
 
+    /// Called on every change to the published set, which it records.
     fn notify(&mut self, protocol_id: u64, name: &[u8], generation: u64) -> WatchNotifications {
+        self.catalog = self.catalog.wrapping_add(1);
         let mut notifications = WatchNotifications::new();
         for index in 0..self.watches.len() {
             let Some(watch) = self.watches[index] else {

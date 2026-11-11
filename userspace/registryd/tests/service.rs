@@ -27,12 +27,48 @@ struct Mock {
     fail_closes: Vec<u64>,
     probes: Vec<(u64, Result<ProbeSignals, ()>)>,
     probe_calls: Vec<u64>,
+    /// The kernel's per-direction channel depth, when a test models it.
+    depth: Option<usize>,
+    queued: Vec<(u64, usize)>,
+    writable_asked: Vec<bool>,
+}
+
+impl Mock {
+    /// Whether one more datagram fits in `channel`'s queue, counting it if so.
+    fn enqueue(&mut self, channel: u64) -> bool {
+        let Some(depth) = self.depth else {
+            return true;
+        };
+        let index = match self.queued.iter().position(|(c, _)| *c == channel) {
+            Some(index) => index,
+            None => {
+                self.queued.push((channel, 0));
+                self.queued.len() - 1
+            }
+        };
+        if self.queued[index].1 >= depth {
+            return false;
+        }
+        self.queued[index].1 += 1;
+        true
+    }
+
+    /// The client receives everything queued on `channel`.
+    fn drain(&mut self, channel: u64) {
+        self.queued.retain(|(c, _)| *c != channel);
+    }
 }
 
 impl Transport for Mock {
     type Error = ();
 
-    fn wait(&mut self, _control: u64, _endpoints: &[InstalledEndpoint]) -> Result<WaitEvent, ()> {
+    fn wait(
+        &mut self,
+        _control: u64,
+        _endpoints: &[InstalledEndpoint],
+        writable: &[bool],
+    ) -> Result<WaitEvent, ()> {
+        self.writable_asked = writable.to_vec();
         Ok(self.event.take().unwrap())
     }
 
@@ -86,11 +122,23 @@ impl Transport for Mock {
 
     fn send(&mut self, channel: u64, bytes: &[u8]) -> Result<(), ()> {
         self.send_attempts += 1;
-        if self.fail_sends.contains(&self.send_attempts) {
+        if self.fail_sends.contains(&self.send_attempts) || !self.enqueue(channel) {
             return Err(());
         }
         self.sent.push((channel, bytes.to_vec()));
         Ok(())
+    }
+
+    fn try_send(&mut self, channel: u64, bytes: &[u8]) -> Result<bool, ()> {
+        self.send_attempts += 1;
+        if self.fail_sends.contains(&self.send_attempts) {
+            return Err(());
+        }
+        if !self.enqueue(channel) {
+            return Ok(false);
+        }
+        self.sent.push((channel, bytes.to_vec()));
+        Ok(true)
     }
 
     fn send_move(
@@ -121,7 +169,48 @@ fn event(index: Option<usize>, readable: bool, peer_closed: bool) -> WaitEvent {
         endpoint_index: index,
         readable,
         peer_closed,
+        writable: false,
     }
+}
+
+fn writable(index: usize) -> WaitEvent {
+    WaitEvent {
+        endpoint_index: Some(index),
+        readable: false,
+        peer_closed: false,
+        writable: true,
+    }
+}
+
+/// Installs and publishes `count` services, then the enumerating client
+/// (endpoint 41, handle 141, wait index `count`).
+fn catalog(service: &mut RegistryService, mock: &mut Mock, count: u64) {
+    for ordinal in 1..=count {
+        install_publication_with(service, mock, ordinal);
+        drive(
+            service,
+            mock,
+            event(Some(ordinal as usize - 1), true, false),
+            &empty(MessageType::Publish, 1_000 + ordinal, 1),
+            None,
+        )
+        .unwrap();
+    }
+    install_client(service, mock);
+}
+
+/// The ServiceList pages sent to the client so far: (page, page_count, records).
+fn pages(mock: &Mock) -> Vec<(u16, u16, u16)> {
+    mock.sent
+        .iter()
+        .filter(|(channel, _)| *channel == 141)
+        .filter_map(|(_, bytes)| match parse(bytes, 0).ok()?.message {
+            Message::ServiceList(page) => {
+                Some((page.page_index, page.page_count, page.record_count))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn handle(value: u64, rights: u64) -> ReceivedHandle {
@@ -755,4 +844,106 @@ fn sweep_probe_and_cleanup_failures_terminate_before_install() {
         mock.closed.iter().filter(|handle| **handle == 142).count(),
         1
     );
+}
+
+/// A full catalog takes more pages than a channel queues (the kernel holds
+/// two datagrams per direction): the listing pauses on a full queue, resumes
+/// as the client drains, and never treats backpressure as a dead client.
+#[test]
+fn listing_longer_than_the_queue_pauses_and_resumes_in_order() {
+    for count in [5u64, 32] {
+        let mut service = RegistryService::new(1);
+        let mut mock = Mock::default();
+        catalog(&mut service, &mut mock, count);
+        mock.depth = Some(2);
+        let client = count as usize;
+        drive(
+            &mut service,
+            &mut mock,
+            event(Some(client), true, false),
+            &empty(MessageType::Enumerate, 41, 20),
+            None,
+        )
+        .unwrap();
+        let page_count = count.div_ceil(2) as u16;
+        assert_eq!(pages(&mock).len(), 2);
+        while pages(&mock).len() < usize::from(page_count) {
+            // The paused client is watched for queue space.
+            drive(
+                &mut service,
+                &mut mock,
+                event(None, false, false),
+                &[],
+                None,
+            )
+            .ok();
+            assert!(mock.writable_asked[client]);
+            mock.drain(141);
+            drive(&mut service, &mut mock, writable(client), &[], None).unwrap();
+        }
+        assert!(!mock.closed.contains(&141), "the client was dropped");
+        let got = pages(&mock);
+        assert_eq!(
+            got.iter().map(|p| p.0).collect::<Vec<_>>(),
+            (0..page_count).collect::<Vec<_>>()
+        );
+        assert!(got.iter().all(|p| p.1 == page_count));
+        assert_eq!(got.iter().map(|p| u64::from(p.2)).sum::<u64>(), count);
+        // Complete: the client is no longer watched for space and can list again.
+        mock.drain(141);
+        drive(
+            &mut service,
+            &mut mock,
+            event(Some(client), true, false),
+            &empty(MessageType::Enumerate, 41, 21),
+            None,
+        )
+        .unwrap();
+        assert_eq!(pages(&mock).len(), usize::from(page_count) + 2);
+        assert!(error_codes(&mock).is_empty());
+    }
+}
+
+#[test]
+fn paused_listing_fails_when_the_catalog_changes_and_refuses_a_second_listing() {
+    let mut service = RegistryService::new(1);
+    let mut mock = Mock::default();
+    catalog(&mut service, &mut mock, 5);
+    mock.depth = Some(2);
+    drive(
+        &mut service,
+        &mut mock,
+        event(Some(5), true, false),
+        &empty(MessageType::Enumerate, 41, 20),
+        None,
+    )
+    .unwrap();
+    mock.drain(141);
+    drive(
+        &mut service,
+        &mut mock,
+        event(Some(5), true, false),
+        &empty(MessageType::Enumerate, 41, 21),
+        None,
+    )
+    .unwrap();
+    assert_eq!(error_codes(&mock), vec![ErrorCode::OutstandingLimit]);
+    // A sixth publication changes the catalog under the paused listing.
+    install_publication_with(&mut service, &mut mock, 6);
+    drive(
+        &mut service,
+        &mut mock,
+        event(Some(5), true, false),
+        &empty(MessageType::Publish, 1_006, 1),
+        None,
+    )
+    .unwrap();
+    mock.drain(141);
+    drive(&mut service, &mut mock, writable(6), &[], None).unwrap();
+    assert_eq!(
+        error_codes(&mock),
+        vec![ErrorCode::OutstandingLimit, ErrorCode::InvalidState]
+    );
+    assert_eq!(pages(&mock).len(), 2);
+    assert!(!mock.closed.contains(&141));
 }
