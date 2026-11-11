@@ -10,6 +10,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod block;
+pub mod memory;
+
 use deepwyrm_syscall::{
     DW_HANDLE_INVALID, DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_ADDRESS_REGION,
     DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_TRANSFER, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
@@ -37,25 +40,16 @@ impl<P> ServicePlatform for P where
 {
 }
 
-/// One registry service, as a publisher installs it or a client looks it up.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ServiceName {
-    pub name: &'static [u8],
-    pub protocol_id: u64,
-    pub major: u16,
-    pub minor: u16,
-}
+pub use wyrmroot_service_proto::roles::ServiceName;
 
-impl ServiceName {
-    fn lookup(&self) -> Lookup<'static> {
-        Lookup {
-            protocol_id: self.protocol_id,
-            version: ProtocolVersion {
-                major: self.major,
-                minor: self.minor,
-            },
-            service_name: self.name,
-        }
+fn lookup(service: &ServiceName) -> Lookup<'static> {
+    Lookup {
+        protocol_id: service.protocol_id,
+        version: ProtocolVersion {
+            major: service.major,
+            minor: service.minor,
+        },
+        service_name: service.name,
     }
 }
 
@@ -121,7 +115,10 @@ fn admitted(info: DwReceivedHandleInfoV1, object_type: DwObjectType, rights: DwR
         && info.reserved == [0; 2]
 }
 
-fn close_all<P: ServicePlatform + ?Sized>(platform: &mut P, handles: &[DwReceivedHandleInfoV1]) {
+pub(crate) fn close_all<P: ServicePlatform + ?Sized>(
+    platform: &mut P,
+    handles: &[DwReceivedHandleInfoV1],
+) {
     for info in handles {
         let _ = platform.close_handle(info.handle);
     }
@@ -308,7 +305,7 @@ pub fn accept_offer<P: ServicePlatform + ?Sized>(
         close_all(platform, received);
         return Err(31);
     };
-    let ours = matches!(parsed.message, RegistryMessage::ConnectOffer(lookup) if lookup == service.lookup())
+    let ours = matches!(parsed.message, RegistryMessage::ConnectOffer(lookup) if lookup == crate::lookup(&service))
         && parsed.header.message_type == RegistryMessageType::ConnectOffer
         && parsed.header.registry_generation == grant.registry_generation
         && parsed.header.endpoint_id == grant.endpoint_id
@@ -418,7 +415,7 @@ impl Registry {
 
         let (direct, remote) = platform.create_channel(CONNECT_RIGHTS).map_err(|_| 50u32)?;
         let header = self.header(RegistryMessageType::LookupConnect);
-        let size = match encode_lookup(header, service.lookup(), &mut bytes) {
+        let size = match encode_lookup(header, lookup(&service), &mut bytes) {
             Ok(size) => size,
             Err(_) => {
                 let _ = platform.close_handle(direct);

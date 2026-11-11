@@ -162,6 +162,22 @@ name = "wyrmroot-block-proto"
 version = "0.0.0"
 
 [[package]]
+name = "wyrmroot-blockmgr"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-block-proto",
+ "wyrmroot-channel-model",
+ "wyrmroot-device-proto",
+ "wyrmroot-loader",
+ "wyrmroot-partition",
+ "wyrmroot-registry-proto",
+ "wyrmroot-runtime",
+ "wyrmroot-service",
+ "wyrmroot-service-proto",
+]
+
+[[package]]
 name = "wyrmroot-bootfs"
 version = "0.0.0"
 dependencies = [
@@ -188,7 +204,11 @@ name = "wyrmroot-channel-model"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
+ "wyrmroot-block-proto",
+ "wyrmroot-loader",
+ "wyrmroot-registry-proto",
  "wyrmroot-runtime",
+ "wyrmroot-service-proto",
 ]
 
 [[package]]
@@ -310,6 +330,7 @@ name = "wyrmroot-service"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
+ "wyrmroot-block-proto",
  "wyrmroot-channel-model",
  "wyrmroot-loader",
  "wyrmroot-registry-proto",

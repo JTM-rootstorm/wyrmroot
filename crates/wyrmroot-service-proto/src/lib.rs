@@ -30,6 +30,8 @@ pub const MAX_BYTES: usize = FIXED_BYTES + MAX_CHANNELS * CHANNEL_BYTES;
 /// The most handles a STAGE carries.
 pub const MAX_HANDLES: usize = 2 + MAX_CHANNELS;
 
+pub mod roles;
+
 const TYPE_STAGE: u32 = 1;
 const HAS_PUBLICATION: u32 = 1 << 0;
 const HAS_CLIENT: u32 = 1 << 1;

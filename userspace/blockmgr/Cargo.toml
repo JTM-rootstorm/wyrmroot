@@ -1,0 +1,41 @@
+[package]
+name = "wyrmroot-blockmgr"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Boot-volume discovery and WRBD volume service (storage W6)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "blockmgr"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-blockmgr"]
+
+[features]
+default = []
+native-blockmgr = ["dep:wyrmroot-loader"]
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-block-proto = { path = "../../crates/wyrmroot-block-proto" }
+wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
+wyrmroot-partition = { path = "../../crates/wyrmroot-partition" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+wyrmroot-service = { path = "../../crates/wyrmroot-service" }
+wyrmroot-service-proto = { path = "../../crates/wyrmroot-service-proto" }
+
+[dev-dependencies]
+wyrmroot-channel-model = { path = "../../crates/wyrmroot-channel-model" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("wyrmroot"))'] }

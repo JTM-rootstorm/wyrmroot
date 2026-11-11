@@ -32,6 +32,7 @@ const SERVICE: ServiceName = ServiceName {
     protocol_id: 0x4442_5257,
     major: 1,
     minor: 0,
+    supervisor_role_id: 4,
 };
 const GRANT: Publication = Publication {
     registry_generation: 3,
@@ -245,7 +246,7 @@ fn offers_for_this_service_are_accepted_and_others_closed() {
                 endpoint_generation: GRANT.endpoint_generation,
                 transaction_id: 3,
             },
-            service.lookup(),
+            crate::lookup(&service),
             &mut bytes,
         )
         .unwrap();
@@ -309,7 +310,7 @@ fn connect_waits_for_publication_then_looks_up_with_a_fresh_channel() {
     let lookup = parse_registry(&bytes, handles.len()).unwrap();
     assert_eq!(
         lookup.message,
-        RegistryMessage::LookupConnect(SERVICE.lookup())
+        RegistryMessage::LookupConnect(crate::lookup(&SERVICE))
     );
     assert_eq!(handles[0].rights, CONNECT_RIGHTS);
     assert_eq!(handles[0].object_type, DW_OBJECT_TYPE_CHANNEL);

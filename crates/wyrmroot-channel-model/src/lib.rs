@@ -4,11 +4,14 @@
 //! MemoryObjects backed by shared byte vectors and a manual clock.
 //!
 //! One handle table serves every process: the test plays the peers of the
-//! code under test. A wait that finds nothing ready fails with TIMED_OUT at
-//! once, since nothing else runs while it would block; tests drive services
-//! one step at a time. Mapping is not modelled: services reach memory
+//! code under test, either between calls or as scripted [`Peer`]s that run
+//! whenever a wait finds nothing ready, standing in for processes that run
+//! concurrently. A wait that still finds nothing ready once no peer makes
+//! progress fails with TIMED_OUT at once. Mapping is not modelled: services reach memory
 //! through their own mapper seams, and tests read MemoryObjects with
 //! [`World::memory`].
+
+pub mod fakes;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -24,8 +27,8 @@ use deepwyrm_syscall::{
     DwTaskTerminationInfoV1, DwWaitItemV1, DwWaitResultV1,
 };
 use wyrmroot_runtime::{
-    CapabilityInfo, ChannelPlatform, ClockPlatform, HandlePlatform, NativeError, ReceiveCounts,
-    WaitPlatform,
+    CapabilityInfo, ChannelPlatform, ClockPlatform, HandlePlatform, MappedBootfs, MappingPlan,
+    MemoryPlatform, NativeError, OwnedMemoryMapping, ReceiveCounts, WaitPlatform,
 };
 
 /// Shared bytes of one MemoryObject.
@@ -60,7 +63,12 @@ struct Endpoint {
     queue: VecDeque<Datagram>,
 }
 
+/// A scripted process: does whatever it can with the world and reports
+/// whether it did anything.
+pub type Peer = Box<dyn FnMut(&mut World) -> bool>;
+
 pub struct World {
+    peers: Vec<Peer>,
     endpoints: Vec<Endpoint>,
     handles: BTreeMap<u64, (Object, DwRights)>,
     next: u64,
@@ -83,12 +91,30 @@ impl Default for World {
 impl World {
     pub fn new() -> Self {
         Self {
+            peers: Vec::new(),
             endpoints: Vec::new(),
             handles: BTreeMap::new(),
             next: 0x100,
             capacity: 16,
             now: 1_000,
         }
+    }
+
+    pub fn add_peer(&mut self, peer: impl FnMut(&mut World) -> bool + 'static) {
+        self.peers.push(Box::new(peer));
+    }
+
+    /// Runs every peer once; whether any made progress.
+    pub fn run_peers(&mut self) -> bool {
+        let mut peers = std::mem::take(&mut self.peers);
+        let mut progressed = false;
+        for peer in &mut peers {
+            progressed |= peer(self);
+        }
+        // Peers added while running join the end.
+        peers.append(&mut self.peers);
+        self.peers = peers;
+        progressed
     }
 
     pub fn install(&mut self, object: Object, rights: DwRights) -> DwHandle {
@@ -367,20 +393,25 @@ impl WaitPlatform for World {
         items: &[DwWaitItemV1],
         _: DwDeadline,
     ) -> Result<DwWaitResultV1, NativeError> {
-        for (index, item) in items.iter().enumerate() {
-            let observed = self.signals(item.handle)?;
-            if observed.0 & item.signals.0 != 0 {
-                return Ok(DwWaitResultV1 {
-                    size: 48,
-                    version: 1,
-                    index: index as u32,
-                    observed,
-                    ..DwWaitResultV1::default()
-                });
+        loop {
+            for (index, item) in items.iter().enumerate() {
+                let observed = self.signals(item.handle)?;
+                if observed.0 & item.signals.0 != 0 {
+                    return Ok(DwWaitResultV1 {
+                        size: 48,
+                        version: 1,
+                        index: index as u32,
+                        observed,
+                        ..DwWaitResultV1::default()
+                    });
+                }
+            }
+            // Nothing is ready: let the other processes run, and if none of
+            // them does anything the deadline passes.
+            if !self.run_peers() {
+                return fail(DW_STATUS_TIMED_OUT);
             }
         }
-        // Nothing is ready and nothing else runs: the deadline passes.
-        fail(DW_STATUS_TIMED_OUT)
     }
 
     fn wait_one(
@@ -420,6 +451,61 @@ impl ClockPlatform for World {
 
     fn cancel_timer(&mut self, _: DwHandle) -> Result<(), NativeError> {
         Ok(())
+    }
+}
+
+/// MemoryObjects exist; mapping them is the services' mapper seam's job.
+impl MemoryPlatform for World {
+    fn create_memory_object(
+        &mut self,
+        bytes: u64,
+        rights: DwRights,
+    ) -> Result<DwHandle, NativeError> {
+        Ok(self.memory_object(bytes as usize, rights).0)
+    }
+
+    fn map_memory_read_write(
+        &mut self,
+        _: DwHandle,
+        _: DwHandle,
+        _: u64,
+    ) -> Result<OwnedMemoryMapping, NativeError> {
+        fail(DW_STATUS_INVALID_ARGUMENT)
+    }
+
+    fn map_memory_read_only(
+        &mut self,
+        _: DwHandle,
+        _: DwHandle,
+        _: u64,
+    ) -> Result<OwnedMemoryMapping, NativeError> {
+        fail(DW_STATUS_INVALID_ARGUMENT)
+    }
+
+    fn unmap_memory(&mut self, _: OwnedMemoryMapping) -> Result<(), NativeError> {
+        unimplemented!("the model never hands out a mapping")
+    }
+
+    fn materialize_read_only_memory(
+        &mut self,
+        _: DwHandle,
+        _: &[u8],
+        _: DwRights,
+    ) -> Result<DwHandle, NativeError> {
+        unimplemented!()
+    }
+
+    fn map_bootfs_read_only(
+        &mut self,
+        _: DwHandle,
+        _: DwHandle,
+        _: MappingPlan,
+    ) -> Result<MappedBootfs, NativeError> {
+        unimplemented!()
+    }
+
+    fn unmap_bootfs(&mut self, _: MappedBootfs) -> Result<(), NativeError> {
+        unimplemented!()
     }
 }
 
