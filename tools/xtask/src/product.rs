@@ -35,10 +35,11 @@ use deepwyrm_abi::{
 };
 use wyrmroot_bootfs::{
     launch_policy::{
-        JOB_V2_PROFILE_ID, LaunchPolicyEntry, WYRMSH_PATH, WYRMSH_PROFILE_ID,
-        encode as encode_policy,
+        JOB_V2_PROFILE_ID, LaunchPolicyEntry, SERVICE_ROLE_PROFILE_ID, WYRMSH_PATH,
+        WYRMSH_PROFILE_ID, encode as encode_policy,
     },
-    product::{Product, build as build_bootfs},
+    paths::{BLOCKMGR_PATH, FAT32D_PATH, VFSD_PATH},
+    product::{Product, ServiceArtifact, build as build_bootfs},
 };
 use wyrmroot_device_proto::manifest::{
     ContentIdentity, HEADER_BYTES as WRDM_HEADER_BYTES, RECORD_BYTES as WRDM_RECORD_BYTES,
@@ -60,7 +61,7 @@ pub(crate) const ESP_NAME: &str = "esp.img";
 const WYRMSH_FLAGS: [&str; 2] = ["-Cjump-tables=no", "-Zemit-stack-sizes"];
 
 /// The product's native roles, in bootfs assembly order.
-pub(crate) const NATIVES: [NativeSpec; 9] = [
+pub(crate) const NATIVES: [NativeSpec; 12] = [
     native(
         "system-init",
         "wyrmroot-system-init",
@@ -96,6 +97,21 @@ pub(crate) const NATIVES: [NativeSpec; 9] = [
         "native-virtio-blkd",
         "virtio-blkd",
     ),
+    native(
+        "blockmgr",
+        "wyrmroot-blockmgr",
+        "blockmgr",
+        "native-blockmgr",
+        "blockmgr",
+    ),
+    native(
+        "fat32d",
+        "wyrmroot-fat32d",
+        "fat32d",
+        "native-fat32d",
+        "fat32d",
+    ),
+    native("vfsd", "wyrmroot-vfsd", "vfsd", "native-vfsd", "vfsd"),
     native(
         "consoled",
         "wyrmroot-consoled",
@@ -234,6 +250,9 @@ pub(crate) fn build(output: &Path, deep_repository: &Path) -> Result<(), Failure
             ("devmgr.elf", native_bytes("devmgr")),
             ("uart16550d.elf", native_bytes("uart16550d")),
             ("virtio-blkd.elf", native_bytes("virtio-blkd")),
+            ("blockmgr.elf", native_bytes("blockmgr")),
+            ("fat32d.elf", native_bytes("fat32d")),
+            ("vfsd.elf", native_bytes("vfsd")),
             ("consoled.elf", native_bytes("consoled")),
             ("wyrmsh.elf", native_bytes("wyrmsh")),
             ("hello.elf", native_bytes("hello")),
@@ -418,7 +437,16 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
 
     let hello = identity("hello");
     let cpu_hog = identity("cpu-hog");
-    let mut policy = [0u8; 512];
+    let services = ["blockmgr", "fat32d", "vfsd"].map(identity);
+    let service = |path, content_sha256| LaunchPolicyEntry {
+        path,
+        content_sha256,
+        startup_abi: 1,
+        profile_id: SERVICE_ROLE_PROFILE_ID,
+        allow_no_streams: true,
+        allow_three_streams: false,
+    };
+    let mut policy = [0u8; 1024];
     let policy_size = encode_policy(
         generation,
         &[
@@ -440,6 +468,10 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
                 allow_no_streams: false,
                 allow_three_streams: true,
             },
+            // The storage service roles (root `STORAGE_PLAN.md` W6).
+            service(BLOCKMGR_PATH, services[0]),
+            service(FAT32D_PATH, services[1]),
+            service(VFSD_PATH, services[2]),
             LaunchPolicyEntry {
                 path: WYRMSH_PATH,
                 content_sha256: role_hashes[4],
@@ -472,6 +504,20 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
         wyrmsh_identity: role_hashes[4],
         hello_identity: hello,
         cpu_hog_identity: cpu_hog,
+        services: [
+            ServiceArtifact {
+                bytes: &natives["blockmgr"],
+                identity: services[0],
+            },
+            ServiceArtifact {
+                bytes: &natives["fat32d"],
+                identity: services[1],
+            },
+            ServiceArtifact {
+                bytes: &natives["vfsd"],
+                identity: services[2],
+            },
+        ],
     })
     .map_err(|error| Failure::task(format!("bootfs build failed: {error:?}")))?;
     if bootfs.len() > MAX_BOOTFS_BYTES {

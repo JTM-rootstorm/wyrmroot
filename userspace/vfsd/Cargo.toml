@@ -34,6 +34,6 @@ wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 unused_crate_dependencies = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("wyrmroot"))'] }

@@ -524,6 +524,62 @@ pub fn load_device_coordinator_resource_process<P: LoaderPlatform>(
 /// A request for any other path is refused before anything is created.
 pub const DEVICE_DRIVER_PATHS: [&str; 2] = ["/system/uart16550d", "/system/virtio-blkd"];
 
+/// The bootfs service roles init stages itself (root `STORAGE_PLAN.md` W6).
+pub const SERVICE_ROLE_PATHS: [&str; 3] = ["/system/blockmgr", "/system/fat32d", "/system/vfsd"];
+
+/// Constructs one service role with the device-driver startup shape: the
+/// self root and one control Channel, the child's end of init's WRSV stage
+/// Channel. The role id and attempt ride the INIT's correlation; the
+/// remaining correlation fields repeat them, since no coordinator issued
+/// the launch. Failure leaves the endpoint with the caller unless the
+/// error says it was consumed.
+pub fn load_service_role_process<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: ServiceRoleLoadRequest<'_>,
+) -> Result<LoadedProcess, DeviceDriverLoadError<P::Error>> {
+    if !SERVICE_ROLE_PATHS.contains(&request.display_path)
+        || request.role_id == 0
+        || request.attempt_generation == 0
+    {
+        return Err(DeviceDriverLoadError::caller_retains(LoadError::Launch(
+            LaunchError::HandleCount,
+        )));
+    }
+    let channels = [request.control_endpoint];
+    let mut consumed = false;
+    load_process_internal(
+        platform,
+        authority,
+        InternalLoadRequest {
+            image: request.image,
+            profile: LaunchProfile::DeviceDriver,
+            transaction_id: request.transaction_id,
+            startup: StartupSpec::Legacy(request.display_path),
+            channels: &channels,
+            device_manifest: None,
+            supervisor_generation: None,
+            driver_correlation: Some((
+                1,
+                request.role_id,
+                request.attempt_generation,
+                request.role_id,
+                request.role_id,
+                request.attempt_generation,
+            )),
+            consoled_correlation: None,
+            wyrmsh_correlation: None,
+            resource_domain: None,
+        },
+        LoadFault::None,
+        &mut consumed,
+    )
+    .map_err(|error| DeviceDriverLoadError {
+        error,
+        control_endpoint_consumed: consumed,
+    })
+}
+
 /// Constructs only the acceptance driver's process and transfers only its
 /// reduced direct control endpoint. The caller supplies sender-side staging
 /// authority because the loader must MOVE the endpoint once; the driver still

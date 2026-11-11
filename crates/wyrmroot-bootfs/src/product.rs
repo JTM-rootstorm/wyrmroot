@@ -2,7 +2,7 @@
 //!
 //! Callers supply the exact immutable bytes of every entry; the builder checks
 //! the device manifest and launch policy against the identities the producer
-//! computed, then emits the thirteen entries in the existing `cpio newc`
+//! computed, then emits the sixteen entries in the existing `cpio newc`
 //! format. Content admission for arbitrary archives stays in
 //! [`crate::content`].
 
@@ -15,7 +15,8 @@ use alloc::vec::Vec;
 use crate::{
     builder::{BuildError, Builder, FileMode},
     launch_policy::{
-        JOB_V2_PROFILE_ID, LaunchPolicy, WYRMSH_PATH as POLICY_WYRMSH_PATH, WYRMSH_PROFILE_ID,
+        JOB_V2_PROFILE_ID, LaunchPolicy, SERVICE_ROLE_PROFILE_ID,
+        WYRMSH_PATH as POLICY_WYRMSH_PATH, WYRMSH_PROFILE_ID,
     },
 };
 use wyrmroot_device_proto::{Manifest as DeviceManifest, manifest::ContentIdentity};
@@ -47,10 +48,20 @@ pub struct Product<'a> {
     pub wyrmsh_identity: [u8; 32],
     pub hello_identity: [u8; 32],
     pub cpu_hog_identity: [u8; 32],
+    /// The storage service roles, in [`SERVICE_ROLE_PATHS`] order, each with
+    /// the identity its launch-policy entry must name.
+    pub services: [ServiceArtifact<'a>; 3],
+}
+
+/// One service role's executable and identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceArtifact<'a> {
+    pub bytes: &'a [u8],
+    pub identity: [u8; 32],
 }
 
 impl Product<'_> {
-    fn entries(&self) -> [(&'static str, &[u8], FileMode); 13] {
+    fn entries(&self) -> [(&'static str, &[u8], FileMode); 16] {
         use FileMode::{Executable, ReadOnly};
         [
             (INIT_PATH, self.init, Executable),
@@ -66,6 +77,9 @@ impl Product<'_> {
             (MARKER_PATH, MARKER, ReadOnly),
             (DEVICE_MANIFEST_PATH, self.device_manifest, ReadOnly),
             (LAUNCH_POLICY_PATH, self.launch_policy, ReadOnly),
+            (BLOCKMGR_PATH, self.services[0].bytes, Executable),
+            (FAT32D_PATH, self.services[1].bytes, Executable),
+            (VFSD_PATH, self.services[2].bytes, Executable),
         ]
     }
 }
@@ -110,8 +124,17 @@ fn validate(product: &Product<'_>) -> Result<(), BuildError> {
     }
     let policy =
         LaunchPolicy::parse(product.launch_policy).map_err(|_| BuildError::InvalidLaunchPolicy)?;
-    if policy.len() != 3 {
+    if policy.len() != 3 + SERVICE_ROLE_PATHS.len() {
         return Err(BuildError::InvalidLaunchPolicy);
+    }
+    for (path, service) in SERVICE_ROLE_PATHS.into_iter().zip(product.services) {
+        let entry = policy.find(path).ok_or(BuildError::InvalidLaunchPolicy)?;
+        if entry.profile_id != SERVICE_ROLE_PROFILE_ID {
+            return Err(BuildError::InvalidLaunchPolicy);
+        }
+        if service.identity == [0; 32] || entry.content_sha256 != service.identity {
+            return Err(BuildError::PayloadIdentityMismatch);
+        }
     }
     let entry = |path| policy.find(path).ok_or(BuildError::InvalidLaunchPolicy);
     let (hello, cpu_hog, wyrmsh) = (
@@ -159,6 +182,7 @@ mod tests {
     const HOG: [u8; 32] = [0xf3; 32];
 
     const BLOCK: [u8; 32] = [0xb1; 32];
+    const SERVICES: [[u8; 32]; 3] = [[0xc1; 32], [0xc2; 32], [0xc3; 32]];
     const WRDM_BYTES: usize = 32 + 2 * 144;
 
     fn wrdm(identity: [u8; 32]) -> [u8; WRDM_BYTES] {
@@ -197,13 +221,26 @@ mod tests {
             allow_no_streams: false,
             allow_three_streams: true,
         };
-        let mut output = vec![0; 512];
-        let used = if include_hog {
-            encode([0x42; 32], &[hog, hello, shell], &mut output)
-        } else {
-            encode([0x42; 32], &[hello, shell], &mut output)
+        let service = |path, identity| LaunchPolicyEntry {
+            path,
+            content_sha256: identity,
+            startup_abi: 1,
+            profile_id: SERVICE_ROLE_PROFILE_ID,
+            allow_no_streams: true,
+            allow_three_streams: false,
+        };
+        let services = [
+            service(BLOCKMGR_PATH, SERVICES[0]),
+            service(FAT32D_PATH, SERVICES[1]),
+            service(VFSD_PATH, SERVICES[2]),
+        ];
+        let mut entries = vec![];
+        if include_hog {
+            entries.push(hog);
         }
-        .unwrap();
+        entries.extend([hello, services[0], services[1], services[2], shell]);
+        let mut output = vec![0; 1024];
+        let used = encode([0x42; 32], &entries, &mut output).unwrap();
         output.truncate(used);
         output
     }
@@ -227,11 +264,25 @@ mod tests {
             wyrmsh_identity: SHELL,
             hello_identity: HELLO,
             cpu_hog_identity: HOG,
+            services: [
+                ServiceArtifact {
+                    bytes: b"blockmgr-elf",
+                    identity: SERVICES[0],
+                },
+                ServiceArtifact {
+                    bytes: b"fat32d-elf",
+                    identity: SERVICES[1],
+                },
+                ServiceArtifact {
+                    bytes: b"vfsd-elf",
+                    identity: SERVICES[2],
+                },
+            ],
         }
     }
 
     #[test]
-    fn builds_the_thirteen_entry_product_deterministically() {
+    fn builds_the_sixteen_entry_product_deterministically() {
         let manifest = wrdm(UART);
         let policy = policy(false, true);
         let product = product(&manifest, &policy);
@@ -244,15 +295,18 @@ mod tests {
             vec![
                 b"bin/cpu-hog".as_slice(),
                 b"bin/hello".as_slice(),
+                b"system/blockmgr".as_slice(),
                 b"system/bootstrap/device-manifest-v1".as_slice(),
                 b"system/bootstrap/launch-policy-v1".as_slice(),
                 b"system/bootstrap/product-v1".as_slice(),
                 b"system/bootstrap/rrc-a-v1".as_slice(),
                 b"system/consoled".as_slice(),
                 b"system/devmgr".as_slice(),
+                b"system/fat32d".as_slice(),
                 b"system/init".as_slice(),
                 b"system/registryd".as_slice(),
                 b"system/uart16550d".as_slice(),
+                b"system/vfsd".as_slice(),
                 b"system/virtio-blkd".as_slice(),
                 b"system/wyrmsh".as_slice(),
             ]
@@ -262,7 +316,7 @@ mod tests {
                 .entries()
                 .filter(|entry| entry.is_executable())
                 .count(),
-            9
+            12
         );
         assert_eq!(
             archive.lookup(MARKER_PATH.as_bytes()).unwrap().data(),
@@ -337,5 +391,10 @@ mod tests {
         let mut empty = product(&manifest, &policy);
         empty.cpu_hog = b"";
         assert_eq!(build(empty), Err(BuildError::EmptyArtifact));
+        for service in 0..3 {
+            let mut changed = product(&manifest, &policy);
+            changed.services[service].identity = [0x99; 32];
+            assert_eq!(build(changed), Err(BuildError::PayloadIdentityMismatch));
+        }
     }
 }

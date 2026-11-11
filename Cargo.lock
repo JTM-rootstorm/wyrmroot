@@ -376,6 +376,7 @@ dependencies = [
  "wyrmroot-registryd",
  "wyrmroot-rrc-manifest",
  "wyrmroot-runtime",
+ "wyrmroot-service-proto",
  "wyrmroot-uart16550d",
 ]
 

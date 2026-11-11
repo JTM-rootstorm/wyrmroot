@@ -20,6 +20,7 @@ use wyrmroot_runtime::{
     map_bootfs_read_only, monotonic_active_now, query_capability_info, query_memory_object_size,
     receive_channel, send_channel, set_timer, unmap_bootfs, wait_many, wait_one,
 };
+use wyrmroot_service_proto as _;
 use wyrmroot_system_init::continue_system_init_resource_product;
 use wyrmroot_system_init::fatal_application_status;
 use wyrmroot_system_init::validate_wait_until_completion;

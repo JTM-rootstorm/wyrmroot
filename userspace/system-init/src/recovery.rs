@@ -53,7 +53,7 @@ where
         // tick has nothing to watch.
         return console_step(resident, system, loader, waits, now_ns, false);
     };
-    let mut items = [DwWaitItemV1::default(); 7];
+    let mut items = [DwWaitItemV1::default(); 7 + SERVICE_COUNT];
     items[0] = DwWaitItemV1 {
         handle: devmgr.loaded.process,
         signals: DW_SIGNAL_EXITED,
@@ -92,10 +92,41 @@ where
         };
         item_count += 1;
     }
+    // The storage service roles (root `STORAGE_PLAN.md` W6) come last, so the
+    // indices above keep their meaning.
+    let service_base = item_count;
+    let mut service_slots = [0usize; SERVICE_COUNT];
+    for (slot, service) in state.services.iter().enumerate() {
+        if let Some(service) = service {
+            service_slots[item_count - service_base] = slot;
+            items[item_count] = DwWaitItemV1 {
+                handle: service.loaded.process,
+                signals: DW_SIGNAL_EXITED,
+            };
+            item_count += 1;
+        }
+    }
     let observed = system.wait_many(&items[..item_count], DwDeadline(now_ns));
     match observed {
         Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {}
         Err(error) => return Err(InitError::Native(error)),
+        // No restart yet: an exited service role is reaped and its service
+        // stays down.
+        Ok(result)
+            if (service_base..item_count).contains(&(result.index as usize))
+                && result.observed.0 & DW_SIGNAL_EXITED.0 != 0 =>
+        {
+            let slot = service_slots[result.index as usize - service_base];
+            let attempt = resident
+                .product
+                .as_mut()
+                .and_then(|state| state.services[slot].take())
+                .ok_or(InitError::AbsentState(0x50))?;
+            attribute_failure(
+                RecoveryOperation::ReapDriver,
+                retire_service(system, waits, attempt, false),
+            )?;
+        }
         Ok(result) => {
             let event =
                 classify_resident_poll(result, registry_present, driver_present, storage_present)?;
@@ -455,6 +486,9 @@ where
         failed |= JOBS;
     }
     if reap_storage_driver(resident, system, waits, true).is_err() {
+        failed |= DRIVER;
+    }
+    if retire_services(resident, system, waits).is_err() {
         failed |= DRIVER;
     }
     if let Some(state) = resident.product.as_mut() {
@@ -911,6 +945,7 @@ pub(crate) fn recovery_fixture_resident(
             next_controller_transaction: NEXT_CONTROLLER_TRANSACTION,
             driver,
             storage_driver: None,
+            services: [None; SERVICE_COUNT],
             last_reaped_driver: None,
             last_driver_attempt: driver_request.map_or(0, |request| request.attempt_generation.0),
             last_driver_session: driver_request.map_or(0, |request| request.launch_session.0),

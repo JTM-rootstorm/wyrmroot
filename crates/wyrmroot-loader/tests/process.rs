@@ -19,7 +19,8 @@ use wyrmroot_loader::{
         load_d6_resource_owner_process, load_device_coordinator_process,
         load_device_coordinator_resource_process, load_device_driver_process, load_job_process,
         load_launch_client_process, load_process, load_process_with_fault,
-        load_resource_domain_process, load_service_process, load_wyrmsh_process,
+        load_resource_domain_process, load_service_process, load_service_role_process,
+        load_wyrmsh_process,
     },
 };
 use wyrmroot_registry_proto::{Correlation, CorrelationEnvironment};
@@ -1229,6 +1230,49 @@ fn device_driver_loads_each_admitted_driver_path_and_refuses_any_other() {
         );
         assert!(platform.sent_transfers.is_empty());
     }
+}
+
+#[test]
+fn service_roles_load_only_their_paths_and_move_only_the_control_endpoint() {
+    let image = executable();
+    let request = |display_path| wyrmroot_loader::process::ServiceRoleLoadRequest {
+        image: &image,
+        display_path,
+        control_endpoint: DwHandle(0x940),
+        role_id: 0x101,
+        attempt_generation: 2,
+        transaction_id: 9,
+    };
+    for path in wyrmroot_loader::process::SERVICE_ROLE_PATHS {
+        let mut platform = Mock::new(None);
+        load_service_role_process(&mut platform, authority(), request(path))
+            .unwrap_or_else(|error| panic!("{path}: {error:?}"));
+        // The INIT names the role and attempt the stage must match.
+        let fields = (
+            u64::from_le_bytes(platform.sent_init[64..72].try_into().unwrap()),
+            u64::from_le_bytes(platform.sent_init[72..80].try_into().unwrap()),
+        );
+        assert_eq!(fields, (0x101, 2), "{path}");
+        assert_eq!(platform.sent_transfers.len(), 2);
+        assert_eq!(platform.sent_transfers[1].handle, DwHandle(0x940));
+        assert_eq!(
+            platform.sent_transfers[1].requested_rights,
+            wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
+        );
+    }
+    for path in ["/system/virtio-blkd", "/system/wyrmsh", "system/vfsd", ""] {
+        let mut platform = Mock::new(None);
+        let error =
+            load_service_role_process(&mut platform, authority(), request(path)).unwrap_err();
+        assert!(!error.control_endpoint_consumed, "{path}");
+        assert!(platform.sent_transfers.is_empty());
+    }
+    let mut platform = Mock::new(None);
+    let zero_role = wyrmroot_loader::process::ServiceRoleLoadRequest {
+        role_id: 0,
+        ..request("/system/vfsd")
+    };
+    assert!(load_service_role_process(&mut platform, authority(), zero_role).is_err());
 }
 
 #[test]

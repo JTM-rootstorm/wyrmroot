@@ -119,6 +119,10 @@ pub(crate) struct ResidentState {
     /// reaped without a restart, and devmgr recovery and shutdown retire it
     /// first.
     pub(crate) storage_driver: Option<DriverNativeAttempt>,
+    /// The storage service roles (root `STORAGE_PLAN.md` W6), by `services`
+    /// spec order. Like the boot-disk driver they are outside the recovery
+    /// root: an exit is reaped without a restart.
+    pub(crate) services: [Option<ServiceAttempt>; SERVICE_COUNT],
     pub(crate) last_reaped_driver: Option<DriverLaunchRequest>,
     pub(crate) last_driver_attempt: u64,
     pub(crate) last_driver_session: u64,
@@ -421,6 +425,16 @@ where
             return Err(poison.err().unwrap_or(error));
         }
     };
+    let services = launch_services(
+        system,
+        loader,
+        waits,
+        authority,
+        bootfs,
+        registry.control_channel,
+        &mut topology,
+        &mut publication_allocator,
+    );
     let session = Some(ConsoleState::new(topology.generation())?);
     let state = ResidentState {
         session,
@@ -436,6 +450,7 @@ where
         next_controller_transaction: devmgr.next_controller_transaction,
         driver: None,
         storage_driver: None,
+        services,
         last_reaped_driver: None,
         last_driver_attempt: 0,
         last_driver_session: 0,

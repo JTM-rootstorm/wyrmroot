@@ -25,6 +25,7 @@ mod product;
 mod recovery;
 mod registry;
 pub mod resident_loop;
+mod services;
 
 // One crate-wide namespace for the resident supervisor's parts, which were a
 // single module before they were split by responsibility.
@@ -32,6 +33,7 @@ use crate::controller::*;
 pub use crate::errors::*;
 use crate::{
     console::*, job_dispatch::*, job_launch::*, jobs::*, product::*, recovery::*, registry::*,
+    services::*,
 };
 
 use deepwyrm_syscall::{

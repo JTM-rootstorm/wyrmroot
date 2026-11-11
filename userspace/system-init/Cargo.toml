@@ -30,6 +30,7 @@ wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }
 wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
 wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+wyrmroot-service-proto = { path = "../../crates/wyrmroot-service-proto" }
 
 [dev-dependencies]
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }

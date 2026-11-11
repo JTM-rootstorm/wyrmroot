@@ -10,10 +10,15 @@ pub const MAX_PATH_BYTES: usize = 256;
 const MAGIC: [u8; 4] = *b"WRJP";
 const VERSION_MAJOR: u16 = 1;
 /// The only accepted minor. Minor 0 (JobV2 only) and minor 2 (the E8
-/// recovery-trigger profile) were closed with their phases.
-const VERSION_MINOR: u16 = 1;
+/// recovery-trigger profile) were closed with their phases; minor 1 lacked
+/// the service-role profile that minor 3 adds (root `STORAGE_PLAN.md` W6).
+const VERSION_MINOR: u16 = 3;
 pub const JOB_V2_PROFILE_ID: u16 = 1;
 pub const WYRMSH_PROFILE_ID: u16 = 2;
+/// A bootfs service role init launches and stages itself: startup ABI 1
+/// (the self-root-plus-control startup), no streams, under `system/`.
+/// Profile 3 stays retired with the E8 recovery trigger.
+pub const SERVICE_ROLE_PROFILE_ID: u16 = 4;
 pub const WYRMSH_PATH: &str = "system/wyrmsh";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,9 +186,7 @@ impl<'a> LaunchPolicy<'a> {
             return Err(PolicyError::InvalidStartupProfile);
         }
         let stream_modes = get_u16(record, 10)?;
-        if stream_modes == 0
-            || stream_modes & !0b11 != 0
-            || (profile_id == WYRMSH_PROFILE_ID && stream_modes != 0b10)
+        if stream_modes == 0 || stream_modes & !0b11 != 0 || !modes_match(profile_id, stream_modes)
         {
             return Err(PolicyError::InvalidStreamModes);
         }
@@ -219,15 +222,26 @@ impl<'a> LaunchPolicy<'a> {
     }
 }
 
-/// Exactly one profile may name each path: the Wyrmsh profile only
-/// `system/wyrmsh`, and JobV2 every other path.
+/// The Wyrmsh profile names only `system/wyrmsh`, the service-role profile
+/// only other `system/` paths, and JobV2 any path but `system/wyrmsh`.
 fn profile_matches_path(startup_abi: u16, profile_id: u16, path: &str) -> bool {
-    startup_abi == 2
-        && match profile_id {
-            JOB_V2_PROFILE_ID => path != WYRMSH_PATH,
-            WYRMSH_PROFILE_ID => path == WYRMSH_PATH,
-            _ => false,
+    match profile_id {
+        JOB_V2_PROFILE_ID => startup_abi == 2 && path != WYRMSH_PATH,
+        WYRMSH_PROFILE_ID => startup_abi == 2 && path == WYRMSH_PATH,
+        SERVICE_ROLE_PROFILE_ID => {
+            startup_abi == 1 && path.starts_with("system/") && path != WYRMSH_PATH
         }
+        _ => false,
+    }
+}
+
+/// Wyrmsh takes exactly three streams and a service role none.
+fn modes_match(profile_id: u16, stream_modes: u16) -> bool {
+    match profile_id {
+        WYRMSH_PROFILE_ID => stream_modes == 0b10,
+        SERVICE_ROLE_PROFILE_ID => stream_modes == 0b01,
+        _ => true,
+    }
 }
 
 pub fn encode(
@@ -278,13 +292,13 @@ pub fn encode(
         }
         let stream_modes =
             u16::from(entry.allow_no_streams) | (u16::from(entry.allow_three_streams) << 1);
-        if stream_modes == 0 || (entry.profile_id == WYRMSH_PROFILE_ID && stream_modes != 0b10) {
+        if stream_modes == 0 || !modes_match(entry.profile_id, stream_modes) {
             return Err(PolicyError::InvalidStreamModes);
         }
         let record = HEADER_BYTES + index * RECORD_BYTES;
         put_u32(output, record, string_offset as u32)?;
         put_u16(output, record + 4, entry.path.len() as u16)?;
-        put_u16(output, record + 6, 2)?;
+        put_u16(output, record + 6, entry.startup_abi)?;
         put_u16(output, record + 8, entry.profile_id)?;
         put_u16(output, record + 10, stream_modes)?;
         put_u32(output, record + 12, 1)?;
@@ -412,13 +426,73 @@ mod tests {
         );
     }
 
-    /// F4 WR-F4-L2: the closed minors 0 and 2 and the E8 recovery-trigger
-    /// profile 3 are refused by the production parser.
+    #[test]
+    fn service_roles_are_bound_to_system_paths_abi_one_and_no_streams() {
+        let service = LaunchPolicyEntry {
+            path: "system/vfsd",
+            content_sha256: [0x33; 32],
+            startup_abi: 1,
+            profile_id: SERVICE_ROLE_PROFILE_ID,
+            allow_no_streams: true,
+            allow_three_streams: false,
+        };
+        let mut bytes = [0_u8; 512];
+        let size = encode([0x11; 32], &[HELLO, service], &mut bytes).unwrap();
+        let parsed = LaunchPolicy::parse(&bytes[..size]).unwrap();
+        assert_eq!(parsed.find("system/vfsd"), Some(service));
+        for (entry, error) in [
+            (
+                LaunchPolicyEntry {
+                    path: "bin/vfsd",
+                    ..service
+                },
+                PolicyError::InvalidStartupProfile,
+            ),
+            (
+                LaunchPolicyEntry {
+                    path: WYRMSH_PATH,
+                    ..service
+                },
+                PolicyError::InvalidStartupProfile,
+            ),
+            (
+                LaunchPolicyEntry {
+                    startup_abi: 2,
+                    ..service
+                },
+                PolicyError::InvalidStartupProfile,
+            ),
+            (
+                LaunchPolicyEntry {
+                    allow_three_streams: true,
+                    ..service
+                },
+                PolicyError::InvalidStreamModes,
+            ),
+            (
+                LaunchPolicyEntry {
+                    allow_no_streams: false,
+                    allow_three_streams: true,
+                    ..service
+                },
+                PolicyError::InvalidStreamModes,
+            ),
+        ] {
+            assert_eq!(
+                encode([0x11; 32], &[entry], &mut bytes),
+                Err(error),
+                "{entry:?}"
+            );
+        }
+    }
+
+    /// F4 WR-F4-L2: the closed minors 0 and 2, the superseded minor 1, and
+    /// the E8 recovery-trigger profile 3 are refused by the production parser.
     #[test]
     fn closed_minors_and_unknown_profiles_are_refused() {
         let mut bytes = [0_u8; 512];
         let size = encode([0x11; 32], &[HELLO], &mut bytes).unwrap();
-        for minor in [0_u16, 2, 3] {
+        for minor in [0_u16, 1, 2, 4] {
             let mut mutated = bytes;
             mutated[6..8].copy_from_slice(&minor.to_le_bytes());
             assert_eq!(
@@ -426,7 +500,7 @@ mod tests {
                 Err(PolicyError::UnsupportedVersion)
             );
         }
-        for profile in [0_u16, 3, 4] {
+        for profile in [0_u16, 3, 5] {
             let mut mutated = bytes;
             mutated[HEADER_BYTES + 8..HEADER_BYTES + 10].copy_from_slice(&profile.to_le_bytes());
             assert_eq!(

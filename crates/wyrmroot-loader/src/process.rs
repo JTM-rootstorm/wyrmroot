@@ -207,6 +207,18 @@ pub struct DeviceDriverLoadRequest<'a> {
     pub transaction_id: u64,
 }
 
+/// A bootfs service role's construction (root `STORAGE_PLAN.md` W6). The
+/// Channel is the child's end of init's control pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceRoleLoadRequest<'a> {
+    pub image: &'a [u8],
+    pub display_path: &'a str,
+    pub control_endpoint: DwHandle,
+    pub role_id: u64,
+    pub attempt_generation: u64,
+    pub transaction_id: u64,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum StartupSpec<'a> {
     Legacy(&'a str),
