@@ -252,6 +252,36 @@ pub trait DevicePlatform {
     ) -> Result<DwDeviceResourceInfoV1, NativeError>;
     /// [`crate::interrupt_info`].
     fn interrupt_info(&mut self, interrupt: DwHandle) -> Result<DwInterruptInfoV1, NativeError>;
+    /// [`crate::device_pci_command`].
+    fn device_pci_command(
+        &mut self,
+        resource: DwHandle,
+        memory_space: bool,
+        bus_master: bool,
+    ) -> Result<(), NativeError>;
+    /// [`crate::device_mmio_object_create`].
+    fn device_mmio_object_create(
+        &mut self,
+        resource: DwHandle,
+        bar: u32,
+        requested_rights: DwRights,
+    ) -> Result<DwHandle, NativeError>;
+    /// [`crate::dma_map`].
+    fn dma_map(
+        &mut self,
+        resource: DwHandle,
+        memory_object: DwHandle,
+        offset: u64,
+        byte_len: u64,
+        access: u32,
+    ) -> Result<u64, NativeError>;
+    /// [`crate::dma_unmap`].
+    fn dma_unmap(
+        &mut self,
+        resource: DwHandle,
+        iova: u64,
+        byte_len: u64,
+    ) -> Result<(), NativeError>;
 }
 
 /// The seven production traits together.
@@ -603,6 +633,44 @@ impl DevicePlatform for NativePlatform {
 
     fn interrupt_info(&mut self, interrupt: DwHandle) -> Result<DwInterruptInfoV1, NativeError> {
         crate::interrupt_info(interrupt)
+    }
+
+    fn device_pci_command(
+        &mut self,
+        resource: DwHandle,
+        memory_space: bool,
+        bus_master: bool,
+    ) -> Result<(), NativeError> {
+        crate::device_pci_command(resource, memory_space, bus_master)
+    }
+
+    fn device_mmio_object_create(
+        &mut self,
+        resource: DwHandle,
+        bar: u32,
+        requested_rights: DwRights,
+    ) -> Result<DwHandle, NativeError> {
+        crate::device_mmio_object_create(resource, bar, requested_rights)
+    }
+
+    fn dma_map(
+        &mut self,
+        resource: DwHandle,
+        memory_object: DwHandle,
+        offset: u64,
+        byte_len: u64,
+        access: u32,
+    ) -> Result<u64, NativeError> {
+        crate::dma_map(resource, memory_object, offset, byte_len, access)
+    }
+
+    fn dma_unmap(
+        &mut self,
+        resource: DwHandle,
+        iova: u64,
+        byte_len: u64,
+    ) -> Result<(), NativeError> {
+        crate::dma_unmap(resource, iova, byte_len)
     }
 }
 

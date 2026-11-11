@@ -133,14 +133,30 @@ role is fixed the same way:
 4. **Publication by the driver (a §1 deviation).** devmgr does not broker the
    block service. Init installs the registry publication when it constructs the
    driver and sends the endpoint over the driver's launch Channel as one `WRPG`
-   grant; the driver publishes after its `READY`. A dead driver's publication
-   retires with its endpoint.
+   grant; the driver publishes after its `READY` and its device bring-up
+   (item 6). A dead driver's publication retires with its endpoint.
 5. **Containment.** The lane is not part of the recovery root. A refused claim,
    construction or stage closes only the lane, never devmgr or the console. A
    boot-disk driver exit is reaped without a restart, and a devmgr recovery or
    shutdown retires the driver first, so the replacement's claim never meets a
    live lease. Restart policy and re-publication after a registry replacement
    are later work.
+6. **The driver (root `STORAGE_PLAN.md` W3).** After `READY` the driver
+   brings the device up itself: it walks the virtio PCI capabilities, maps
+   their one BAR uncached, creates its own three-page DMA memory and maps it
+   into the function's IOMMU domain, enables bus mastering only then, and
+   negotiates `VERSION_1` and `ACCESS_PLATFORM` (a device without either is
+   refused). It reads block 0 through the queue and requires the boot
+   signature `0x55AA` before it publishes, so a published
+   `device.block.virtio0` proves a live DMA round trip. Each registry
+   connection offer for exactly this service and `WRBD` 1.0 becomes a direct
+   client Channel (at most four; further offers are closed). A client
+   attaches one MemoryObject carrying exactly `READ` and `WRITE`, which the
+   driver maps for the device (at most 1 MiB), and names block ranges in it;
+   data never crosses the Channel. A malformed message closes that client
+   only; a device fault or a request that does not complete in 5 s resets
+   the device and stops the driver. At exit the device is reset before any
+   memory it could reach is unmapped.
 
 ## 4. Immutable device-role manifest
 

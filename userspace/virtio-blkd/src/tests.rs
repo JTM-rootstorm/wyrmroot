@@ -34,6 +34,14 @@ use wyrmroot_runtime::platform::recording::{Call, Datagram, RecordingPlatform, R
 use wyrmroot_runtime::{BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo};
 
 use super::*;
+use crate::virtio_tests::{BAR_BYTES, CLIENT_IOVA, MEM_IOVA, Model, SECTORS};
+use deepwyrm_syscall::{
+    DW_DMA_ACCESS_DEVICE_READ, DW_DMA_ACCESS_DEVICE_WRITE, DW_OBJECT_TYPE_MEMORY_OBJECT,
+    DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_WRITE, DwRights,
+};
+use wyrmroot_block_proto::{
+    Body as WrbdBody, MAX_BYTES as WRBD_MAX_BYTES, Message as WrbdMessage, Status as WrbdStatus,
+};
 
 const BOOTSTRAP: DwHandle = DwHandle(0x10);
 const SELF_ROOT: DwHandle = DwHandle(0x20);
@@ -333,11 +341,132 @@ fn offer_bytes() -> Vec<u8> {
     bytes
 }
 
+/// Hands the role the model device in place of the two address-space
+/// mappings, and keeps it when the role gives it back.
+struct ModelMapper {
+    model: Option<Model>,
+    returned: Option<Model>,
+}
+
+impl ModelMapper {
+    fn new(model: Model) -> Self {
+        Self {
+            model: Some(model),
+            returned: None,
+        }
+    }
+}
+
+impl role::DeviceMapper<RecordingPlatform> for ModelMapper {
+    type Hardware = Model;
+
+    fn map(
+        &mut self,
+        _: &mut RecordingPlatform,
+        root: DwHandle,
+        bar: DwHandle,
+        bar_bytes: u64,
+        dma: DwHandle,
+    ) -> Result<Model, wyrmroot_runtime::NativeError> {
+        assert_eq!(
+            (root, bar, bar_bytes, dma),
+            (SELF_ROOT, BAR_OBJECT, BAR_BYTES, DMA_OBJECT)
+        );
+        Ok(self.model.take().expect("mapped twice"))
+    }
+
+    fn unmap(&mut self, _: &mut RecordingPlatform, hardware: Model) -> bool {
+        self.returned = Some(hardware);
+        true
+    }
+}
+
+const BAR_OBJECT: DwHandle = DwHandle(0x30);
+const DMA_OBJECT: DwHandle = DwHandle(0x31);
+const CLIENT: DwHandle = DwHandle(0x32);
+const CLIENT_MEMORY: DwHandle = DwHandle(0x33);
+
 fn run_scripted(script: Vec<Reply>) -> (u32, Vec<Call>) {
+    let (code, calls, _) = run_with_model(script, Model::new());
+    (code, calls)
+}
+
+fn run_with_model(script: Vec<Reply>, model: Model) -> (u32, Vec<Call>, Option<Model>) {
     let mut platform = RecordingPlatform::scripted(script);
-    let code = role::blk_main(&mut platform, BOOTSTRAP);
+    let mut mapper = ModelMapper::new(model);
+    let code = role::blk_main(&mut platform, &mut mapper, BOOTSTRAP);
     platform.assert_script_consumed();
-    (code, platform.take_calls())
+    (code, platform.take_calls(), mapper.returned)
+}
+
+/// The config-space reads the capability walk makes, answered from the
+/// model's config space.
+fn capability_replies() -> Vec<Reply> {
+    let config = crate::virtio_tests::config_space();
+    let mut read = crate::virtio_tests::reader(&config);
+    let mut replies = Vec::new();
+    crate::virtio::find_capabilities(|offset, width| {
+        let value = read(offset, width);
+        replies.push(Reply::Pio(value.map_err(|()| unreachable!())));
+        value
+    })
+    .unwrap();
+    replies
+}
+
+/// READY, then bring-up and the self-test read.
+fn bring_up_replies() -> Vec<Reply> {
+    let mut replies = vec![Reply::Unit(Ok(()))];
+    replies.extend(capability_replies());
+    replies.extend([
+        // Memory decoding on, the BAR object and its size, the DMA object
+        // and its IOVA, bus mastering on.
+        Reply::Unit(Ok(())),
+        Reply::Handle(Ok(BAR_OBJECT)),
+        Reply::Value(Ok(BAR_BYTES)),
+        Reply::Handle(Ok(DMA_OBJECT)),
+        Reply::Value(Ok(MEM_IOVA)),
+        Reply::Unit(Ok(())),
+        // The self-test read's deadline; the model completes at once.
+        Reply::Deadline(Ok(DwDeadline(1_000))),
+    ]);
+    replies
+}
+
+fn publish_replies() -> Vec<Reply> {
+    vec![
+        Reply::Unit(Ok(())),
+        Reply::Deadline(Ok(DwDeadline(300))),
+        ready_wait(0, DW_SIGNAL_READABLE),
+        receive(registry_bytes(RegistryMessageType::Published), vec![]),
+    ]
+}
+
+/// Bus mastering off, the DMA object unmapped, both objects closed, then
+/// the resource, publication, control and self root.
+fn retire_replies(connections_with_buffers: usize) -> Vec<Reply> {
+    let mut replies = vec![Reply::Unit(Ok(()))];
+    replies.extend((0..connections_with_buffers * 3).map(|_| Reply::Unit(Ok(()))));
+    replies.extend((0..7).map(|_| Reply::Unit(Ok(()))));
+    replies
+}
+
+fn retire_calls() -> Vec<Call> {
+    vec![
+        Call::DmaUnmap {
+            resource: RESOURCE,
+            iova: MEM_IOVA,
+            byte_len: crate::virtio::DMA_BYTES,
+        },
+        Call::CloseHandle { handle: DMA_OBJECT },
+        Call::CloseHandle { handle: BAR_OBJECT },
+        Call::CloseHandle { handle: RESOURCE },
+        Call::CloseHandle {
+            handle: PUBLICATION,
+        },
+        Call::CloseHandle { handle: CONTROL },
+        Call::CloseHandle { handle: SELF_ROOT },
+    ]
 }
 
 fn sent_on(calls: &[Call], channel: DwHandle) -> Vec<Vec<u8>> {
@@ -357,31 +486,59 @@ fn sent_on(calls: &[Call], channel: DwHandle) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn wrbd_request(transaction_id: u64, body: WrbdBody) -> Vec<u8> {
+    let mut bytes = [0u8; WRBD_MAX_BYTES];
+    let size = wyrmroot_block_proto::encode(
+        WrbdMessage {
+            transaction_id,
+            body,
+        },
+        &mut bytes,
+    )
+    .unwrap();
+    bytes[..size].to_vec()
+}
+
+fn client_memory(rights: DwRights) -> DwReceivedHandleInfoV1 {
+    DwReceivedHandleInfoV1 {
+        handle: CLIENT_MEMORY,
+        object_type: DW_OBJECT_TYPE_MEMORY_OBJECT,
+        rights,
+        ..DwReceivedHandleInfoV1::default()
+    }
+}
+
+fn accept_client() -> Vec<Reply> {
+    vec![
+        ready_wait(1, DW_SIGNAL_READABLE),
+        receive(offer_bytes(), vec![channel(CLIENT)]),
+    ]
+}
+
+/// The client's Channel is wait item 2, after control and publication.
+fn client_sends(bytes: Vec<u8>, handles: Vec<DwReceivedHandleInfoV1>) -> Vec<Reply> {
+    vec![ready_wait(2, DW_SIGNAL_READABLE), receive(bytes, handles)]
+}
+
+fn replies_to_client(calls: &[Call]) -> Vec<WrbdMessage> {
+    sent_on(calls, CLIENT)
+        .iter()
+        .map(|bytes| wyrmroot_block_proto::parse(bytes, 0).unwrap())
+        .collect()
+}
+
 #[test]
-fn the_driver_stages_publishes_refuses_offers_and_exits_when_devmgr_closes() {
+fn the_driver_brings_up_the_disk_reads_block_zero_and_publishes_only_then() {
     let mut script = startup_replies();
     script.extend(stage_replies(BOOT_DISK_POLICY.pci.ids));
-    script.extend([
-        // READY to devmgr, PUBLISH to the registry and its PUBLISHED.
-        Reply::Unit(Ok(())),
-        Reply::Unit(Ok(())),
-        Reply::Deadline(Ok(DwDeadline(300))),
-        ready_wait(0, DW_SIGNAL_READABLE),
-        receive(registry_bytes(RegistryMessageType::Published), vec![]),
-        // One connection offer, whose endpoint is closed.
-        ready_wait(1, DW_SIGNAL_READABLE),
-        receive(offer_bytes(), vec![channel(OFFERED)]),
-        Reply::Unit(Ok(())),
-        // devmgr closes the control Channel.
-        ready_wait(0, DW_SIGNAL_PEER_CLOSED),
-        // Resource, publication, control and self root are closed.
-        Reply::Unit(Ok(())),
-        Reply::Unit(Ok(())),
-        Reply::Unit(Ok(())),
-        Reply::Unit(Ok(())),
-    ]);
-    let (code, calls) = run_scripted(script);
+    script.extend(bring_up_replies());
+    script.extend(publish_replies());
+    // devmgr closes the control Channel.
+    script.push(ready_wait(0, DW_SIGNAL_PEER_CLOSED));
+    script.extend(retire_replies(0));
+    let (code, calls, model) = run_with_model(script, Model::new());
     assert_eq!(code, 0);
+    let model = model.unwrap();
 
     let mut ready = [0; READY_BYTES];
     pci_driver::encode(
@@ -396,43 +553,504 @@ fn the_driver_stages_publishes_refuses_offers_and_exits_when_devmgr_closes() {
         sent_on(&calls, PUBLICATION),
         [registry_bytes(RegistryMessageType::Publish)]
     );
-    assert!(calls.contains(&Call::DevicePciConfigRead {
-        resource: RESOURCE,
-        offset: PCI_CONFIG_IDS,
-        width: 4,
-    }));
-    // The serve loop waits on both endpoints with no deadline.
-    assert!(calls.contains(&Call::WaitMany {
-        items: vec![
-            DwWaitItemV1 {
-                handle: CONTROL,
-                signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
-            },
-            DwWaitItemV1 {
-                handle: PUBLICATION,
-                signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
-            },
-        ],
-        deadline: DW_DEADLINE_INFINITE,
-    }));
-    let closes: Vec<_> = calls
+    // The bring-up order: memory decoding, the BAR, DMA memory mapped for
+    // the device, and only then bus mastering.
+    let device_calls: Vec<&Call> = calls
         .iter()
-        .filter_map(|call| match call {
-            Call::CloseHandle { handle } => Some(*handle),
-            _ => None,
+        .filter(|call| {
+            matches!(
+                call,
+                Call::DevicePciCommand { .. }
+                    | Call::DeviceMmioObjectCreate { .. }
+                    | Call::CreateMemoryObject { .. }
+                    | Call::DmaMap { .. }
+                    | Call::DmaUnmap { .. }
+            )
         })
         .collect();
     assert_eq!(
-        closes,
+        device_calls,
         [
-            BOOTSTRAP,
-            OFFERED,
-            RESOURCE,
-            PUBLICATION,
-            CONTROL,
-            SELF_ROOT
+            &Call::DevicePciCommand {
+                resource: RESOURCE,
+                memory_space: true,
+                bus_master: false
+            },
+            &Call::DeviceMmioObjectCreate {
+                resource: RESOURCE,
+                bar: 4,
+                requested_rights: DwRights(
+                    DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0
+                ),
+            },
+            &Call::CreateMemoryObject {
+                bytes: crate::virtio::DMA_BYTES,
+                rights: DwRights(
+                    DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0
+                ),
+            },
+            &Call::DmaMap {
+                resource: RESOURCE,
+                memory_object: DMA_OBJECT,
+                offset: 0,
+                byte_len: crate::virtio::DMA_BYTES,
+                access: DW_DMA_ACCESS_DEVICE_READ | DW_DMA_ACCESS_DEVICE_WRITE,
+            },
+            &Call::DevicePciCommand {
+                resource: RESOURCE,
+                memory_space: true,
+                bus_master: true
+            },
+            &Call::DevicePciCommand {
+                resource: RESOURCE,
+                memory_space: false,
+                bus_master: false
+            },
+            &Call::DmaUnmap {
+                resource: RESOURCE,
+                iova: MEM_IOVA,
+                byte_len: crate::virtio::DMA_BYTES,
+            },
         ]
     );
+    // One read of block 0, before the PUBLISH; the device was reset at exit.
+    assert_eq!(model.executed, [(crate::virtio::BLK_T_IN, 0, 512)]);
+    assert_eq!(model.status, 0);
+    let publish = calls
+        .iter()
+        .position(
+            |call| matches!(call, Call::SendChannel { channel, .. } if *channel == PUBLICATION),
+        )
+        .unwrap();
+    // The self-test read's deadline is the first after bus mastering.
+    let bus_master = calls
+        .iter()
+        .position(|call| {
+            matches!(
+                call,
+                Call::DevicePciCommand {
+                    bus_master: true,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let self_test = bus_master
+        + calls[bus_master..]
+            .iter()
+            .position(|call| matches!(call, Call::MonotonicDeadlineAfter { .. }))
+            .unwrap();
+    assert!(self_test < publish);
+    assert!(calls.ends_with(&retire_calls()));
+}
+
+#[test]
+fn a_disk_without_the_boot_signature_is_never_published() {
+    let mut model = Model::new();
+    model.disk[510] = 0;
+    let mut script = startup_replies();
+    script.extend(stage_replies(BOOT_DISK_POLICY.pci.ids));
+    script.extend(bring_up_replies());
+    script.extend(retire_replies(0));
+    let (code, calls, model) = run_with_model(script, model);
+    assert_eq!(code, role::FAILURE_BASE | 126);
+    assert!(sent_on(&calls, PUBLICATION).is_empty());
+    assert_eq!(model.unwrap().status, 0, "the device was reset");
+    assert!(calls.ends_with(&retire_calls()));
+}
+
+#[test]
+fn a_device_without_iommu_translation_stops_the_driver_before_any_request() {
+    let mut model = Model::new();
+    model.offered &= !crate::virtio::FEATURE_ACCESS_PLATFORM;
+    let mut script = startup_replies();
+    script.extend(stage_replies(BOOT_DISK_POLICY.pci.ids));
+    let mut bring_up = bring_up_replies();
+    bring_up.pop();
+    script.extend(bring_up);
+    script.extend(retire_replies(0));
+    let (code, calls, model) = run_with_model(script, model);
+    assert_eq!(code, role::FAILURE_BASE | 115);
+    let model = model.unwrap();
+    assert!(model.executed.is_empty());
+    assert!(model.status & crate::virtio::STATUS_FAILED != 0);
+    assert!(sent_on(&calls, PUBLICATION).is_empty());
+}
+
+#[test]
+fn a_client_attaches_a_buffer_and_reads_writes_and_flushes_through_it() {
+    let mut script = startup_replies();
+    script.extend(stage_replies(BOOT_DISK_POLICY.pci.ids));
+    script.extend(bring_up_replies());
+    script.extend(publish_replies());
+    script.extend(accept_client());
+    script.extend(client_sends(wrbd_request(1, WrbdBody::GetInfo), vec![]));
+    script.push(Reply::Unit(Ok(())));
+    script.extend(client_sends(
+        wrbd_request(2, WrbdBody::Attach { byte_len: 0x1_0000 }),
+        vec![client_memory(role::ATTACH_RIGHTS)],
+    ));
+    script.extend([Reply::Value(Ok(CLIENT_IOVA)), Reply::Unit(Ok(()))]);
+    let read = wyrmroot_block_proto::Transfer {
+        lba: 1,
+        block_count: 2,
+        buffer_offset: 512,
+    };
+    script.extend(client_sends(wrbd_request(3, WrbdBody::Read(read)), vec![]));
+    script.extend([Reply::Deadline(Ok(DwDeadline(2_000))), Reply::Unit(Ok(()))]);
+    let write = wyrmroot_block_proto::Transfer {
+        lba: 40,
+        block_count: 1,
+        buffer_offset: 512,
+    };
+    script.extend(client_sends(
+        wrbd_request(4, WrbdBody::Write(write)),
+        vec![],
+    ));
+    script.extend([Reply::Deadline(Ok(DwDeadline(3_000))), Reply::Unit(Ok(()))]);
+    script.extend(client_sends(wrbd_request(5, WrbdBody::Flush), vec![]));
+    script.extend([Reply::Deadline(Ok(DwDeadline(4_000))), Reply::Unit(Ok(()))]);
+    // Past the end of the disk: refused before the device sees it.
+    let beyond = wyrmroot_block_proto::Transfer {
+        lba: SECTORS,
+        block_count: 1,
+        buffer_offset: 0,
+    };
+    script.extend(client_sends(
+        wrbd_request(6, WrbdBody::Read(beyond)),
+        vec![],
+    ));
+    script.push(Reply::Unit(Ok(())));
+    // The client leaves: its buffer is unmapped, then closed with its Channel.
+    script.push(ready_wait(2, DW_SIGNAL_PEER_CLOSED));
+    script.extend([
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+    ]);
+    script.push(ready_wait(0, DW_SIGNAL_PEER_CLOSED));
+    script.extend(retire_replies(0));
+    let (code, calls, model) = run_with_model(script, Model::new());
+    assert_eq!(code, 0);
+    let model = model.unwrap();
+
+    let replies = replies_to_client(&calls);
+    let complete = |transaction_id, status| WrbdMessage {
+        transaction_id,
+        body: WrbdBody::Complete(status),
+    };
+    assert_eq!(
+        replies,
+        [
+            WrbdMessage {
+                transaction_id: 1,
+                body: WrbdBody::Info(wyrmroot_block_proto::Info {
+                    block_size: 512,
+                    flags: wyrmroot_block_proto::INFO_FLUSH,
+                    block_count: SECTORS,
+                    max_transfer_blocks: 256,
+                }),
+            },
+            complete(2, WrbdStatus::Ok),
+            complete(3, WrbdStatus::Ok),
+            complete(4, WrbdStatus::Ok),
+            complete(5, WrbdStatus::Ok),
+            complete(6, WrbdStatus::OutOfRange),
+        ]
+    );
+    // The read landed in the client's buffer; the write came from it.
+    assert_eq!(model.client[512..1536], model.disk[512..1536]);
+    assert_eq!(model.disk[40 * 512..41 * 512], model.disk[512..1024]);
+    assert!(calls.contains(&Call::DmaMap {
+        resource: RESOURCE,
+        memory_object: CLIENT_MEMORY,
+        offset: 0,
+        byte_len: 0x1_0000,
+        access: DW_DMA_ACCESS_DEVICE_READ | DW_DMA_ACCESS_DEVICE_WRITE,
+    }));
+    let unmap = calls
+        .iter()
+        .position(|call| {
+            *call
+                == Call::DmaUnmap {
+                    resource: RESOURCE,
+                    iova: CLIENT_IOVA,
+                    byte_len: 0x1_0000,
+                }
+        })
+        .unwrap();
+    assert_eq!(
+        calls[unmap + 1..unmap + 3],
+        [
+            Call::CloseHandle {
+                handle: CLIENT_MEMORY
+            },
+            Call::CloseHandle { handle: CLIENT }
+        ]
+    );
+}
+
+#[test]
+fn bad_attachments_are_refused_and_their_handles_closed() {
+    let mut script = startup_replies();
+    script.extend(stage_replies(BOOT_DISK_POLICY.pci.ids));
+    script.extend(bring_up_replies());
+    script.extend(publish_replies());
+    script.extend(accept_client());
+    // A read before any buffer.
+    let read = wyrmroot_block_proto::Transfer {
+        lba: 0,
+        block_count: 1,
+        buffer_offset: 0,
+    };
+    script.extend(client_sends(wrbd_request(1, WrbdBody::Read(read)), vec![]));
+    script.push(Reply::Unit(Ok(())));
+    // Wider rights than a DMA buffer needs: closed, Invalid.
+    script.extend(client_sends(
+        wrbd_request(2, WrbdBody::Attach { byte_len: 4096 }),
+        vec![client_memory(DwRights(
+            role::ATTACH_RIGHTS.0 | DW_RIGHT_DUPLICATE.0,
+        ))],
+    ));
+    script.extend([Reply::Unit(Ok(())), Reply::Unit(Ok(()))]);
+    // Above the attach limit: closed, Invalid, never mapped.
+    script.extend(client_sends(
+        wrbd_request(
+            3,
+            WrbdBody::Attach {
+                byte_len: crate::block::MAX_ATTACH_BYTES + 4096,
+            },
+        ),
+        vec![client_memory(role::ATTACH_RIGHTS)],
+    ));
+    script.extend([Reply::Unit(Ok(())), Reply::Unit(Ok(()))]);
+    // The kernel has no room: closed, NoResources.
+    script.extend(client_sends(
+        wrbd_request(4, WrbdBody::Attach { byte_len: 4096 }),
+        vec![client_memory(role::ATTACH_RIGHTS)],
+    ));
+    script.extend([
+        Reply::Value(Err(wyrmroot_runtime::NativeError::Status(
+            deepwyrm_syscall::DW_STATUS_NO_RESOURCES,
+        ))),
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+    ]);
+    // A malformed message closes the connection (no buffer to unmap).
+    script.extend(client_sends(vec![0; 40], vec![]));
+    script.push(Reply::Unit(Ok(())));
+    script.push(ready_wait(0, DW_SIGNAL_PEER_CLOSED));
+    script.extend(retire_replies(0));
+    let (code, calls, model) = run_with_model(script, Model::new());
+    assert_eq!(code, 0);
+    assert!(
+        model.unwrap().executed.len() == 1,
+        "only the self-test read"
+    );
+    let statuses: Vec<_> = replies_to_client(&calls)
+        .into_iter()
+        .map(|message| message.body)
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            WrbdBody::Complete(WrbdStatus::NoBuffer),
+            WrbdBody::Complete(WrbdStatus::Invalid),
+            WrbdBody::Complete(WrbdStatus::Invalid),
+            WrbdBody::Complete(WrbdStatus::NoResources),
+        ]
+    );
+    let memory_closes = calls
+        .iter()
+        .filter(|call| {
+            **call
+                == Call::CloseHandle {
+                    handle: CLIENT_MEMORY,
+                }
+        })
+        .count();
+    assert_eq!(memory_closes, 3);
+    let client_maps = calls
+        .iter()
+        .filter(|call| matches!(call, Call::DmaMap { memory_object, .. } if *memory_object == CLIENT_MEMORY))
+        .count();
+    assert_eq!(client_maps, 1);
+    assert!(calls.contains(&Call::CloseHandle { handle: CLIENT }));
+}
+
+#[test]
+fn offers_for_another_service_or_beyond_the_limit_are_closed() {
+    let mut script = startup_replies();
+    script.extend(stage_replies(BOOT_DISK_POLICY.pci.ids));
+    script.extend(bring_up_replies());
+    script.extend(publish_replies());
+    // An offer naming another protocol version.
+    let mut other = vec![0; 512];
+    let size = encode_lookup(
+        RegistryHeader {
+            message_type: RegistryMessageType::ConnectOffer,
+            ..published_header()
+        },
+        Lookup {
+            protocol_id: BLOCK_DEVICE_PROTOCOL_ID,
+            version: ProtocolVersion { major: 2, minor: 0 },
+            service_name: BOOT_DISK_SERVICE_NAME,
+        },
+        &mut other,
+    )
+    .unwrap();
+    other.truncate(size);
+    script.push(ready_wait(1, DW_SIGNAL_READABLE));
+    script.push(receive(other, vec![channel(OFFERED)]));
+    script.push(Reply::Unit(Ok(())));
+    // Four accepted, the fifth closed.
+    for index in 0..5u64 {
+        script.push(ready_wait(1, DW_SIGNAL_READABLE));
+        script.push(receive(
+            offer_bytes(),
+            vec![channel(DwHandle(0x40 + index))],
+        ));
+    }
+    script.push(Reply::Unit(Ok(())));
+    script.push(ready_wait(0, DW_SIGNAL_PEER_CLOSED));
+    // Retirement closes the four accepted Channels.
+    let mut retire = retire_replies(0);
+    retire.extend((0..4).map(|_| Reply::Unit(Ok(()))));
+    script.extend(retire);
+    let (code, calls) = run_scripted(script);
+    assert_eq!(code, 0);
+    let closes: Vec<_> = calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::CloseHandle { handle }
+                if handle.0 == 0x24 || (0x40..0x50).contains(&handle.0) =>
+            {
+                Some(handle.0)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closes, [0x24, 0x44, 0x40, 0x41, 0x42, 0x43]);
+    // The serve loop waits on control, publication and every connection.
+    assert!(
+        calls.contains(&Call::WaitMany {
+            items: [
+                CONTROL,
+                PUBLICATION,
+                DwHandle(0x40),
+                DwHandle(0x41),
+                DwHandle(0x42),
+                DwHandle(0x43)
+            ]
+            .map(|handle| DwWaitItemV1 {
+                handle,
+                signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            })
+            .to_vec(),
+            deadline: DW_DEADLINE_INFINITE,
+        })
+    );
+}
+
+#[test]
+fn a_hung_request_times_out_resets_the_device_and_stops_the_driver() {
+    let mut script = startup_replies();
+    script.extend(stage_replies(BOOT_DISK_POLICY.pci.ids));
+    script.extend(bring_up_replies());
+    script.extend(publish_replies());
+    script.extend(accept_client());
+    script.extend(client_sends(wrbd_request(1, WrbdBody::Flush), vec![]));
+    // Before the deadline, then past it.
+    script.extend([
+        Reply::Deadline(Ok(DwDeadline(5_000))),
+        Reply::Value(Ok(4_999)),
+        Reply::Value(Ok(5_000)),
+    ]);
+    // Retirement: the client Channel (no buffer) is closed too.
+    let mut retire = retire_replies(0);
+    retire.push(Reply::Unit(Ok(())));
+    script.extend(retire);
+    let mut platform = RecordingPlatform::scripted(script);
+    let mut mapper = ModelMapper::new(Model::new());
+    // The self-test read completes; the model stalls from the flush on.
+    let code = role::blk_main(&mut platform, &mut StallAfterFirst(&mut mapper), BOOTSTRAP);
+    platform.assert_script_consumed();
+    assert_eq!(code, role::FAILURE_BASE | 131);
+    let calls = platform.take_calls();
+    // No reply was sent: the client sees its Channel close.
+    assert!(sent_on(&calls, CLIENT).is_empty());
+    assert!(calls.contains(&Call::CloseHandle { handle: CLIENT }));
+    let model = mapper.returned.unwrap();
+    assert_eq!(
+        model.status, 0,
+        "the device was reset before memory was released"
+    );
+}
+
+/// A mapper whose model stalls after the self-test read.
+struct StallAfterFirst<'m>(&'m mut ModelMapper);
+
+struct Stalling(Model);
+
+impl crate::virtio::Hardware for Stalling {
+    fn bar_read(
+        &mut self,
+        offset: u64,
+        width: crate::virtio::Width,
+    ) -> Result<u64, crate::virtio::Fault> {
+        self.0.bar_read(offset, width)
+    }
+
+    fn bar_write(
+        &mut self,
+        offset: u64,
+        width: crate::virtio::Width,
+        value: u64,
+    ) -> Result<(), crate::virtio::Fault> {
+        let result = self.0.bar_write(offset, width, value);
+        if !self.0.executed.is_empty() {
+            self.0.stall = true;
+        }
+        result
+    }
+
+    fn mem_read(
+        &mut self,
+        offset: u64,
+        width: crate::virtio::Width,
+    ) -> Result<u64, crate::virtio::Fault> {
+        self.0.mem_read(offset, width)
+    }
+
+    fn mem_write(
+        &mut self,
+        offset: u64,
+        width: crate::virtio::Width,
+        value: u64,
+    ) -> Result<(), crate::virtio::Fault> {
+        self.0.mem_write(offset, width, value)
+    }
+}
+
+impl role::DeviceMapper<RecordingPlatform> for StallAfterFirst<'_> {
+    type Hardware = Stalling;
+
+    fn map(
+        &mut self,
+        platform: &mut RecordingPlatform,
+        root: DwHandle,
+        bar: DwHandle,
+        bar_bytes: u64,
+        dma: DwHandle,
+    ) -> Result<Stalling, wyrmroot_runtime::NativeError> {
+        self.0
+            .map(platform, root, bar, bar_bytes, dma)
+            .map(Stalling)
+    }
+
+    fn unmap(&mut self, platform: &mut RecordingPlatform, hardware: Stalling) -> bool {
+        self.0.unmap(platform, hardware.0)
+    }
 }
 
 #[test]
@@ -449,6 +1067,11 @@ fn a_function_with_other_ids_gets_no_ready_and_no_publication() {
     assert_eq!(code, role::FAILURE_BASE | StageError::WrongIds.code());
     assert!(sent_on(&calls, CONTROL).is_empty());
     assert!(sent_on(&calls, PUBLICATION).is_empty());
+    // The function was never touched beyond its config space.
+    assert!(!calls.iter().any(|call| matches!(
+        call,
+        Call::DevicePciCommand { .. } | Call::DeviceMmioObjectCreate { .. } | Call::DmaMap { .. }
+    )));
     assert!(calls.ends_with(&[
         Call::CloseHandle { handle: RESOURCE },
         Call::CloseHandle {

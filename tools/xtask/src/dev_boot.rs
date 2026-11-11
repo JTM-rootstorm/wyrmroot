@@ -8,7 +8,8 @@
 //!
 //! `--check` drives COM2 instead: it waits for the prompt, lists `services`
 //! until the boot-disk driver's `device.block.virtio0` is published (root
-//! `STORAGE_PLAN.md` W2), runs `bin/hello` (a shell job under its TaskGroup
+//! `STORAGE_PLAN.md` W2; since W3 the driver publishes only after a DMA read
+//! of block 0 through its virtqueue), runs `bin/hello` (a shell job under its TaskGroup
 //! limits) to its output and the next prompt, sends Ctrl-D, and
 //! requires the kernel's power-off line on COM1. That is the smoke check for
 //! development commits.

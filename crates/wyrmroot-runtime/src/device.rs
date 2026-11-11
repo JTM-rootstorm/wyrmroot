@@ -116,6 +116,67 @@ pub fn device_pci_config_read(
     Ok(value)
 }
 
+/// Sets a PCI_FUNCTION's command-register memory-space and bus-master bits;
+/// the kernel preserves every other bit and always clears I/O decoding.
+pub fn device_pci_command(
+    resource: DwHandle,
+    memory_space: bool,
+    bus_master: bool,
+) -> Result<(), NativeError> {
+    require_success(deepwyrm_syscall::device_pci_command(
+        resource,
+        memory_space,
+        bus_master,
+    ))
+}
+
+/// Creates a MemoryObject over one whole admitted memory BAR of a
+/// PCI_FUNCTION; map it with the ordinary mapping calls (uncached, never
+/// executable).
+pub fn device_mmio_object_create(
+    resource: DwHandle,
+    bar: u32,
+    requested_rights: DwRights,
+) -> Result<DwHandle, NativeError> {
+    let mut memory = DwHandle(0);
+    require_success(deepwyrm_syscall::device_mmio_object_create(
+        resource,
+        bar,
+        requested_rights,
+        &mut memory,
+    ))?;
+    nonzero_handle(memory)
+}
+
+/// Maps a page-aligned range of a MemoryObject into the function's IOMMU
+/// domain and returns the device-visible address (IOVA).
+pub fn dma_map(
+    resource: DwHandle,
+    memory_object: DwHandle,
+    offset: u64,
+    byte_len: u64,
+    access: u32,
+) -> Result<u64, NativeError> {
+    let mut iova = 0_u64;
+    require_success(deepwyrm_syscall::dma_map(
+        resource,
+        memory_object,
+        offset,
+        byte_len,
+        access,
+        &mut iova,
+    ))?;
+    if iova == 0 || !iova.is_multiple_of(crate::PAGE_SIZE) {
+        return Err(NativeError::Output(NativeOutputError::InvalidObjectInfo));
+    }
+    Ok(iova)
+}
+
+/// Removes one whole `dma_map` mapping by its exact IOVA and length.
+pub fn dma_unmap(resource: DwHandle, iova: u64, byte_len: u64) -> Result<(), NativeError> {
+    require_success(deepwyrm_syscall::dma_unmap(resource, iova, byte_len))
+}
+
 /// Writes one checked scalar to a generated DeviceResource PIO range.
 pub fn device_pio_write(
     resource: DwHandle,

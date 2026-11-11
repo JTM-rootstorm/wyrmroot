@@ -1,11 +1,13 @@
 //! The boot-disk virtio block driver (root `STORAGE_PLAN.md` W2/W3).
 //!
-//! W2 brings the driver up: devmgr moves it the boot disk's PCI-function
-//! DeviceResource with one WRDP STAGE, the driver admits it against its launch
-//! correlation, the kernel's resource facts and the function's live vendor and
-//! device IDs, answers READY, and publishes `device.block.virtio0`. The virtio
-//! transport and the BlockDevice protocol are W3; until then the driver
-//! closes every connection offer, and it never enables bus mastering.
+//! devmgr moves it the boot disk's PCI-function DeviceResource with one WRDP
+//! STAGE; the driver admits it against its launch correlation, the kernel's
+//! resource facts and the function's live vendor and device IDs, and answers
+//! READY (W2). It then brings the modern virtio device up behind the IOMMU,
+//! reads block 0 through its one polled split virtqueue, and only then
+//! publishes `device.block.virtio0`, which it serves with the WRBD
+//! BlockDevice protocol (W3; Wyrmroot `WYR1_C_DEVICE_COORDINATOR_CONTRACT.md`
+//! §3.1 item 6).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -168,5 +170,10 @@ pub const fn admit_config_ids(stage: AdmittedStage, ids: u32) -> Result<(), Stag
     Ok(())
 }
 
+pub mod block;
+pub mod virtio;
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod virtio_tests;

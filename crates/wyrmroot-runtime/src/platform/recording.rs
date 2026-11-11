@@ -190,6 +190,28 @@ pub enum Call {
     InterruptInfo {
         interrupt: DwHandle,
     },
+    DevicePciCommand {
+        resource: DwHandle,
+        memory_space: bool,
+        bus_master: bool,
+    },
+    DeviceMmioObjectCreate {
+        resource: DwHandle,
+        bar: u32,
+        requested_rights: DwRights,
+    },
+    DmaMap {
+        resource: DwHandle,
+        memory_object: DwHandle,
+        offset: u64,
+        byte_len: u64,
+        access: u32,
+    },
+    DmaUnmap {
+        resource: DwHandle,
+        iova: u64,
+        byte_len: u64,
+    },
 }
 
 /// One complete Channel datagram a scripted receive delivers.
@@ -210,8 +232,8 @@ pub enum Reply {
     HandlePair(Result<(DwHandle, DwHandle), NativeError>),
     /// `query_capability_info`.
     CapabilityInfo(Result<CapabilityInfo<DwObjectType, DwRights>, NativeError>),
-    /// `query_memory_object_size`, `monotonic_active_now`, and the selector-31
-    /// nonce methods.
+    /// `query_memory_object_size`, `monotonic_active_now`, `dma_map`, and the
+    /// selector-31 nonce methods.
     Value(Result<u64, NativeError>),
     /// `monotonic_deadline_after`.
     Deadline(Result<DwDeadline, NativeError>),
@@ -744,6 +766,62 @@ impl DevicePlatform for RecordingPlatform {
             self.mismatch("InterruptInfo", &reply)
         };
         result
+    }
+
+    fn device_pci_command(
+        &mut self,
+        resource: DwHandle,
+        memory_space: bool,
+        bus_master: bool,
+    ) -> Result<(), NativeError> {
+        self.unit(Call::DevicePciCommand {
+            resource,
+            memory_space,
+            bus_master,
+        })
+    }
+
+    fn device_mmio_object_create(
+        &mut self,
+        resource: DwHandle,
+        bar: u32,
+        requested_rights: DwRights,
+    ) -> Result<DwHandle, NativeError> {
+        self.handle(Call::DeviceMmioObjectCreate {
+            resource,
+            bar,
+            requested_rights,
+        })
+    }
+
+    fn dma_map(
+        &mut self,
+        resource: DwHandle,
+        memory_object: DwHandle,
+        offset: u64,
+        byte_len: u64,
+        access: u32,
+    ) -> Result<u64, NativeError> {
+        self.value(Call::DmaMap {
+            resource,
+            memory_object,
+            offset,
+            byte_len,
+            access,
+        })
+    }
+
+    fn dma_unmap(
+        &mut self,
+        resource: DwHandle,
+        iova: u64,
+        byte_len: u64,
+    ) -> Result<(), NativeError> {
+        self.unit(Call::DmaUnmap {
+            resource,
+            iova,
+            byte_len,
+        })
     }
 }
 

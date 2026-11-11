@@ -22,6 +22,7 @@ native-virtio-blkd = ["dep:wyrmroot-loader", "dep:wyrmroot-runtime"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true
+wyrmroot-block-proto = { path = "../../crates/wyrmroot-block-proto" }
 wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
 wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }

@@ -4,12 +4,16 @@
 
 use wyrmroot_runtime::{NativePlatform, StartupBlock};
 use {
-    deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_loader as _,
-    wyrmroot_registry_proto as _,
+    deepwyrm_syscall as _, wyrmroot_block_proto as _, wyrmroot_device_proto as _,
+    wyrmroot_loader as _, wyrmroot_registry_proto as _,
 };
 
 fn blk_main(startup: StartupBlock<'_>) -> u32 {
-    wyrmroot_virtio_blkd::role::blk_main(&mut NativePlatform, startup.bootstrap_channel().as_abi())
+    wyrmroot_virtio_blkd::role::blk_main(
+        &mut NativePlatform,
+        &mut wyrmroot_virtio_blkd::role::NativeMapper,
+        startup.bootstrap_channel().as_abi(),
+    )
 }
 
 #[cfg(target_os = "wyrmroot")]

@@ -68,8 +68,8 @@ pub const SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY: PublicationPolicy = Publi
     supervisor_role_id: SERIAL_CONSOLE_SUPERVISOR_ROLE_ID,
 };
 
-/// The boot disk's BlockDevice service (root `STORAGE_PLAN.md` W2/W3). Its
-/// `WRBD` protocol is defined by W3; until then a connection offer is closed.
+/// The boot disk's BlockDevice service (root `STORAGE_PLAN.md` W2/W3), served
+/// with the `WRBD` protocol (`wyrmroot-block-proto`).
 pub const BOOT_DISK_SERVICE_NAME: &[u8] = b"device.block.virtio0";
 pub const BLOCK_DEVICE_PROTOCOL_ID: u64 = u64::from_le_bytes(*b"WRBD\0\0\0\0");
 pub const BLOCK_DEVICE_SUPERVISOR_ROLE_ID: u32 = 3;

@@ -131,6 +131,90 @@ impl OwnedMemoryMapping {
     }
 }
 
+/// Volatile scalar access to a live mapping, for device registers and memory
+/// shared with a device through the IOMMU.
+///
+/// Each access is bounds- and alignment-checked against this mapping and goes
+/// through a raw pointer, never a Rust reference, so a device or another
+/// mapping changing the same bytes does not break Rust's aliasing rules. The
+/// mapping is live for as long as this token exists: only
+/// [`crate::unmap_memory`] removes it, and that consumes the token.
+impl OwnedMemoryMapping {
+    /// The mapping's length in bytes.
+    pub const fn byte_len(&self) -> u64 {
+        self.bytes
+    }
+
+    fn scalar_address<T>(&self, offset: u64) -> Result<u64, NativeError> {
+        let width = core::mem::size_of::<T>() as u64;
+        let end = offset
+            .checked_add(width)
+            .ok_or(NativeError::Output(NativeOutputError::InvalidMappedRange))?;
+        if end > self.bytes || !offset.is_multiple_of(width) {
+            return Err(NativeError::Output(NativeOutputError::InvalidMappedRange));
+        }
+        self.address
+            .0
+            .checked_add(offset)
+            .ok_or(NativeError::Output(NativeOutputError::InvalidMappedRange))
+    }
+
+    fn read_scalar<T: Copy>(&self, offset: u64) -> Result<T, NativeError> {
+        let address = self.scalar_address::<T>(offset)?;
+        // SAFETY: the range was validated at mapping time, the access lies
+        // within it and is naturally aligned, and the mapping is live while
+        // this token exists. Volatile access through a raw pointer makes no
+        // claim of exclusivity over bytes a device may change.
+        Ok(unsafe { core::ptr::read_volatile(address as *const T) })
+    }
+
+    fn write_scalar<T: Copy>(&mut self, offset: u64, value: T) -> Result<(), NativeError> {
+        if !self.writable {
+            return Err(NativeError::Status(
+                deepwyrm_syscall::DW_STATUS_ACCESS_DENIED,
+            ));
+        }
+        let address = self.scalar_address::<T>(offset)?;
+        // SAFETY: as for `read_scalar`; the mapping is writable.
+        unsafe { core::ptr::write_volatile(address as *mut T, value) };
+        Ok(())
+    }
+
+    pub fn read_u8(&self, offset: u64) -> Result<u8, NativeError> {
+        self.read_scalar(offset)
+    }
+
+    pub fn read_u16(&self, offset: u64) -> Result<u16, NativeError> {
+        self.read_scalar(offset)
+    }
+
+    pub fn read_u32(&self, offset: u64) -> Result<u32, NativeError> {
+        self.read_scalar(offset)
+    }
+
+    pub fn write_u8(&mut self, offset: u64, value: u8) -> Result<(), NativeError> {
+        self.write_scalar(offset, value)
+    }
+
+    pub fn write_u16(&mut self, offset: u64, value: u16) -> Result<(), NativeError> {
+        self.write_scalar(offset, value)
+    }
+
+    pub fn write_u32(&mut self, offset: u64, value: u32) -> Result<(), NativeError> {
+        self.write_scalar(offset, value)
+    }
+
+    /// One naturally aligned 64-bit access. Device registers that the
+    /// device's specification splits into 32-bit halves need two `write_u32`.
+    pub fn write_u64(&mut self, offset: u64, value: u64) -> Result<(), NativeError> {
+        self.write_scalar(offset, value)
+    }
+
+    pub fn read_u64(&self, offset: u64) -> Result<u64, NativeError> {
+        self.read_scalar(offset)
+    }
+}
+
 #[cfg(any(test, feature = "platform-recording"))]
 impl OwnedMemoryMapping {
     /// The root region and byte extent, for the recording platform's call log.
@@ -460,6 +544,66 @@ mod materialization_tests {
             requested_child.0,
             DW_RIGHT_READ.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0
         );
+    }
+}
+
+#[cfg(test)]
+mod volatile_access_tests {
+    use super::*;
+
+    /// A token over a host buffer: the accessors only ever dereference the
+    /// token's own address and length.
+    fn over(buffer: &mut [u64], writable: bool) -> OwnedMemoryMapping {
+        OwnedMemoryMapping {
+            root: DwHandle(1),
+            address: DwUserAddress(buffer.as_mut_ptr() as u64),
+            bytes: (buffer.len() * 8) as u64,
+            writable,
+        }
+    }
+
+    #[test]
+    fn scalars_round_trip_little_endian_at_their_offsets() {
+        let mut buffer = [0u64; 2];
+        let mut mapping = over(&mut buffer, true);
+        mapping.write_u32(0, 0x1122_3344).unwrap();
+        mapping.write_u16(4, 0x5566).unwrap();
+        mapping.write_u8(6, 0x77).unwrap();
+        mapping.write_u64(8, 0x0102_0304_0506_0708).unwrap();
+        assert_eq!(mapping.read_u8(0), Ok(0x44));
+        assert_eq!(mapping.read_u16(2), Ok(0x1122));
+        assert_eq!(mapping.read_u32(4), Ok(0x0077_5566));
+        assert_eq!(mapping.read_u64(8), Ok(0x0102_0304_0506_0708));
+        assert_eq!(mapping.byte_len(), 16);
+        assert_eq!(buffer[0], 0x0077_5566_1122_3344);
+    }
+
+    #[test]
+    fn accesses_outside_or_misaligned_or_unwritable_are_refused() {
+        let mut buffer = [0u64; 2];
+        let mut mapping = over(&mut buffer, true);
+        fn refused<T>(result: Result<T, NativeError>) -> bool {
+            matches!(
+                result,
+                Err(NativeError::Output(NativeOutputError::InvalidMappedRange))
+            )
+        }
+        assert!(refused(mapping.read_u8(16)));
+        assert!(refused(mapping.read_u32(14)));
+        assert!(refused(mapping.read_u64(16)));
+        assert!(refused(mapping.read_u64(u64::MAX - 3)));
+        assert!(refused(mapping.read_u16(1)));
+        assert!(refused(mapping.read_u32(2)));
+        assert!(refused(mapping.write_u64(4, 1)));
+        assert_eq!(buffer, [0; 2]);
+        let mut read_only = over(&mut buffer, false);
+        assert_eq!(
+            read_only.write_u8(0, 1),
+            Err(NativeError::Status(
+                deepwyrm_syscall::DW_STATUS_ACCESS_DENIED
+            ))
+        );
+        assert_eq!(read_only.read_u8(0), Ok(0));
     }
 }
 
