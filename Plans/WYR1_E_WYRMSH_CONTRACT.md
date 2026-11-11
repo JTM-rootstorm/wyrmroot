@@ -285,7 +285,9 @@ transaction:
    connection with live orphan jobs retains its own bounded tombstone/accounting
    until those jobs reach terminal and are reaped. It may coexist with S2 when
    capacity permits; it never grants S2 access to those jobs. Normal shell exit
-   does not silently terminate every old background job.
+   does not silently terminate every old background job. Retention is bounded
+   by WYR1-B §9.4: beyond its limits, the oldest disconnected connection's
+   orphans are terminated and reaped.
 
 Ordinary S1-to-S2 child restart on healthy consoled C1 preserves C1's console
 generation and ConsoleLauncher connection. It refreshes child/status/registry

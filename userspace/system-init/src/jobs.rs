@@ -19,6 +19,15 @@ use wyrmroot_runtime::{
 };
 
 pub(crate) const MAX_CONNECTIONS: usize = 16;
+/// Closed connections that may keep live orphans. The rest of
+/// `MAX_CONNECTIONS` stays free for live consoles, shells and their
+/// replacements, so orphans can never stop a new shell from starting
+/// (F4 WYR1-F4-M1).
+pub(crate) const MAX_ORPHAN_CONNECTIONS: usize = 8;
+/// Live orphan jobs across every closed connection. The rest of
+/// `MAX_LIVE_JOBS` stays free for live sessions.
+pub(crate) const MAX_ORPHAN_JOBS: usize = MAX_LIVE_JOBS / 2;
+const _: () = assert!(MAX_ORPHAN_CONNECTIONS + 4 <= MAX_CONNECTIONS);
 pub(crate) const REPLAY_RECORDS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -258,6 +267,8 @@ pub(crate) struct Connection {
     pub(crate) identity: ConnectionIdentity,
     pub(crate) replay: Replay,
     pub(crate) open: bool,
+    /// Order in which the connection closed; zero while it is open.
+    pub(crate) closed_order: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,6 +301,7 @@ pub(crate) struct JobController {
     pub(crate) completed_start: usize,
     pub(crate) completed_len: usize,
     pub(crate) next_job_id: u64,
+    pub(crate) next_closed_order: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -442,6 +454,7 @@ impl JobController {
             completed_start: 0,
             completed_len: 0,
             next_job_id: 1,
+            next_closed_order: 1,
         }
     }
 
@@ -464,6 +477,7 @@ impl JobController {
             identity,
             replay: Replay::new(),
             open: true,
+            closed_order: 0,
         });
         Ok(())
     }
@@ -915,8 +929,13 @@ impl JobController {
 
     pub(crate) fn disconnect(&mut self, id: u64, generation: u64) -> Result<(), JobError> {
         let identity = identity(id, generation)?;
+        let closed_order = self.next_closed_order;
+        self.next_closed_order = closed_order
+            .checked_add(1)
+            .ok_or(JobError::ArithmeticOverflow)?;
         let connection = self.connection_mut(identity)?;
         connection.open = false;
+        connection.closed_order = closed_order;
         for job in self
             .jobs
             .iter_mut()
@@ -938,6 +957,64 @@ impl JobController {
 
     /// Reclaims closed session slots only after their retained orphan jobs
     /// have terminally completed. IDs are never reassigned by this operation.
+    /// Orphans that must be terminated to bring closed connections back within
+    /// `MAX_ORPHAN_CONNECTIONS` and `MAX_ORPHAN_JOBS`: every still-running
+    /// orphan of the oldest closed connections, oldest first. Retain-and-reap
+    /// (WYR1-B 9.4) keeps recent background jobs running; only the bound is
+    /// new. Returns how many job IDs were written to `out`.
+    pub(crate) fn orphans_to_retire(&self, out: &mut [u64; MAX_LIVE_JOBS]) -> usize {
+        let running =
+            |job: &&Job| job.orphaned && job.terminal.is_none() && job.phase == JobPhase::Running;
+        let holds = |identity: ConnectionIdentity| {
+            self.jobs
+                .iter()
+                .flatten()
+                .filter(running)
+                .filter(|job| job.owner == identity)
+                .count()
+        };
+        let mut connections = 0;
+        let mut orphans = 0;
+        for connection in self.connections.iter().flatten() {
+            let held = holds(connection.identity);
+            if !connection.open && held != 0 {
+                connections += 1;
+                orphans += held;
+            }
+        }
+        let mut written = 0;
+        let mut retired_up_to = 0;
+        while connections > MAX_ORPHAN_CONNECTIONS || orphans > MAX_ORPHAN_JOBS {
+            let Some(oldest) = self
+                .connections
+                .iter()
+                .flatten()
+                .filter(|connection| {
+                    !connection.open
+                        && connection.closed_order > retired_up_to
+                        && holds(connection.identity) != 0
+                })
+                .min_by_key(|connection| connection.closed_order)
+            else {
+                break;
+            };
+            retired_up_to = oldest.closed_order;
+            for job in self
+                .jobs
+                .iter()
+                .flatten()
+                .filter(running)
+                .filter(|job| job.owner == oldest.identity)
+            {
+                out[written] = job.id;
+                written += 1;
+                orphans -= 1;
+            }
+            connections -= 1;
+        }
+        written
+    }
+
     pub(crate) fn reclaim_closed_sessions(&mut self) {
         for slot in &mut self.connections {
             let Some(connection) = *slot else {
@@ -1330,5 +1407,98 @@ mod tests {
                 deepwyrm_syscall::DwHandle(10),
             ]
         );
+    }
+
+    fn hog(controller: &mut JobController, owner: ConnectionIdentity, id: u64) {
+        let slot = controller.jobs.iter().position(Option::is_none).unwrap();
+        controller.jobs[slot] = Some(Job {
+            id,
+            owner,
+            phase: JobPhase::Running,
+            orphaned: false,
+            process: 100 + id,
+            task_group: 200 + id,
+            launch_channel: 300 + id,
+            terminal: None,
+            cleanup_result: 0,
+            published: true,
+        });
+    }
+
+    /// F4 WYR1-F4-M1: repeated `spawn bin/cpu-hog; exit` keeps the newest
+    /// orphans running but never lets them hold more than the orphan bounds,
+    /// so a new shell connection can always open.
+    #[test]
+    fn orphans_beyond_the_bounds_are_retired_oldest_first() {
+        let mut controller = JobController::new();
+        let mut out = [0; MAX_LIVE_JOBS];
+        for shell in 1..=40_u64 {
+            controller.reclaim_closed_sessions();
+            controller.open_connection(shell, 1).unwrap();
+            let owner = identity(shell, 1).unwrap();
+            hog(&mut controller, owner, shell);
+            controller.disconnect(shell, 1).unwrap();
+            let count = controller.orphans_to_retire(&mut out);
+            for &job_id in &out[..count] {
+                let job = controller
+                    .jobs
+                    .iter_mut()
+                    .flatten()
+                    .find(|job| job.id == job_id)
+                    .unwrap();
+                assert!(job.orphaned);
+                // The kernel ends the task group; the poll loop reaps it.
+                job.phase = JobPhase::Terminating;
+            }
+            controller.jobs.iter_mut().for_each(|slot| {
+                if slot.is_some_and(|job| job.phase == JobPhase::Terminating) {
+                    *slot = None;
+                }
+            });
+            let held = controller.jobs.iter().flatten().count();
+            assert!(held <= MAX_ORPHAN_CONNECTIONS, "shell {shell}: {held}");
+            if shell > MAX_ORPHAN_CONNECTIONS as u64 {
+                // Exactly the oldest went; the newest eight are still running.
+                assert_eq!(count, 1);
+                assert_eq!(out[0], shell - MAX_ORPHAN_CONNECTIONS as u64);
+            } else {
+                assert_eq!(count, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn many_orphans_of_one_connection_are_bounded_by_job_count() {
+        let mut controller = JobController::new();
+        let mut out = [0; MAX_LIVE_JOBS];
+        controller.open_connection(1, 1).unwrap();
+        controller.open_connection(2, 1).unwrap();
+        for id in 1..=10 {
+            hog(&mut controller, identity(1, 1).unwrap(), id);
+        }
+        for id in 11..=20 {
+            hog(&mut controller, identity(2, 1).unwrap(), id);
+        }
+        controller.disconnect(1, 1).unwrap();
+        assert_eq!(controller.orphans_to_retire(&mut out), 0);
+        controller.disconnect(2, 1).unwrap();
+        // Twenty orphans exceed the bound of sixteen: the older connection's
+        // ten go, the newer connection's ten stay.
+        assert_eq!(controller.orphans_to_retire(&mut out), 10);
+        let mut retired = [0; 10];
+        retired.copy_from_slice(&out[..10]);
+        retired.sort_unstable();
+        assert_eq!(retired, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn open_connections_are_never_retired() {
+        let mut controller = JobController::new();
+        let mut out = [0; MAX_LIVE_JOBS];
+        controller.open_connection(1, 1).unwrap();
+        for id in 1..=MAX_LIVE_JOBS as u64 {
+            hog(&mut controller, identity(1, 1).unwrap(), id);
+        }
+        assert_eq!(controller.orphans_to_retire(&mut out), 0);
     }
 }

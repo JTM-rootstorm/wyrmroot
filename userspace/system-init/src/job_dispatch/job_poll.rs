@@ -6,6 +6,42 @@ use super::*;
 /// current registry generation and poison state; request bytes cannot select
 /// either authority.
 #[allow(clippy::too_many_arguments)]
+/// Terminates the orphans that keep closed connections over their bounds
+/// (F4 WYR1-F4-M1). Each job's task group is ended here; the poll loop then
+/// observes the exit and reaps it, as for any other job, and the empty
+/// connection slot is reclaimed. Returns whether any termination failed.
+fn retire_excess_orphans<S: ResidentPlatform>(
+    system: &mut S,
+    jobs: &mut JobDispatcher,
+) -> Result<bool, InitError> {
+    let mut retire = [0; wyrmroot_launch_proto::MAX_LIVE_JOBS];
+    let count = jobs.jobs.orphans_to_retire(&mut retire);
+    let mut failed = false;
+    for &job_id in &retire[..count] {
+        let Some(resources) = jobs
+            .jobs
+            .forced_termination_resources(job_id)
+            .map_err(InitError::Jobs)?
+        else {
+            continue;
+        };
+        if system
+            .terminate_task_group(DwHandle(resources.task_group))
+            .is_err()
+        {
+            jobs.jobs
+                .record_cleanup_bits(job_id, 1 << 0)
+                .map_err(InitError::Jobs)?;
+            failed = true;
+        } else {
+            jobs.jobs
+                .commit_forced_termination(job_id, resources)
+                .map_err(InitError::Jobs)?;
+        }
+    }
+    Ok(failed)
+}
+
 pub(crate) fn poll_job_dispatcher_with_shell<S, L, W>(
     system: &mut S,
     loader: &mut L,
@@ -212,6 +248,7 @@ where
                         failed |=
                             cleanup_shell_before_publication(system, waits, jobs, outer).is_err();
                     }
+                    failed |= retire_excess_orphans(system, jobs)?;
                     if failed {
                         return Err(InitError::Cleanup);
                     }

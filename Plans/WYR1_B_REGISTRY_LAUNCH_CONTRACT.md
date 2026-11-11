@@ -595,6 +595,14 @@ controller records, permits the job to run, observes terminal state, and reaps
 it exactly once. A later connection cannot reattach to the orphan. This creates
 neither leaked children nor ambient cross-connection kill authority.
 
+Retention is bounded (F4 WYR1-F4-M1, 2026-11-10). At most
+`MAX_ORPHAN_CONNECTIONS` (8) closed connections may hold running orphans, and
+at most `MAX_ORPHAN_JOBS` (16) orphans may run in total. When a disconnect
+exceeds either bound, init terminates every running orphan of the oldest
+closed connections until both hold, then reaps them through the ordinary path.
+The remaining connection and job capacity therefore stays available to live
+sessions, so orphans that never exit cannot stop a new shell from starting.
+
 ### 9.5 Slice-F dispatcher dispositions
 
 Slice F fixes the following controller behavior for selector 27 only. These
