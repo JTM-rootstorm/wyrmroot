@@ -1,0 +1,18 @@
+[package]
+name = "wyrmroot-channel-model"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Host-only in-memory model of Deepwyrm Channels, waits, clocks and MemoryObjects for service tests"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-runtime = { path = "../wyrmroot-runtime" }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_crate_dependencies = "deny"

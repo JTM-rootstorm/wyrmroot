@@ -1,0 +1,24 @@
+[package]
+name = "wyrmroot-service"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Service-role startup, stage, registry publication and client helpers"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-loader = { path = "../wyrmroot-loader" }
+wyrmroot-registry-proto = { path = "../wyrmroot-registry-proto" }
+wyrmroot-runtime = { path = "../wyrmroot-runtime" }
+wyrmroot-service-proto = { path = "../wyrmroot-service-proto" }
+
+[dev-dependencies]
+wyrmroot-channel-model = { path = "../wyrmroot-channel-model" }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_crate_dependencies = "deny"

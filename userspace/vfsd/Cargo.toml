@@ -14,6 +14,9 @@ deepwyrm-syscall.workspace = true
 wyrmroot-fs-proto = { path = "../../crates/wyrmroot-fs-proto" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
 
+[dev-dependencies]
+wyrmroot-channel-model = { path = "../../crates/wyrmroot-channel-model" }
+
 [lints.rust]
 unsafe_code = "forbid"
 unused_crate_dependencies = "deny"

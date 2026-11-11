@@ -184,6 +184,14 @@ name = "wyrmroot-bootstrap-proto"
 version = "0.0.0"
 
 [[package]]
+name = "wyrmroot-channel-model"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-runtime",
+]
+
+[[package]]
 name = "wyrmroot-console-proto"
 version = "0.0.0"
 
@@ -298,6 +306,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrmroot-service"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-channel-model",
+ "wyrmroot-loader",
+ "wyrmroot-registry-proto",
+ "wyrmroot-runtime",
+ "wyrmroot-service-proto",
+]
+
+[[package]]
+name = "wyrmroot-service-proto"
+version = "0.0.0"
+
+[[package]]
 name = "wyrmroot-stream-proto"
 version = "0.0.0"
 
@@ -341,6 +365,7 @@ name = "wyrmroot-vfsd"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
+ "wyrmroot-channel-model",
  "wyrmroot-fs-proto",
  "wyrmroot-runtime",
 ]
