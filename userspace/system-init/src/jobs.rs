@@ -32,8 +32,19 @@ pub(crate) const MAX_SHELL_JOBS: usize = 4;
 /// Live orphan jobs across every closed connection. The rest of
 /// `MAX_SHELL_JOBS` stays free for the live shell.
 pub(crate) const MAX_ORPHAN_JOBS: usize = MAX_SHELL_JOBS / 2;
+// Init's own wait usage does not grow with jobs. Init is single-threaded and
+// polls each session with a one-item, deadline-now wait and each job with
+// `query_task_termination`; its only blocking job wait is one item, while a
+// launch awaits READY. So init holds at most one registered wait item at a
+// time, and deepwyrm's two exit waits per live job are a conservative
+// allowance.
+
+/// Live shell jobs one ShellJobs connection may hold, so one shell cannot
+/// take every `MAX_SHELL_JOBS` slot from another.
+pub(crate) const MAX_JOBS_PER_SHELL: usize = MAX_SHELL_JOBS - 1;
 /// Each job's own TaskGroup limits: a job creates no kernel objects of its
-/// own and registers at most one wait (deepwyrm's `JOB_OWN_WAITS`). Init
+/// own and registers at most four wait items, enough for a small wait-many
+/// (deepwyrm's `JOB_OWN_WAITS`). Init
 /// creates the job's Process, Thread, memory and channels, so those are
 /// charged to init and bounded by `MAX_SHELL_JOBS`.
 pub const JOB_TASK_GROUP_LIMITS: [(u32, u32); 8] = [
@@ -44,7 +55,7 @@ pub const JOB_TASK_GROUP_LIMITS: [(u32, u32); 8] = [
     (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_THREAD, 0),
     (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_PROCESS, 0),
     (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_TASK_GROUP, 0),
-    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_WAIT, 1),
+    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_WAIT, 4),
 ];
 const _: () = assert!(MAX_ORPHAN_CONNECTIONS + 4 <= MAX_CONNECTIONS);
 pub(crate) const REPLAY_RECORDS: usize = 32;
@@ -518,16 +529,16 @@ impl JobController {
         request: RequestTicket,
         shell_job: bool,
     ) -> Result<LaunchTicket, JobError> {
-        if shell_job
-            && self
-                .jobs
-                .iter()
-                .flatten()
-                .filter(|job| job.shell_job)
-                .count()
-                >= MAX_SHELL_JOBS
-        {
-            return Err(JobError::Capacity);
+        if shell_job {
+            let shell_jobs = || self.jobs.iter().flatten().filter(|job| job.shell_job);
+            if shell_jobs().count() >= MAX_SHELL_JOBS
+                || shell_jobs()
+                    .filter(|job| job.owner == request.owner)
+                    .count()
+                    >= MAX_JOBS_PER_SHELL
+            {
+                return Err(JobError::Capacity);
+            }
         }
         let slot = self
             .jobs
@@ -758,6 +769,22 @@ impl JobController {
         }
         job.phase = JobPhase::Terminating;
         Ok(())
+    }
+
+    /// The TaskGroup of a running job whose forced termination the kernel
+    /// refused (cleanup bit 0), so the poll loop can try it again rather
+    /// than leave the job holding its slot.
+    pub(crate) fn termination_to_retry(&self, job_id: u64) -> Option<JobResources> {
+        let job = self.jobs.iter().flatten().find(|job| job.id == job_id)?;
+        (job.cleanup_result & 1 != 0
+            && job.phase == JobPhase::Running
+            && job.terminal.is_none()
+            && job.task_group != 0)
+            .then_some(JobResources {
+                process: job.process,
+                task_group: job.task_group,
+                launch_channel: job.launch_channel,
+            })
     }
 
     pub(crate) fn record_cleanup_bits(&mut self, job_id: u64, bits: u32) -> Result<(), JobError> {
@@ -1539,30 +1566,60 @@ mod tests {
     }
 
     /// F4 DW1-F4-M1: a fifth concurrent shell job is refused; the kernel is
-    /// sized for four. The shell's own launch is not a shell job.
+    /// sized for four. One shell holds at most `MAX_JOBS_PER_SHELL`, so it
+    /// cannot take every slot from another. The shell's own launch is not a
+    /// shell job.
     #[test]
     fn shell_jobs_are_capped_at_the_kernel_geometry() {
         let mut controller = JobController::new();
         controller.open_connection(1, 1).unwrap();
-        let ticket = |controller: &mut JobController, transaction_id| {
+        controller.open_connection(2, 1).unwrap();
+        let ticket = |controller: &mut JobController, connection_id, transaction_id| {
             controller
                 .reserve_request(Reservation {
-                    connection_id: 1,
+                    connection_id,
                     generation: 1,
                     transaction_id,
                 })
                 .unwrap()
         };
-        for transaction in 1..=MAX_SHELL_JOBS as u64 {
-            let request = ticket(&mut controller, transaction);
+        for transaction in 1..=MAX_JOBS_PER_SHELL as u64 {
+            let request = ticket(&mut controller, 1, transaction);
             controller.begin_reserved_launch(request, true).unwrap();
         }
-        let request = ticket(&mut controller, 100);
+        let request = ticket(&mut controller, 1, 50);
         assert_eq!(
             controller.begin_reserved_launch(request, true),
             Err(JobError::Capacity)
         );
-        let request = ticket(&mut controller, 101);
+        for transaction in (MAX_JOBS_PER_SHELL + 1)..=MAX_SHELL_JOBS {
+            let request = ticket(&mut controller, 2, transaction as u64);
+            controller.begin_reserved_launch(request, true).unwrap();
+        }
+        let request = ticket(&mut controller, 2, 100);
+        assert_eq!(
+            controller.begin_reserved_launch(request, true),
+            Err(JobError::Capacity)
+        );
+        let request = ticket(&mut controller, 1, 101);
         assert!(controller.begin_reserved_launch(request, false).is_ok());
+    }
+
+    /// A job whose forced termination the kernel refused is offered for a
+    /// retry until it is committed; a healthy running job is not.
+    #[test]
+    fn a_refused_termination_is_retried() {
+        let mut controller = JobController::new();
+        controller.open_connection(1, 1).unwrap();
+        hog(&mut controller, identity(1, 1).unwrap(), 1);
+        hog(&mut controller, identity(1, 1).unwrap(), 2);
+        assert_eq!(controller.termination_to_retry(1), None);
+        controller.record_cleanup_bits(1, 1 << 0).unwrap();
+        let resources = controller
+            .termination_to_retry(1)
+            .expect("refused termination offered for retry");
+        assert_eq!(controller.termination_to_retry(2), None);
+        controller.commit_forced_termination(1, resources).unwrap();
+        assert_eq!(controller.termination_to_retry(1), None);
     }
 }

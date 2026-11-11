@@ -4,6 +4,11 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_ELF_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PROGRAM_HEADERS: usize = 16;
 pub const MAX_LOAD_SEGMENTS: usize = 8;
+/// PT_LOAD segments a JobV2 image may have. Deepwyrm's production geometry
+/// budgets each live shell job this many image MemoryObjects plus its stack
+/// (`JOB_IMAGE_OBJECTS`), and init creates those objects, so the loader
+/// enforces the bound rather than the job's TaskGroup limits.
+pub const MAX_JOB_LOAD_SEGMENTS: usize = 2;
 pub const MAX_MAPPED_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 pub const USER_END_EXCLUSIVE: u64 = 0x0000_8000_0000_0000;
 pub const STACK_TOP: u64 = 0x0000_7fff_ffff_0000;

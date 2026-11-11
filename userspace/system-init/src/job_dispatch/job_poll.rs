@@ -17,29 +17,51 @@ fn retire_excess_orphans<S: ResidentPlatform>(
     let mut retire = [0; wyrmroot_launch_proto::MAX_LIVE_JOBS];
     let count = jobs.jobs.orphans_to_retire(&mut retire);
     let mut failed = false;
+    // Every listed orphan is attempted; an accounting error on one is
+    // reported after the rest, not instead of them.
+    let mut first_error = None;
     for &job_id in &retire[..count] {
-        let Some(resources) = jobs
-            .jobs
-            .forced_termination_resources(job_id)
-            .map_err(InitError::Jobs)?
-        else {
-            continue;
-        };
-        if system
-            .terminate_task_group(DwHandle(resources.task_group))
-            .is_err()
-        {
-            jobs.jobs
-                .record_cleanup_bits(job_id, 1 << 0)
-                .map_err(InitError::Jobs)?;
-            failed = true;
-        } else {
-            jobs.jobs
-                .commit_forced_termination(job_id, resources)
-                .map_err(InitError::Jobs)?;
+        match terminate_orphan(system, jobs, job_id) {
+            Ok(terminated) => failed |= !terminated,
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
     }
-    Ok(failed)
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(failed),
+    }
+}
+
+/// Ends one job's TaskGroup, recording a refusal as cleanup bit 0 for the
+/// poll loop to retry. Returns whether the termination was committed (or
+/// the job needs none).
+fn terminate_orphan<S: ResidentPlatform>(
+    system: &mut S,
+    jobs: &mut JobDispatcher,
+    job_id: u64,
+) -> Result<bool, InitError> {
+    let Some(resources) = jobs
+        .jobs
+        .forced_termination_resources(job_id)
+        .map_err(InitError::Jobs)?
+    else {
+        return Ok(true);
+    };
+    if system
+        .terminate_task_group(DwHandle(resources.task_group))
+        .is_err()
+    {
+        jobs.jobs
+            .record_cleanup_bits(job_id, 1 << 0)
+            .map_err(InitError::Jobs)?;
+        return Ok(false);
+    }
+    jobs.jobs
+        .commit_forced_termination(job_id, resources)
+        .map_err(InitError::Jobs)?;
+    Ok(true)
 }
 
 pub(crate) fn poll_job_dispatcher_with_shell<S, L, W>(
@@ -279,6 +301,19 @@ where
                 }
             }
         };
+        if !exited && let Some(resources) = jobs.jobs.termination_to_retry(loaded.job_id) {
+            // A termination the kernel refused earlier is tried again each
+            // time the job comes round, so the job cannot hold its slot
+            // forever. Its cleanup bit stays set as the record of the refusal.
+            if system
+                .terminate_task_group(DwHandle(resources.task_group))
+                .is_ok()
+            {
+                jobs.jobs
+                    .commit_forced_termination(loaded.job_id, resources)
+                    .map_err(InitError::Jobs)?;
+            }
+        }
         if exited {
             let result = reap_job(system, waits, jobs, loaded)?;
             let nested = close_shell_session_for_job(system, jobs, loaded.job_id);

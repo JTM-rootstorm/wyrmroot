@@ -65,6 +65,9 @@ pub(crate) fn load_process_internal<P: LoaderPlatform>(
             delegated_channels_consumed,
             plan,
         ),
+        StartupSpec::JobV2 { .. } if plan.segments.len() > elf::MAX_JOB_LOAD_SEGMENTS => Err(
+            LoadError::Elf(ElfError::TooManyLoadSegments(plan.segments.len())),
+        ),
         StartupSpec::JobV2 {
             path,
             argv,

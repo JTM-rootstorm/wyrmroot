@@ -3,7 +3,7 @@ use deepwyrm_syscall::{
     DwRights,
 };
 use wyrmroot_loader::{
-    elf::{STACK_BOTTOM, STACK_BYTES},
+    elf::{ElfError, MAX_JOB_LOAD_SEGMENTS, STACK_BOTTOM, STACK_BYTES},
     launch::{
         DEVICE_MANIFEST_RIGHTS, DEVICE_MANIFEST_TRANSFER_RIGHTS, LaunchProfile,
         RESOURCE_DOMAIN_CLAIM_RIGHTS, RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS,
@@ -1471,6 +1471,43 @@ fn job_v2_selects_zero_or_three_stream_profile_and_retains_streams_on_failed_mov
     }
 }
 
+/// F4: deepwyrm budgets a job image at `MAX_JOB_LOAD_SEGMENTS` PT_LOADs, so
+/// a JobV2 image with more is refused before any platform operation.
+#[test]
+fn job_images_are_bounded_to_the_kernel_budget_of_load_segments() {
+    let argv = ["bin/hello"];
+    let load = |image: &[u8]| {
+        let mut platform = Mock::new(None);
+        let result = load_job_process(
+            &mut platform,
+            authority(),
+            JobLoadRequest {
+                image,
+                policy_path: "bin/hello",
+                argv: &argv,
+                environment: &[],
+                streams: &[],
+                transaction_id: 0x1330,
+            },
+        );
+        (
+            result.map(|_| ()).map_err(|error| error.error),
+            platform.events,
+        )
+    };
+    let fits = executable_with_loads(MAX_JOB_LOAD_SEGMENTS as u16);
+    assert_eq!(load(&fits).0, Ok(()));
+    let over = executable_with_loads(MAX_JOB_LOAD_SEGMENTS as u16 + 1);
+    let (result, events) = load(&over);
+    assert_eq!(
+        result,
+        Err(LoadError::Elf(ElfError::TooManyLoadSegments(
+            MAX_JOB_LOAD_SEGMENTS + 1
+        )))
+    );
+    assert!(events.is_empty());
+}
+
 #[test]
 fn job_load_reports_stream_ownership_after_successful_init_move() {
     let image = executable();
@@ -1907,6 +1944,24 @@ fn executable() -> Vec<u8> {
     put64(&mut bytes, 96, 16);
     put64(&mut bytes, 104, 32);
     put64(&mut bytes, 112, 4096);
+    bytes
+}
+/// `executable` with `loads` page-separated PT_LOADs: R+X, then R, then RW.
+fn executable_with_loads(loads: u16) -> Vec<u8> {
+    let mut bytes = executable();
+    bytes.resize(0x1000 * (usize::from(loads) + 1), 0);
+    put16(&mut bytes, 56, loads);
+    for index in 0..u64::from(loads) {
+        let header = 64 + 56 * index as usize;
+        put32(&mut bytes, header, 1);
+        put32(&mut bytes, header + 4, [5, 4, 6][(index as usize).min(2)]);
+        put64(&mut bytes, header + 8, 0x1000 * (index + 1));
+        put64(&mut bytes, header + 16, 0x400000 + 0x1000 * index);
+        put64(&mut bytes, header + 24, 0x400000 + 0x1000 * index);
+        put64(&mut bytes, header + 32, 16);
+        put64(&mut bytes, header + 40, 32);
+        put64(&mut bytes, header + 48, 4096);
+    }
     bytes
 }
 fn put16(bytes: &mut [u8], at: usize, value: u16) {
