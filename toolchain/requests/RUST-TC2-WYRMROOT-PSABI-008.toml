@@ -1,0 +1,85 @@
+schema_version = 1
+request_id = "RUST-TC2-WYRMROOT-PSABI-008"
+coordinator_request_id = "RUST-TC2-WYRMROOT-PSABI-008"
+artifact_request_id = "RUST-TC2-WYRMROOT-PSABI-008"
+status = "accepted-immutable-artifact"
+request_kind = "rebuild-wyrmroot-rust-toolchain-for-target-change"
+
+[requirement]
+phase_gate = "TOOLCHAIN_PLAN.md step 2 prerequisite D2 (TOOLCHAIN_LLVM_FORK_RULES.md O4)"
+consumer_repository = "wyrmroot"
+consumer_revision = "the Wyrmroot commit containing this exact request record"
+expected_behavior = "x86_64-unknown-wyrmroot uses the SysV x86-64 psABI: no soft-float ABI and no disabled features, so it advertises exactly the x86-64 baseline (x87, fxsr, sse, sse2) and passes float and double in SSE registers, matching clang's x86_64-unknown-wyrmroot from LLVM-TC2-WYRMROOT-PSABI-002. Safe only on Deepwyrm 948cc7e or later, which saves each user thread's x87/SSE/AVX state."
+consumer_checks = [
+    "tools/pinned-cargo xtask dev-boot --check",
+    "tools/pinned-cargo xtask dev-boot --check --smp",
+    "<accepted-rustc> --print cfg --target x86_64-unknown-wyrmroot",
+]
+
+[rust]
+canonical_base_commit = "e6b7d48fa865da31cb6f4fa224db8abf3df81b5d"
+accepted_commit = "d54c16b7f2160f9c5bd61456cf27eaf7f3c45aab"
+fork_repository = "https://github.com/JTM-rootstorm/rust.git"
+requested_toolchain_name = "wyrmroot-1.97.1-d54c16b7"
+source_edit_requested = true
+target = "x86_64-unknown-wyrmroot"
+rustc_abi = "default"
+target_features = ""
+required_targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-wyrmroot",
+    "x86_64-unknown-uefi",
+    "x86_64-unknown-none",
+]
+
+[build]
+stage = 1
+host = "x86_64-unknown-linux-gnu"
+llvm_version = "22.1.6"
+llvm_source = "rust gitlink src/llvm-project = dcc3606807c989700e0ac1cac18c31741bcd40d9, X86 only, no assertions, link-shared"
+network = "offline"
+stage0 = "accepted RUST-WYR0-I-B-SYSROOTS-007 toolchain as a same-version local rebuild"
+build_root = "/home/mike/Documents/Programming/OS-Project/.tmp/RUST-TC2-WYRMROOT-PSABI-008/build"
+bootstrap_config = "/home/mike/Documents/Programming/OS-Project/.tmp/RUST-TC2-WYRMROOT-PSABI-008/bootstrap.toml"
+source_worktree = "/home/mike/Documents/Programming/OS-Project/.worktrees/rust/RUST-TC2-WYRMROOT-PSABI-008"
+accepted_artifact_root = "/home/mike/Documents/Programming/OS-Project/artifacts/toolchains/accepted/RUST-TC2-WYRMROOT-PSABI-008"
+artifact_manifest_sha256 = "92ef73c1c1fe1b875a7deccc7a84f338b966d3d194d87ab365431344a69129d8"
+toolchain_tree_sha256 = "61fbbf59bc8ca5ebe3362208c353875d73d693ecfeee5034f0a32f0fea526105"
+retained_components = ["cargo (byte-identical to RUST-WYR0-I-B-SYSROOTS-007)"]
+omitted_components = ["llvm-tools", "rust-objcopy"]
+omitted_components_note = "No Wyrmroot or Deepwyrm build step uses the toolchain llvm-tools (llc and llvm-objcopy and the rest) or rust-objcopy; inspection scripts take host LLVM tools from PATH."
+
+[validation]
+target_cfg = "passed: target_feature x87, fxsr, sse, sse2 and nothing wider; no soft-float"
+float_codegen = "passed: f32/f64 add compile to addss/addsd on xmm registers"
+ui_cfg_wyrmroot_target = "passed by hand (rustc against tests/auxiliary/minicore.rs); compiletest itself needs anstyle-lossy, absent from the offline Cargo home"
+rustc_target_unit_test = "not run: the local-rebuild stage0 sysroot has no host test crate"
+
+[artifacts]
+rustc_sha256 = "32ffeaa4f1e2ed800dc72a5c1b51ed33d792749a3ac2b78feed268d16245335a"
+cargo_sha256 = "a73b2c25573d251489101c0d8f19ad3702eb9761166de5ed8437b472b6c038ce"
+rust_lld_sha256 = "e1db91e76e6a8a59708c38bfedb6b3223f2f3ae5a79750e8234c19205794ba97"
+rustc_driver_sha256 = "4ff9b4c91468a5c6515aef36b20feb7db08df7a4007a2c1b6a22c968166dc393"
+llvm_sha256 = "09bc41b2ac3d5d6441ab939b774f926b425099b3e1b5b2ebd15bf7528ea3dc2e"
+host_core_sha256 = "c313e62baa1dd1a0e248cca732ba325eee7c5aaa205f13d321b0c90cc943efe0"
+host_std_sha256 = "3cb2c5db4358858667e7220a1b034e9c08d8391853c302ebbafa090c6a87dbb5"
+host_proc_macro_sha256 = "1399f85dc6280fd7899a15123220fcc3a66b50578a22f446f97f46bda3f74b3e"
+host_compiler_builtins_sha256 = "586218bc5cb8066d6d015ae9f2bad0d288461cd9e2514d1e81be979b70d7a1ac"
+wyrmroot_core_sha256 = "c7d5f117e32d7e3368fb5e9d97ceda6cb9003654535837fdcbafaa5f85c25319"
+wyrmroot_alloc_sha256 = "cd9d38836bb48b672fc313a8c34deafdbe3033862b8ce8e4df4a05165e4ee15b"
+wyrmroot_compiler_builtins_sha256 = "0bd07312c167156cdcf51d20c1888e5d235dc93a1671d95d5a5449c9f2e6a1ea"
+uefi_core_sha256 = "25eb0124facfc4dbbfc14f1704f52d2c97fc0254dc2411b6bc0526f88aea17c4"
+uefi_alloc_sha256 = "d7d22d2e86ea45d4bbb57a18d0cf0a377e09226c772ccf51fb86065e3d940727"
+uefi_std_sha256 = "d0c1bbe23b4e90bb8160006b3f0d417956494ddf0e6e9fdc2c277d176bdf55e6"
+uefi_proc_macro_sha256 = "05b0cc5e64668b67865522cb526847a269d37097c425632ac06b051353bd3614"
+uefi_compiler_builtins_sha256 = "ee7630c3425b104b537ea83cbdea4d11eaa4b06d3476e3c82ebae068ef84a857"
+none_core_sha256 = "340d621a713ccedbbbb9e2816af7948cb6d2cd5931d1ea92e46573139f5a1f10"
+none_alloc_sha256 = "9b586f1832bb302371a2a7a3b4f4c7c7f73608ea5b10eb2317b0a750d616c11b"
+none_compiler_builtins_sha256 = "87d1bf9ab89a89047809cb5a82202e97f9aa15ff2285b9779735ed92b1d2efcb"
+
+[policy]
+human_reviewer = "Mike"
+human_review_state = "pending"
+soundness_classification = "target-specification-codegen-default"
+llm_disclosure = "Claude Opus 5.5 (claude-opus-5-5) wrote the target change and tests and ran the build under coordinator direction."
+security_gate = "not-run; the change enables hardware FP codegen for a kernel that preserves FP state (Deepwyrm D2); goes to the toolchain milestone review"

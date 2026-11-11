@@ -11,7 +11,7 @@ use crate::secure_fs::{Directory, SealedFile};
 use crate::sha256::bytes_digest;
 use crate::toolchain_artifact::AcceptedToolchain;
 
-const TOOLCHAIN_REQUEST: &str = "toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.toml";
+const TOOLCHAIN_REQUEST: &str = "toolchain/requests/RUST-TC2-WYRMROOT-PSABI-008.toml";
 const MAX_LOADER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DEBUG_SYMBOL_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const INSPECTION_PATH: &str = "/usr/lib/llvm/22/bin:/usr/bin:/bin";

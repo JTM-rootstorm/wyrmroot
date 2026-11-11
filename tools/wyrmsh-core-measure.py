@@ -82,7 +82,7 @@ def main():
     if output.parent.resolve() != output.parent:
         raise ValueError('unresolved output parent')
     identity = tomllib.loads((REPO / 'toolchain/host-rust-toolchain.toml').read_text())
-    manifest_path = REPO.parent / 'artifacts/toolchains/accepted/RUST-WYR0-I-B-SYSROOTS-007/manifest.toml'
+    manifest_path = REPO.parent / 'artifacts/toolchains/accepted/RUST-TC2-WYRMROOT-PSABI-008/manifest.toml'
     manifest_sha = 'cc78368219552cce8fdaad38ab419040cab945fe175aa774d6dca51eece84fd2'
     regular(manifest_path)
     if digest(manifest_path) != manifest_sha:

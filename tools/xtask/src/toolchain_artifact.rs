@@ -9,13 +9,13 @@ use crate::elf_runtime::{RuntimeMetadata, inspect};
 use crate::error::Failure;
 use crate::sha256::{bytes_digest, file_digest, reader_digest};
 
-const REQUEST_PATH: &str = "toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.toml";
+const REQUEST_PATH: &str = "toolchain/requests/RUST-TC2-WYRMROOT-PSABI-008.toml";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
-const COORDINATOR_REQUEST: &str = "RUST-WYR0-I-B-SYSROOTS-007";
-const CONSUMER_REQUEST: &str = "RUST-WYR0-I-B-SYSROOTS-007";
-const RUST_SOURCE_TREE: &str = "aa3d5f9d1311772c99e385067d07641c01b8d203";
-const RUSTC_DRIVER_NAME: &str = "librustc_driver-948919618f142f9a.so";
-const LLVM_NAME: &str = "libLLVM.so.22.1-rust-1.97.1-stable";
+const COORDINATOR_REQUEST: &str = "RUST-TC2-WYRMROOT-PSABI-008";
+const CONSUMER_REQUEST: &str = "RUST-TC2-WYRMROOT-PSABI-008";
+const RUST_SOURCE_TREE: &str = "d0a636959c2fe96d6b9dfd577be77c30fa2281d2";
+const RUSTC_DRIVER_NAME: &str = "librustc_driver-ec77465cc608d8ef.so";
+const LLVM_NAME: &str = "libLLVM.so.22.1-rust-dev";
 const SYSTEM_INTERPRETER: &str = "/lib64/ld-linux-x86-64.so.2";
 const GNU_TAR: &str = "/usr/bin/tar";
 const MAX_TOOLCHAIN_ENTRIES: usize = 4096;
@@ -86,7 +86,7 @@ pub(crate) fn prepare(
     expect_string(
         &request,
         "request_kind",
-        "extend-immutable-existing-wyrmroot-rust-toolchain",
+        "rebuild-wyrmroot-rust-toolchain-for-target-change",
         "toolchain request",
     )?;
     let expected_manifest_sha = required_sha256(
@@ -334,7 +334,7 @@ fn validate_manifest_identity(
     expect_bool(
         manifest,
         "build.rust_source_changes",
-        false,
+        true,
         "artifact manifest",
     )?;
     for key in [
@@ -617,9 +617,9 @@ fn validate_runtime_dependencies(
         Some(SYSTEM_INTERPRETER),
         "$ORIGIN/../../../:$ORIGIN/../lib",
         &[
-            "libpthread.so.0",
             "libz.so.1",
             LLVM_NAME,
+            "libstdc++.so.6",
             "libm.so.6",
             "libgcc_s.so.1",
             "libc.so.6",
@@ -661,11 +661,9 @@ fn validate_runtime_dependencies(
         None,
         "$ORIGIN/../lib",
         &[
-            "librt.so.1",
-            "libdl.so.2",
-            "libpthread.so.0",
             "libm.so.6",
             "libz.so.1",
+            "libstdc++.so.6",
             "libgcc_s.so.1",
             "libc.so.6",
             "ld-linux-x86-64.so.2",
@@ -1188,7 +1186,7 @@ fn require_array_member(
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactComponent, CONSUMER_REQUEST, COORDINATOR_REQUEST, contained_path,
+        ArtifactComponent, CONSUMER_REQUEST, COORDINATOR_REQUEST, RUST_SOURCE_TREE, contained_path,
         open_stable_regular_file, parse_manifest, prepare, validate_component,
         validate_manifest_identity, validate_request_component_hashes, verify_local_resolution,
         verify_open_file_identity,
@@ -1199,8 +1197,8 @@ mod tests {
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
-    const COMMIT: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
+    const NAME: &str = "wyrmroot-1.97.1-d54c16b7";
+    const COMMIT: &str = "d54c16b7f2160f9c5bd61456cf27eaf7f3c45aab";
 
     #[test]
     #[ignore = "requires WYRMROOT_RUSTC pointing to the coordinator-accepted immutable artifact"]
@@ -1409,7 +1407,7 @@ consumer_requests = [
 ]
 registered_name = "{NAME}"
 source_commit = "{COMMIT}"
-source_tree = "aa3d5f9d1311772c99e385067d07641c01b8d203"
+source_tree = "{RUST_SOURCE_TREE}"
 source_dirty = false
 source_modified = false
 bootstrap_stage = 1
@@ -1423,7 +1421,7 @@ targets = [
 
 [build]
 status = "passed"
-rust_source_changes = false
+rust_source_changes = true
 
 [acceptance]
 rustc_identity = "passed"

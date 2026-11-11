@@ -197,11 +197,13 @@ pub const fn fs_anchor_value(seed: u64) -> u64 {
     seed ^ 0x5753_5f42_4153_4521 | 1
 }
 
-/// Checks the state a hog reads before it loads its own: every XMM
-/// register zero, MXCSR and FCW at their initial values.
+/// Checks the control state a hog reads before it loads its own: MXCSR
+/// and FCW at their initial values. Compiled code never changes either,
+/// while it may already have used XMM registers before `main`, so these are
+/// what show whether a fresh Thread inherited another Thread's FP state.
 #[must_use]
-pub fn is_initial_state(xmm: &[u8; WITNESS_BYTES], mxcsr: u32, fcw: u16) -> bool {
-    mxcsr == INITIAL_MXCSR && fcw == INITIAL_FCW && xmm.iter().all(|byte| *byte == 0)
+pub const fn is_initial_state(mxcsr: u32, fcw: u16) -> bool {
+    mxcsr == INITIAL_MXCSR && fcw == INITIAL_FCW
 }
 
 #[cfg(test)]
@@ -375,14 +377,10 @@ mod tests {
     }
 
     #[test]
-    fn the_initial_state_is_zero_registers_and_reset_controls() {
-        let zero = [0u8; WITNESS_BYTES];
-        assert!(is_initial_state(&zero, 0x1f80, 0x037f));
-        assert!(!is_initial_state(&zero, WITNESS_MXCSR, 0x037f));
-        assert!(!is_initial_state(&zero, 0x1f80, 0x027f));
-        let mut dirty = zero;
-        dirty[255] = 1;
-        assert!(!is_initial_state(&dirty, 0x1f80, 0x037f));
+    fn the_initial_state_is_the_reset_mxcsr_and_fcw() {
+        assert!(is_initial_state(0x1f80, 0x037f));
+        assert!(!is_initial_state(WITNESS_MXCSR, 0x037f));
+        assert!(!is_initial_state(0x1f80, 0x027f));
         assert_ne!(WITNESS_MXCSR, INITIAL_MXCSR);
     }
 

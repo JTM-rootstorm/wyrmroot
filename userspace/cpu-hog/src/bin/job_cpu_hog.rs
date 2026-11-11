@@ -61,134 +61,152 @@ fn job_cpu_hog_main(startup: StartupBlock<'_>) -> u32 {
     ) {
         return error.exit_code();
     }
-    // Read before anything else: a Thread that has never run must hold the
-    // initial FP state, not what the previous Thread on this CPU left.
-    let (initial_xmm, initial_mxcsr, initial_fcw) = registers::read();
+    // Read before the hog changes anything: a Thread that has never run
+    // must hold the initial MXCSR and x87 control word, not what the
+    // previous Thread on this CPU left.
+    let (initial_mxcsr, initial_fcw) = registers::controls();
     let mut system = NativeSystem;
     let seed = match prepare_job_cpu_hog(&mut system, startup.bootstrap_channel().as_abi()) {
         Ok(seed) => seed,
         Err(error) => return error.exit_code(),
     };
-    if !is_initial_state(&initial_xmm, initial_mxcsr, initial_fcw) {
+    if !is_initial_state(initial_mxcsr, initial_fcw) {
         return WitnessFailure::InitialState.exit_code();
     }
-    match hold_and_spin(seed) {
-        Err(failure) => failure.exit_code(),
-    }
-}
-
-/// Holds this launch's pattern in XMM0-15, MXCSR and FS, and spins checking
-/// them; never yields, blocks or makes a syscall once the pattern is held.
-fn hold_and_spin(seed: u64) -> Result<core::convert::Infallible, WitnessFailure> {
     let anchor = fs_anchor_value(seed);
     let anchor_address = core::ptr::from_ref(&anchor) as u64;
     if deepwyrm_syscall::thread_set_fs_base(anchor_address) != deepwyrm_syscall::DW_STATUS_SUCCESS {
-        return Err(WitnessFailure::SetFsBase);
+        return WitnessFailure::SetFsBase.exit_code();
     }
     let pattern = witness_pattern(seed);
-    registers::load(&pattern, WITNESS_MXCSR);
-    loop {
-        let (xmm, mxcsr, _) = registers::read();
-        if xmm != pattern || mxcsr != WITNESS_MXCSR {
-            return Err(WitnessFailure::FpState);
-        }
-        if registers::fs_word() != core::hint::black_box(anchor) {
-            return Err(WitnessFailure::FsBase);
-        }
-        core::hint::spin_loop();
+    match registers::hold_and_spin(&pattern, WITNESS_MXCSR, core::hint::black_box(anchor)) {
+        registers::Lost::FpState => WitnessFailure::FpState.exit_code(),
+        registers::Lost::FsBase => WitnessFailure::FsBase.exit_code(),
     }
 }
 
-/// The only code that touches FP registers. The guest target is soft-float,
-/// so compiled Rust never reads or writes XMM, MXCSR or x87 state, and what
-/// this module loads stays put between its calls unless the kernel loses it.
+/// The FP-register code. Compiled Rust may use XMM registers, so the hog
+/// holds its pattern only inside one asm block that loads XMM0-15 and MXCSR,
+/// then spins checking them and the word at its FS base, and leaves only when
+/// one changed. It never yields, blocks or makes a syscall in that loop.
 #[allow(
     unsafe_code,
-    reason = "reads and loads XMM0-15, MXCSR and the x87 control word, and reads the word at the FS base"
+    reason = "loads and checks XMM0-15, MXCSR and the word at the FS base, and reads the x87 control word"
 )]
 mod registers {
     use super::WITNESS_BYTES;
 
-    #[repr(C, align(16))]
-    struct Image([u8; WITNESS_BYTES]);
+    pub(super) enum Lost {
+        FpState,
+        FsBase,
+    }
 
-    pub(super) fn read() -> ([u8; WITNESS_BYTES], u32, u16) {
-        let mut image = Image([0; WITNESS_BYTES]);
+    #[repr(C, align(16))]
+    struct Image([u8; WITNESS_BYTES + 16]);
+
+    pub(super) fn controls() -> (u32, u16) {
         let mut mxcsr = 0u32;
         let mut fcw = 0u16;
-        // SAFETY: every store targets the 256-byte, 16-byte-aligned `image` or the two locals.
+        // SAFETY: the two stores target the two locals.
         unsafe {
             core::arch::asm!(
-                "movdqa xmmword ptr [{p} + 0], xmm0",
-                "movdqa xmmword ptr [{p} + 16], xmm1",
-                "movdqa xmmword ptr [{p} + 32], xmm2",
-                "movdqa xmmword ptr [{p} + 48], xmm3",
-                "movdqa xmmword ptr [{p} + 64], xmm4",
-                "movdqa xmmword ptr [{p} + 80], xmm5",
-                "movdqa xmmword ptr [{p} + 96], xmm6",
-                "movdqa xmmword ptr [{p} + 112], xmm7",
-                "movdqa xmmword ptr [{p} + 128], xmm8",
-                "movdqa xmmword ptr [{p} + 144], xmm9",
-                "movdqa xmmword ptr [{p} + 160], xmm10",
-                "movdqa xmmword ptr [{p} + 176], xmm11",
-                "movdqa xmmword ptr [{p} + 192], xmm12",
-                "movdqa xmmword ptr [{p} + 208], xmm13",
-                "movdqa xmmword ptr [{p} + 224], xmm14",
-                "movdqa xmmword ptr [{p} + 240], xmm15",
                 "stmxcsr dword ptr [{m}]",
                 "fnstcw word ptr [{f}]",
-                p = in(reg) image.0.as_mut_ptr(),
                 m = in(reg) &raw mut mxcsr,
                 f = in(reg) &raw mut fcw,
                 options(nostack, preserves_flags)
             );
         }
-        (image.0, mxcsr, fcw)
+        (mxcsr, fcw)
     }
 
-    pub(super) fn load(pattern: &[u8; WITNESS_BYTES], mxcsr: u32) {
-        let image = Image(*pattern);
-        // SAFETY: every load reads the 256-byte, 16-byte-aligned `image` or `mxcsr`, whose
-        // reserved bits are clear.
+    pub(super) fn hold_and_spin(pattern: &[u8; WITNESS_BYTES], mxcsr: u32, anchor: u64) -> Lost {
+        let source = Image({
+            let mut bytes = [0u8; WITNESS_BYTES + 16];
+            bytes[..WITNESS_BYTES].copy_from_slice(pattern);
+            bytes[WITNESS_BYTES..WITNESS_BYTES + 4].copy_from_slice(&mxcsr.to_le_bytes());
+            bytes
+        });
+        let mut scratch = Image([0; WITNESS_BYTES + 16]);
+        let lost: u64;
+        // SAFETY: the block reads `source` and writes `scratch`, both 16-byte aligned and
+        // WITNESS_BYTES + 16 long; MXCSR comes from `mxcsr`, whose reserved bits are clear; the FS
+        // base is the address of the caller's live anchor. It declares every XMM register it
+        // loads, and leaves MXCSR as the hog's pattern, which only the exit path runs under.
         unsafe {
             core::arch::asm!(
-                "movdqa xmm0, xmmword ptr [{p} + 0]",
-                "movdqa xmm1, xmmword ptr [{p} + 16]",
-                "movdqa xmm2, xmmword ptr [{p} + 32]",
-                "movdqa xmm3, xmmword ptr [{p} + 48]",
-                "movdqa xmm4, xmmword ptr [{p} + 64]",
-                "movdqa xmm5, xmmword ptr [{p} + 80]",
-                "movdqa xmm6, xmmword ptr [{p} + 96]",
-                "movdqa xmm7, xmmword ptr [{p} + 112]",
-                "movdqa xmm8, xmmword ptr [{p} + 128]",
-                "movdqa xmm9, xmmword ptr [{p} + 144]",
-                "movdqa xmm10, xmmword ptr [{p} + 160]",
-                "movdqa xmm11, xmmword ptr [{p} + 176]",
-                "movdqa xmm12, xmmword ptr [{p} + 192]",
-                "movdqa xmm13, xmmword ptr [{p} + 208]",
-                "movdqa xmm14, xmmword ptr [{p} + 224]",
-                "movdqa xmm15, xmmword ptr [{p} + 240]",
-                "ldmxcsr dword ptr [{m}]",
-                p = in(reg) image.0.as_ptr(),
-                m = in(reg) &raw const mxcsr,
-                options(nostack, preserves_flags, readonly)
+                "movdqa xmm0, xmmword ptr [{src} + 0]",
+                "movdqa xmm1, xmmword ptr [{src} + 16]",
+                "movdqa xmm2, xmmword ptr [{src} + 32]",
+                "movdqa xmm3, xmmword ptr [{src} + 48]",
+                "movdqa xmm4, xmmword ptr [{src} + 64]",
+                "movdqa xmm5, xmmword ptr [{src} + 80]",
+                "movdqa xmm6, xmmword ptr [{src} + 96]",
+                "movdqa xmm7, xmmword ptr [{src} + 112]",
+                "movdqa xmm8, xmmword ptr [{src} + 128]",
+                "movdqa xmm9, xmmword ptr [{src} + 144]",
+                "movdqa xmm10, xmmword ptr [{src} + 160]",
+                "movdqa xmm11, xmmword ptr [{src} + 176]",
+                "movdqa xmm12, xmmword ptr [{src} + 192]",
+                "movdqa xmm13, xmmword ptr [{src} + 208]",
+                "movdqa xmm14, xmmword ptr [{src} + 224]",
+                "movdqa xmm15, xmmword ptr [{src} + 240]",
+                "ldmxcsr dword ptr [{src} + 256]",
+                "2:",
+                "movdqa xmmword ptr [{scr} + 0], xmm0",
+                "movdqa xmmword ptr [{scr} + 16], xmm1",
+                "movdqa xmmword ptr [{scr} + 32], xmm2",
+                "movdqa xmmword ptr [{scr} + 48], xmm3",
+                "movdqa xmmword ptr [{scr} + 64], xmm4",
+                "movdqa xmmword ptr [{scr} + 80], xmm5",
+                "movdqa xmmword ptr [{scr} + 96], xmm6",
+                "movdqa xmmword ptr [{scr} + 112], xmm7",
+                "movdqa xmmword ptr [{scr} + 128], xmm8",
+                "movdqa xmmword ptr [{scr} + 144], xmm9",
+                "movdqa xmmword ptr [{scr} + 160], xmm10",
+                "movdqa xmmword ptr [{scr} + 176], xmm11",
+                "movdqa xmmword ptr [{scr} + 192], xmm12",
+                "movdqa xmmword ptr [{scr} + 208], xmm13",
+                "movdqa xmmword ptr [{scr} + 224], xmm14",
+                "movdqa xmmword ptr [{scr} + 240], xmm15",
+                "stmxcsr dword ptr [{scr} + 256]",
+                "xor {i:e}, {i:e}",
+                "3:",
+                "mov {t}, qword ptr [{scr} + {i}]",
+                "cmp {t}, qword ptr [{src} + {i}]",
+                "jne 4f",
+                "add {i}, 8",
+                "cmp {i}, 264",
+                "jb 3b",
+                "mov {t}, qword ptr fs:[0]",
+                "cmp {t}, {anchor}",
+                "jne 5f",
+                "pause",
+                "jmp 2b",
+                "4:",
+                "mov {lost:e}, 1",
+                "jmp 6f",
+                "5:",
+                "mov {lost:e}, 2",
+                "6:",
+                src = in(reg) source.0.as_ptr(),
+                scr = in(reg) scratch.0.as_mut_ptr(),
+                anchor = in(reg) anchor,
+                i = out(reg) _,
+                t = out(reg) _,
+                lost = out(reg) lost,
+                out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
+                out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
+                out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
+                out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+                options(nostack)
             );
         }
-    }
-
-    /// The word at the FS base.
-    pub(super) fn fs_word() -> u64 {
-        let value: u64;
-        // SAFETY: the FS base is the address of the caller's live anchor, set by
-        // `thread_set_fs_base`; the kernel keeps it with this Thread.
-        unsafe {
-            core::arch::asm!(
-                "mov {}, qword ptr fs:[0]",
-                out(reg) value,
-                options(nostack, preserves_flags, readonly)
-            );
+        if lost == 2 {
+            Lost::FsBase
+        } else {
+            Lost::FpState
         }
-        value
     }
 }
 
