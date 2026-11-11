@@ -252,6 +252,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrmroot-partition"
+version = "0.0.0"
+
+[[package]]
 name = "wyrmroot-registry-proto"
 version = "0.0.0"
 

@@ -1,0 +1,14 @@
+[package]
+name = "wyrmroot-partition"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Allocation-free GPT and MBR partition discovery over a block device"
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"
