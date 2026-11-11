@@ -234,6 +234,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrmroot-fs-proto"
+version = "0.0.0"
+
+[[package]]
 name = "wyrmroot-hello"
 version = "0.0.0"
 dependencies = [
@@ -326,6 +330,15 @@ dependencies = [
  "wyrmroot-runtime",
  "wyrmroot-stream-proto",
  "wyrmroot-uart16550-core",
+]
+
+[[package]]
+name = "wyrmroot-vfsd"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-fs-proto",
+ "wyrmroot-runtime",
 ]
 
 [[package]]

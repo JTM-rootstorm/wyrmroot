@@ -1,0 +1,20 @@
+[package]
+name = "wyrmroot-vfsd"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "VFS namespace core: mount table, path opens and synthetic directories (storage W5)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-fs-proto = { path = "../../crates/wyrmroot-fs-proto" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_crate_dependencies = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("wyrmroot"))'] }
