@@ -5,9 +5,17 @@
 /// The supplied function receives a fully validated startup block and returns the process exit
 /// code. This macro deliberately owns the only assembly and raw startup-page boundary needed by
 /// ordinary Wyrmroot executables.
+///
+/// `native_entry!(handler, prologue = "...")` places AT&T assembly at the very start of
+/// `_start`, before any compiled code runs, for executables that must observe the exact register
+/// state the kernel enters them with. The prologue must leave RSP, RDI and RSI unchanged and may
+/// only store to the executable's own memory.
 #[macro_export]
 macro_rules! native_entry {
     ($handler:path) => {
+        $crate::native_entry!($handler, prologue = "");
+    };
+    ($handler:path, prologue = $prologue:literal) => {
         #[allow(
             unsafe_code,
             reason = "the shared Wyrmroot entry shim captures the kernel-supplied initial stack pointer and crosses the runtime's documented startup-page boundary"
@@ -21,6 +29,9 @@ macro_rules! native_entry {
                 .global _start
                 .type _start,@function
             _start:
+                "#,
+                $prologue,
+                r#"
                 movq %rsp, %rdx
                 xorq %rbp, %rbp
                 andq $-16, %rsp

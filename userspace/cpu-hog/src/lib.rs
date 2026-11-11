@@ -145,13 +145,22 @@ pub const WITNESS_MXCSR: u32 = 0x7f80;
 /// The MXCSR and x87 control word a Thread that has never run must see.
 pub const INITIAL_MXCSR: u32 = 0x1f80;
 pub const INITIAL_FCW: u16 = 0x037f;
+/// Bytes of an FXSAVE image.
+pub const FXSAVE_BYTES: usize = 512;
+/// Selectors the hog holds in DS, ES or GS: the DPL3 data and code
+/// descriptors at any RPL. None is null, so a selector reset to null shows up
+/// as a change. Null selectors with a nonzero RPL are left out: IRET back to
+/// CPL3 reloads DS and ES as 0 when they hold one, on every interrupt return,
+/// so they cannot survive preemption on any kernel.
+pub const LOADABLE_SELECTORS: [u16; 8] = [0x28, 0x29, 0x2a, 0x2b, 0x30, 0x31, 0x32, 0x33];
 
-/// Why the hog stopped spinning. The hog holds its own FP registers and FS
-/// base across every preemption; seeing either change means the kernel
-/// lost or leaked user state (Deepwyrm toolchain D1, D2).
+/// Why the hog stopped spinning. The hog holds its own FP registers, FS
+/// base and DS/ES/GS selectors across every preemption; seeing any of them
+/// change means the kernel lost or leaked user state (Deepwyrm toolchain
+/// D1, D2, and the D1/D2 security review).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WitnessFailure {
-    /// The hog did not start from the initial FP state.
+    /// The hog did not start from the initial FP state and null selectors.
     InitialState,
     /// `thread_set_fs_base` refused the hog's anchor.
     SetFsBase,
@@ -159,6 +168,8 @@ pub enum WitnessFailure {
     FpState,
     /// The FS base changed while the hog was preempted.
     FsBase,
+    /// DS, ES or GS changed while the hog was preempted.
+    Selectors,
 }
 
 impl WitnessFailure {
@@ -170,8 +181,17 @@ impl WitnessFailure {
                 Self::SetFsBase => 1,
                 Self::FpState => 2,
                 Self::FsBase => 3,
+                Self::Selectors => 4,
             }
     }
+}
+
+fn splitmix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// The register pattern one hog holds, distinct per launch `seed` and never
@@ -181,14 +201,20 @@ pub fn witness_pattern(seed: u64) -> [u8; WITNESS_BYTES] {
     let mut state = seed;
     let mut pattern = [0u8; WITNESS_BYTES];
     for chunk in pattern.as_chunks_mut::<8>().0 {
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        chunk.copy_from_slice(&(z | 1).to_le_bytes());
+        chunk.copy_from_slice(&(splitmix(&mut state) | 1).to_le_bytes());
     }
     pattern
+}
+
+/// The DS, ES and GS selectors one hog holds, chosen from
+/// [`LOADABLE_SELECTORS`] by its launch `seed`.
+#[must_use]
+pub fn witness_selectors(seed: u64) -> [u16; 3] {
+    let mut state = !seed;
+    [(); 3].map(|()| {
+        let index = splitmix(&mut state) % LOADABLE_SELECTORS.len() as u64;
+        LOADABLE_SELECTORS[index as usize]
+    })
 }
 
 /// The value at the hog's FS base: its seed, folded so it is never zero.
@@ -197,13 +223,21 @@ pub const fn fs_anchor_value(seed: u64) -> u64 {
     seed ^ 0x5753_5f42_4153_4521 | 1
 }
 
-/// Checks the control state a hog reads before it loads its own: MXCSR
-/// and FCW at their initial values. Compiled code never changes either,
-/// while it may already have used XMM registers before `main`, so these are
-/// what show whether a fresh Thread inherited another Thread's FP state.
+/// Checks the state the hog's `_start` captured before any compiled code
+/// ran: an FXSAVE image of the initial x87 and SSE state (FCW 0x037F, empty
+/// stack, MXCSR 0x1F80, every ST and XMM register zero) and null DS, ES, FS
+/// and GS. FOP, FIP and FDP are not checked: CPUs that skip them on restore
+/// show the kernel's fixed scrub addresses there instead of zero.
 #[must_use]
-pub const fn is_initial_state(mxcsr: u32, fcw: u16) -> bool {
-    mxcsr == INITIAL_MXCSR && fcw == INITIAL_FCW
+pub fn is_initial_entry_state(fxsave: &[u8; FXSAVE_BYTES], selectors: [u16; 4]) -> bool {
+    let word = |at: usize| u16::from_le_bytes([fxsave[at], fxsave[at + 1]]);
+    let mxcsr = u32::from_le_bytes([fxsave[24], fxsave[25], fxsave[26], fxsave[27]]);
+    word(0) == INITIAL_FCW
+        && word(2) == 0
+        && fxsave[4] == 0
+        && mxcsr == INITIAL_MXCSR
+        && fxsave[32..416].iter().all(|byte| *byte == 0)
+        && selectors == [0; 4]
 }
 
 #[cfg(test)]
@@ -376,12 +410,50 @@ mod tests {
         }
     }
 
+    fn initial_image() -> [u8; FXSAVE_BYTES] {
+        let mut image = [0u8; FXSAVE_BYTES];
+        image[0..2].copy_from_slice(&INITIAL_FCW.to_le_bytes());
+        image[24..28].copy_from_slice(&INITIAL_MXCSR.to_le_bytes());
+        // MXCSR_MASK, FOP, FIP and FDP are the CPU's business.
+        image[28..32].copy_from_slice(&0xffffu32.to_le_bytes());
+        image[8..16].copy_from_slice(&0xffff_ffff_8000_1000u64.to_le_bytes());
+        image
+    }
+
     #[test]
-    fn the_initial_state_is_the_reset_mxcsr_and_fcw() {
-        assert!(is_initial_state(0x1f80, 0x037f));
-        assert!(!is_initial_state(WITNESS_MXCSR, 0x037f));
-        assert!(!is_initial_state(0x1f80, 0x027f));
+    fn the_initial_state_is_the_reset_fp_image_and_null_selectors() {
+        assert!(is_initial_entry_state(&initial_image(), [0; 4]));
         assert_ne!(WITNESS_MXCSR, INITIAL_MXCSR);
+        for (at, value) in [
+            (0, 0x7eu8),
+            (2, 1),
+            (4, 1),
+            (24, 0x00),
+            (32, 1),
+            (160, 1),
+            (415, 1),
+        ] {
+            let mut image = initial_image();
+            image[at] = value;
+            assert!(!is_initial_entry_state(&image, [0; 4]), "byte {at}");
+        }
+        for index in 0..4 {
+            let mut selectors = [0; 4];
+            selectors[index] = 0x2b;
+            assert!(!is_initial_entry_state(&initial_image(), selectors));
+        }
+    }
+
+    #[test]
+    fn witness_selectors_are_loadable_and_never_null() {
+        for seed in [0, 1, 7, 8, u64::MAX] {
+            for selector in witness_selectors(seed) {
+                assert!(LOADABLE_SELECTORS.contains(&selector));
+                assert_ne!(selector, 0);
+            }
+        }
+        let first = witness_selectors(0);
+        assert!((1..16).any(|seed| witness_selectors(seed) != first));
     }
 
     #[test]
@@ -397,6 +469,7 @@ mod tests {
             WitnessFailure::SetFsBase,
             WitnessFailure::FpState,
             WitnessFailure::FsBase,
+            WitnessFailure::Selectors,
         ]
         .map(WitnessFailure::exit_code);
         for (index, code) in codes.iter().enumerate() {
