@@ -386,6 +386,43 @@ fn map_memory(
     })
 }
 
+/// Runs `use_bytes` over a fresh, zeroed, private read-write scratch region
+/// of `bytes` bytes mapped into `root`, then unmaps it.
+///
+/// Private means no capability to the backing MemoryObject survives: its only
+/// handle is closed as soon as the region is mapped, so no other mapping,
+/// process or device can ever reach these bytes. That is what makes handing
+/// safe code an exclusive slice sound. The region is gone when this returns;
+/// the higher-ranked callback keeps the slice from escaping.
+pub fn with_private_memory<R>(
+    root: DwHandle,
+    bytes: u64,
+    use_bytes: impl for<'bytes> FnOnce(&'bytes mut [u8]) -> R,
+) -> Result<R, NativeError> {
+    let memory = create_memory_object(
+        bytes,
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0),
+    )?;
+    let mapped = map_memory_read_write(root, memory, bytes);
+    // Close the only handle whatever happened: the mapping keeps the object
+    // alive, and nothing else may ever name it.
+    let closed = crate::close_handle(memory);
+    let mut mapping = mapped?;
+    if let Err(error) = closed {
+        let _ = unmap_memory(mapping);
+        return Err(error);
+    }
+    // SAFETY: the mapping is live and writable until the unmap below, its
+    // backing is a fresh zero-filled MemoryObject, and no handle to that
+    // object exists any more, so no other mapping, process, thread or device
+    // can read or write these bytes while the callback holds the slice.
+    let result = unsafe { mapping.with_bytes_mut(use_bytes) };
+    let unmapped = unmap_memory(mapping);
+    let value = result?;
+    unmapped?;
+    Ok(value)
+}
+
 pub(crate) fn unmap_memory(mapping: OwnedMemoryMapping) -> Result<(), NativeError> {
     require_success(deepwyrm_syscall::address_region_unmap(
         mapping.root,

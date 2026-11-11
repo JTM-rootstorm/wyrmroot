@@ -236,6 +236,7 @@ pub(crate) fn spawn<System: WyrmshSystem>(
         path,
         argv,
         &[],
+        false,
     ) {
         Ok(job_id) => {
             if !jobs.publish(slot, job_id) {
@@ -279,22 +280,46 @@ pub(crate) fn run<System: WyrmshSystem>(
     jobs: &mut JobTable,
     path: &str,
     argv: Arguments<'_>,
+    image: Option<DwHandle>,
 ) -> Result<(), ShellError> {
+    // The image Channel goes to init with the launch, or is closed here.
+    let close_image = |system: &mut System| {
+        if let Some(image) = image {
+            let _ = system.close_handle(image);
+        }
+    };
     let Some(slot) = jobs.reserve() else {
+        close_image(system);
         return expected_text(system, stderr, stdout, controls, b"run", b"capacity");
     };
     let mut pairs = [EMPTY_PAIR; 3];
     if let Err(error) = create_stream_pairs(system, &mut pairs) {
         jobs.abort(slot);
+        close_image(system);
         close_pairs(system, &mut pairs, true)?;
         return Err(error);
     }
-    let transfers = pairs.map(|pair| DwHandleTransferV1 {
-        handle: pair.child,
-        requested_rights: CHILD_CHANNEL_TRANSFER_RIGHTS,
-        operation: DW_HANDLE_TRANSFER_MOVE,
-        ..DwHandleTransferV1::default()
-    });
+    let mut transfers = [DwHandleTransferV1::default(); 4];
+    for (transfer, pair) in transfers.iter_mut().zip(&pairs) {
+        *transfer = DwHandleTransferV1 {
+            handle: pair.child,
+            requested_rights: CHILD_CHANNEL_TRANSFER_RIGHTS,
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            ..DwHandleTransferV1::default()
+        };
+    }
+    let count = match image {
+        Some(handle) => {
+            transfers[3] = DwHandleTransferV1 {
+                handle,
+                requested_rights: CHILD_CHANNEL_TRANSFER_RIGHTS,
+                operation: DW_HANDLE_TRANSFER_MOVE,
+                ..DwHandleTransferV1::default()
+            };
+            4
+        }
+        None => 3,
+    };
     let launched = launch(
         system,
         stdout,
@@ -304,8 +329,12 @@ pub(crate) fn run<System: WyrmshSystem>(
         transactions,
         path,
         argv,
-        &transfers,
+        &transfers[..count],
+        image.is_some(),
     );
+    if launched.as_ref().is_err_and(|failure| !failure.committed) {
+        close_image(system);
+    }
     let job_id = match launched {
         Ok(job_id) => {
             for pair in &mut pairs {

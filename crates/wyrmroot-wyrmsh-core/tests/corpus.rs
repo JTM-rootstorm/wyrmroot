@@ -349,3 +349,26 @@ fn ls_and_cat_take_vfs_paths_and_normalize_lexically() {
         Err(UsageError::InvalidPath)
     );
 }
+
+#[test]
+fn run_of_an_absolute_path_is_a_file_run_and_bootfs_paths_are_unchanged() {
+    let mut parser = Parser::new();
+    let parsed = parser.parse(b"run /boot/EFI/x.elf a b").unwrap();
+    let Ok(Command::RunFile { path, argv }) = parsed.command() else {
+        panic!("expected RunFile");
+    };
+    assert_eq!(path, "/boot/EFI/x.elf");
+    assert_eq!(argv.len(), 3);
+    assert!(matches!(
+        parser.parse(b"run bin/hello").unwrap().command(),
+        Ok(Command::Run {
+            path: "bin/hello",
+            ..
+        })
+    ));
+    // spawn stays bootfs-only.
+    assert_eq!(
+        parser.parse(b"spawn /boot/x").unwrap().command(),
+        Err(UsageError::InvalidPath)
+    );
+}

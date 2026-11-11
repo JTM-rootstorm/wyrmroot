@@ -204,6 +204,7 @@ pub(crate) fn construct_reserved_launch<S, L, W>(
     request: wyrmroot_launch_proto::LaunchRequest<'_>,
     received: &[DwReceivedHandleInfoV1],
     handle_count: usize,
+    file_image: Option<&[u8]>,
 ) -> Result<ConstructedLaunch, InitError>
 where
     S: ResidentPlatform,
@@ -265,6 +266,7 @@ where
         ticket,
         request,
         streams,
+        file_image,
     ) {
         Ok(prepared) => prepared,
         Err(LaunchEngineError::Publication {
@@ -735,6 +737,7 @@ pub(crate) fn defer_reserved_launch<S, L, W>(
     request: wyrmroot_launch_proto::LaunchRequest<'_>,
     moved: &[DwReceivedHandleInfoV1],
     handle_count: usize,
+    file_image: Option<&[u8]>,
 ) -> Result<JobDispatchOutcome, InitError>
 where
     S: ResidentPlatform,
@@ -754,6 +757,7 @@ where
         request,
         moved,
         handle_count,
+        file_image,
     ) {
         Ok(constructed) => constructed,
         Err(error) => {

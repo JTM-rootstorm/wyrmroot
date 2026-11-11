@@ -15,6 +15,7 @@ use {wyrmroot_devmgr as _, wyrmroot_registryd as _, wyrmroot_uart16550d as _};
 mod console;
 mod controller;
 mod errors;
+mod image_launch;
 mod job_dispatch;
 mod job_launch;
 mod job_sessions;
@@ -293,6 +294,21 @@ pub trait ResidentPlatform: InitPlatform {
         bytes: &[u8],
         rights: DwRights,
     ) -> Result<DwHandle, NativeError>;
+    /// Runs `use_bytes` over fresh private scratch memory of `bytes` bytes
+    /// mapped into `root`, which nothing else can reach, then releases it
+    /// (`wyrmroot_runtime::with_private_memory`). File images are read into
+    /// it (root `STORAGE_PLAN.md` W6). A platform without it refuses.
+    fn with_private_memory<R>(
+        &mut self,
+        root: DwHandle,
+        bytes: u64,
+        use_bytes: impl for<'a> FnOnce(&mut Self, &'a mut [u8]) -> R,
+    ) -> Result<R, NativeError> {
+        let _ = (root, bytes, use_bytes);
+        Err(NativeError::Status(
+            deepwyrm_syscall::DW_STATUS_NOT_SUPPORTED,
+        ))
+    }
 }
 
 /// Selects only the WYR1-C4 WRLP 1.7 four-capability supervisor product.

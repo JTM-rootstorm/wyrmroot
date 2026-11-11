@@ -370,6 +370,7 @@ dependencies = [
  "wyrmroot-consoled",
  "wyrmroot-device-proto",
  "wyrmroot-devmgr",
+ "wyrmroot-fs-proto",
  "wyrmroot-launch-proto",
  "wyrmroot-loader",
  "wyrmroot-registry-proto",

@@ -105,7 +105,7 @@ pub const COMMANDS: [CommandSpec; 14] = [
     CommandSpec {
         name: CommandName::Run,
         spelling: "run",
-        usage: "run <bootfs-path> [args...]",
+        usage: "run <bootfs-path | /path> [args...]",
         arity: Arity::AtLeast(1),
     },
     CommandSpec {
@@ -216,6 +216,13 @@ pub enum Command<'a> {
         path: &'a str,
         argv: Arguments<'a>,
     },
+    /// `run` of an absolute VFS path (root `STORAGE_PLAN.md` W6): the
+    /// executable is read from a mounted filesystem. `argv` starts with the
+    /// path as typed; the adapter normalizes it.
+    RunFile {
+        path: &'a str,
+        argv: Arguments<'a>,
+    },
     /// Background transport uses zero streams; that policy belongs to the adapter.
     Spawn {
         path: &'a str,
@@ -260,6 +267,12 @@ impl<'a> Arguments<'a> {
             CommandName::Status => Command::Status,
             CommandName::Run | CommandName::Spawn => {
                 let path = operands.get(0).ok_or(UsageError::InvalidPath)?;
+                if spec.name == CommandName::Run && path.starts_with('/') {
+                    return Ok(Command::RunFile {
+                        path,
+                        argv: operands,
+                    });
+                }
                 validate_path(path)?;
                 if spec.name == CommandName::Run {
                     Command::Run {

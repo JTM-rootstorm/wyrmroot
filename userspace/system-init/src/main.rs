@@ -10,6 +10,7 @@ use deepwyrm_syscall::{
 use wyrmroot_bootfs as _;
 use wyrmroot_consoled as _;
 use wyrmroot_device_proto as _;
+use wyrmroot_fs_proto as _;
 use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
 use wyrmroot_registry_proto as _;
@@ -145,6 +146,15 @@ impl ResidentPlatform for NativeSystem {
         rights: DwRights,
     ) -> Result<DwHandle, NativeError> {
         wyrmroot_runtime::materialize_read_only_memory(root, bytes, rights)
+    }
+
+    fn with_private_memory<R>(
+        &mut self,
+        root: DwHandle,
+        bytes: u64,
+        use_bytes: impl for<'a> FnOnce(&mut Self, &'a mut [u8]) -> R,
+    ) -> Result<R, NativeError> {
+        wyrmroot_runtime::with_private_memory(root, bytes, |memory| use_bytes(self, memory))
     }
 }
 

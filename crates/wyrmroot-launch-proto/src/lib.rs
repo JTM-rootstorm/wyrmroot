@@ -106,6 +106,11 @@ pub enum MessageType {
     CloseJob = 13,
     Closed = 14,
     Error = 15,
+    /// A three-stream LAUNCH whose executable arrives as a fourth handle, a
+    /// WRFS file Channel, instead of being named in bootfs (root
+    /// `STORAGE_PLAN.md` W6). The path is the file's display path without
+    /// its leading slash; it names nothing in bootfs.
+    LaunchImage = 17,
 }
 
 impl MessageType {
@@ -126,6 +131,7 @@ impl MessageType {
             13 => Self::CloseJob,
             14 => Self::Closed,
             15 => Self::Error,
+            17 => Self::LaunchImage,
             _ => return Err(Error::UnknownMessageType),
         })
     }
@@ -291,6 +297,8 @@ impl JobIds<'_> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Message<'a> {
     Launch(LaunchRequest<'a>),
+    /// Handles: stdin, stdout, stderr, then the image's file Channel.
+    LaunchImage(LaunchRequest<'a>),
     LaunchAccepted {
         job_id: u64,
     },
@@ -542,7 +550,10 @@ pub fn parse_message(bytes: &[u8], received_handles: usize) -> Result<ParsedMess
         return Err(Error::NonzeroFlags);
     }
     let message = match message_type {
-        MessageType::Launch => Message::Launch(parse_launch(bytes, received_handles)?),
+        MessageType::Launch => Message::Launch(parse_launch(bytes, received_handles, false)?),
+        MessageType::LaunchImage => {
+            Message::LaunchImage(parse_launch(bytes, received_handles, true)?)
+        }
         MessageType::LaunchAccepted => Message::LaunchAccepted {
             job_id: parse_job_id(bytes, received_handles)?,
         },
@@ -635,6 +646,30 @@ pub fn encode_launch(
     streams: bool,
     out: &mut [u8],
 ) -> Result<usize, Error> {
+    encode_launch_kind(reservation, path, argv, environment, streams, false, out)
+}
+
+/// Encodes a LAUNCH_IMAGE: a three-stream launch whose fourth handle is the
+/// executable's WRFS file Channel.
+pub fn encode_launch_image(
+    reservation: Reservation,
+    path: &str,
+    argv: &[&str],
+    environment: &[&str],
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    encode_launch_kind(reservation, path, argv, environment, true, true, out)
+}
+
+fn encode_launch_kind(
+    reservation: Reservation,
+    path: &str,
+    argv: &[&str],
+    environment: &[&str],
+    streams: bool,
+    image: bool,
+    out: &mut [u8],
+) -> Result<usize, Error> {
     validate_path(path)?;
     if argv.is_empty() || argv.len() > MAX_ARGV {
         return Err(Error::InvalidArgumentCount);
@@ -676,9 +711,15 @@ pub fn encode_launch(
         return Err(Error::WrongSize);
     }
     out[..total].fill(0);
-    encode_prefix(reservation, MessageType::Launch, out)?;
+    let kind = if image {
+        MessageType::LaunchImage
+    } else {
+        MessageType::Launch
+    };
+    encode_prefix(reservation, kind, out)?;
     put_u32(out, 48, u32::try_from(total).map_err(|_| Error::WrongSize)?)?;
-    put_u32(out, 52, if streams { 3 } else { 0 })?;
+    let handles = if streams { 3 } else { 0 } + u32::from(image);
+    put_u32(out, 52, handles)?;
     put_u16(out, 56, path.len() as u16)?;
     put_u16(out, 58, argv.len() as u16)?;
     put_u16(out, 60, environment.len() as u16)?;
@@ -847,7 +888,11 @@ pub fn encode_job_list(
     Ok(size)
 }
 
-fn parse_launch(bytes: &[u8], received_handles: usize) -> Result<LaunchRequest<'_>, Error> {
+fn parse_launch(
+    bytes: &[u8],
+    received_handles: usize,
+    image: bool,
+) -> Result<LaunchRequest<'_>, Error> {
     if bytes.len() < LAUNCH_FIXED_BYTES {
         return Err(Error::WrongSize);
     }
@@ -872,7 +917,13 @@ fn parse_launch(bytes: &[u8], received_handles: usize) -> Result<LaunchRequest<'
     if envc > MAX_ENVIRONMENT {
         return Err(Error::InvalidEnvironmentCount);
     }
-    if !matches!(stream_count, 0 | STREAM_COUNT) || stream_count != declared_handles {
+    // An image launch is always a foreground job: three streams and the image.
+    let streams_ok = if image {
+        stream_count == STREAM_COUNT && declared_handles == STREAM_COUNT + 1
+    } else {
+        matches!(stream_count, 0 | STREAM_COUNT) && stream_count == declared_handles
+    };
+    if !streams_ok {
         return Err(Error::InvalidStreamRoles);
     }
     if string_bytes > MAX_STRING_BYTES {

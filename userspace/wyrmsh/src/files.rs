@@ -448,3 +448,46 @@ pub(crate) fn cat<System: WyrmshSystem>(
     let _ = system.close_handle(node);
     result
 }
+
+/// `run /path`: opens the file for a LAUNCH_IMAGE. Returns the node and the
+/// length of the canonical path in `canonical`, or `None` once a failure has
+/// been reported. The launch names the file by its canonical path without
+/// the leading slash, so that path must fit WRLJ: ASCII and at most 256
+/// bytes.
+pub(crate) fn open_for_run<System: WyrmshSystem>(
+    system: &mut System,
+    mut console: Console<'_>,
+    identity: ShellIdentity,
+    transactions: &mut TransactionIds,
+    typed: &str,
+    canonical: &mut [u8; MAX_FS_PATH_BYTES],
+) -> Result<Option<(DwHandle, usize)>, ShellError> {
+    let Some((node, _, length)) = open_path(
+        system,
+        &mut console,
+        identity,
+        transactions,
+        "run",
+        typed,
+        OPEN_READ | OPEN_FILE,
+        canonical,
+    )?
+    else {
+        return Ok(None);
+    };
+    let display = &canonical[1..length];
+    if display.is_empty()
+        || display.len() > wyrmroot_launch_proto::MAX_PATH_BYTES
+        || !display.is_ascii()
+    {
+        let _ = system.close_handle(node);
+        console.fail(
+            system,
+            "run",
+            &canonical[..length],
+            b"path is not launchable",
+        )?;
+        return Ok(None);
+    }
+    Ok(Some((node, length)))
+}

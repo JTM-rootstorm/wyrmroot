@@ -12,7 +12,8 @@
 //! of block 0 through its virtqueue) along with `volume.boot0` and
 //! `system.vfs` (W6), lists `/boot/EFI/WYRMROOT` and `cat`s its README
 //! through vfsd, fat32d and blockmgr, runs `bin/hello` (a shell job under its
-//! TaskGroup limits) to its output and the next prompt, sends Ctrl-D, and
+//! TaskGroup limits) to its output and the next prompt, runs the same ELF
+//! from the ESP the same way, sends Ctrl-D, and
 //! requires the kernel's power-off line on COM1. That is the smoke check for
 //! development commits.
 //!
@@ -57,6 +58,9 @@ const LS_COMMAND: &[u8] = b"ls /boot/EFI/WYRMROOT\r";
 const LS_OUTPUT: [&[u8]; 2] = [b"bootstrap.elf\r\n", b"README.TXT\r\n"];
 const CAT_COMMAND: &[u8] = b"cat /boot/EFI/WYRMROOT/README.TXT\r";
 const CAT_OUTPUT: &[u8] = b"This is the Wyrmroot EFI System Partition.";
+/// The same `hello` run from the ESP: init reads the ELF through vfsd and
+/// fat32d instead of bootfs.
+const FILE_JOB_COMMAND: &[u8] = b"run /boot/EFI/WYRMROOT/HELLO.ELF\r";
 /// fat32d mounts beside the shell, so `ls` is retried a few times too.
 const LS_ATTEMPTS: usize = 20;
 /// The driver comes up beside the shell, so the list is retried a few times.
@@ -301,6 +305,19 @@ fn drive(child: &mut Child, com1: &Path, com2: &Arc<Mutex<Vec<u8>>>) -> Result<D
         "the prompt after bin/hello",
         seen(PROMPT, after_job),
     )?;
+    let before_file_job = length();
+    input
+        .write_all(FILE_JOB_COMMAND)
+        .map_err(|error| Failure::task(format!("could not send the file job: {error}")))?;
+    wait_until(deadline, "HELLO.ELF output and the prompt", || {
+        Ok(com2
+            .lock()
+            .map(|com2| {
+                com2.get(before_file_job..)
+                    .is_some_and(|tail| contains(tail, JOB_OUTPUT) && ends_with_prompt(tail))
+            })
+            .unwrap_or(false))
+    })?;
     input
         .write_all(&[END_OF_INPUT])
         .map_err(|error| Failure::task(format!("could not send Ctrl-D: {error}")))?;

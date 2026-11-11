@@ -672,7 +672,40 @@ fn dispatch_local<System: WyrmshSystem>(
             jobs,
             path,
             argv,
+            None,
         )?,
+        Command::RunFile { path, argv } => {
+            let mut canonical = [0u8; wyrmroot_wyrmsh_core::MAX_FS_PATH_BYTES];
+            let console = files::Console {
+                stdout: &mut *stdout,
+                stderr: &mut *stderr,
+                controls,
+            };
+            if let Some((node, length)) = files::open_for_run(
+                system,
+                console,
+                identity,
+                transactions,
+                path,
+                &mut canonical,
+            )? {
+                // `open_for_run` admitted only ASCII.
+                let display = core::str::from_utf8(&canonical[1..length])
+                    .map_err(|_| ShellError::InspectionProtocol)?;
+                jobs::run(
+                    system,
+                    stdout,
+                    stderr,
+                    identity,
+                    controls,
+                    transactions,
+                    jobs,
+                    display,
+                    argv,
+                    Some(node),
+                )?;
+            }
+        }
         Command::Spawn { path, argv } => jobs::spawn(
             system,
             stdout,

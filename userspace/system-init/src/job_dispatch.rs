@@ -658,7 +658,12 @@ where
             }
         },
     };
-    if version == JobWireVersion::Legacy && counts.handles > legacy_handle_limit {
+    // LAUNCH_IMAGE carries the image's file Channel after the three streams
+    // (root `STORAGE_PLAN.md` W6).
+    let image_launch = bytes.get(40..44)
+        == Some(&(wyrmroot_launch_proto::MessageType::LaunchImage as u32).to_le_bytes()[..]);
+    let handle_limit = legacy_handle_limit + usize::from(image_launch);
+    if version == JobWireVersion::Legacy && counts.handles > handle_limit {
         let failed = close_received_reverse(system, &received, counts.handles);
         return Err(if failed {
             InitError::Cleanup
@@ -858,6 +863,36 @@ where
                 request,
                 &received[..legacy_handle_limit],
                 counts.handles,
+                None,
+            )
+        }
+        LaunchMessage::LaunchImage(request) => {
+            let Some(policy) = policy else {
+                if close_received_reverse(system, &received, counts.handles) {
+                    return Err(InitError::Cleanup);
+                }
+                send_observed_job_error(
+                    system,
+                    session,
+                    reservation,
+                    LaunchErrorCode::PolicyRejected,
+                )?;
+                return Ok(JobDispatchOutcome::Responded);
+            };
+            crate::image_launch::defer_image_launch(
+                system,
+                loader,
+                waits,
+                authority,
+                policy,
+                jobs,
+                session,
+                grant,
+                scope,
+                reservation,
+                request_ticket,
+                request,
+                &received[..legacy_handle_limit + 1],
             )
         }
         message => {

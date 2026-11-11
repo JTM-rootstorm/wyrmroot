@@ -13,6 +13,7 @@ pub(crate) fn launch<System: WyrmshSystem>(
     path: &str,
     argv: Arguments<'_>,
     transfers: &[DwHandleTransferV1],
+    image: bool,
 ) -> Result<u64, LaunchFailure> {
     let transaction = transactions.launch().map_err(|_| LaunchFailure {
         kind: LaunchFailureKind::Fatal(ShellError::TransactionExhausted),
@@ -26,15 +27,27 @@ pub(crate) fn launch<System: WyrmshSystem>(
         count += 1;
     }
     let mut request = [0_u8; MAX_LAUNCH_MESSAGE_BYTES];
-    let size = encode_launch(
-        reservation,
-        path,
-        &arguments[..count],
-        &[],
-        !transfers.is_empty(),
-        &mut request,
-    )
-    .map_err(|_| LaunchFailure {
+    let encoded = if image {
+        // A file's argv[0] is its display path, as the launch names it.
+        arguments[0] = path;
+        wyrmroot_launch_proto::encode_launch_image(
+            reservation,
+            path,
+            &arguments[..count],
+            &[],
+            &mut request,
+        )
+    } else {
+        encode_launch(
+            reservation,
+            path,
+            &arguments[..count],
+            &[],
+            !transfers.is_empty(),
+            &mut request,
+        )
+    };
+    let size = encoded.map_err(|_| LaunchFailure {
         kind: LaunchFailureKind::Fatal(ShellError::InspectionProtocol),
         committed: false,
     })?;

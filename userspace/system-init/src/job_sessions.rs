@@ -37,6 +37,12 @@ impl LaunchSessionScope {
         }
     }
 
+    /// Whether this session may run a file image (root `STORAGE_PLAN.md` W6):
+    /// the shell's jobs session, not the console's launcher.
+    pub(crate) const fn admits_image_launch(self) -> bool {
+        matches!(self, Self::ShellJobs)
+    }
+
     pub(crate) const fn admits_shell_v1(self) -> bool {
         matches!(self, Self::ConsoleLauncher)
     }

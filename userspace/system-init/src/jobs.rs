@@ -1312,6 +1312,7 @@ pub(crate) fn prepare_reserved_job<'a, L: LoaderPlatform>(
     ticket: LaunchTicket,
     request: wyrmroot_launch_proto::LaunchRequest<'a>,
     streams: &'a [deepwyrm_syscall::DwHandle],
+    file_image: Option<&'a [u8]>,
 ) -> Result<PreparedJob, LaunchEngineError<L::Error>> {
     if ticket.owner
         != identity(reservation.connection_id, reservation.generation)
@@ -1340,9 +1341,17 @@ pub(crate) fn prepare_reserved_job<'a, L: LoaderPlatform>(
         3 => LaunchProfile::JobV2Streams,
         _ => return Err(reject(jobs, loader, JobError::StreamPolicy)),
     };
-    let image = match policy.authorize(request.path, request.stream_count) {
-        Ok(image) => image,
-        Err(error) => return Err(reject(jobs, loader, error)),
+    // A file image (root `STORAGE_PLAN.md` W6) replaces the bootfs lookup;
+    // it is always a foreground job.
+    let image = match file_image {
+        Some(_) if request.stream_count != 3 => {
+            return Err(reject(jobs, loader, JobError::StreamPolicy));
+        }
+        Some(image) => image,
+        None => match policy.authorize(request.path, request.stream_count) {
+            Ok(image) => image,
+            Err(error) => return Err(reject(jobs, loader, error)),
+        },
     };
     let mut argv = [""; wyrmroot_launch_proto::MAX_ARGV];
     for (index, slot) in argv.iter_mut().take(request.argc()).enumerate() {

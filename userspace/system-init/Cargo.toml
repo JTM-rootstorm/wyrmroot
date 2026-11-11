@@ -24,6 +24,7 @@ native-init = []
 deepwyrm-syscall.workspace = true
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs" }
 wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto" }
+wyrmroot-fs-proto = { path = "../../crates/wyrmroot-fs-proto" }
 wyrmroot-consoled = { path = "../consoled" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }

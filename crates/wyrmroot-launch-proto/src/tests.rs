@@ -415,3 +415,43 @@ fn canonical_job_state_and_list_encoders_reject_bad_identities() {
         Err(Error::ZeroIdentity)
     );
 }
+
+#[test]
+fn launch_image_carries_three_streams_and_the_image_handle() {
+    let mut bytes = [0_u8; 512];
+    let path = "boot/EFI/WYRMROOT/HELLO.ELF";
+    let size = encode_launch_image(R, path, &[path, "x"], &[], &mut bytes).unwrap();
+    let parsed = parse_message(&bytes[..size], 4).unwrap();
+    let Message::LaunchImage(request) = parsed.message else {
+        panic!("expected LAUNCH_IMAGE")
+    };
+    assert_eq!(request.path, path);
+    assert_eq!(request.stream_count, STREAM_COUNT);
+    assert_eq!((request.argc(), request.arg(1)), (2, Some("x")));
+    // The handle count is exact, and it is never a plain LAUNCH.
+    for handles in [0, 3, 5] {
+        assert_eq!(
+            parse_message(&bytes[..size], handles),
+            Err(Error::WrongHandleCount)
+        );
+    }
+    let mut as_launch = bytes;
+    as_launch[40..44].copy_from_slice(&(MessageType::Launch as u32).to_le_bytes());
+    assert_eq!(
+        parse_message(&as_launch[..size], 4),
+        Err(Error::InvalidStreamRoles)
+    );
+    // A plain three-stream LAUNCH relabelled as an image launch lacks the image.
+    let size = encode_launch(R, "bin/hello", &["bin/hello"], &[], true, &mut bytes).unwrap();
+    let mut relabelled = bytes;
+    relabelled[40..44].copy_from_slice(&(MessageType::LaunchImage as u32).to_le_bytes());
+    assert_eq!(
+        parse_message(&relabelled[..size], 3),
+        Err(Error::InvalidStreamRoles)
+    );
+    // Absolute display paths are carried without their leading slash.
+    assert_eq!(
+        encode_launch_image(R, "/boot/x", &["/boot/x"], &[], &mut bytes),
+        Err(Error::InvalidPath)
+    );
+}
