@@ -302,15 +302,16 @@ where
             }
         };
         if !exited && let Some(resources) = jobs.jobs.termination_to_retry(loaded.job_id) {
-            // A termination the kernel refused earlier is tried again each
-            // time the job comes round, so the job cannot hold its slot
-            // forever. Its cleanup bit stays set as the record of the refusal.
+            // A termination the kernel refused earlier (and that was reported
+            // then) is tried again each time the job comes round, so the job
+            // cannot hold its slot forever. Once accepted, the job is reaped
+            // as an ordinary forced termination.
             if system
                 .terminate_task_group(DwHandle(resources.task_group))
                 .is_ok()
             {
                 jobs.jobs
-                    .commit_forced_termination(loaded.job_id, resources)
+                    .commit_retried_termination(loaded.job_id, resources)
                     .map_err(InitError::Jobs)?;
             }
         }

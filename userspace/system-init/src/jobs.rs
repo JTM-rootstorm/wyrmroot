@@ -787,6 +787,27 @@ impl JobController {
             })
     }
 
+    /// Commits a retried termination and clears the refusal's cleanup bit.
+    /// The refusal was reported when it happened (the shell's Terminate got
+    /// CleanupFailure); once the kernel accepts, the job is reaped as an
+    /// ordinary forced termination rather than as a cleanup failure, which
+    /// would stop init.
+    pub(crate) fn commit_retried_termination(
+        &mut self,
+        job_id: u64,
+        resources: JobResources,
+    ) -> Result<(), JobError> {
+        self.commit_forced_termination(job_id, resources)?;
+        let job = self
+            .jobs
+            .iter_mut()
+            .flatten()
+            .find(|job| job.id == job_id)
+            .ok_or(JobError::UnknownJob)?;
+        job.cleanup_result &= !1;
+        Ok(())
+    }
+
     pub(crate) fn record_cleanup_bits(&mut self, job_id: u64, bits: u32) -> Result<(), JobError> {
         if bits & !wyrmroot_launch_proto::CLEANUP_RESULT_MASK != 0 {
             return Err(JobError::ResourceIdentity);
@@ -1619,7 +1640,10 @@ mod tests {
             .termination_to_retry(1)
             .expect("refused termination offered for retry");
         assert_eq!(controller.termination_to_retry(2), None);
-        controller.commit_forced_termination(1, resources).unwrap();
+        controller.commit_retried_termination(1, resources).unwrap();
         assert_eq!(controller.termination_to_retry(1), None);
+        let job = controller.jobs.iter().flatten().find(|job| job.id == 1);
+        assert_eq!(job.unwrap().cleanup_result, 0);
+        assert_eq!(job.unwrap().phase, JobPhase::Terminating);
     }
 }
