@@ -1,0 +1,14 @@
+[package]
+name = "wyrmroot-ext4"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Allocation-free ext4 volume: read-write subset and a formatter"
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_crate_dependencies = "deny"

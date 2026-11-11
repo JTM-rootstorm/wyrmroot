@@ -8,6 +8,7 @@ members = [
     "crates/wyrmroot-channel-model",
     "crates/wyrmroot-console-proto",
     "crates/wyrmroot-device-proto",
+    "crates/wyrmroot-ext4",
     "crates/wyrmroot-fat",
     "crates/wyrmroot-fs-proto",
     "crates/wyrmroot-loader",
