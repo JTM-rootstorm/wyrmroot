@@ -211,8 +211,10 @@ fn qemu_arguments(
         "-drive".into(),
         format!("if=pflash,format=raw,file={}", vars.display()),
         // VT-d, so the kernel can confine device DMA (root `STORAGE_PLAN.md`).
+        // Interrupt remapping too: without it the kernel admits no bus
+        // mastering, since a device could forge interrupts by DMA.
         "-device".into(),
-        "intel-iommu".into(),
+        "intel-iommu,intremap=on".into(),
         // A modern-only virtio disk whose DMA goes through the IOMMU.
         "-drive".into(),
         format!(
@@ -573,7 +575,7 @@ mod tests {
         assert_eq!(
             devices,
             [
-                "intel-iommu",
+                "intel-iommu,intremap=on",
                 "virtio-blk-pci,drive=esp,addr=0x1,disable-legacy=on,iommu_platform=on",
                 "virtio-blk-pci,drive=root,addr=0x2,disable-legacy=on,iommu_platform=on"
             ]
