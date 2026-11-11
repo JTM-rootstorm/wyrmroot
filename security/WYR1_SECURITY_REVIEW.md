@@ -4,7 +4,7 @@
 
 - No Critical or High findings.
 - Three Low findings, all fixed.
-- One Medium (WYR1-F4-M1), dispositioned below.
+- One Medium (WYR1-F4-M1), fixed.
 
 **Review date:** 2026-11-10
 
@@ -81,7 +81,7 @@ It now opens each file once with `O_NOFOLLOW|O_NONBLOCK`, then checks it with `f
 
 The rereview confirmed that no legitimate input stops working: the OVMF images are regular files and Cargo outputs are hard links.
 
-### WYR1-F4-M1: orphaned non-exiting jobs fill the connection slots (Medium; accepted with a target)
+### WYR1-F4-M1: orphaned non-exiting jobs fill the connection slots (Medium; fixed in `e420f29`, `266b2b1`)
 
 The repro is to run `spawn bin/cpu-hog` and then `exit`, repeated:
 
@@ -91,9 +91,24 @@ The repro is to run `spawn bin/cpu-hog` and then `exit`, repeated:
 
 After about 15 shell generations, `open_connection` fails because `MAX_CONNECTIONS = 16`, so no new shell can start until reboot. Each orphan also keeps a CPU busy.
 
-**Disposition:** accepted for WYR1. The behavior follows the contract, and only the local console operator, who can already shut the system down, can trigger it.
+**Original disposition** was "accepted for WYR1, with a target": an orphan policy before packages. Mike chose to fix it now.
 
-**Target:** add an orphan policy before packages, or before any non-console session. Options are terminating the orphans of a closed connection after a grace period, or a per-connection orphan quota. This pairs with the kernel's TaskGroup quotas (DW1-F4-M1).
+**Fix.**
+
+- `e420f29` bounds closed connections that still hold orphans to `MAX_ORPHAN_CONNECTIONS = 8`. After a disconnect, init terminates the orphans of the oldest closed connections past that bound, so a new shell can always open a connection.
+- `266b2b1` caps live shell jobs at `MAX_SHELL_JOBS = 4` (a fifth launch is refused) and orphans at two, and limits each job's TaskGroup in the kernel (Deepwyrm DW1-F4-M1) to zero objects and one wait. It repins to Deepwyrm `c7d7aae`.
+
+**Rereview** (Claude Opus 5.5, `claude-opus-5-5`, effort low, 2026-11-10, read-only, at `266b2b1` with Deepwyrm `c7d7aae`): closed. The kernel half was finished at Deepwyrm `b9bfb55` (see the DW1 record).
+
+**Validation** (development tier): the full `xtask test` on `f39b350` and `dev-boot --check` with Deepwyrm `b9bfb55`, which runs `bin/hello` as a limited job.
+
+**Residual risks** (not defects):
+
+- A job whose cleanup failed keeps one of the four shell-job slots until reboot.
+- One shell can take all four job slots.
+- An error in `retire_excess_orphans` stops the loop partway; the next disconnect retries.
+- `JOB_IMAGE_OBJECTS = 3` assumes at most two PT_LOAD segments.
+- Whether init's job wait set grows per job is not documented.
 
 ## Risks and questions
 
