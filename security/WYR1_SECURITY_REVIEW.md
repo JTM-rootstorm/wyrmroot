@@ -102,13 +102,21 @@ After about 15 shell generations, `open_connection` fails because `MAX_CONNECTIO
 
 **Validation** (development tier): the full `xtask test` on `f39b350` and `dev-boot --check` with Deepwyrm `b9bfb55`, which runs `bin/hello` as a limited job.
 
-**Residual risks** (not defects):
+**Residual risks.** Mike asked for these to be fixed (2026-11-10). Fixed in `d32c49f` and `5f00b55`, with Deepwyrm `5fa9b6a` and `3caecc3`:
 
-- A job whose cleanup failed keeps one of the four shell-job slots until reboot.
-- One shell can take all four job slots.
-- An error in `retire_excess_orphans` stops the loop partway; the next disconnect retries.
-- `JOB_IMAGE_OBJECTS = 3` assumes at most two PT_LOAD segments.
-- Whether init's job wait set grows per job is not documented.
+| Residual risk | Fix | Follow-up review |
+|---|---|---|
+| A job whose cleanup failed keeps a shell-job slot | A refused TaskGroup termination is retried whenever the poll loop reaches the job. Init already retried the rest of cleanup every tick. | Partially closed at `d32c49f`: a successful retry still left the refusal bit set, so reaping the job stopped init (R1). Fixed in `5f00b55`: the bit is cleared once the kernel accepts, since the refusal was already reported to the shell. |
+| One shell can take all four slots | `MAX_JOBS_PER_SHELL = 3` | Closed. The reviewer notes that only one shell session is live at a time and orphans are already capped at two, so in practice this mainly limits the live shell to three jobs. |
+| `retire_excess_orphans` stops partway | Every orphan is attempted; the first error is reported afterwards | Closed |
+| `JOB_IMAGE_OBJECTS = 3` assumes at most two PT_LOADs | The loader refuses a JobV2 image with more than `MAX_JOB_LOAD_SEGMENTS = 2` PT_LOADs. This also caps the JobV2 services, matching Deepwyrm's resident budget. | Closed |
+| Init's job wait set growth undocumented | Documented in `jobs.rs`: init's blocking waits are single-item and its multi-item waits are deadline-now, so its registered waits do not grow with jobs. | Closed |
+
+Jobs may now register four wait items (was one), matching Deepwyrm's `JOB_OWN_WAITS`.
+
+**Follow-up review:** Claude Opus 5.5 (`claude-opus-5-5`), read-only, 2026-11-10, at `d32c49f` with Deepwyrm `5fa9b6a`. See the DW1 record. A retried termination repeats each poll tick while the kernel keeps refusing it. That is bounded but not throttled, and it is accepted.
+
+**Validation** (development tier, final pair Wyrmroot `5f00b55` / Deepwyrm `3caecc3`): `xtask test` and `dev-boot --check`. The new tests were mutation-checked.
 
 ## Risks and questions
 
