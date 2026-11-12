@@ -46,21 +46,60 @@ pub(crate) const MAX_ORPHAN_JOBS: usize = MAX_SHELL_JOBS / 2;
 /// Live shell jobs one ShellJobs connection may hold, so one shell cannot
 /// take every `MAX_SHELL_JOBS` slot from another.
 pub(crate) const MAX_JOBS_PER_SHELL: usize = MAX_SHELL_JOBS - 1;
-/// Each job's own TaskGroup limits: a job creates no kernel objects of its
-/// own and registers at most four wait items, enough for a small wait-many
-/// (deepwyrm's `JOB_OWN_WAITS`). Init
-/// creates the job's Process, Thread, memory and channels, so those are
-/// charged to init and bounded by `MAX_SHELL_JOBS`.
-pub const JOB_TASK_GROUP_LIMITS: [(u32, u32); 8] = [
-    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_CHANNEL, 0),
+/// Each job's own TaskGroup limits. Init creates the job's Process, Thread,
+/// image memory and launch channels, so those are charged to init and
+/// bounded by `MAX_SHELL_JOBS`. What the job creates itself is what a POSIX
+/// program needs (root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W9): four
+/// MemoryObjects for `mmap`, together at most 16 MiB of RAM (Deepwyrm D6's
+/// page class), and ten Channel endpoints, five pairs, for sleeping and up to
+/// four open files. No Events, Timers, Threads, Processes or TaskGroups yet.
+/// At most four wait items, enough for a small wait-many. Deepwyrm's
+/// production ledger counts every one of these per live job
+/// (`JOB_OWN_MEMORY_OBJECTS`, `JOB_OWN_CHANNEL_PAIRS`, `JOB_OWN_WAITS`).
+pub const JOB_TASK_GROUP_LIMITS: [(u32, u32); 9] = [
+    (
+        deepwyrm_syscall::DW_TASK_GROUP_LIMIT_CHANNEL,
+        JOB_CHANNEL_ENDPOINTS,
+    ),
     (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_EVENT, 0),
     (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_TIMER, 0),
-    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_MEMORY_OBJECT, 0),
+    (
+        deepwyrm_syscall::DW_TASK_GROUP_LIMIT_MEMORY_OBJECT,
+        JOB_MEMORY_OBJECTS,
+    ),
     (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_THREAD, 0),
     (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_PROCESS, 0),
     (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_TASK_GROUP, 0),
     (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_WAIT, 4),
+    (
+        deepwyrm_syscall::DW_TASK_GROUP_LIMIT_MEMORY_PAGES,
+        JOB_MEMORY_PAGES,
+    ),
 ];
+/// Channel endpoints a job may create: one `channel_create` uses two.
+pub const JOB_CHANNEL_ENDPOINTS: u32 = 10;
+pub const JOB_MEMORY_OBJECTS: u32 = 4;
+/// 16 MiB of 4 KiB pages.
+pub const JOB_MEMORY_PAGES: u32 = 4096;
+// Every class has exactly one limit.
+const _: () = {
+    assert!(
+        JOB_TASK_GROUP_LIMITS.len() == deepwyrm_syscall::DW_TASK_GROUP_LIMIT_CLASS_COUNT as usize
+    );
+    let mut class = 0;
+    while class < JOB_TASK_GROUP_LIMITS.len() {
+        let mut found = 0;
+        let mut index = 0;
+        while index < JOB_TASK_GROUP_LIMITS.len() {
+            if JOB_TASK_GROUP_LIMITS[index].0 as usize == class {
+                found += 1;
+            }
+            index += 1;
+        }
+        assert!(found == 1);
+        class += 1;
+    }
+};
 const _: () = assert!(MAX_ORPHAN_CONNECTIONS + 4 <= MAX_CONNECTIONS);
 pub(crate) const REPLAY_RECORDS: usize = 32;
 
