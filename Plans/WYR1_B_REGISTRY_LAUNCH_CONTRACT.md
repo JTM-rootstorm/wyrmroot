@@ -133,10 +133,15 @@ job that maps nothing closes the handle; `bin/hello` and `bin/cpu-hog` do.
 
 Jobs launched from a file (`LAUNCH_IMAGE`, §9.1) use WRLP minor `13`
 (2026-11-12, root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W5): after the
-three streams, role `NAMESPACE` (17) carries a WRNS connection to `system.vfs`
-through which the job opens paths. The launcher supplies it and init forwards
-it without using it, so a job can reach exactly the namespace its launcher
-could. A job that opens no paths closes it. Its working directory is not a
+three streams, role `NAMESPACE` (17) carries the Channel through which the
+job opens paths. The shell sends its WRNS connection to `system.vfs`, but the
+handle is launcher-supplied and init does not verify where it leads: init
+forwards it without using it, and the loader admits only a Channel with
+exactly the child rights. A job therefore reaches at most what its launcher
+could. A job that opens no paths closes it. Each running file job holds one
+`vfsd` client connection; init's `MAX_SHELL_JOBS` (4) plus the shell's own
+connection stays below `vfsd`'s `MAX_CLIENTS` (8), and raising the first
+needs the second checked. Its working directory is not a
 startup role: a POSIX program takes it from its `PWD` environment entry and
 starts at `/` without one. Bootfs launches keep WRLP 1.12 and receive no
 namespace.
