@@ -59,6 +59,12 @@ pub struct LockServer<const N: usize, const OWNERS: usize> {
     next_sequence: u64,
 }
 
+impl<const N: usize, const OWNERS: usize> Default for LockServer<N, OWNERS> {
+    fn default() -> Self {
+        Self::with_owner_limit(N)
+    }
+}
+
 impl<const N: usize, const OWNERS: usize> LockServer<N, OWNERS> {
     /// A server whose owners hold at most `owner_limit` locks each.
     pub const fn with_owner_limit(owner_limit: usize) -> Self {
