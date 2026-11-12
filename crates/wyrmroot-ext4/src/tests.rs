@@ -511,3 +511,56 @@ fn sync_flushes_the_device() {
     volume.sync(&mut disk).unwrap();
     assert_eq!(disk.flushes, before + 1);
 }
+
+/// A deleted entry's stale name length may run past its record and the
+/// block; walking it must not read the name (review D1, 2026-11-11).
+#[test]
+fn a_deleted_entry_with_a_stale_long_name_is_skipped() {
+    let mut disk = Memory::new(SIZE);
+    format(&mut disk, SIZE as u64, &params(4096)).unwrap();
+    // Drop metadata_csum (ro_compat bit 0x400) so the edit needs no checksum.
+    let ro_compat = 1024 + 0x64;
+    let flags = u32::from_le_bytes(disk.bytes[ro_compat..ro_compat + 4].try_into().unwrap());
+    disk.bytes[ro_compat..ro_compat + 4].copy_from_slice(&(flags & !0x400).to_le_bytes());
+    let bs = 4096;
+    let root = (0..SIZE / bs)
+        .map(|block| block * bs)
+        .find(|&at| {
+            let d = &disk.bytes[at..at + 24];
+            d[0..4] == 2u32.to_le_bytes() && d[8] == b'.' && d[12..16] == 2u32.to_le_bytes()
+        })
+        .expect("the root directory block");
+    let limit = bs - 12;
+    let mut offset = 0;
+    let last = loop {
+        let rec_len = usize::from(u16::from_le_bytes(
+            disk.bytes[root + offset + 4..root + offset + 6]
+                .try_into()
+                .unwrap(),
+        ));
+        if offset + rec_len == limit {
+            break (offset, rec_len);
+        }
+        offset += rec_len;
+    };
+    let field = root + last.0 + 4;
+    disk.bytes[field..field + 2].copy_from_slice(&((last.1 - 8) as u16).to_le_bytes());
+    let deleted = root + limit - 8;
+    disk.bytes[deleted..deleted + 8].copy_from_slice(&[0, 0, 0, 0, 8, 0, 255, 0]);
+
+    let mut volume = Volume::mount(&mut disk, SIZE as u64, true).unwrap();
+    assert_eq!(
+        volume
+            .lookup(&mut disk, ROOT_INODE, b"x")
+            .map(|stat| stat.inode),
+        Err(Error::NotFound)
+    );
+    assert_eq!(
+        names(&volume, &mut disk, ROOT_INODE),
+        [b"lost+found".to_vec()]
+    );
+    volume
+        .create(&mut disk, ROOT_INODE, b"after", Kind::File)
+        .unwrap();
+    assert!(volume.lookup(&mut disk, ROOT_INODE, b"after").is_ok());
+}

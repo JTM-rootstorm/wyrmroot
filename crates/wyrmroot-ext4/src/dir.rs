@@ -54,13 +54,20 @@ fn walk<'a, T>(
     let mut offset = 0;
     while offset < limit {
         let rec_len = usize::from(get16(block, offset + 4));
-        let name_len = usize::from(block[offset + 6]);
+        let inode = get32(block, offset);
+        // Only a live entry's name was checked to fit; a deleted entry's
+        // stale name length means nothing.
+        let name: &[u8] = if inode == 0 {
+            &[]
+        } else {
+            &block[offset + 8..offset + 8 + usize::from(block[offset + 6])]
+        };
         let raw = Raw {
             offset,
-            inode: get32(block, offset),
+            inode,
             rec_len,
             file_type: block[offset + 7],
-            name: &block[offset + 8..offset + 8 + name_len],
+            name,
         };
         if let ControlFlow::Break(value) = visit(raw) {
             return Some(value);

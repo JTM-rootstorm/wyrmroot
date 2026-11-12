@@ -481,6 +481,7 @@ impl<V: View> Server<V> {
         let transaction_id = message.transaction_id;
         let status = |status| Body::Status { status, value: 0 };
         let writable = here.access & ACCESS_WRITE != 0;
+        let readable = here.access & ACCESS_READ != 0;
         let mut listing = [0u8; MAX_DIRENT_BYTES];
         let mut data = [0u8; MAX_IO_BYTES];
         let mut device = Self::device(platform, &mut self.client, &mut self.view, &mut self.cache);
@@ -502,7 +503,7 @@ impl<V: View> Server<V> {
                 Ok(stat) => Body::Attr(Self::attr(stat, here.access)),
                 Err(error) => status(status_of(error)),
             },
-            Body::ReadDir { cookie } => {
+            Body::ReadDir { cookie } if readable => {
                 let mut writer = EntryWriter::new(&mut listing);
                 let listed = self
                     .volume
@@ -527,7 +528,7 @@ impl<V: View> Server<V> {
                     Err(error) => status(status_of(error)),
                 }
             }
-            Body::Read { offset, length } => {
+            Body::Read { offset, length } if readable => {
                 let out = &mut data[..length as usize];
                 match self.volume.read(&mut device, here.inode, offset, out) {
                     Ok(read) => Body::Data(&data[..read]),
@@ -560,6 +561,7 @@ impl<V: View> Server<V> {
                     Err(error) => status_of(error),
                 })
             }
+            Body::ReadDir { .. } | Body::Read { .. } => status(Status::AccessDenied),
             Body::Write { .. } | Body::Truncate { .. } | Body::Unlink { .. } => {
                 status(if self.volume.read_only() {
                     Status::ReadOnly
@@ -598,6 +600,10 @@ impl<V: View> Server<V> {
         flags: u32,
         path: &[u8],
     ) -> Result<Stat, Status> {
+        // Access never grows (WRFS): reading below needs a readable handle.
+        if flags & OPEN_READ != 0 && dir.access & ACCESS_READ == 0 {
+            return Err(Status::AccessDenied);
+        }
         if flags & OPEN_MUTATING != 0 {
             if self.volume.read_only() {
                 return Err(Status::ReadOnly);

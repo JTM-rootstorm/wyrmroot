@@ -453,8 +453,8 @@ fn publish<P: BlockPlatform>(
 }
 
 /// Resets and initializes the device over the staged resource: maps its
-/// BAR and the driver's DMA memory, maps that memory for the device, enables
-/// bus mastering and starts queue 0.
+/// BAR and the driver's DMA memory, resets the device, maps that memory for
+/// the device, enables bus mastering and starts queue 0.
 fn bring_up<P: BlockPlatform, M: DeviceMapper<P>>(
     platform: &mut P,
     mapper: &mut M,
@@ -481,10 +481,6 @@ fn bring_up<P: BlockPlatform, M: DeviceMapper<P>>(
     live.dma_object = platform
         .create_memory_object(DMA_BYTES, DMA_OBJECT_RIGHTS)
         .map_err(|_| 104u32)?;
-    let iova = platform
-        .dma_map(resource, live.dma_object, 0, DMA_BYTES, DMA_ACCESS)
-        .map_err(|_| 105u32)?;
-    live.dma_iova = Some(iova);
     let hardware = live.hardware.insert(
         mapper
             .map(
@@ -496,6 +492,14 @@ fn bring_up<P: BlockPlatform, M: DeviceMapper<P>>(
             )
             .map_err(|_| 106u32)?,
     );
+    // A predecessor may have left the device programmed: reset it before it
+    // can see any of this driver's memory or master the bus.
+    crate::virtio::reset_device(hardware, caps, bar_bytes)
+        .map_err(|error| 110 + virtio_code(error))?;
+    let iova = platform
+        .dma_map(resource, live.dma_object, 0, DMA_BYTES, DMA_ACCESS)
+        .map_err(|_| 105u32)?;
+    live.dma_iova = Some(iova);
     // The IOMMU confines whatever the device does once it may master the bus.
     platform
         .device_pci_command(resource, true, true)

@@ -413,7 +413,7 @@ impl role::DeviceMapper<RecordingPlatform> for ModelMapper {
 
     fn map(
         &mut self,
-        _: &mut RecordingPlatform,
+        platform: &mut RecordingPlatform,
         root: DwHandle,
         bar: DwHandle,
         bar_bytes: u64,
@@ -422,6 +422,19 @@ impl role::DeviceMapper<RecordingPlatform> for ModelMapper {
         assert_eq!(
             (root, bar, bar_bytes, dma),
             (SELF_ROOT, BAR_OBJECT, BAR_BYTES, DMA_OBJECT)
+        );
+        // The device is mapped, and so reset, before it can reach any of the
+        // driver's memory: no DMA mapping or bus mastering yet (review D3).
+        assert!(
+            !platform.calls().iter().any(|call| matches!(
+                call,
+                Call::DmaMap { .. }
+                    | Call::DevicePciCommand {
+                        bus_master: true,
+                        ..
+                    }
+            )),
+            "the device could reach driver memory before its reset"
         );
         Ok(self.model.take().expect("mapped twice"))
     }

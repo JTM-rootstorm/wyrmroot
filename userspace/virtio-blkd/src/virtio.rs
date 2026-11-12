@@ -630,3 +630,14 @@ fn mem_write<H: Hardware>(
         .mem_write(offset, width, value)
         .map_err(|Fault| Error::Access)
 }
+
+/// Resets the device before the driver gives it any memory, so nothing a
+/// predecessor programmed survives (status 0, then wait for 0).
+pub fn reset_device<H: Hardware>(
+    hardware: &mut H,
+    caps: Capabilities,
+    bar_bytes: u64,
+) -> Result<(), Error> {
+    region_end(caps.common, bar_bytes)?;
+    Bar { hardware, caps }.reset()
+}

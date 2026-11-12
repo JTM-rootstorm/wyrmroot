@@ -491,3 +491,32 @@ fn nodes_outlive_the_root_and_init_retires_the_role() {
         Ok(false)
     );
 }
+
+/// Access never grows: a write-only handle neither reads nor lists, and
+/// cannot open anything for reading (review D4, 2026-11-11).
+#[test]
+fn a_write_only_handle_neither_reads_nor_opens_for_reading() {
+    let mut fs = fs();
+    let root = fs.root;
+    let (etc, status, _) = fs.open(root, OPEN_WRITE | OPEN_DIRECTORY, b"etc");
+    assert_eq!(status, Status::Ok);
+    assert_eq!(
+        fs.status(etc, Body::ReadDir { cookie: 0 }).0,
+        Status::AccessDenied
+    );
+    let (_, status, _) = fs.open(etc, OPEN_READ, b"motd");
+    assert_eq!(status, Status::AccessDenied);
+    let (motd, status, _) = fs.open(etc, OPEN_WRITE, b"motd");
+    assert_eq!(status, Status::Ok);
+    assert_eq!(
+        fs.status(
+            motd,
+            Body::Read {
+                offset: 0,
+                length: 8
+            }
+        )
+        .0,
+        Status::AccessDenied
+    );
+}
