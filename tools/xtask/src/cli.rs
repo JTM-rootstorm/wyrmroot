@@ -3,13 +3,15 @@ use crate::{error::Failure, gate::Scope};
 pub(crate) const USAGE: &str = r#"Wyrmroot development task dispatcher
 
 Usage:
-    tools/pinned-cargo xtask dev-boot [--smp] [--check] [--deep-repository <path>]
+    tools/pinned-cargo xtask dev-boot [--smp] [--check] [--deep-repository <path>] [--sdk <path>]
     tools/pinned-cargo xtask product --output <fresh-directory> [--deep-repository <path>]
     tools/pinned-cargo xtask test [all|fmt|clippy|unit|root]
 
 dev-boot builds the current product from both working trees and boots it in
 local QEMU; COM2 is the `wyrmsh` console. --check drives the prompt, sends
-Ctrl-D and requires the kernel's power-off line instead.
+Ctrl-D and requires the kernel's power-off line instead. --sdk names a built
+Wyrmroot SDK (`wyrmroot-sdk/out`): its C hello goes on the ESP, and --check
+runs it.
 
 product builds the same product into a directory: artifacts/esp.img plus the
 loader, kernel, bootstrap, natives, bootfs and OVMF pair.
@@ -33,6 +35,7 @@ pub(crate) enum Action {
         check: bool,
         smp: bool,
         deep_repository: Option<String>,
+        sdk: Option<String>,
     },
     Product {
         output: String,
@@ -67,28 +70,37 @@ fn dispatch_dev_boot(arguments: &[String]) -> Result<Action, Failure> {
     let mut check = false;
     let mut smp = false;
     let mut deep_repository = None;
+    let mut sdk = None;
     let mut rest = arguments.iter();
     while let Some(argument) = rest.next() {
-        match argument.as_str() {
-            "--check" if !check => check = true,
-            "--smp" if !smp => smp = true,
-            "--deep-repository" if deep_repository.is_none() => {
-                deep_repository =
-                    Some(rest.next().cloned().ok_or_else(|| {
-                        Failure::usage("dev-boot --deep-repository requires a path")
-                    })?);
+        let slot = match argument.as_str() {
+            "--check" if !check => {
+                check = true;
+                continue;
             }
+            "--smp" if !smp => {
+                smp = true;
+                continue;
+            }
+            "--deep-repository" if deep_repository.is_none() => &mut deep_repository,
+            "--sdk" if sdk.is_none() => &mut sdk,
             _ => {
                 return Err(Failure::usage(
-                    "dev-boot accepts [--smp] [--check] [--deep-repository <path>]",
+                    "dev-boot accepts [--smp] [--check] [--deep-repository <path>] [--sdk <path>]",
                 ));
             }
-        }
+        };
+        *slot = Some(
+            rest.next()
+                .cloned()
+                .ok_or_else(|| Failure::usage(format!("dev-boot {argument} requires a path")))?,
+        );
     }
     Ok(Action::DevBoot {
         check,
         smp,
         deep_repository,
+        sdk,
     })
 }
 
@@ -134,7 +146,22 @@ mod tests {
             Ok(Action::DevBoot {
                 check: true,
                 smp: false,
-                deep_repository: None
+                deep_repository: None,
+                sdk: None
+            })
+        );
+        assert_eq!(
+            dispatch(&arguments(&[
+                "dev-boot",
+                "--sdk",
+                "../wyrmroot-sdk/out",
+                "--check"
+            ])),
+            Ok(Action::DevBoot {
+                check: true,
+                smp: false,
+                deep_repository: None,
+                sdk: Some("../wyrmroot-sdk/out".into())
             })
         );
         assert_eq!(
@@ -160,6 +187,8 @@ mod tests {
             &["product"][..],
             &["product", "--output"],
             &["dev-boot", "--check", "--check"],
+            &["dev-boot", "--sdk"],
+            &["dev-boot", "--sdk", "a", "--sdk", "b"],
             &["test", "native"],
             &["wyr1f", "prepare"],
         ] {

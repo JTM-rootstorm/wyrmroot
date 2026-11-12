@@ -42,10 +42,12 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             check,
             smp,
             deep_repository,
+            sdk,
         } => dev_boot::run(&dev_boot::DevBoot {
             check,
             smp,
             deep_repository,
+            sdk,
         })
         .map(Some),
         Action::Product {
@@ -59,7 +61,7 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
                     tasks::canonical_project_root(&repository)?.join("deepwyrm")
                 }
             };
-            product::build(&PathBuf::from(&output), &deep)?;
+            product::build(&PathBuf::from(&output), &deep, None)?;
             Ok(Some(format!("PRODUCT_BUILT output={output}\n")))
         }
         Action::Test(scope) => gate::run(scope).map(|()| None),

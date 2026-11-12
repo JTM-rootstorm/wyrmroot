@@ -49,6 +49,9 @@ pub(crate) struct DevBoot {
     pub(crate) check: bool,
     pub(crate) smp: bool,
     pub(crate) deep_repository: Option<String>,
+    /// A built Wyrmroot SDK (`wyrmroot-sdk/out`) whose C hello goes on the
+    /// ESP and, under `--check`, runs (root `TOOLCHAIN_PLAN.md` step 2).
+    pub(crate) sdk: Option<String>,
 }
 
 /// The same memory and CPU counts as the F matrix's default and SMP profiles.
@@ -70,6 +73,8 @@ const SERVICES: [&[u8]; 5] = [
 const ESP_LISTING: [&[u8]; 2] = [b"bootstrap.elf\r\n", b"README.TXT\r\n"];
 const ESP_README: &[u8] = b"This is the Wyrmroot EFI System Partition.";
 const JOB_OUTPUT: &[u8] = b"hello from native stdout";
+/// What `wyrmroot-sdk/programs/hello.c` prints when run with no arguments.
+const SDK_HELLO_OUTPUT: &[u8] = b"hello from musl: 1 argument, 6*7=42, pi=3.14159, pages=64";
 /// Services and mounts come up beside the shell, so their checks are retried.
 const ATTEMPTS: usize = 20;
 /// What the first boot writes and the second reads back.
@@ -93,7 +98,8 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
     fs::create_dir_all(&root)
         .map_err(|error| Failure::task(format!("could not create dev-boot root: {error}")))?;
     let product = root.join("product");
-    product::build(&product, &deep)?;
+    let sdk = boot.sdk.as_ref().map(PathBuf::from);
+    product::build(&product, &deep, sdk.as_deref())?;
 
     // The product's firmware vars are sealed read-only; the run gets its own copy.
     let vars = root.join("OVMF_VARS.fd");
@@ -118,7 +124,12 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
     if boot.check {
         let reboot = root.join("com1-reboot.log");
         let second = qemu_arguments(boot.smp, &product, &vars, &reboot, &root_disk);
-        check(&[(&args, &com1), (&second, &reboot)], &root, unique)
+        check(
+            &[(&args, &com1), (&second, &reboot)],
+            &root,
+            unique,
+            sdk.is_some(),
+        )
     } else {
         eprintln!(
             "dev-boot: {} (Ctrl-D at the prompt shuts down)",
@@ -220,11 +231,12 @@ fn check(
     boots: &[(&Vec<String>, &PathBuf); 2],
     root: &Path,
     unique: u128,
+    sdk: bool,
 ) -> Result<String, Failure> {
     let started = Instant::now();
     let token = format!("dev-boot persisted {unique}");
     let first = boot_once(boots[0].0, boots[0].1, &root.join("com2.log"), |shell| {
-        first_boot(shell, &token)
+        first_boot(shell, &token, sdk)
     });
     first?;
     let second = boot_once(
@@ -242,7 +254,7 @@ fn check(
 }
 
 /// Everything the first boot checks, ending with the persistent write.
-fn first_boot(shell: &mut Shell<'_>, token: &str) -> Result<(), Failure> {
+fn first_boot(shell: &mut Shell<'_>, token: &str, sdk: bool) -> Result<(), Failure> {
     shell.retry("services", "every storage service published", |output| {
         SERVICES.iter().all(|service| contains(output, service))
     })?;
@@ -265,6 +277,20 @@ fn first_boot(shell: &mut Shell<'_>, token: &str) -> Result<(), Failure> {
     // The same `hello` from the ESP: init reads the ELF through vfsd and
     // fat32d instead of bootfs.
     shell.expect("run /boot/EFI/WYRMROOT/HELLO.ELF", JOB_OUTPUT)?;
+    if sdk {
+        // A static C program built against the SDK: musl over the POSIX
+        // layer, started from the ESP like the hello above, ending in a
+        // normal exit with status 0.
+        let output = shell.run("run /boot/EFI/WYRMROOT/SDKHELLO.ELF")?;
+        if !contains(&output, SDK_HELLO_OUTPUT)
+            || !contains(&output, b"classification=normal application=0 ")
+        {
+            return Err(Failure::task(format!(
+                "dev-boot check: the SDK hello printed {:?}",
+                String::from_utf8_lossy(&output)
+            )));
+        }
+    }
     for job in hogs {
         // A hog that already exited makes this `invalid-state`; `wait` then
         // shows its exit code.
