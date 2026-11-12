@@ -212,6 +212,11 @@ fn qemu_arguments(
         format!("{MEMORY_MIB}M"),
         "-smp".into(),
         vcpus.to_string(),
+        // The default TCG model lacks what large-memory support relies on:
+        // 1 GiB pages for the kernel's direct map, SMEP and SMAP
+        // (Deepwyrm DW2 M2).
+        "-cpu".into(),
+        "qemu64,+pdpe1gb,+smep,+smap".into(),
         "-nodefaults".into(),
         "-display".into(),
         "none".into(),
@@ -709,6 +714,28 @@ mod tests {
             b"\r\nwyrmsh> ".to_vec()
         );
         assert_eq!(strip_escapes(b"a\x1b[1;31mb"), b"ab".to_vec());
+    }
+
+    #[test]
+    fn the_guest_cpu_has_gigabyte_pages_smep_and_smap() {
+        let args = qemu_arguments(
+            false,
+            Path::new("product"),
+            Path::new("vars"),
+            Path::new("com1"),
+            Path::new("root"),
+        );
+        let cpu = args
+            .windows(2)
+            .find(|pair| pair[0] == "-cpu")
+            .map(|pair| pair[1].clone())
+            .expect("a CPU model is chosen");
+        for feature in ["+pdpe1gb", "+smep", "+smap"] {
+            assert!(
+                cpu.split(',').any(|part| part == feature),
+                "{feature} in {cpu}"
+            );
+        }
     }
 
     #[test]
