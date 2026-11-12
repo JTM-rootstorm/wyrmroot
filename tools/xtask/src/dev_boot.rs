@@ -223,8 +223,10 @@ fn qemu_arguments(
         "-nodefaults".into(),
         "-display".into(),
         "none".into(),
+        // A monitor socket beside COM1, so a failed check can record where
+        // every CPU was before QEMU is killed.
         "-monitor".into(),
-        "none".into(),
+        format!("unix:{},server,nowait", monitor_socket(com1).display()),
         "-no-reboot".into(),
         "-drive".into(),
         format!(
@@ -500,6 +502,7 @@ fn boot_once(
     let com2 = Arc::new(Mutex::new(Vec::new()));
     let result = drive(&mut child, com1, &com2, script);
     if result.is_err() {
+        record_cpu_state(&monitor_socket(com1), &com1.with_extension("cpu-state.txt"));
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -508,6 +511,52 @@ fn boot_once(
         let _ = fs::write(transcript, &*com2);
     }
     result
+}
+
+/// The QEMU monitor socket of the boot whose COM1 log is `com1`.
+fn monitor_socket(com1: &Path) -> PathBuf {
+    com1.with_extension("monitor")
+}
+
+/// Stops the guest and writes every CPU's registers and the top of each
+/// stack, from QEMU's monitor at `socket`, to `output`. Best effort: a
+/// failed check is reported either way.
+fn record_cpu_state(socket: &Path, output: &Path) {
+    let Ok(mut monitor) = std::os::unix::net::UnixStream::connect(socket) else {
+        return;
+    };
+    let _ = monitor.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut state = Vec::new();
+    let read_all = |monitor: &mut std::os::unix::net::UnixStream, state: &mut Vec<u8>| {
+        let mut buffer = [0_u8; 65536];
+        while let Ok(read) = monitor.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            state.extend_from_slice(&buffer[..read]);
+        }
+    };
+    read_all(&mut monitor, &mut state);
+    let mut commands = vec![
+        "stop".to_owned(),
+        "info status".to_owned(),
+        "info cpus".to_owned(),
+        "info registers -a".to_owned(),
+    ];
+    for cpu in 0..SMP_VCPUS {
+        commands.push(format!("cpu {cpu}"));
+        commands.push("x /96gx $rsp".to_owned());
+    }
+    for command in commands {
+        if monitor
+            .write_all(format!("{command}\n").as_bytes())
+            .is_err()
+        {
+            break;
+        }
+        read_all(&mut monitor, &mut state);
+    }
+    let _ = fs::write(output, strip_escapes(&state));
 }
 
 fn drive(
