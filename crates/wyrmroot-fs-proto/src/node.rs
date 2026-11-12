@@ -36,7 +36,9 @@
 //! the filesystem's root Channel and a node opened through another node
 //! inherits; a running job holds one connection. No client names its own,
 //! so none can stand in for another in this walk. A node with no client (0)
-//! is a client of its own. The answer is checked when a LOCK starts to wait
+//! is a client of its own. A node handed to another job stays its opener's:
+//! that job's locks through it count as the opener's, so a deadlock between
+//! them and the receiver's own Channels is not found. The answer is checked when a LOCK starts to wait
 //! and again whenever waiters are granted.
 //!
 //! A request that does not apply to the node (READ on a directory, UNLINK

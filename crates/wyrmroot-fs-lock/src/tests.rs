@@ -404,3 +404,24 @@ mod server {
         );
     }
 }
+
+#[test]
+fn a_grant_pass_after_no_change_does_no_work() {
+    // W10 review R3: a waiter is looked at again only after locks or waits
+    // changed, so an idle server's passes cost nothing.
+    use crate::{LockServer, Outcome};
+    use wyrmroot_fs_proto::node::LOCK_WAIT;
+    let mut server = LockServer::<16, 4>::with_owner_limit(4);
+    let whole = lock(0, 0, LockMode::Exclusive);
+    assert_eq!(server.request(1, 10, 7, whole, 0, 0), Outcome::Granted);
+    assert_eq!(
+        server.request(2, 20, 7, whole, LOCK_WAIT, 5),
+        Outcome::Waiting
+    );
+    assert_eq!(server.take_granted(), None);
+    assert!(!server.has_changes());
+    assert_eq!(server.take_granted(), None);
+    server.release(1);
+    assert!(server.has_changes());
+    assert_eq!(server.take_granted(), Some((2, 5, Outcome::Granted)));
+}

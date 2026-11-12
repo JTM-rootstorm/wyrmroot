@@ -997,12 +997,7 @@ fn a_node_s_client_is_inherited_and_never_named_by_a_client() {
     let (forged, status, _) = fs.open_as(etc, OPEN_READ, b"motd", 2);
     assert_eq!(status, Status::Invalid);
     assert!(fs.world.peer_closed(forged));
-    let (reply, _) = fs.world.receive(etc);
-    assert!(matches!(
-        node::parse(&reply, 0).unwrap().body,
-        Body::Status {
-            status: Status::Invalid,
-            ..
-        }
-    ));
+    // OPEN is one-way: the directory's Channel hears nothing (review D1).
+    assert!(!fs.world.readable(etc));
+    assert_eq!(fs.list(etc), [(Kind::File, "motd".into())]);
 }

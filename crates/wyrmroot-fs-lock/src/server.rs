@@ -57,6 +57,9 @@ pub struct LockServer<const N: usize, const OWNERS: usize> {
     table: LockTable<N>,
     owners: [Option<Owner>; OWNERS],
     next_sequence: u64,
+    /// Locks or waits changed since [`Self::take_granted`] last found
+    /// nothing, so waiters are worth looking at again.
+    changed: bool,
 }
 
 impl<const N: usize, const OWNERS: usize> Default for LockServer<N, OWNERS> {
@@ -72,6 +75,7 @@ impl<const N: usize, const OWNERS: usize> LockServer<N, OWNERS> {
             table: LockTable::with_owner_limit(owner_limit),
             owners: [None; OWNERS],
             next_sequence: 0,
+            changed: false,
         }
     }
 
@@ -82,6 +86,11 @@ impl<const N: usize, const OWNERS: usize> LockServer<N, OWNERS> {
     /// A lock of another owner that `lock` would conflict with.
     pub fn conflict(&self, node: u64, owner: u64, lock: Lock) -> Option<crate::Held> {
         self.table.conflict(node, owner, lock)
+    }
+
+    /// Whether a grant pass has anything to look at.
+    pub fn has_changes(&self) -> bool {
+        self.changed
     }
 
     pub fn is_waiting(&self, owner: u64) -> bool {
@@ -136,6 +145,7 @@ impl<const N: usize, const OWNERS: usize> LockServer<N, OWNERS> {
             }
         };
         let group = self.owners[index].expect("recorded above").group;
+        self.changed = true;
         match self.table.set(node, owner, lock) {
             Ok(()) => Outcome::Granted,
             Err(LockError::NoRoom) => Outcome::NoRoom,
@@ -219,6 +229,11 @@ impl<const N: usize, const OWNERS: usize> LockServer<N, OWNERS> {
     /// [`Outcome::Deadlock`] for one whose wait has since become endless).
     /// Call until `None` after anything that changes locks or waits.
     pub fn take_granted(&mut self) -> Option<(u64, u64, Outcome)> {
+        // Nothing changed since the last pass found nothing: no waiter can
+        // have become grantable or deadlocked (W10 review R3).
+        if !self.changed {
+            return None;
+        }
         let mut order: [(u64, usize); OWNERS] = [(u64::MAX, usize::MAX); OWNERS];
         let mut count = 0;
         for (index, record) in self.owners.iter().enumerate() {
@@ -253,11 +268,13 @@ impl<const N: usize, const OWNERS: usize> LockServer<N, OWNERS> {
             }
             return Some((record.owner, waiter.token, outcome));
         }
+        self.changed = false;
         None
     }
 
     /// Forgets `owner`: its locks, its wait and its group membership.
     pub fn release(&mut self, owner: u64) {
+        self.changed = true;
         self.table.release(owner);
         for slot in &mut self.owners {
             if slot.is_some_and(|record| record.owner == owner) {

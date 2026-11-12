@@ -856,13 +856,9 @@ impl<V: View> Server<V> {
                             attr: None,
                         },
                     );
+                    // OPEN is one-way: only the new Channel hears of it.
                     let _ = platform.close_handle(server.handle);
-                    return send(
-                        platform,
-                        here.channel,
-                        transaction_id,
-                        status(Status::Invalid),
-                    );
+                    return true;
                 };
                 // The node opened through `here` belongs to `client`.
                 let dir = OpenNode { client, ..here };
