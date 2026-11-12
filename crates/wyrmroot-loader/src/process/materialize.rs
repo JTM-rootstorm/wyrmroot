@@ -24,6 +24,8 @@ pub(crate) fn load_process_internal<P: LoaderPlatform>(
         1
     } else if request.profile == LaunchProfile::JobV2Streams {
         3
+    } else if request.profile == LaunchProfile::JobV2Namespace {
+        4
     } else {
         0
     };
@@ -577,13 +579,16 @@ pub(crate) fn load_process_materialized<P: LoaderPlatform>(
         transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
         transfers[1] = transfer(request.channels[0], launch::CHILD_CHANNEL_RIGHTS);
         2
-    } else if request.profile == LaunchProfile::JobV2Streams {
+    } else if matches!(
+        request.profile,
+        LaunchProfile::JobV2Streams | LaunchProfile::JobV2Namespace
+    ) {
         transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
         for (index, handle) in request.channels.iter().copied().enumerate() {
             transaction.delegated_channels[index] = Some(handle);
             transfers[index + 1] = transfer(handle, launch::CHILD_CHANNEL_RIGHTS);
         }
-        4
+        request.profile.capability_count()
     } else if request.profile.needs_self_root() {
         // WYR0-I probe children and stream-less jobs receive only their own
         // mapping authority at startup. Shared MemoryObjects are a typed controller protocol after

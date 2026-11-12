@@ -173,26 +173,31 @@ pub fn run_stream_hello<System: StreamHelloSystem>(
         })?;
     validate_bootstrap_channel(channel, BOOTSTRAP_CHANNEL_EXPECTATION)
         .map_err(HelloError::BootstrapChannel)?;
-    let mut init = [0_u8; 72];
-    let mut handles = [DwReceivedHandleInfoV1::default(); 4];
+    // A bootfs launch carries the streams; a file launch also carries a
+    // namespace (WRLP 1.13), which is one record and one handle longer.
+    let mut init = [0_u8; 80];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 5];
     let counts = system
         .receive_channel(bootstrap_channel, &mut init, &mut handles)
         .map_err(|cause| HelloError::Native {
             operation: HelloNativeOperation::ReceiveInit,
             cause,
         })?;
-    if counts.bytes > init.len() || counts.handles != handles.len() {
+    if counts.bytes > init.len() || !(4..=handles.len()).contains(&counts.handles) {
         return Err(HelloError::ReceiveCounts(counts));
     }
-    let streams = extract_job_v2_streams(&init[..counts.bytes], &handles)
+    let streams = extract_job_v2_streams(&init[..counts.bytes], &handles[..counts.handles])
         .map_err(HelloError::StreamLaunch)?;
-    // Hello maps nothing, so its self root goes at once.
-    system
-        .close_handle(streams.self_root)
-        .map_err(|cause| HelloError::Native {
-            operation: HelloNativeOperation::CloseBootstrapChannel,
-            cause,
-        })?;
+    // Hello maps nothing and opens no paths, so its self root and any
+    // namespace go at once.
+    for handle in core::iter::once(streams.self_root).chain(streams.namespace) {
+        system
+            .close_handle(handle)
+            .map_err(|cause| HelloError::Native {
+                operation: HelloNativeOperation::CloseBootstrapChannel,
+                cause,
+            })?;
+    }
     let mut stdout = NativeOutput::new(streams.stdout);
     if stdout
         .write(system, b"hello from native stdout\n")
@@ -221,17 +226,13 @@ pub fn run_stream_hello<System: StreamHelloSystem>(
         })?;
     let mut ready = [0_u8; HEADER_BYTES];
     let parsed = wyrmroot_loader::launch::parse_init(
-        LaunchProfile::JobV2Streams,
+        streams.profile,
         &init[..counts.bytes],
-        &handles,
+        &handles[..counts.handles],
     )
     .map_err(HelloError::Launch)?;
-    let size = encode_ready_for_profile(
-        LaunchProfile::JobV2Streams,
-        parsed.transaction_id,
-        &mut ready,
-    )
-    .map_err(HelloError::Launch)?;
+    let size = encode_ready_for_profile(streams.profile, parsed.transaction_id, &mut ready)
+        .map_err(HelloError::Launch)?;
     system
         .send_channel(bootstrap_channel, &ready[..size])
         .map_err(|cause| HelloError::Native {

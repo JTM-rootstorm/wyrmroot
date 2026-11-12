@@ -1516,6 +1516,65 @@ fn failed_service_init_send_leaves_endpoint_with_caller() {
     assert!(!platform.events.contains(&Event::Close(service_channel.0)));
 }
 
+/// Root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W3 and W5: a fourth handle is the
+/// namespace, moved fifth under WRLP 1.13, and argv[0] need not be the path.
+#[test]
+fn job_v2_with_a_namespace_moves_it_after_the_streams() {
+    let image = executable();
+    let argv = ["/boot/EFI/WYRMROOT/HELLO.ELF", "x"];
+    let handles = [
+        DwHandle(0x901),
+        DwHandle(0x902),
+        DwHandle(0x903),
+        DwHandle(0x904),
+    ];
+    let mut platform = Mock::new(None);
+    load_job_process(
+        &mut platform,
+        authority(),
+        JobLoadRequest {
+            image: &image,
+            policy_path: "boot/EFI/WYRMROOT/HELLO.ELF",
+            argv: &argv,
+            environment: &[],
+            streams: &handles,
+            transaction_id: 0x1305,
+        },
+    )
+    .unwrap();
+    let transfers = &platform.sent_transfers;
+    assert_eq!(transfers.len(), 5);
+    assert_eq!(
+        transfers[1..]
+            .iter()
+            .map(|transfer| transfer.handle)
+            .collect::<Vec<_>>(),
+        handles
+    );
+    assert!(transfers[1..].iter().all(|transfer| {
+        transfer.requested_rights == wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
+    }));
+    assert_eq!(&platform.sent_init[6..8], &13_u16.to_le_bytes());
+
+    // Two handles are neither shape.
+    let mut refused = Mock::new(None);
+    let error = load_job_process(
+        &mut refused,
+        authority(),
+        JobLoadRequest {
+            image: &image,
+            policy_path: "bin/hello",
+            argv: &argv,
+            environment: &[],
+            streams: &handles[..2],
+            transaction_id: 0x1306,
+        },
+    )
+    .unwrap_err();
+    assert!(!error.streams_consumed);
+    assert!(refused.sent_transfers.is_empty());
+}
+
 #[test]
 fn job_v2_selects_zero_or_three_stream_profile_and_retains_streams_on_failed_move() {
     let image = executable();

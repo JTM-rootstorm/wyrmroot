@@ -109,7 +109,6 @@ pub enum StartupBlockError {
     StringBytesExceeded,
     InvalidEnvironment,
     DuplicateEnvironment,
-    Argv0Mismatch,
     StringContainsNul,
 }
 
@@ -199,9 +198,8 @@ impl<'a> StartupBlockV2Plan<'a> {
         if environment.len() > MAX_ENVIRONMENT {
             return Err(StartupBlockError::TooManyEnvironmentEntries);
         }
-        if argv[0] != path {
-            return Err(StartupBlockError::Argv0Mismatch);
-        }
+        // argv[0] is the launcher's choice (root
+        // `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W3); `path` names the image.
         if path.is_empty() || path.as_bytes().contains(&0) {
             return Err(if path.is_empty() {
                 StartupBlockError::EmptyDisplayPath
@@ -211,7 +209,6 @@ impl<'a> StartupBlockV2Plan<'a> {
         }
         if argv
             .iter()
-            .skip(1)
             .chain(environment.iter())
             .any(|value| value.as_bytes().contains(&0))
         {

@@ -630,7 +630,7 @@ where
     let legacy_handle_limit = wyrmroot_launch_proto::STREAM_COUNT;
     let mut bytes = [0_u8; wyrmroot_launch_proto::MAX_LAUNCH_MESSAGE_BYTES];
     let mut received =
-        [DwReceivedHandleInfoV1::default(); wyrmroot_launch_proto::SHELL_V1_HANDLE_COUNT];
+        [DwReceivedHandleInfoV1::default(); wyrmroot_launch_proto::MAX_REQUEST_HANDLES];
     let counts = system
         .receive_channel(session, &mut bytes, &mut received)
         .map_err(InitError::Native)?;
@@ -658,11 +658,16 @@ where
             }
         },
     };
-    // LAUNCH_IMAGE carries the image's file Channel after the three streams
-    // (root `STORAGE_PLAN.md` W6).
+    // LAUNCH_IMAGE carries the image's file Channel and the job's namespace
+    // after the three streams (root `STORAGE_PLAN.md` W6,
+    // `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W5).
     let image_launch = bytes.get(40..44)
         == Some(&(wyrmroot_launch_proto::MessageType::LaunchImage as u32).to_le_bytes()[..]);
-    let handle_limit = legacy_handle_limit + usize::from(image_launch);
+    let handle_limit = if image_launch {
+        wyrmroot_launch_proto::LAUNCH_IMAGE_HANDLE_COUNT
+    } else {
+        legacy_handle_limit
+    };
     if version == JobWireVersion::Legacy && counts.handles > handle_limit {
         let failed = close_received_reverse(system, &received, counts.handles);
         return Err(if failed {
@@ -892,7 +897,7 @@ where
                 reservation,
                 request_ticket,
                 request,
-                &received[..legacy_handle_limit + 1],
+                &received[..wyrmroot_launch_proto::LAUNCH_IMAGE_HANDLE_COUNT],
             )
         }
         message => {

@@ -722,6 +722,7 @@ impl LoaderPlatform for SmokeLoader {
             | launch::LaunchProfile::LaunchClient
             | launch::LaunchProfile::Dw1bProgress
             | launch::LaunchProfile::JobV2Streams
+            | launch::LaunchProfile::JobV2Namespace
             | launch::LaunchProfile::DeviceCoordinator
             | launch::LaunchProfile::DeviceCoordinatorResourceDomain
             | launch::LaunchProfile::DeviceDriver

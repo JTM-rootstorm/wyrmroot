@@ -208,8 +208,8 @@ fn hello_rejects_bootstrap_channel_excess_rights() {
 }
 
 struct StreamFixture {
-    init: [u8; 72],
-    handles: [DwReceivedHandleInfoV1; 4],
+    init: Vec<u8>,
+    handles: Vec<DwReceivedHandleInfoV1>,
     wait_signals: DwSignals,
     wait_count: usize,
     sent: Vec<Vec<u8>>,
@@ -218,17 +218,26 @@ struct StreamFixture {
 }
 impl StreamFixture {
     fn new() -> Self {
-        let mut init = [0; 72];
-        encode_init(LaunchProfile::JobV2Streams, 9, &mut init).unwrap();
+        Self::profile(LaunchProfile::JobV2Streams)
+    }
+    /// A file launch's INIT: the streams, then the namespace (handle 24).
+    fn with_namespace() -> Self {
+        Self::profile(LaunchProfile::JobV2Namespace)
+    }
+    fn profile(profile: LaunchProfile) -> Self {
+        let mut init = vec![0; profile.init_size()];
+        encode_init(profile, 9, &mut init).unwrap();
         let handle = |raw| DwReceivedHandleInfoV1 {
             handle: DwHandle(raw),
             object_type: DW_OBJECT_TYPE_CHANNEL,
             rights: wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS,
             ..DwReceivedHandleInfoV1::default()
         };
+        let mut handles = vec![root(), handle(21), handle(22), handle(23), handle(24)];
+        handles.truncate(profile.capability_count());
         Self {
             init,
-            handles: [root(), handle(21), handle(22), handle(23)],
+            handles,
             wait_signals: DW_SIGNAL_PEER_CLOSED,
             wait_count: 0,
             sent: vec![],
@@ -253,11 +262,11 @@ impl HelloSystem for StreamFixture {
         bytes: &mut [u8],
         handles: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, NativeError> {
-        bytes[..72].copy_from_slice(&self.init);
-        handles.copy_from_slice(&self.handles);
+        bytes[..self.init.len()].copy_from_slice(&self.init);
+        handles[..self.handles.len()].copy_from_slice(&self.handles);
         Ok(ReceiveCounts {
-            bytes: 72,
-            handles: 4,
+            bytes: self.init.len(),
+            handles: self.handles.len(),
         })
     }
     fn send_channel(&mut self, _: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
@@ -270,6 +279,7 @@ impl HelloSystem for StreamFixture {
             CHANNEL => "close-bootstrap",
             DwHandle(21..=23) => "close-stream",
             ROOT => "close-root",
+            DwHandle(24) => "close-namespace",
             _ => "close-other",
         });
         self.closed.push(handle);
@@ -359,4 +369,37 @@ fn stream_hello_rejects_readable_post_ready_data() {
         [ROOT, DwHandle(21), DwHandle(22), DwHandle(23)]
     );
     assert_eq!(fixture.events.last(), Some(&"wait-release"));
+}
+
+/// A hello run from a file receives a namespace (WRLP 1.13), closes it with
+/// its self root, and answers READY under the namespace profile.
+#[test]
+fn stream_hello_closes_a_namespace_and_answers_under_its_profile() {
+    let mut fixture = StreamFixture::with_namespace();
+    assert_eq!(run_stream_hello(&mut fixture, CHANNEL), Ok(()));
+    assert_eq!(
+        fixture.closed,
+        [
+            ROOT,
+            DwHandle(24),
+            DwHandle(21),
+            DwHandle(22),
+            DwHandle(23),
+            CHANNEL
+        ]
+    );
+    let ready = fixture.sent.last().unwrap();
+    assert!(
+        wyrmroot_loader::launch::parse_ready_for_profile(LaunchProfile::JobV2Namespace, ready, 9)
+            .is_ok()
+    );
+
+    // Any other handle count is refused before anything is closed.
+    let mut short = StreamFixture::new();
+    short.handles.truncate(3);
+    assert!(matches!(
+        run_stream_hello(&mut short, CHANNEL),
+        Err(HelloError::ReceiveCounts(_))
+    ));
+    assert!(short.closed.is_empty());
 }

@@ -1333,16 +1333,20 @@ pub(crate) fn prepare_reserved_job<'a, L: LoaderPlatform>(
             cleanup_failed,
         }
     };
-    if request.stream_count != streams.len() {
+    // A file image (root `STORAGE_PLAN.md` W6) also hands the job its
+    // namespace after the streams (`TOOLCHAIN_POSIX_LAYER_DESIGN.md` W5).
+    let namespace = usize::from(file_image.is_some());
+    if request.stream_count + namespace != streams.len() {
         return Err(reject(jobs, loader, JobError::StreamPolicy));
     }
-    let profile = match request.stream_count {
-        0 => LaunchProfile::JobV2,
-        3 => LaunchProfile::JobV2Streams,
+    let profile = match (request.stream_count, namespace) {
+        (0, 0) => LaunchProfile::JobV2,
+        (3, 0) => LaunchProfile::JobV2Streams,
+        (3, 1) => LaunchProfile::JobV2Namespace,
         _ => return Err(reject(jobs, loader, JobError::StreamPolicy)),
     };
-    // A file image (root `STORAGE_PLAN.md` W6) replaces the bootfs lookup;
-    // it is always a foreground job.
+    // A file image replaces the bootfs lookup; it is always a foreground
+    // job.
     let image = match file_image {
         Some(_) if request.stream_count != 3 => {
             return Err(reject(jobs, loader, JobError::StreamPolicy));

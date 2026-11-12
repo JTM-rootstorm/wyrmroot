@@ -307,6 +307,39 @@ fn open_path<System: WyrmshSystem>(
     flags: u32,
     canonical: &mut [u8; MAX_FS_PATH_BYTES],
 ) -> Result<Option<(DwHandle, Attr, usize)>, ShellError> {
+    let opened = open_path_keeping_vfs(
+        system,
+        console,
+        identity,
+        transactions,
+        command,
+        typed,
+        flags,
+        canonical,
+    )?;
+    Ok(opened.map(|(node, attr, length, vfs)| {
+        // The node is now the filesystem's; vfsd is not needed again.
+        let _ = system.close_handle(vfs);
+        (node, attr, length)
+    }))
+}
+
+/// [`open_path`], but the `system.vfs` connection stays open and is
+/// returned after the node.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit shell capability custody"
+)]
+fn open_path_keeping_vfs<System: WyrmshSystem>(
+    system: &mut System,
+    console: &mut Console<'_>,
+    identity: ShellIdentity,
+    transactions: &mut TransactionIds,
+    command: &str,
+    typed: &str,
+    flags: u32,
+    canonical: &mut [u8; MAX_FS_PATH_BYTES],
+) -> Result<Option<(DwHandle, Attr, usize, DwHandle)>, ShellError> {
     let Ok(length) = normalize_fs_path(typed, canonical) else {
         console.fail(system, command, typed.as_bytes(), b"not an absolute path")?;
         return Ok(None);
@@ -318,12 +351,17 @@ fn open_path<System: WyrmshSystem>(
             return Ok(None);
         }
     };
-    let opened = open(system, vfs, flags, &canonical[..length])?;
-    // The node is now the filesystem's; vfsd is not needed again.
-    let _ = system.close_handle(vfs);
+    let opened = match open(system, vfs, flags, &canonical[..length]) {
+        Ok(opened) => opened,
+        Err(error) => {
+            let _ = system.close_handle(vfs);
+            return Err(error);
+        }
+    };
     match opened {
-        Ok((node, attr)) => Ok(Some((node, attr, length))),
+        Ok((node, attr)) => Ok(Some((node, attr, length, vfs))),
         Err(failure) => {
+            let _ = system.close_handle(vfs);
             console.fail(system, command, &canonical[..length], failure)?;
             Ok(None)
         }
@@ -454,11 +492,12 @@ pub(crate) fn cat<System: WyrmshSystem>(
     result
 }
 
-/// `run /path`: opens the file for a LAUNCH_IMAGE. Returns the node and the
-/// length of the canonical path in `canonical`, or `None` once a failure has
-/// been reported. The launch names the file by its canonical path without
-/// the leading slash, so that path must fit WRLJ: ASCII and at most 256
-/// bytes.
+/// `run /path`: opens the file for a LAUNCH_IMAGE. Returns the node, the
+/// `system.vfs` connection it was opened through, which the job receives as
+/// its namespace (root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W5), and the length
+/// of the canonical path in `canonical`; or `None` once a failure has been
+/// reported. The launch names the file by its canonical path without the
+/// leading slash, so that path must fit WRLJ: ASCII and at most 256 bytes.
 pub(crate) fn open_for_run<System: WyrmshSystem>(
     system: &mut System,
     mut console: Console<'_>,
@@ -466,8 +505,8 @@ pub(crate) fn open_for_run<System: WyrmshSystem>(
     transactions: &mut TransactionIds,
     typed: &str,
     canonical: &mut [u8; MAX_FS_PATH_BYTES],
-) -> Result<Option<(DwHandle, usize)>, ShellError> {
-    let Some((node, _, length)) = open_path(
+) -> Result<Option<(DwHandle, DwHandle, usize)>, ShellError> {
+    let Some((node, _, length, vfs)) = open_path_keeping_vfs(
         system,
         &mut console,
         identity,
@@ -486,6 +525,7 @@ pub(crate) fn open_for_run<System: WyrmshSystem>(
         || !display.is_ascii()
     {
         let _ = system.close_handle(node);
+        let _ = system.close_handle(vfs);
         console.fail(
             system,
             "run",
@@ -494,7 +534,7 @@ pub(crate) fn open_for_run<System: WyrmshSystem>(
         )?;
         return Ok(None);
     }
-    Ok(Some((node, length)))
+    Ok(Some((node, vfs, length)))
 }
 
 /// Sends `body` and expects STATUS: its status and value.

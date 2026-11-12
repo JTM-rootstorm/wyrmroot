@@ -112,6 +112,8 @@ pub fn load_job_process<P: LoaderPlatform>(
     let profile = match request.streams.len() {
         0 => LaunchProfile::JobV2,
         3 => LaunchProfile::JobV2Streams,
+        // The three streams, then the namespace.
+        4 => LaunchProfile::JobV2Namespace,
         _ => {
             return Err(JobLoadError::caller_retains(LoadError::Launch(
                 LaunchError::HandleCount,

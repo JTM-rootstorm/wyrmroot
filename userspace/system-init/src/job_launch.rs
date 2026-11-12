@@ -228,7 +228,11 @@ where
             });
         }
     };
-    let streams = [received[0].handle, received[1].handle, received[2].handle];
+    // Three streams, and for a file launch the namespace after them.
+    let mut streams = [DwHandle(0); wyrmroot_launch_proto::STREAM_COUNT + 1];
+    for (slot, info) in streams.iter_mut().zip(&received[..handle_count]) {
+        *slot = info.handle;
+    }
     let streams = &streams[..handle_count];
     let task_group = match system.create_attempt_task_group(authority.task_group) {
         Ok(task_group) => task_group,

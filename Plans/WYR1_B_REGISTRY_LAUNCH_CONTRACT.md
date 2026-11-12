@@ -101,7 +101,10 @@ until Deepwyrm gives userspace an entropy source; a C library must cope
 without it. The loader builds no TLS block: a program with `PT_TLS` sets up
 its own from `AT_PHDR` and its thread pointer (`thread_set_fs_base`).
 
-`argv[0]` is required and must exactly equal the launch-policy bootfs path.
+`argv[0]` is required. For a job it is the launcher's choice, as in POSIX
+(2026-11-12, root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W3): the launch
+path alone selects the image and its policy identity, and `argv[0]` grants
+nothing. Init's own service launches still set it to the bootfs path.
 Environment entries are `NAME=VALUE`; `NAME` matches
 `[A-Z_][A-Z0-9_]{0,63}` and duplicate names are rejected. No value is treated
 as capability, handle, path authority, or loader configuration.
@@ -120,12 +123,23 @@ rights before use.
 | `RegistryClient` | self root; registry-client Channel |
 | `LaunchClient` | self root; launch-session Channel |
 | `JobV2` | self root; then zero or exactly three stream Channels in stdin, stdout, stderr order (WRLP 1.12, below) |
+| `JobV2Namespace` | self root; the three stream Channels; then one namespace Channel (WRLP 1.13, below) |
 
 Jobs moved to WRLP minor `12` on 2026-11-11 (root
 `TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W1): a job's INIT names its own
 root AddressRegion first, with the self-root rights below, so a POSIX layer
 can map memory (`mmap`, `malloc`). The 1.3 job shape is no longer accepted. A
 job that maps nothing closes the handle; `bin/hello` and `bin/cpu-hog` do.
+
+Jobs launched from a file (`LAUNCH_IMAGE`, §9.1) use WRLP minor `13`
+(2026-11-12, root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W5): after the
+three streams, role `NAMESPACE` (17) carries a WRNS connection to `system.vfs`
+through which the job opens paths. The launcher supplies it and init forwards
+it without using it, so a job can reach exactly the namespace its launcher
+could. A job that opens no paths closes it. Its working directory is not a
+startup role: a POSIX program takes it from its `PWD` environment entry and
+starts at `/` without one. Bootfs launches keep WRLP 1.12 and receive no
+namespace.
 
 The WRRM v1 startup-profile field truthfully encodes `BootstrapRegistry` as
 wire value `2`. WYR1-A manifests continue to encode `EarlyBootStub` as `1`;
@@ -141,11 +155,12 @@ Exact role contracts are:
 | registry client | Channel | `READ | WRITE | WAIT | INSPECT` |
 | launch session | Channel | `READ | WRITE | WAIT | INSPECT` |
 | stdin/stdout/stderr | Channel | `READ | WRITE | WAIT | INSPECT` |
+| namespace | Channel | `READ | WRITE | WAIT | INSPECT` |
 
 Startup ABI v2 covers `JobV2` plus the profile-authorized `BootstrapService`
 and `RegistryClient` peers. `JobV2` receives its vector through the Thread
-start stack and its optional stream roles through WRLP. Its `argv[0]` exactly
-matches the launch-policy path. A bootstrap peer's `argv[0]` exactly matches
+start stack and its optional stream roles through WRLP. Its `argv[0]` is the
+launcher's choice (§3). A bootstrap peer's `argv[0]` exactly matches
 the controller-authorized bootfs path. Stream roles are opaque Channels in
 WYR1-B; WYR1-D defines their byte-stream protocol. Passing the roles here does
 not claim console, fd, terminal, or stdout behavior.
@@ -548,6 +563,9 @@ Every complete message appends an eight-byte prefix: `type: u32` and zero
 | 13 | `CLOSE_JOB` |
 | 14 | `CLOSED` |
 | 15 | `ERROR` |
+| 17 | `LAUNCH_IMAGE` |
+
+Type 16 is `LAUNCH_SHELL_V1` under minor `1` (`WYR1_E_WYRMSH_CONTRACT.md`).
 
 ### 9.1 Launch body
 
@@ -561,7 +579,8 @@ reserved fields. It is followed by:
 4. the canonical path bytes; then
 5. argv and environment bytes in record order without gaps or aliases.
 
-`argv_count` is `1..=64`; `argv[0]` exactly equals the path. Environment count
+`argv_count` is `1..=64`; `argv[0]` is any string, independent of the path
+(§3). Environment count
 is `0..=64`. Aggregate argv/environment bytes are at most 16 KiB. Stream roles
 are either absent or exactly `STDIN`, `STDOUT`, `STDERR` in that order.
 
@@ -569,6 +588,15 @@ For three streams, `LAUNCH` moves exactly three Channel endpoints into init
 with `READ | WRITE | WAIT | INSPECT | TRANSFER`; init later forwards them to
 the child with `TRANSFER` removed. Zero streams moves no handle. Every mismatch
 fails before loader construction.
+
+`LAUNCH_IMAGE` (root `STORAGE_PLAN.md` W6) has the `LAUNCH` body with
+exactly three stream roles and moves five handles: the three streams, a WRFS
+file Channel holding the executable, and a WRNS namespace Channel for the job
+(WRLP 1.13, §4), each with `READ | WRITE | WAIT | INSPECT | TRANSFER`. Any
+other handle count is malformed. Init reads the image through the file Channel
+and closes it; the job is built from those bytes without a launch-policy
+identity, and its path is the file's display path without the leading slash.
+Only shell-job sessions may send it.
 
 The path is a canonical nonempty relative bootfs path with no leading slash,
 empty component, `.`, `..`, alias, NUL, or non-ASCII byte. Display spelling may

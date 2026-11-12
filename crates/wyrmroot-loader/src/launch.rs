@@ -48,6 +48,9 @@ const MINOR_V1_11: u16 = 11;
 /// Jobs receive their self root ahead of their stream roles (root
 /// `TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W1).
 const MINOR_V1_12: u16 = 12;
+/// Jobs launched from a file also receive a namespace Channel after their
+/// streams (root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W5).
+const MINOR_V1_13: u16 = 13;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
@@ -66,6 +69,7 @@ const ROLE_DEVICE_CONTROL: u32 = 13;
 const ROLE_RESOURCE_DOMAIN: u32 = 14;
 const ROLE_D6_RESOURCE_DOMAIN: u32 = 15;
 const ROLE_CONSOLE_STATUS: u32 = 16;
+const ROLE_NAMESPACE: u32 = 17;
 
 pub const SELF_ROOT_RIGHTS: DwRights =
     DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
@@ -150,6 +154,10 @@ pub enum LaunchProfile {
     /// Launched job with its self root and exact stdin/stdout/stderr Channel
     /// roles.
     JobV2Streams,
+    /// Launched job with its self root, its three stream roles and one WRNS
+    /// namespace Channel, through which it opens paths. Jobs launched from a
+    /// file receive it (WRLP 1.13).
+    JobV2Namespace,
     /// Selector-26-only progress peer with exactly one test data Channel.
     Dw1bProgress,
     /// WYR1-C device coordinator with self root, publication authority, and
@@ -183,6 +191,7 @@ impl LaunchProfile {
             Self::Consoled => 3,
             Self::Wyrmsh => 6,
             Self::JobV2Streams => 4,
+            Self::JobV2Namespace => 5,
             Self::DeviceCoordinator => 3,
             Self::DeviceCoordinatorResourceDomain => 4,
             Self::DeviceDriver => 2,
@@ -201,6 +210,7 @@ impl LaunchProfile {
             | Self::RegistryClient
             | Self::LaunchClient => MINOR_V1_3,
             Self::JobV2 | Self::JobV2Streams => MINOR_V1_12,
+            Self::JobV2Namespace => MINOR_V1_13,
             Self::Dw1bProgress => MINOR_V1_4_TEST,
             Self::DeviceCoordinator => MINOR_V1_5,
             Self::DeviceCoordinatorResourceDomain => MINOR_V1_9,
@@ -396,10 +406,20 @@ fn encode_init_inner(
         }
     } else if profile == LaunchProfile::Dw1bProgress {
         put_u32(output, HEADER_BYTES, ROLE_DW1B_PROGRESS_DATA);
-    } else if profile == LaunchProfile::JobV2Streams {
-        for (index, role) in [ROLE_SELF_ROOT, ROLE_STDIN, ROLE_STDOUT, ROLE_STDERR]
-            .into_iter()
-            .enumerate()
+    } else if matches!(
+        profile,
+        LaunchProfile::JobV2Streams | LaunchProfile::JobV2Namespace
+    ) {
+        for (index, role) in [
+            ROLE_SELF_ROOT,
+            ROLE_STDIN,
+            ROLE_STDOUT,
+            ROLE_STDERR,
+            ROLE_NAMESPACE,
+        ]
+        .into_iter()
+        .take(profile.capability_count())
+        .enumerate()
         {
             put_u32(output, HEADER_BYTES + index * 8, role);
         }
@@ -734,7 +754,10 @@ pub fn parse_init(
             return Err(LaunchError::BadCapabilityRole { index: 0 });
         }
         validate_handle(handles[0], DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS, 0)?;
-    } else if profile == LaunchProfile::JobV2Streams {
+    } else if matches!(
+        profile,
+        LaunchProfile::JobV2Streams | LaunchProfile::JobV2Namespace
+    ) {
         for (index, (role, object_type, rights)) in [
             (
                 ROLE_SELF_ROOT,
@@ -744,8 +767,10 @@ pub fn parse_init(
             (ROLE_STDIN, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
             (ROLE_STDOUT, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
             (ROLE_STDERR, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+            (ROLE_NAMESPACE, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
         ]
         .into_iter()
+        .take(profile.capability_count())
         .enumerate()
         {
             if get_u32(bytes, HEADER_BYTES + index * 8) != role
@@ -912,6 +937,7 @@ impl LaunchProfile {
                     | Self::Consoled
                     | Self::JobV2
                     | Self::JobV2Streams
+                    | Self::JobV2Namespace
             )
     }
 

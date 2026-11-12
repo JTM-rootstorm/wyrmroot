@@ -68,28 +68,43 @@ impl StreamEndpoint {
 }
 
 /// The job's self root and the exact stdin, stdout, stderr tuple
-/// transferred by JobV2Streams (WRLP 1.12).
+/// transferred by JobV2Streams (WRLP 1.12), with the namespace a job
+/// launched from a file also receives (JobV2Namespace, WRLP 1.13).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobV2Streams {
+    /// The profile INIT was validated against; READY must use the same one.
+    pub profile: LaunchProfile,
     /// The job's own root AddressRegion (`MAP | MODIFY | INSPECT`). A job
     /// that maps nothing closes it.
     pub self_root: DwHandle,
     pub stdin: StreamEndpoint,
     pub stdout: StreamEndpoint,
     pub stderr: StreamEndpoint,
+    /// A WRNS namespace Channel, present only under JobV2Namespace. A job
+    /// that opens no paths closes it.
+    pub namespace: Option<DwHandle>,
 }
 
 /// Validates the reached JobV2 stream-role record before exposing handles.
+/// Four handles are the stream profile and five the namespace profile;
+/// nothing else is accepted.
 pub fn extract_job_v2_streams(
     bytes: &[u8],
     handles: &[DwReceivedHandleInfoV1],
 ) -> Result<JobV2Streams, LaunchError> {
-    parse_init(LaunchProfile::JobV2Streams, bytes, handles)?;
+    let profile = match handles.len() {
+        4 => LaunchProfile::JobV2Streams,
+        5 => LaunchProfile::JobV2Namespace,
+        _ => return Err(LaunchError::HandleCount),
+    };
+    parse_init(profile, bytes, handles)?;
     Ok(JobV2Streams {
+        profile,
         self_root: handles[0].handle,
         stdin: StreamEndpoint(handles[1].handle),
         stdout: StreamEndpoint(handles[2].handle),
         stderr: StreamEndpoint(handles[3].handle),
+        namespace: handles.get(4).map(|info| info.handle),
     })
 }
 

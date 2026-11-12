@@ -280,12 +280,14 @@ pub(crate) fn run<System: WyrmshSystem>(
     jobs: &mut JobTable,
     path: &str,
     argv: Arguments<'_>,
-    image: Option<DwHandle>,
+    image: Option<(DwHandle, DwHandle)>,
 ) -> Result<(), ShellError> {
-    // The image Channel goes to init with the launch, or is closed here.
+    // The image and namespace Channels go to init with the launch, or are
+    // closed here.
     let close_image = |system: &mut System| {
-        if let Some(image) = image {
+        if let Some((image, namespace)) = image {
             let _ = system.close_handle(image);
+            let _ = system.close_handle(namespace);
         }
     };
     let Some(slot) = jobs.reserve() else {
@@ -299,7 +301,8 @@ pub(crate) fn run<System: WyrmshSystem>(
         close_pairs(system, &mut pairs, true)?;
         return Err(error);
     }
-    let mut transfers = [DwHandleTransferV1::default(); 4];
+    let mut transfers =
+        [DwHandleTransferV1::default(); wyrmroot_launch_proto::LAUNCH_IMAGE_HANDLE_COUNT];
     for (transfer, pair) in transfers.iter_mut().zip(&pairs) {
         *transfer = DwHandleTransferV1 {
             handle: pair.child,
@@ -309,14 +312,16 @@ pub(crate) fn run<System: WyrmshSystem>(
         };
     }
     let count = match image {
-        Some(handle) => {
-            transfers[3] = DwHandleTransferV1 {
-                handle,
-                requested_rights: CHILD_CHANNEL_TRANSFER_RIGHTS,
-                operation: DW_HANDLE_TRANSFER_MOVE,
-                ..DwHandleTransferV1::default()
-            };
-            4
+        Some((image, namespace)) => {
+            for (slot, handle) in transfers[3..].iter_mut().zip([image, namespace]) {
+                *slot = DwHandleTransferV1 {
+                    handle,
+                    requested_rights: CHILD_CHANNEL_TRANSFER_RIGHTS,
+                    operation: DW_HANDLE_TRANSFER_MOVE,
+                    ..DwHandleTransferV1::default()
+                };
+            }
+            wyrmroot_launch_proto::LAUNCH_IMAGE_HANDLE_COUNT
         }
         None => 3,
     };

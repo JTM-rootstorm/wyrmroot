@@ -28,8 +28,7 @@ pub(crate) fn launch<System: WyrmshSystem>(
     }
     let mut request = [0_u8; MAX_LAUNCH_MESSAGE_BYTES];
     let encoded = if image {
-        // A file's argv[0] is its display path, as the launch names it.
-        arguments[0] = path;
+        // argv[0] stays as typed: the launch names the file by `path`.
         wyrmroot_launch_proto::encode_launch_image(
             reservation,
             path,

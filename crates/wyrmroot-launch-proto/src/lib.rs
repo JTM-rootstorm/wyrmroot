@@ -34,6 +34,11 @@ pub const MAX_ENVIRONMENT: usize = 64;
 pub const MAX_STRING_BYTES: usize = 16 * 1024;
 pub const MAX_PATH_BYTES: usize = 256;
 pub const STREAM_COUNT: usize = 3;
+/// Handles a LAUNCH_IMAGE carries: the three streams, the image's file
+/// Channel, then the job's namespace Channel.
+pub const LAUNCH_IMAGE_HANDLE_COUNT: usize = STREAM_COUNT + 2;
+/// The most handles any request a launch session accepts may carry.
+pub const MAX_REQUEST_HANDLES: usize = LAUNCH_IMAGE_HANDLE_COUNT;
 pub const SHELL_V1_HANDLE_COUNT: usize = 4;
 pub const SHELL_V1_REQUEST_BYTES: usize = 128;
 pub const SHELL_V1_REPLY_BYTES: usize = 56;
@@ -108,8 +113,10 @@ pub enum MessageType {
     Error = 15,
     /// A three-stream LAUNCH whose executable arrives as a fourth handle, a
     /// WRFS file Channel, instead of being named in bootfs (root
-    /// `STORAGE_PLAN.md` W6). The path is the file's display path without
-    /// its leading slash; it names nothing in bootfs.
+    /// `STORAGE_PLAN.md` W6). The fifth handle is a WRNS namespace Channel
+    /// the job receives as its namespace (root
+    /// `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W5). The path is the file's display
+    /// path without its leading slash; it names nothing in bootfs.
     LaunchImage = 17,
 }
 
@@ -297,7 +304,8 @@ impl JobIds<'_> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Message<'a> {
     Launch(LaunchRequest<'a>),
-    /// Handles: stdin, stdout, stderr, then the image's file Channel.
+    /// Handles: stdin, stdout, stderr, the image's file Channel, then the
+    /// job's namespace Channel.
     LaunchImage(LaunchRequest<'a>),
     LaunchAccepted {
         job_id: u64,
@@ -366,7 +374,6 @@ pub enum Error {
     InvalidUtf8,
     InvalidEnvironment,
     DuplicateEnvironmentName,
-    Argv0Mismatch,
     InvalidJobState,
     InvalidErrorCode,
     InvalidTerminationClassification,
@@ -650,7 +657,8 @@ pub fn encode_launch(
 }
 
 /// Encodes a LAUNCH_IMAGE: a three-stream launch whose fourth handle is the
-/// executable's WRFS file Channel.
+/// executable's WRFS file Channel and whose fifth is the job's WRNS
+/// namespace Channel.
 pub fn encode_launch_image(
     reservation: Reservation,
     path: &str,
@@ -676,9 +684,6 @@ fn encode_launch_kind(
     }
     if environment.len() > MAX_ENVIRONMENT {
         return Err(Error::InvalidEnvironmentCount);
-    }
-    if argv[0] != path {
-        return Err(Error::Argv0Mismatch);
     }
     validate_environment(environment)?;
     let string_bytes = argv
@@ -718,7 +723,7 @@ fn encode_launch_kind(
     };
     encode_prefix(reservation, kind, out)?;
     put_u32(out, 48, u32::try_from(total).map_err(|_| Error::WrongSize)?)?;
-    let handles = if streams { 3 } else { 0 } + u32::from(image);
+    let handles = if streams { 3 } else { 0 } + 2 * u32::from(image);
     put_u32(out, 52, handles)?;
     put_u16(out, 56, path.len() as u16)?;
     put_u16(out, 58, argv.len() as u16)?;
@@ -917,9 +922,10 @@ fn parse_launch(
     if envc > MAX_ENVIRONMENT {
         return Err(Error::InvalidEnvironmentCount);
     }
-    // An image launch is always a foreground job: three streams and the image.
+    // An image launch is always a foreground job: three streams, the image
+    // and the namespace.
     let streams_ok = if image {
-        stream_count == STREAM_COUNT && declared_handles == STREAM_COUNT + 1
+        stream_count == STREAM_COUNT && declared_handles == LAUNCH_IMAGE_HANDLE_COUNT
     } else {
         matches!(stream_count, 0 | STREAM_COUNT) && stream_count == declared_handles
     };
@@ -983,9 +989,6 @@ fn parse_launch(
         strings,
         count: envc,
     };
-    if argv.get(0) != Some(path) {
-        return Err(Error::Argv0Mismatch);
-    }
     validate_environment_records(environment)?;
     Ok(LaunchRequest {
         path,

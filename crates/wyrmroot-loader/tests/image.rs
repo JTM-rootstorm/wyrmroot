@@ -100,18 +100,22 @@ fn startup_v2_uses_five_pages_and_canonical_vectors() {
     assert_eq!(&block[96..106], b"bin/hello\0");
     assert_eq!(&block[106..113], b"kobold\0");
     assert_eq!(&block[113..123], b"MODE=gate\0");
-    assert_eq!(
-        write_startup_block_v2(
-            &mut block,
-            STARTUP_V2_BLOCK_ADDRESS,
-            "bin/hello",
-            &["wrong"],
-            &[],
-            &NO_TABLE,
-        ),
-        Err(StartupBlockError::Argv0Mismatch)
-    );
+    // argv[0] need not be the path, but it may not hold a NUL either.
+    let mut other = vec![0_u8; block.len()];
+    write_startup_block_v2(
+        &mut other,
+        STARTUP_V2_BLOCK_ADDRESS,
+        "bin/hello",
+        &["hello"],
+        &[],
+        &NO_TABLE,
+    )
+    .unwrap();
+    assert_eq!(get64(&other, 0), 1);
+    let argv0 = (get64(&other, 8) - STARTUP_V2_BLOCK_ADDRESS) as usize;
+    assert_eq!(&other[argv0..argv0 + 6], b"hello\0");
     for (argv, environment) in [
+        (["bad\0argv0"].as_slice(), [].as_slice()),
         (
             ["bin/hello", "bad\0arg"].as_slice(),
             ["MODE=gate"].as_slice(),

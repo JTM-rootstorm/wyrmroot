@@ -2,7 +2,9 @@
 //! `STORAGE_PLAN.md` W6).
 //!
 //! The shell opens the file through vfsd and moves its WRFS Channel to init
-//! with a three-stream LAUNCH_IMAGE. Init reads the whole file, at most
+//! with a three-stream LAUNCH_IMAGE, followed by a WRNS connection to vfsd
+//! that init passes to the job untouched as its namespace (WRLP 1.13, root
+//! `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W5). Init never uses the namespace. Init reads the whole file, at most
 //! [`MAX_IMAGE_BYTES`] and within [`IMAGE_READ_TIMEOUT_NS`], into private
 //! memory no other process can reach, constructs the job from those bytes
 //! exactly as it would a bootfs JobV2 payload, and drops the copy. The job
@@ -143,9 +145,9 @@ fn read_image<S: ResidentPlatform>(
     Ok(())
 }
 
-/// Handles one LAUNCH_IMAGE: `received` holds the three streams and then
-/// the file. The file is always closed; the streams go to the job or are
-/// closed with the refusal.
+/// Handles one LAUNCH_IMAGE: `received` holds the three streams, the file
+/// and the namespace. The file is always closed; the streams and the
+/// namespace go to the job or are closed with the refusal.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn defer_image_launch<S, L, W>(
     system: &mut S,
@@ -167,9 +169,15 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    let count = wyrmroot_launch_proto::LAUNCH_IMAGE_HANDLE_COUNT;
+    if received.len() != count {
+        return Err(InitError::Accounting);
+    }
     let file = received[3].handle;
+    // What the job receives: the streams, then the namespace.
+    let moved = [received[0], received[1], received[2], received[4]];
     let refuse = |system: &mut S, code: LaunchErrorCode| {
-        let failed = close_received_reverse(system, received, 4);
+        let failed = close_received_reverse(system, received, count);
         if failed {
             return Err(InitError::Cleanup);
         }
@@ -208,8 +216,8 @@ where
                 reservation,
                 request_ticket,
                 request,
-                &received[..3],
-                3,
+                &moved,
+                moved.len(),
                 Some(&*image),
             )),
             Err(error) => Err(error),
@@ -219,7 +227,7 @@ where
     let result = match outcome {
         Ok(Ok(dispatched)) => dispatched,
         Ok(Err(ImageError::Unacceptable)) => {
-            let failed = close_received_reverse(system, received, 3);
+            let failed = close_received_reverse(system, &moved, moved.len());
             if failed {
                 return Err(InitError::Cleanup);
             }
@@ -232,7 +240,7 @@ where
             .map(|()| JobDispatchOutcome::Responded)
         }
         Ok(Err(ImageError::Unreadable)) | Err(_) => {
-            let failed = close_received_reverse(system, received, 3);
+            let failed = close_received_reverse(system, &moved, moved.len());
             if failed {
                 return Err(InitError::Cleanup);
             }

@@ -681,7 +681,7 @@ fn dispatch_local<System: WyrmshSystem>(
                 stderr: &mut *stderr,
                 controls,
             };
-            if let Some((node, length)) = files::open_for_run(
+            if let Some((node, namespace, length)) = files::open_for_run(
                 system,
                 console,
                 identity,
@@ -702,7 +702,7 @@ fn dispatch_local<System: WyrmshSystem>(
                     jobs,
                     display,
                     argv,
-                    Some(node),
+                    Some((node, namespace)),
                 )?;
             }
         }

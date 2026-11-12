@@ -618,6 +618,49 @@ fn jobs_receive_their_self_root_first_under_wrlp_1_12() {
     );
 }
 
+/// Root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W5: a job launched from a file
+/// receives a namespace Channel after its streams, under WRLP 1.13, and the
+/// stream-only shape cannot stand in for it.
+#[test]
+fn file_jobs_receive_a_namespace_after_their_streams_under_wrlp_1_13() {
+    let root = received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS);
+    let channel = |id| received(id, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS);
+    let mut init = [0xaa; HEADER_BYTES + 40];
+    assert_eq!(
+        launch::encode_init(LaunchProfile::JobV2Namespace, 0x1303, &mut init),
+        Ok(HEADER_BYTES + 40)
+    );
+    assert_eq!(
+        (get16(&init, 6), get32(&init, 16), get32(&init, 20)),
+        (13, 80, 5)
+    );
+    let roles: Vec<u32> = (0..5).map(|index| get32(&init, 40 + index * 8)).collect();
+    assert_eq!(roles, [1, 8, 9, 10, 17]);
+    let handles = [root, channel(3), channel(4), channel(5), channel(6)];
+    assert!(launch::parse_init(LaunchProfile::JobV2Namespace, &init, &handles).is_ok());
+    // The namespace is an ordinary child Channel: no TRANSFER, nothing else.
+    let mut wide = handles;
+    wide[4].rights = deepwyrm_syscall::DwRights(CHILD_CHANNEL_RIGHTS.0 | SELF_ROOT_RIGHTS.0);
+    assert_eq!(
+        launch::parse_init(LaunchProfile::JobV2Namespace, &init, &wide),
+        Err(LaunchError::HandleMetadata { index: 4 })
+    );
+    assert_eq!(
+        launch::parse_init(LaunchProfile::JobV2Namespace, &init, &handles[..4]),
+        Err(LaunchError::HandleCount)
+    );
+    // Neither profile accepts the other's INIT.
+    assert!(launch::parse_init(LaunchProfile::JobV2Streams, &init, &handles[..4]).is_err());
+    let mut streams = [0xaa; HEADER_BYTES + 32];
+    launch::encode_init(LaunchProfile::JobV2Streams, 0x1304, &mut streams).unwrap();
+    assert!(launch::parse_init(LaunchProfile::JobV2Namespace, &streams, &handles).is_err());
+    // READY is bound to the namespace profile's minor.
+    let mut ready = [0_u8; HEADER_BYTES];
+    launch::encode_ready_for_profile(LaunchProfile::JobV2Namespace, 0x1303, &mut ready).unwrap();
+    assert!(launch::parse_ready_for_profile(LaunchProfile::JobV2Namespace, &ready, 0x1303).is_ok());
+    assert!(launch::parse_ready_for_profile(LaunchProfile::JobV2Streams, &ready, 0x1303).is_err());
+}
+
 #[test]
 fn wyr1_c_device_coordinator_has_exact_hardware_free_startup_roles() {
     let mut init = [0u8; DEVICE_COORDINATOR_BYTES];

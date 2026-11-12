@@ -814,8 +814,10 @@ fn shell_v1_receive_failure_retains_uncommitted_sender_handles() {
         &mut platform.inbound,
     )
     .unwrap();
-    platform.inbound_handle_count = 5;
-    for (index, info) in platform.inbound_handles[..5].iter_mut().enumerate() {
+    // One handle more than any request may carry, so the receive fails.
+    let excess = wyrmroot_launch_proto::MAX_REQUEST_HANDLES + 1;
+    platform.inbound_handle_count = excess;
+    for (index, info) in platform.inbound_handles[..excess].iter_mut().enumerate() {
         info.handle = DwHandle(41 + index as u64);
     }
 
@@ -832,7 +834,7 @@ fn shell_v1_receive_failure_retains_uncommitted_sender_handles() {
         ),
         Err(InitError::Native(FAILURE))
     );
-    assert_eq!(platform.inbound_handle_count, 5);
+    assert_eq!(platform.inbound_handle_count, excess);
     assert_eq!(platform.close_count, 0);
     assert_eq!(platform.sent_len, 0);
 }
@@ -1325,4 +1327,72 @@ fn shell_jobs_refuse_shell_v1() {
         true,
     );
     assert_eq!(code, LaunchErrorCode::PolicyRejected);
+}
+
+/// Root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W5: a LAUNCH_IMAGE carries five
+/// handles (streams, file, namespace). Init takes all five, closes all five
+/// when it refuses, and refuses the old four-handle shape as malformed.
+#[test]
+fn image_launch_takes_and_cleans_five_handles() {
+    let authority = LoadAuthority {
+        parent_root: DwHandle(1),
+        bootfs: DwHandle(2),
+        task_group: DwHandle(3),
+    };
+    let path = "boot/EFI/WYRMROOT/HELLO.ELF";
+    for (handles, expected) in [
+        (
+            wyrmroot_launch_proto::LAUNCH_IMAGE_HANDLE_COUNT,
+            LaunchErrorCode::PolicyRejected,
+        ),
+        (4, LaunchErrorCode::MalformedRequest),
+    ] {
+        let mut platform = MockPlatform::new();
+        platform.fail_send = false;
+        let mut waits = TerminalWaits;
+        let mut loader = InitSendLoader::new();
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ShellJobs)
+            .unwrap();
+        platform.inbound_len = wyrmroot_launch_proto::encode_launch_image(
+            reservation(1),
+            path,
+            &["/boot/EFI/WYRMROOT/HELLO.ELF"],
+            &[],
+            &mut platform.inbound,
+        )
+        .unwrap();
+        platform.inbound_handle_count = handles;
+        for (index, info) in platform.inbound_handles[..handles].iter_mut().enumerate() {
+            info.handle = DwHandle(41 + index as u64);
+        }
+        // Without a launch policy init refuses every launch; what matters is
+        // that it accounted for every handle it was given.
+        assert_eq!(
+            dispatch_one_job_request(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                authority,
+                None,
+                &mut jobs,
+                DwHandle(90),
+                owner,
+            ),
+            Ok(JobDispatchOutcome::Responded)
+        );
+        let closed: Vec<u64> = platform.closed[..platform.close_count]
+            .iter()
+            .map(|handle| handle.0)
+            .collect();
+        assert_eq!(closed, (41..41 + handles as u64).rev().collect::<Vec<_>>());
+        let reply =
+            wyrmroot_launch_proto::parse_message(&platform.sent[..platform.sent_len], 0).unwrap();
+        assert_eq!(
+            reply.message,
+            wyrmroot_launch_proto::Message::Error { code: expected }
+        );
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+    }
 }

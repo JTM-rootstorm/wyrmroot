@@ -256,10 +256,6 @@ fn malformed_launch_fails_before_construction() {
         Err(Error::InvalidPath)
     );
     assert_eq!(
-        encode_launch(R, "bin/hello", &["other"], &[], false, &mut bytes),
-        Err(Error::Argv0Mismatch)
-    );
-    assert_eq!(
         encode_launch(
             R,
             "bin/hello",
@@ -417,11 +413,15 @@ fn canonical_job_state_and_list_encoders_reject_bad_identities() {
 }
 
 #[test]
-fn launch_image_carries_three_streams_and_the_image_handle() {
+fn launch_image_carries_streams_image_and_namespace_handles() {
     let mut bytes = [0_u8; 512];
     let path = "boot/EFI/WYRMROOT/HELLO.ELF";
     let size = encode_launch_image(R, path, &[path, "x"], &[], &mut bytes).unwrap();
-    let parsed = parse_message(&bytes[..size], 4).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(bytes[52..56].try_into().unwrap()),
+        LAUNCH_IMAGE_HANDLE_COUNT as u32
+    );
+    let parsed = parse_message(&bytes[..size], LAUNCH_IMAGE_HANDLE_COUNT).unwrap();
     let Message::LaunchImage(request) = parsed.message else {
         panic!("expected LAUNCH_IMAGE")
     };
@@ -429,7 +429,7 @@ fn launch_image_carries_three_streams_and_the_image_handle() {
     assert_eq!(request.stream_count, STREAM_COUNT);
     assert_eq!((request.argc(), request.arg(1)), (2, Some("x")));
     // The handle count is exact, and it is never a plain LAUNCH.
-    for handles in [0, 3, 5] {
+    for handles in [0, 3, 4, 6] {
         assert_eq!(
             parse_message(&bytes[..size], handles),
             Err(Error::WrongHandleCount)
@@ -438,7 +438,7 @@ fn launch_image_carries_three_streams_and_the_image_handle() {
     let mut as_launch = bytes;
     as_launch[40..44].copy_from_slice(&(MessageType::Launch as u32).to_le_bytes());
     assert_eq!(
-        parse_message(&as_launch[..size], 4),
+        parse_message(&as_launch[..size], LAUNCH_IMAGE_HANDLE_COUNT),
         Err(Error::InvalidStreamRoles)
     );
     // A plain three-stream LAUNCH relabelled as an image launch lacks the image.
@@ -453,5 +453,35 @@ fn launch_image_carries_three_streams_and_the_image_handle() {
     assert_eq!(
         encode_launch_image(R, "/boot/x", &["/boot/x"], &[], &mut bytes),
         Err(Error::InvalidPath)
+    );
+}
+
+#[test]
+fn argv0_is_independent_of_the_path() {
+    // POSIX programs choose their own argv[0] (root
+    // `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W3); the path alone selects the image.
+    let mut bytes = [0_u8; 512];
+    let size = encode_launch(R, "bin/hello", &["hello", "x"], &[], true, &mut bytes).unwrap();
+    let Message::Launch(request) = parse_message(&bytes[..size], STREAM_COUNT).unwrap().message
+    else {
+        panic!("expected LAUNCH")
+    };
+    assert_eq!((request.path, request.arg(0)), ("bin/hello", Some("hello")));
+
+    let path = "boot/EFI/WYRMROOT/HELLO.ELF";
+    let size =
+        encode_launch_image(R, path, &["/boot/EFI/WYRMROOT/HELLO.ELF"], &[], &mut bytes).unwrap();
+    let Message::LaunchImage(request) = parse_message(&bytes[..size], LAUNCH_IMAGE_HANDLE_COUNT)
+        .unwrap()
+        .message
+    else {
+        panic!("expected LAUNCH_IMAGE")
+    };
+    assert_eq!(request.arg(0), Some("/boot/EFI/WYRMROOT/HELLO.ELF"));
+    // An empty argv[0] is still an argument; argc stays at least one.
+    assert!(encode_launch(R, "bin/hello", &[""], &[], false, &mut bytes).is_ok());
+    assert_eq!(
+        encode_launch(R, "bin/hello", &[], &[], false, &mut bytes),
+        Err(Error::InvalidArgumentCount)
     );
 }
