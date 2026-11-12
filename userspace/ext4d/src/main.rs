@@ -4,8 +4,8 @@
 
 use wyrmroot_runtime::{NativePlatform, StartupBlock};
 use {
-    deepwyrm_syscall as _, wyrmroot_block_proto as _, wyrmroot_ext4 as _, wyrmroot_fs_proto as _,
-    wyrmroot_loader as _, wyrmroot_service_proto as _,
+    deepwyrm_syscall as _, wyrmroot_block_proto as _, wyrmroot_ext4 as _, wyrmroot_fs_lock as _,
+    wyrmroot_fs_proto as _, wyrmroot_loader as _, wyrmroot_service_proto as _,
 };
 
 fn ext4d_main(startup: StartupBlock<'_>) -> u32 {
