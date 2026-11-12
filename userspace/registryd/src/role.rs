@@ -148,6 +148,7 @@ const fn registry_error_code(error: RegistryError) -> u32 {
         RegistryError::WrongEndpointKind => 0xB101_0030,
         RegistryError::UnknownTransaction => 0xB101_0031,
         RegistryError::InvalidState => 0xB101_0032,
+        RegistryError::LookupDenied => 0xB101_0033,
     }
 }
 

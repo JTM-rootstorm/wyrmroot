@@ -316,10 +316,19 @@ MOVE to exact `READ | WRITE | WAIT | INSPECT`. Its body is:
 | following | name length | service-name bytes |
 
 `INSTALL_CLIENT` carries one registry-side Channel reduced by the atomic MOVE
-to exact `READ | WRITE | WAIT | INSPECT`. Its fixed 104-byte message appends nonzero
-installed endpoint ID, nonzero installed endpoint generation, nonzero client
-ID, nonzero client generation, enumeration scope, and zero reserved fields.
-Enumeration scope is `0 NONE` or `1 BOOTSTRAP_METADATA`.
+to exact `READ | WRITE | WAIT | INSPECT`. Its body is nonzero installed
+endpoint ID (offset 64), nonzero installed endpoint generation (72), nonzero
+client ID (80), nonzero client generation (88), enumeration scope (96, u32),
+the service-name byte count (100, u16, 1..=128), zero reserved (102, u16),
+and the service-name bytes from 104; the message is exactly 104 plus the name
+length. Enumeration scope is `0 NONE` or `1 BOOTSTRAP_METADATA`.
+
+The name is the one service this client may reach: registryd refuses a
+`LOOKUP_CONNECT` or `WATCH` for any other name, with `NOT_PUBLISHED`, so the
+refusal reveals nothing about other services (root `STORAGE_PLAN.md` W7
+review R1). Init names it per role: each blockmgr its disk, fat32d and ext4d
+their volume, consoled and init's publication observer the serial console,
+and wyrmsh `system.vfs`. Enumeration is governed by the scope alone.
 
 Duplicate endpoint/publication/client IDs, duplicate live service names,
 unsupported versions, wrong handles, capacity exhaustion, or stale generation

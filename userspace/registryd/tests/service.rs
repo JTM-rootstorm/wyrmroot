@@ -291,6 +291,7 @@ fn install_client(service: &mut RegistryService, mock: &mut Mock) {
             client_id: 51,
             client_generation: 1,
             scope: EnumerationScope::BootstrapMetadata,
+            service_name: b"echo",
         },
         &mut bytes,
     )
@@ -328,6 +329,7 @@ fn install_client_with(
             client_id,
             client_generation: 1,
             scope: EnumerationScope::BootstrapMetadata,
+            service_name: b"echo",
         },
         &mut bytes,
     )
@@ -429,6 +431,7 @@ fn readable_commits_before_peer_close_on_control_and_endpoint() {
             client_id: 51,
             client_generation: 1,
             scope: EnumerationScope::BootstrapMetadata,
+            service_name: b"echo",
         },
         &mut install,
     )

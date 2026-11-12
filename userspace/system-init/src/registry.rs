@@ -12,7 +12,7 @@ use deepwyrm_syscall::{
 use wyrmroot_loader::launch::{CHILD_CHANNEL_RIGHTS, LaunchProfile};
 use wyrmroot_registry_proto::{
     EnumerationScope, HEADER_BYTES as REGISTRY_HEADER_BYTES, Header as RegistryHeader,
-    InstallClient, MAX_SERVICE_LIST_PAGES, Message as RegistryMessage,
+    InstallClient, MAX_INSTALL_CLIENT_BYTES, MAX_SERVICE_LIST_PAGES, Message as RegistryMessage,
     MessageType as RegistryMessageType, SERVICE_LIST_PREFIX_BYTES, SERVICE_LIST_RECORD_BYTES,
     encode_empty as encode_registry_empty, encode_install_client, parse as parse_registry_message,
 };
@@ -340,8 +340,9 @@ pub(crate) fn install_client<S: ResidentPlatform>(
     grant: EndpointGrant,
     registry_endpoint: DwHandle,
     client_id: u64,
+    service_name: &[u8],
 ) -> Result<(), InitError> {
-    let mut bytes = [0u8; 104];
+    let mut bytes = [0u8; MAX_INSTALL_CLIENT_BYTES];
     let size = encode_install_client(
         RegistryHeader {
             message_type: RegistryMessageType::InstallClient,
@@ -356,6 +357,7 @@ pub(crate) fn install_client<S: ResidentPlatform>(
             client_id,
             client_generation: grant.role_generation,
             scope: EnumerationScope::None,
+            service_name,
         },
         &mut bytes,
     )
@@ -370,7 +372,7 @@ pub(crate) fn install_wyrmsh_registry_client<S: ResidentPlatform>(
     registry_endpoint: DwHandle,
     transaction_id: u64,
 ) -> Result<(), InitError> {
-    let mut bytes = [0_u8; 104];
+    let mut bytes = [0_u8; MAX_INSTALL_CLIENT_BYTES];
     let size = encode_install_client(
         RegistryHeader {
             message_type: RegistryMessageType::InstallClient,
@@ -388,6 +390,8 @@ pub(crate) fn install_wyrmsh_registry_client<S: ResidentPlatform>(
             client_id: transaction_id,
             client_generation: grant.role_generation,
             scope: EnumerationScope::BootstrapMetadata,
+            // The shell reaches only the file namespace.
+            service_name: wyrmroot_service_proto::roles::SYSTEM_VFS.name,
         },
         &mut bytes,
     )

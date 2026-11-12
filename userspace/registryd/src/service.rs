@@ -828,7 +828,8 @@ fn error_code(error: RegistryError) -> ErrorCode {
         RegistryError::TransactionReplay => ErrorCode::TransactionReplay,
         RegistryError::OutstandingLimit => ErrorCode::OutstandingLimit,
         RegistryError::Capacity => ErrorCode::Capacity,
-        RegistryError::NotPublished => ErrorCode::NotPublished,
+        // A service the client may not reach is, to it, not published.
+        RegistryError::NotPublished | RegistryError::LookupDenied => ErrorCode::NotPublished,
         RegistryError::UnsupportedVersion => ErrorCode::UnsupportedVersion,
         RegistryError::EnumerationDenied => ErrorCode::EnumerationDenied,
         RegistryError::UnknownTransaction | RegistryError::UnknownEndpoint => {

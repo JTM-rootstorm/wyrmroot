@@ -81,6 +81,8 @@ pub enum RegistryError {
     NotPublished,
     UnsupportedVersion,
     EnumerationDenied,
+    /// The client was installed for another service (storage review R1).
+    LookupDenied,
     TransactionLive,
     TransactionReplay,
     OutstandingLimit,
@@ -265,12 +267,19 @@ struct Client {
     handle: u64,
     client_id: u64,
     scope: EnumerationScope,
+    /// The one service this client may look up or watch.
+    service: [u8; MAX_SERVICE_NAME_BYTES],
+    service_len: u8,
     live_transactions: [u64; MAX_OUTSTANDING_PER_CLIENT],
     live_count: usize,
     replay: Replay<MAX_CLIENT_REPLAY>,
 }
 
 impl Client {
+    fn may_reach(&self, service_name: &[u8]) -> bool {
+        &self.service[..usize::from(self.service_len)] == service_name
+    }
+
     fn reserve(&mut self, transaction: u64) -> Result<(), RegistryError> {
         if transaction == 0 {
             return Err(RegistryError::ZeroIdentity);
@@ -464,7 +473,7 @@ impl RegistryState {
         &mut self,
         registry_generation: u64,
         handle: u64,
-        install: InstallClient,
+        install: InstallClient<'_>,
     ) -> Result<(), RegistryError> {
         let endpoint = EndpointIdentity {
             id: install.endpoint_id,
@@ -483,11 +492,19 @@ impl RegistryState {
             .iter()
             .position(Option::is_none)
             .ok_or(RegistryError::Capacity)?;
+        let service_len = u8::try_from(install.service_name.len())
+            .ok()
+            .filter(|&len| len != 0 && usize::from(len) <= MAX_SERVICE_NAME_BYTES)
+            .ok_or(RegistryError::InvalidState)?;
+        let mut service = [0; MAX_SERVICE_NAME_BYTES];
+        service[..install.service_name.len()].copy_from_slice(install.service_name);
         self.clients[index] = Some(Client {
             endpoint,
             handle,
             client_id: install.client_id,
             scope: install.scope,
+            service,
+            service_len,
             live_transactions: [0; MAX_OUTSTANDING_PER_CLIENT],
             live_count: 0,
             replay: Replay::new(),
@@ -593,6 +610,17 @@ impl RegistryState {
             .as_mut()
             .unwrap()
             .reserve(transaction)?;
+        if !self.clients[client_index]
+            .as_ref()
+            .unwrap()
+            .may_reach(request.service_name)
+        {
+            self.clients[client_index]
+                .as_mut()
+                .unwrap()
+                .complete(transaction);
+            return Err(RegistryError::LookupDenied);
+        }
         let result = self
             .services
             .iter()
@@ -635,6 +663,17 @@ impl RegistryState {
             .as_mut()
             .unwrap()
             .reserve(transaction)?;
+        if !self.clients[client_index]
+            .as_ref()
+            .unwrap()
+            .may_reach(request.service_name)
+        {
+            self.clients[client_index]
+                .as_mut()
+                .unwrap()
+                .complete(transaction);
+            return Err(RegistryError::LookupDenied);
+        }
         let current = self.current_generation(request.protocol_id, request.service_name);
         if current != request.last_observed_generation {
             self.clients[client_index]
@@ -1044,6 +1083,7 @@ mod tests {
                     client_id: endpoint.id + 100,
                     client_generation: endpoint.generation,
                     scope,
+                    service_name: b"echo",
                 },
             )
             .unwrap();
@@ -1070,6 +1110,7 @@ mod tests {
                     client_id: 3,
                     client_generation: 1,
                     scope: EnumerationScope::None,
+                    service_name: b"echo",
                 }
             ),
             Err(RegistryError::DuplicateEndpoint)
@@ -1216,6 +1257,55 @@ mod tests {
         );
     }
 
+    /// A client reaches only the service init installed it for; any other
+    /// name is refused without a transaction left live (storage review R1).
+    #[test]
+    fn a_client_looks_up_and_watches_only_its_installed_service() {
+        let mut state = RegistryState::new(7).unwrap();
+        let mut bytes = [0u8; 256];
+        for (endpoint, name) in [(31, &b"echo"[..]), (32, b"volume.root0")] {
+            let publisher = EndpointIdentity {
+                id: endpoint,
+                generation: 1,
+            };
+            state
+                .install_publication(
+                    7,
+                    100 + endpoint,
+                    publication_install(&mut bytes, publisher, endpoint + 10, 13, name),
+                )
+                .unwrap();
+            state.publish(publisher, 1).unwrap();
+        }
+        let client = EndpointIdentity {
+            id: 41,
+            generation: 1,
+        };
+        install_client(&mut state, client, EnumerationScope::None);
+        let lookup = |name| Lookup {
+            protocol_id: 17,
+            version: ProtocolVersion { major: 1, minor: 0 },
+            service_name: name,
+        };
+        assert_eq!(
+            state.lookup(client, 1, lookup(b"volume.root0")),
+            Err(RegistryError::LookupDenied)
+        );
+        assert_eq!(
+            state.watch(
+                client,
+                2,
+                Watch {
+                    protocol_id: 17,
+                    last_observed_generation: 0,
+                    service_name: b"volume.root0",
+                }
+            ),
+            Err(RegistryError::LookupDenied)
+        );
+        assert!(state.lookup(client, 3, lookup(b"echo")).is_ok());
+    }
+
     #[test]
     fn enumeration_is_ticketed_sorted_and_replayed_only_on_complete() {
         let mut state = RegistryState::new(7).unwrap();
@@ -1342,6 +1432,7 @@ mod tests {
                     client_id: clients[2].id + 100,
                     client_generation: 2,
                     scope: EnumerationScope::None,
+                    service_name: b"echo",
                 }
             ),
             Err(RegistryError::DuplicateClient)
@@ -1372,6 +1463,7 @@ mod tests {
                     client_id: u1_client_id,
                     client_generation: 1,
                     scope: EnumerationScope::None,
+                    service_name: b"echo",
                 },
             )
             .unwrap();
@@ -1387,6 +1479,7 @@ mod tests {
                     client_id: u2_client_id,
                     client_generation: 2,
                     scope: EnumerationScope::None,
+                    service_name: b"echo",
                 },
             )
             .unwrap();
@@ -1400,6 +1493,7 @@ mod tests {
                     client_id: u1_client_id,
                     client_generation: 2,
                     scope: EnumerationScope::None,
+                    service_name: b"echo",
                 },
             ),
             Err(RegistryError::DuplicateClient)

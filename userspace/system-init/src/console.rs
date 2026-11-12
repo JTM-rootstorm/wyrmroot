@@ -193,6 +193,7 @@ where
         grant,
         registry_endpoint,
         operation,
+        SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY.service_name,
     ) {
         let cleanup_failed =
             system.close_handle(registry_endpoint).is_err() | system.close_handle(client).is_err();
@@ -328,6 +329,7 @@ where
         registry_grant,
         registry_endpoint,
         transaction,
+        SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY.service_name,
     ) {
         let failed = system.close_handle(registry_endpoint).is_err()
             | system.close_handle(child_registry).is_err()

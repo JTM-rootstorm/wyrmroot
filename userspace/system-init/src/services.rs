@@ -61,7 +61,8 @@ struct Spec {
     path: &'static str,
     display_path: &'static str,
     publication: Option<ServiceName>,
-    client: bool,
+    /// The one service the role's registry client may reach.
+    client: Option<&'static [u8]>,
 }
 
 const SPECS: [Spec; SERVICE_COUNT] = [
@@ -70,35 +71,35 @@ const SPECS: [Spec; SERVICE_COUNT] = [
         path: BLOCKMGR_PATH,
         display_path: "/system/blockmgr",
         publication: Some(BOOT_VOLUME),
-        client: true,
+        client: Some(wyrmroot_device_proto::manifest::BOOT_DISK_SERVICE_NAME),
     },
     Spec {
         role_id: ROOT_BLOCKMGR_ROLE_ID,
         path: BLOCKMGR_PATH,
         display_path: "/system/blockmgr",
         publication: Some(ROOT_VOLUME),
-        client: true,
+        client: Some(wyrmroot_device_proto::manifest::DATA_DISK_SERVICE_NAME),
     },
     Spec {
         role_id: FAT32D_ROLE_ID,
         path: FAT32D_PATH,
         display_path: "/system/fat32d",
         publication: None,
-        client: true,
+        client: Some(BOOT_VOLUME.name),
     },
     Spec {
         role_id: EXT4D_ROLE_ID,
         path: EXT4D_PATH,
         display_path: "/system/ext4d",
         publication: None,
-        client: true,
+        client: Some(ROOT_VOLUME.name),
     },
     Spec {
         role_id: VFSD_ROLE_ID,
         path: VFSD_PATH,
         display_path: "/system/vfsd",
         publication: Some(SYSTEM_VFS),
-        client: false,
+        client: None,
     },
 ];
 
@@ -352,7 +353,7 @@ fn stage_service<S: ResidentPlatform>(
             }
             None => None,
         };
-        let client = if spec.client {
+        let client = if let Some(service_name) = spec.client {
             let grant = topology
                 .issue(role_generation, EndpointKind::RegistryClient)
                 .map_err(InitError::Jobs)?;
@@ -364,6 +365,7 @@ fn stage_service<S: ResidentPlatform>(
                 grant,
                 registry_end,
                 transaction_id + 2,
+                service_name,
             ) {
                 let _ = system.close_handle(registry_end);
                 return Err(error);

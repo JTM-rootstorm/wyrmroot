@@ -133,12 +133,15 @@ pub struct InstallPublication<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InstallClient {
+pub struct InstallClient<'a> {
     pub endpoint_id: u64,
     pub endpoint_generation: u64,
     pub client_id: u64,
     pub client_generation: u64,
     pub scope: EnumerationScope,
+    /// The one service this client may look up or watch. Init names it;
+    /// registryd refuses every other name (storage review R1).
+    pub service_name: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,7 +260,7 @@ impl ErrorCode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Message<'a> {
     InstallPublication(InstallPublication<'a>),
-    InstallClient(InstallClient),
+    InstallClient(InstallClient<'a>),
     Publish,
     Published,
     Retire,
@@ -496,21 +499,29 @@ pub fn parse(bytes: &[u8], received_handle_count: usize) -> Result<ParsedMessage
         }
         MessageType::InstallClient => {
             require_handles(received_handle_count, 1)?;
-            require_size(bytes, 104)?;
+            if bytes.len() < 105 {
+                return Err(Error::WrongSize);
+            }
             let scope = match read_u32(bytes, 96)? {
                 0 => EnumerationScope::None,
                 1 => EnumerationScope::BootstrapMetadata,
                 _ => return Err(Error::InvalidScope),
             };
-            if read_u32(bytes, 100)? != 0 {
+            if read_u16(bytes, 102)? != 0 {
                 return Err(Error::NonzeroReserved);
             }
+            if bytes.len() != 104 + usize::from(read_u16(bytes, 100)?) {
+                return Err(Error::WrongSize);
+            }
+            let service_name = &bytes[104..];
+            validate_name(service_name)?;
             let value = InstallClient {
                 endpoint_id: read_u64(bytes, 64)?,
                 endpoint_generation: read_u64(bytes, 72)?,
                 client_id: read_u64(bytes, 80)?,
                 client_generation: read_u64(bytes, 88)?,
                 scope,
+                service_name,
             };
             if value.endpoint_id == 0
                 || value.endpoint_generation == 0
@@ -827,7 +838,7 @@ pub fn encode_install_publication(
 
 pub fn encode_install_client(
     header: Header,
-    install: InstallClient,
+    install: InstallClient<'_>,
     out: &mut [u8],
 ) -> Result<usize, Error> {
     if header.message_type != MessageType::InstallClient
@@ -838,7 +849,9 @@ pub fn encode_install_client(
     {
         return Err(Error::ZeroIdentity);
     }
-    encode_header(header, 1, 104, out)?;
+    validate_name(install.service_name)?;
+    let size = 104 + install.service_name.len();
+    encode_header(header, 1, size, out)?;
     put_u64(out, 64, install.endpoint_id)?;
     put_u64(out, 72, install.endpoint_generation)?;
     put_u64(out, 80, install.client_id)?;
@@ -851,8 +864,14 @@ pub fn encode_install_client(
             EnumerationScope::BootstrapMetadata => 1,
         },
     )?;
-    Ok(104)
+    put_u16(out, 100, install.service_name.len() as u16)?;
+    put_u16(out, 102, 0)?;
+    out[104..size].copy_from_slice(install.service_name);
+    Ok(size)
 }
+
+/// The largest INSTALL_CLIENT message.
+pub const MAX_INSTALL_CLIENT_BYTES: usize = 104 + MAX_SERVICE_NAME_BYTES;
 
 pub fn validate_name(name: &[u8]) -> Result<(), Error> {
     if name.is_empty() || name.len() > MAX_SERVICE_NAME_BYTES || !name[0].is_ascii_lowercase() {

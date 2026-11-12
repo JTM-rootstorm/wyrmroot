@@ -332,3 +332,52 @@ fn minimal_header_decode_preserves_recoverable_correlation() {
     bytes[48..56].fill(0);
     assert_eq!(decode_header(&bytes), Err(Error::ZeroIdentity));
 }
+
+#[test]
+fn install_client_carries_exactly_one_valid_service_name() {
+    let install = InstallClient {
+        endpoint_id: 21,
+        endpoint_generation: 2,
+        client_id: 3,
+        client_generation: 5,
+        scope: EnumerationScope::BootstrapMetadata,
+        service_name: b"system.vfs",
+    };
+    let mut bytes = [0u8; MAX_INSTALL_CLIENT_BYTES];
+    let size =
+        encode_install_client(header(MessageType::InstallClient), install, &mut bytes).unwrap();
+    assert_eq!(size, 104 + b"system.vfs".len());
+    let Message::InstallClient(value) = parse(&bytes[..size], 1).unwrap().message else {
+        panic!("wrong message")
+    };
+    assert_eq!(value, install);
+
+    // A truncated or padded body, a nonzero reserved half, and a bad name
+    // are refused.
+    assert_eq!(
+        parse(&bytes[..size - 1], 1).map(|_| ()),
+        Err(Error::WrongSize)
+    );
+    let mut reserved = bytes;
+    reserved[102] = 1;
+    assert_eq!(
+        parse(&reserved[..size], 1).map(|_| ()),
+        Err(Error::NonzeroReserved)
+    );
+    let mut bad = bytes;
+    bad[104] = b'S';
+    assert!(parse(&bad[..size], 1).is_err());
+    for name in [&b""[..], b"Upper"] {
+        assert!(
+            encode_install_client(
+                header(MessageType::InstallClient),
+                InstallClient {
+                    service_name: name,
+                    ..install
+                },
+                &mut bytes
+            )
+            .is_err()
+        );
+    }
+}
