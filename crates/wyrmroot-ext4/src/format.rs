@@ -54,7 +54,7 @@ struct Layout {
 
 /// Whether group `number` holds a superblock backup (`sparse_super`:
 /// 0, 1 and powers of 3, 5 and 7).
-fn has_backup(number: u32) -> bool {
+pub(crate) fn has_backup(number: u32) -> bool {
     if number <= 1 {
         return true;
     }

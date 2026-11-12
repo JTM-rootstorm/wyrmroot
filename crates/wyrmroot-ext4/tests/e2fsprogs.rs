@@ -791,3 +791,106 @@ fn a_mke2fs_journal_takes_commits_that_e2fsck_replays() {
         pattern(30_000, 6)
     );
 }
+
+fn debugfs_write(path: &Path, request: &str) {
+    let output = tool("debugfs")
+        .arg("-w")
+        .arg("-R")
+        .arg(request)
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn first_number(text: &[u8]) -> u64 {
+    String::from_utf8_lossy(text)
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|word| !word.is_empty())
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// What opening the journal of `path` (made writable) reports.
+fn open_journal(path: &Path) -> Result<(), wyrmroot_ext4::Error> {
+    let bytes = fs::metadata(path).unwrap().len();
+    let mut disk = open_image(path);
+    recover(&mut disk, bytes)?;
+    let mut volume = Volume::mount(&mut disk, bytes, true)?;
+    Journal::open(&mut volume, &mut disk).map(|_| ())
+}
+
+#[test]
+fn a_hostile_journal_is_refused() {
+    // A journal superblock claiming more blocks than the file maps (W11
+    // review D1: the walk's bound came from the image).
+    let path = journaled_format("hostile-maxlen.img", 4096, 32 << 20);
+    let at = first_number(&debugfs(&path, "bmap <8> 0"));
+    let mut sb = block_of(&path, at, 4096);
+    sb.truncate(1024);
+    sb[0x10..0x14].copy_from_slice(&u32::MAX.to_be_bytes());
+    sb[0xFC..0x100].fill(0);
+    let sum = wyrmroot_ext4::crc::update(!0, &sb);
+    sb[0xFC..0x100].copy_from_slice(&sum.to_be_bytes());
+    open_image(&path).write(at * 4096, &sb).unwrap();
+    assert_eq!(open_journal(&path), Err(wyrmroot_ext4::Error::Corrupt));
+
+    // A journal extent over the inode table (D2).
+    let path = journaled_format("hostile-extent.img", 4096, 32 << 20);
+    let header = dumpe2fs(&path);
+    let output = tool("dumpe2fs").arg(&path).output().unwrap();
+    let groups = String::from_utf8_lossy(&output.stdout).into_owned();
+    let table = groups
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Inode table at "))
+        .map(|rest| first_number(rest.as_bytes()))
+        .unwrap_or_else(|| panic!("{header}{groups}"));
+    debugfs_write(&path, &format!("sif <8> block[5] {table}"));
+    assert_eq!(open_journal(&path), Err(wyrmroot_ext4::Error::Corrupt));
+
+    // A journal inode that is the root directory (D2).
+    let path = journaled_format("hostile-inum.img", 4096, 32 << 20);
+    debugfs_write(&path, "ssv journal_inum 2");
+    assert_eq!(open_journal(&path), Err(wyrmroot_ext4::Error::Corrupt));
+}
+
+#[test]
+fn a_journal_without_checksums_or_64bit_takes_commits_that_e2fsck_replays() {
+    let path = mke2fs_image("mke2fs-plain", &["-O", "^metadata_csum,^64bit"]);
+    let header = dumpe2fs(&path);
+    assert!(
+        !header.contains("metadata_csum") && !header.contains("64bit"),
+        "{header}"
+    );
+    let (mut disk, mut volume, mut journal, mut transaction) = journaled(&path, Some(3));
+    let mut view = Journaled {
+        device: &mut disk,
+        transaction: &mut transaction,
+    };
+    let new = volume
+        .create(&mut view, ROOT_INODE, b"plain.txt", Kind::File)
+        .unwrap();
+    volume
+        .write(&mut view, new.inode, 0, &pattern(9_000, 13))
+        .unwrap();
+    assert!(
+        journal
+            .commit(&volume, &mut disk, &mut transaction)
+            .is_err()
+    );
+    drop(disk);
+    assert!(!dumpe2fs(&path).contains("journal_checksum"));
+    let by_e2fsck = e2fsck_replayed(&path, "mke2fs-plain-e2fsck.img");
+    assert_eq!(debugfs(&by_e2fsck, "cat /plain.txt"), pattern(9_000, 13));
+    let bytes = fs::metadata(&path).unwrap().len();
+    let mut disk = open_image(&path);
+    assert_eq!(recover(&mut disk, bytes), Ok(true));
+    drop(disk);
+    fsck_clean(&path);
+    assert_eq!(debugfs(&path, "cat /plain.txt"), pattern(9_000, 13));
+}

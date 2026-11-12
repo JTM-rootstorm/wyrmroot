@@ -23,15 +23,21 @@
 //! descriptor, revoke and commit blocks, with no, v2 or v3 checksums.
 //! Fast commits and external journals are refused.
 
+use crate::extent::Run;
 use crate::{
-    Device, DeviceError, Error, INCOMPAT_RECOVER, Inode, MAX_BLOCK_BYTES, SUPERBLOCK_BYTES, Volume,
-    crc, get32,
+    BG_BLOCK_UNINIT, Device, DeviceError, Error, INCOMPAT_RECOVER, Kind, MAX_BLOCK_BYTES,
+    RO_COMPAT_SPARSE_SUPER, ROOT_INODE, SUPERBLOCK_BYTES, Volume, crc, get16, get32,
 };
 
 /// `s_feature_compat` bit: the volume has a journal.
 pub(crate) const COMPAT_HAS_JOURNAL: u32 = 0x4;
 /// `s_feature_incompat` bit: the journal is on another device.
 const INCOMPAT_JOURNAL_DEV: u32 = 0x8;
+/// `s_feature_compat` bit: superblock backups only where
+/// `s_backup_bgs` says, which [`Log::load`] does not check against.
+const COMPAT_SPARSE_SUPER2: u32 = 0x200;
+/// The most extents a journal file may have.
+const MAX_RUNS: usize = 64;
 /// The inode `format` gives the journal.
 pub(crate) const JOURNAL_INODE: u32 = 8;
 
@@ -41,6 +47,7 @@ const COMMIT: u32 = 2;
 const SUPERBLOCK_V2: u32 = 4;
 const REVOKE: u32 = 5;
 
+const J_COMPAT_CHECKSUM: u32 = 0x1;
 const J_REVOKE: u32 = 0x1;
 const J_64BIT: u32 = 0x2;
 const J_ASYNC_COMMIT: u32 = 0x4;
@@ -55,7 +62,7 @@ const TAG_LAST: u32 = 0x8;
 
 /// The most revoked blocks [`recover`] tracks.
 const MAX_REVOKES: usize = 256;
-/// The most tags one descriptor holds (1 KiB blocks, 8-byte tags).
+/// The most tags one descriptor holds (4 KiB blocks, 8-byte tags).
 const MAX_TAGS: usize = MAX_BLOCK_BYTES / 8;
 
 /// A device error raised by [`Journaled`] when the transaction is full.
@@ -83,7 +90,9 @@ struct Tag {
 
 /// The journal file: where it is and how its blocks are laid out.
 struct Log {
-    inode: Inode,
+    /// The journal file's extents, contiguous from logical block 0.
+    runs: [Run; MAX_RUNS],
+    run_count: usize,
     block_size: usize,
     first: u32,
     maxlen: u32,
@@ -94,22 +103,35 @@ struct Log {
 }
 
 impl Log {
-    /// Reads and checks the journal superblock of `volume`'s journal inode.
+    /// Reads and checks `volume`'s journal: its inode, where its blocks are,
+    /// and its superblock. The journal must be a reserved regular inode
+    /// whose blocks are distinct, in use and clear of the superblocks, group
+    /// descriptors, bitmaps and inode tables, as Linux and e2fsck require;
+    /// a journal that cannot be one is [`Error::Corrupt`].
     fn load<D: Device>(
         volume: &Volume,
         device: &mut D,
         sb: &mut [u8; SUPERBLOCK_BYTES],
     ) -> Result<Self, Error> {
         let incompat = get32(&volume.sb, 0x60);
-        if incompat & INCOMPAT_JOURNAL_DEV != 0 || volume.sb[0xE4..0xE8] != [0; 4] {
+        if incompat & INCOMPAT_JOURNAL_DEV != 0
+            || volume.sb[0xE4..0xE8] != [0; 4]
+            || get32(&volume.sb, 0x5C) & COMPAT_SPARSE_SUPER2 != 0
+        {
             return Err(Error::Unsupported);
         }
         let number = get32(&volume.sb, 0xE0);
+        if number == 0 || number == ROOT_INODE || number >= volume.first_inode {
+            return Err(Error::Corrupt);
+        }
         let inode = volume.inode(device, number)?;
+        if inode.kind() != Some(Kind::File) || inode.links() == 0 {
+            return Err(Error::Corrupt);
+        }
         let block_size = volume.bs();
-        let size = inode.size();
         let mut log = Self {
-            inode,
+            runs: [Run::default(); MAX_RUNS],
+            run_count: 0,
             block_size,
             first: 0,
             maxlen: 0,
@@ -117,6 +139,15 @@ impl Log {
             seed: None,
             uuid: [0; 16],
         };
+        log.run_count = volume.runs(device, &inode, &mut log.runs)?;
+        let mut mapped = 0u32;
+        for run in &log.runs[..log.run_count] {
+            if run.logical != mapped {
+                return Err(Error::Corrupt);
+            }
+            mapped = mapped.checked_add(run.len).ok_or(Error::Corrupt)?;
+        }
+        log.check_placement(volume, device)?;
         let at = log.physical(volume, device, 0)?;
         device.read(at * block_size as u64, sb)?;
         if be32(sb, 0) != MAGIC || be32(sb, 4) != SUPERBLOCK_V2 {
@@ -128,7 +159,8 @@ impl Log {
         if be32(sb, 0xC) as usize != block_size
             || first == 0
             || first >= maxlen
-            || u64::from(maxlen) * block_size as u64 > size
+            || maxlen > mapped
+            || u64::from(maxlen) * block_size as u64 > inode.size()
             || be32(sb, 0x40) > 1
         {
             return Err(Error::Corrupt);
@@ -151,16 +183,81 @@ impl Log {
         Ok(log)
     }
 
+    /// The journal's blocks: pairwise distinct, marked in use, and clear
+    /// of every group's superblock and descriptor copies, bitmaps and inode
+    /// table.
+    fn check_placement<D: Device>(&self, volume: &Volume, device: &mut D) -> Result<(), Error> {
+        let runs = &self.runs[..self.run_count];
+        for (index, run) in runs.iter().enumerate() {
+            let end = run.physical + u64::from(run.len);
+            if runs[index + 1..].iter().any(|other| {
+                other.physical < end && run.physical < other.physical + u64::from(other.len)
+            }) {
+                return Err(Error::Corrupt);
+            }
+        }
+        let overlaps = |first: u64, count: u64| {
+            runs.iter().any(|run| {
+                first < run.physical + u64::from(run.len) && run.physical < first + count
+            })
+        };
+        let sparse = volume.has_ro_compat(RO_COMPAT_SPARSE_SUPER);
+        let descriptor_blocks =
+            (u64::from(volume.groups) * volume.desc_size as u64).div_ceil(volume.bs() as u64);
+        let reserved = u64::from(get16(&volume.sb, 0xCE));
+        if overlaps(0, u64::from(volume.first_data_block) + 1) {
+            return Err(Error::Corrupt);
+        }
+        let mut bitmap = [0u8; MAX_BLOCK_BYTES];
+        let bitmap = &mut bitmap[..volume.bs()];
+        for number in 0..volume.groups {
+            let start = volume.group_first_block(number);
+            if (!sparse || crate::format::has_backup(number))
+                && overlaps(start, 1 + descriptor_blocks + reserved)
+            {
+                return Err(Error::Corrupt);
+            }
+            let group = volume.group(device, number)?;
+            if overlaps(volume.block_bitmap(&group), 1)
+                || overlaps(volume.inode_bitmap(&group), 1)
+                || overlaps(volume.inode_table(&group), volume.inode_table_blocks())
+            {
+                return Err(Error::Corrupt);
+            }
+            let count = u64::from(volume.blocks_in_group(number));
+            if !overlaps(start, count) {
+                continue;
+            }
+            if group.flags() & BG_BLOCK_UNINIT != 0 {
+                return Err(Error::Corrupt);
+            }
+            volume.read_block(device, volume.block_bitmap(&group), bitmap)?;
+            for run in runs {
+                let from = run.physical.max(start);
+                let to = (run.physical + u64::from(run.len)).min(start + count);
+                for block in from..to {
+                    let index = (block - start) as usize;
+                    if bitmap[index / 8] & (1 << (index % 8)) == 0 {
+                        return Err(Error::Corrupt);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Where journal block `logical` lives.
     fn physical<D: Device>(
         &self,
-        volume: &Volume,
-        device: &mut D,
+        _volume: &Volume,
+        _device: &mut D,
         logical: u32,
     ) -> Result<u64, Error> {
-        match volume.map(device, &self.inode, logical)? {
-            Some(mapped) if !mapped.uninit => Ok(mapped.physical),
-            _ => Err(Error::Corrupt),
-        }
+        self.runs[..self.run_count]
+            .iter()
+            .find(|run| logical >= run.logical && logical - run.logical < run.len)
+            .map(|run| run.physical + u64::from(logical - run.logical))
+            .ok_or(Error::Corrupt)
     }
 
     fn read<D: Device>(
@@ -202,14 +299,14 @@ impl Log {
         self.incompat & J_64BIT != 0
     }
 
+    /// A tag's size. Linux adds two bytes to v2 tags, which `journal.rst`
+    /// omits (Linux 7.2.14 `journal_tag_bytes`, D3 of the W11 review).
     fn tag_bytes(&self) -> usize {
         if self.v3() {
-            16
-        } else if self.wide() {
-            12
-        } else {
-            8
+            return 16;
         }
+        let v2 = if self.incompat & J_CSUM_V2 != 0 { 2 } else { 0 };
+        if self.wide() { 12 + v2 } else { 8 + v2 }
     }
 
     /// Where descriptor and revoke blocks' records end.
@@ -351,7 +448,7 @@ impl Revoked {
     fn skips(&self, block: u64, sequence: u32) -> bool {
         self.entries[..self.len]
             .iter()
-            .any(|entry| entry.0 == block && entry.1 >= sequence)
+            .any(|entry| entry.0 == block && entry.1.wrapping_sub(sequence) as i32 >= 0)
     }
 }
 
@@ -389,7 +486,7 @@ fn walk<D: Device>(
                 for _ in 0..=count {
                     position = log.next(position);
                 }
-                steps += 1 + count as u32;
+                steps = steps.saturating_add(1 + count as u32);
                 continue;
             }
             REVOKE => {
@@ -407,7 +504,7 @@ fn walk<D: Device>(
             _ => break,
         }
         position = log.next(position);
-        steps += 1;
+        steps = steps.saturating_add(1);
     }
     Ok(expected)
 }
@@ -427,13 +524,24 @@ pub fn recover<D: Device>(device: &mut D, device_bytes: u64) -> Result<bool, Err
         };
     }
     let mut sb = [0u8; SUPERBLOCK_BYTES];
-    let log = Log::load(&volume, device, &mut sb)?;
+    let needs_recovery = get32(&volume.sb, 0x60) & INCOMPAT_RECOVER != 0;
+    let log = match Log::load(&volume, device, &mut sb) {
+        // A journal this module cannot use, on a volume that needs no
+        // recovery, is left for the mount to decide on (read-only).
+        Err(Error::Unsupported) if !needs_recovery => return Ok(false),
+        other => other?,
+    };
     let start = be32(&sb, 0x1C);
     let sequence = be32(&sb, 0x18);
     let mut replayed = false;
     if start != 0 {
         if start < log.first || start >= log.maxlen {
             return Err(Error::Corrupt);
+        }
+        // Asynchronous commits are only safe to replay when every block's
+        // checksum is checked.
+        if log.incompat & J_ASYNC_COMMIT != 0 && log.seed.is_none() {
+            return Err(Error::Unsupported);
         }
         let end = walk(
             &volume,
@@ -518,7 +626,9 @@ pub fn recover<D: Device>(device: &mut D, device_bytes: u64) -> Result<bool, Err
             },
         )?;
         device.flush()?;
-        put_be32(&mut sb, 0x18, end);
+        // The next transaction starts past the last one replayed, so a
+        // stale commit block can never be taken for it (as Linux does).
+        put_be32(&mut sb, 0x18, end.wrapping_add(1));
         put_be32(&mut sb, 0x1C, 0);
         if log.seed.is_some() {
             let sum = superblock_checksum(&sb);
@@ -679,16 +789,19 @@ impl<D: Device, S: Store, const SLOTS: usize> Device for Journaled<'_, D, S, SLO
                     if transaction.len == transaction.limit {
                         return Err(TRANSACTION_FULL);
                     }
+                    // The slot holds its whole block before it is counted.
                     let slot = transaction.len;
+                    let mut whole = [0u8; MAX_BLOCK_BYTES];
+                    let whole = &mut whole[..size];
                     if take != size {
-                        let mut base = [0u8; MAX_BLOCK_BYTES];
-                        let base = &mut base[..size];
-                        self.device.read(block * size as u64, base)?;
-                        transaction.save(slot, 0, base)?;
+                        self.device.read(block * size as u64, whole)?;
                     }
+                    whole[within..within + take].copy_from_slice(&data[done..done + take]);
+                    transaction.save(slot, 0, whole)?;
                     transaction.homes[slot] = block;
                     transaction.len += 1;
-                    slot
+                    done += take;
+                    continue;
                 }
             };
             transaction.save(slot, within, &data[done..done + take])?;
@@ -770,6 +883,10 @@ impl Journal {
         }
         log.incompat = incompat;
         put_be32(&mut sb, 0x28, incompat);
+        // v1 block checksums are never written, and Linux refuses them
+        // beside v2 or v3 (W11 review D5).
+        let compat = be32(&sb, 0x24) & !J_COMPAT_CHECKSUM;
+        put_be32(&mut sb, 0x24, compat);
         let sequence = be32(&sb, 0x18);
         let journal = Self { log, sb, sequence };
         journal.write_superblock(volume, device, 0)?;
@@ -809,7 +926,8 @@ impl Journal {
     /// Commits `transaction`: makes the data written so far durable, logs
     /// and commits the metadata, then writes it home and empties the
     /// journal. `device` is the volume itself, not the [`Journaled`] view.
-    /// On failure the transaction is kept; committing it again is safe.
+    /// On failure before the checkpoint ends, the transaction is kept and
+    /// committing it again is safe.
     pub fn commit<D: Device, S: Store, const SLOTS: usize>(
         &mut self,
         volume: &Volume,

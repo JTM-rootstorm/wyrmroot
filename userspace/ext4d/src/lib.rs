@@ -333,6 +333,8 @@ pub struct Server<V> {
     /// When the running transaction must commit, in monotonic nanoseconds.
     commit_due: Option<u64>,
     full: bool,
+    /// A commit failed: no more are tried, and SYNC fails (W11 review R4).
+    failed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -476,6 +478,7 @@ impl<V: View> Server<V> {
             journal,
             commit_due: None,
             full: false,
+            failed: false,
         })
     }
 
@@ -575,11 +578,15 @@ impl<V: View> Server<V> {
             cache: &mut self.cache,
         };
         self.commit_due = None;
+        if self.failed {
+            return Err(Ext4Error::Corrupt);
+        }
         let result = match self.journal.as_mut() {
             Some((journal, transaction)) => journal.commit(&self.volume, &mut device, transaction),
             None => self.volume.sync(&mut device),
         };
         if result.is_err() {
+            self.failed = self.journal.is_some();
             self.volume.set_read_only();
         }
         result
@@ -592,6 +599,9 @@ impl<V: View> Server<V> {
         let Some((_, transaction)) = self.journal.as_mut() else {
             return;
         };
+        if self.failed {
+            return;
+        }
         if core::mem::take(&mut self.full) {
             transaction.discard();
             self.commit_due = None;

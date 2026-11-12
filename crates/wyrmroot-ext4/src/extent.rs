@@ -15,6 +15,14 @@ const MAX_DEPTH: u16 = 5;
 const MAX_LEN: u32 = 32768;
 const ROOT_ENTRIES: u16 = 4;
 
+/// One extent of a file, as [`Volume::runs`] lists it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Run {
+    pub(crate) logical: u32,
+    pub(crate) len: u32,
+    pub(crate) physical: u64,
+}
+
 /// Where one logical block lives.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Mapped {
@@ -195,6 +203,57 @@ impl Volume {
             return Err(Error::Corrupt);
         }
         Ok(())
+    }
+
+    /// Lists `inode`'s initialised extents in tree order into `out`; returns
+    /// how many. Trees deeper than one level, unwritten extents and more
+    /// extents than `out` holds are [`Error::Unsupported`].
+    pub(crate) fn runs<D: Device>(
+        &self,
+        device: &mut D,
+        inode: &Inode,
+        out: &mut [Run],
+    ) -> Result<usize, Error> {
+        if inode.flags() & EXT4_EXTENTS_FL == 0 {
+            return Err(Error::Unsupported);
+        }
+        let mut count = 0;
+        let mut push = |found: Extent, out: &mut [Run]| -> Result<(), Error> {
+            self.check_extent(found)?;
+            if found.uninit {
+                return Err(Error::Unsupported);
+            }
+            let slot = out.get_mut(count).ok_or(Error::Unsupported)?;
+            *slot = Run {
+                logical: found.logical,
+                len: found.len,
+                physical: found.physical,
+            };
+            count += 1;
+            Ok(())
+        };
+        let root = inode.root();
+        let head = header(root)?;
+        match head.depth {
+            0 => {
+                for index in 0..usize::from(head.entries) {
+                    push(extent(root, index)?, out)?;
+                }
+            }
+            1 => {
+                let mut node = [0u8; MAX_BLOCK_BYTES];
+                let node = &mut node[..self.bs()];
+                for index in 0..usize::from(head.entries) {
+                    let (_, block) = index_entry(root, index);
+                    let leaf = self.read_node(device, inode, block, 0, node)?;
+                    for entry in 0..usize::from(leaf.entries) {
+                        push(extent(node, entry)?, out)?;
+                    }
+                }
+            }
+            _ => return Err(Error::Unsupported),
+        }
+        Ok(count)
     }
 
     /// Maps logical block `logical` of `inode`.
