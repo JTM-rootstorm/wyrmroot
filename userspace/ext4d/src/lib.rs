@@ -864,15 +864,9 @@ impl<V: View> Server<V> {
                         status(Status::Invalid),
                     );
                 };
-                self.open(
-                    platform,
-                    transaction_id,
-                    here,
-                    flags,
-                    path,
-                    server.handle,
-                    client,
-                );
+                // The node opened through `here` belongs to `client`.
+                let dir = OpenNode { client, ..here };
+                self.open(platform, transaction_id, dir, flags, path, server.handle);
                 self.settle(platform);
                 return true;
             }
@@ -1124,7 +1118,6 @@ impl<V: View> Server<V> {
         flags: u32,
         path: &[u8],
         server: DwHandle,
-        client: u64,
     ) {
         let slot = self.nodes.iter().position(Option::is_none);
         let found = match slot {
@@ -1161,7 +1154,7 @@ impl<V: View> Server<V> {
                     channel: server,
                     inode: stat.inode,
                     access,
-                    client,
+                    client: dir.client,
                 });
             }
             _ => {

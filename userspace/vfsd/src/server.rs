@@ -330,7 +330,14 @@ impl Vfs {
     ) {
         let status = match self.mounts.resolve(path) {
             Resolution::Mount { index, rest } => {
-                match self.forward(platform, owner, transaction_id, flags, index, rest, server) {
+                match self.forward(
+                    platform,
+                    (owner, transaction_id),
+                    flags,
+                    index,
+                    rest,
+                    server,
+                ) {
                     Ok(()) => return,
                     Err(status) => status,
                 }
@@ -360,8 +367,7 @@ impl Vfs {
     fn forward<P: VfsPlatform>(
         &mut self,
         platform: &mut P,
-        owner: u64,
-        transaction_id: u64,
+        (owner, transaction_id): (u64, u64),
         mut flags: u32,
         index: usize,
         rest: &[u8],
