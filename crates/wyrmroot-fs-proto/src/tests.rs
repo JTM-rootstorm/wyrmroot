@@ -88,6 +88,7 @@ fn every_node_message_round_trips_with_its_handle_count() {
         Body::Unlink { name: b"old" },
         Body::Sync,
         Body::QueryFilesystem,
+        Body::Close,
         Body::OnOpen {
             status: Status::Ok,
             attr: Some(ATTR),
@@ -271,8 +272,8 @@ fn header_damage_is_refused_before_the_body_is_read() {
     assert_eq!(damaged(0, b'X'), Err(Error::WrongMagic));
     assert_eq!(damaged(4, 2), Err(Error::WrongVersion));
     // An earlier peer is refused, as is a later minor.
-    assert_eq!(damaged(6, 1), Err(Error::WrongVersion));
-    assert_eq!(damaged(6, 3), Err(Error::WrongVersion));
+    assert_eq!(damaged(6, 2), Err(Error::WrongVersion));
+    assert_eq!(damaged(6, 4), Err(Error::WrongVersion));
     assert_eq!(damaged(8, 99), Err(Error::UnknownMessage));
     assert_eq!(damaged(12, 47), Err(Error::WrongSize));
     assert_eq!(damaged(16, 1), Err(Error::WrongHandleCount));

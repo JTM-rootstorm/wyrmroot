@@ -799,6 +799,12 @@ impl<V: View> Server<V> {
             }
             return false;
         };
+        // CLOSE (WRFS 1.3) drops the node with no reply, whatever it was
+        // doing: its locks and a waiting LOCK go with it, and closing this end
+        // tells the client its close is complete.
+        if message.body == Body::Close {
+            return false;
+        }
         let transaction_id = message.transaction_id;
         let status = |status| Body::Status { status, value: 0 };
         let writable = here.access & ACCESS_WRITE != 0;

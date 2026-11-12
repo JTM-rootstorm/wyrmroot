@@ -432,6 +432,9 @@ impl<V: View> Server<V> {
                 total_bytes: self.volume.total_bytes(),
                 free_bytes: 0,
             }),
+            // CLOSE (WRFS 1.3): drop the node with no reply; closing this end
+            // completes the client's close.
+            Body::Close => return false,
             _ => return false,
         };
         send(platform, channel, transaction_id, reply)

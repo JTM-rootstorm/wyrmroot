@@ -561,6 +561,9 @@ impl Vfs {
                 total_bytes: 0,
                 free_bytes: 0,
             }),
+            // CLOSE (WRFS 1.3): drop the node with no reply; closing this end
+            // completes the client's close.
+            NodeBody::Close => return false,
             _ => return false,
         };
         send_node(platform, channel, transaction_id, reply)

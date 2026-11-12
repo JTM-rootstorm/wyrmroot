@@ -72,6 +72,7 @@ const TYPE_SYNC: u32 = 8;
 const TYPE_QUERY_FILESYSTEM: u32 = 9;
 const TYPE_LOCK: u32 = 10;
 const TYPE_TEST_LOCK: u32 = 11;
+const TYPE_CLOSE: u32 = 12;
 const TYPE_ON_OPEN: u32 = 16;
 const TYPE_STATUS: u32 = 17;
 const TYPE_ATTR: u32 = 18;
@@ -238,6 +239,12 @@ pub enum Body<'a> {
     /// Asks for a lock of another Channel that `Lock` (shared or exclusive)
     /// would conflict with (1.1).
     TestLock(Lock),
+    /// Ends this node (1.3). The server releases everything the Channel
+    /// holds (its locks, a waiting lock request) and closes its end, with no
+    /// reply. The client waits for its end to be peer-closed, then closes it,
+    /// so both ends, and the client's charge for them, are gone when its
+    /// close returns.
+    Close,
     /// `attr` is present exactly when `status` is OK.
     OnOpen {
         status: Status,
@@ -276,13 +283,14 @@ impl Body<'_> {
                 | Self::QueryFilesystem
                 | Self::Lock { .. }
                 | Self::TestLock(_)
+                | Self::Close
         )
     }
 
     pub const fn wire_size(&self) -> usize {
         HEADER_BYTES
             + match self {
-                Self::GetAttr | Self::Sync | Self::QueryFilesystem => 0,
+                Self::GetAttr | Self::Sync | Self::QueryFilesystem | Self::Close => 0,
                 Self::ReadDir { .. } | Self::Truncate { .. } => 8,
                 Self::Open { path, .. } => 16 + path.len(),
                 Self::Unlink { name } => 8 + name.len(),
@@ -322,6 +330,7 @@ impl Body<'_> {
             Self::FsInfo(_) => TYPE_FS_INFO,
             Self::Lock { .. } => TYPE_LOCK,
             Self::TestLock(_) => TYPE_TEST_LOCK,
+            Self::Close => TYPE_CLOSE,
             Self::LockInfo(_) => TYPE_LOCK_INFO,
         }
     }
@@ -444,7 +453,7 @@ pub fn encode(message: &Message<'_>, output: &mut [u8]) -> Result<usize, Error> 
         message.transaction_id,
     );
     match *body {
-        Body::GetAttr | Body::Sync | Body::QueryFilesystem => {}
+        Body::GetAttr | Body::Sync | Body::QueryFilesystem | Body::Close => {}
         Body::Open {
             flags,
             path,
@@ -577,6 +586,10 @@ pub fn parse(bytes: &[u8], handle_count: usize) -> Result<Message<'_>, Error> {
         TYPE_SYNC => {
             fixed(0)?;
             Body::Sync
+        }
+        TYPE_CLOSE => {
+            fixed(0)?;
+            Body::Close
         }
         TYPE_QUERY_FILESYSTEM => {
             fixed(0)?;
@@ -749,6 +762,7 @@ fn validate(body: &Body<'_>) -> Result<(), Error> {
         | Body::Truncate { .. }
         | Body::Sync
         | Body::QueryFilesystem
+        | Body::Close
         | Body::Status { .. } => {}
     }
     Ok(())

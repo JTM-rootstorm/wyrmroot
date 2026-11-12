@@ -3,10 +3,10 @@
 //! Two protocols share one header layout, one status set and one path
 //! grammar:
 //!
-//! - [`node`] (`WRFS` 1.2) is spoken on a Channel to one opened directory or
+//! - [`node`] (`WRFS` 1.3) is spoken on a Channel to one opened directory or
 //!   file. A filesystem service serves it, and so does `vfsd` for the
 //!   synthetic directories above its mount points.
-//! - [`namespace`] (`WRNS` 1.2, unchanged from 1.0 but for the shared header's version) is spoken to `vfsd`: OPEN of an absolute
+//! - [`namespace`] (`WRNS` 1.3, unchanged from 1.0 but for the shared header's version) is spoken to `vfsd`: OPEN of an absolute
 //!   path through the mount table, and MOUNT/UNMOUNT on the administrative
 //!   connection.
 //!
@@ -41,7 +41,7 @@ pub mod namespace;
 pub mod node;
 
 pub const MAJOR: u16 = 1;
-pub const MINOR: u16 = 2;
+pub const MINOR: u16 = 3;
 pub const HEADER_BYTES: usize = 32;
 /// The longest path either protocol carries, in bytes.
 pub const MAX_PATH_BYTES: usize = 1024;

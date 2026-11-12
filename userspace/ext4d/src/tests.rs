@@ -1001,3 +1001,60 @@ fn a_node_s_client_is_inherited_and_never_named_by_a_client() {
     assert!(!fs.world.readable(etc));
     assert_eq!(fs.list(etc), [(Kind::File, "motd".into())]);
 }
+
+impl Fs {
+    /// Sends CLOSE on `channel` and lets the server run once.
+    fn send_close(&mut self, channel: DwHandle) {
+        self.transaction += 1;
+        let mut bytes = vec![0u8; node::MAX_BYTES];
+        let size = node::encode(
+            &node::Message {
+                transaction_id: self.transaction,
+                body: Body::Close,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        self.world.send(channel, &bytes[..size], &[]);
+        self.step();
+    }
+}
+
+#[test]
+fn close_drops_the_node_and_its_locks_with_no_reply() {
+    // WRFS 1.3: the server's end closing is the client's sign that its close
+    // is complete, so its charge for the pair is gone before it opens again
+    // (dev-boot 2026-11-12: SQLite's journal delete got EMFILE).
+    let mut fs = fs();
+    let root = fs.root;
+    let (holder, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    let (other, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    let taken = fs.lock_send(holder, lock(0, 0, LockMode::Exclusive), 0);
+    assert_eq!(fs.answer(holder, taken).0, Status::Ok);
+    fs.send_close(holder);
+    assert!(fs.world.peer_closed(holder), "the server closed its end");
+    assert!(!fs.world.readable(holder), "CLOSE has no reply");
+    // The lock went with it, while the client still holds its end.
+    let free = fs.lock_send(other, lock(0, 0, LockMode::Exclusive), 0);
+    assert_eq!(fs.answer(other, free).0, Status::Ok);
+}
+
+#[test]
+fn close_ends_a_node_whose_lock_is_waiting() {
+    let mut fs = fs();
+    let root = fs.root;
+    let (holder, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    let (waiter, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    let taken = fs.lock_send(holder, lock(0, 0, LockMode::Exclusive), 0);
+    assert_eq!(fs.answer(holder, taken).0, Status::Ok);
+    let _waiting = fs.lock_send(waiter, lock(0, 0, LockMode::Exclusive), LOCK_WAIT);
+    fs.send_close(waiter);
+    assert!(fs.world.peer_closed(waiter));
+    assert!(
+        !fs.world.readable(waiter),
+        "neither CLOSE nor the wait is answered"
+    );
+    // The holder's unlock grants nothing to the closed waiter.
+    let unlock = fs.lock_send(holder, lock(0, 0, LockMode::Unlock), 0);
+    assert_eq!(fs.answer(holder, unlock).0, Status::Ok);
+}
