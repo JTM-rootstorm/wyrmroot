@@ -98,10 +98,14 @@ impl wyrmroot_ext4::Device for Image<'_> {
     }
 }
 
-const IMAGE_BYTES: usize = 4 << 20;
+const IMAGE_BYTES: usize = 8 << 20;
 
 /// An ext4 volume holding `etc/motd`.
 fn ext4_image() -> Vec<u8> {
+    image_with_journal(0)
+}
+
+fn image_with_journal(journal_blocks: u32) -> Vec<u8> {
     let mut bytes = vec![0u8; IMAGE_BYTES];
     let mut image = Image(&mut bytes);
     wyrmroot_ext4::format(
@@ -112,6 +116,7 @@ fn ext4_image() -> Vec<u8> {
             uuid: *b"ext4d-test-image",
             label: [0; 16],
             time: 1_700_000_000,
+            journal_blocks,
         },
     )
     .unwrap();
@@ -279,10 +284,12 @@ impl Fs {
         }
     }
 
-    /// The disk's bytes read directly with `wyrmroot-ext4`: `path`'s data.
+    /// The disk's bytes read directly with `wyrmroot-ext4`: `path`'s data,
+    /// as a crash now would leave it (the journal replayed on a copy).
     fn on_disk(&self, path: &[u8]) -> Option<Vec<u8>> {
         let mut bytes = self.disk.borrow().image.clone();
         let mut image = Image(&mut bytes);
+        wyrmroot_ext4::recover(&mut image, IMAGE_BYTES as u64).unwrap();
         let volume = Volume::mount(&mut image, IMAGE_BYTES as u64, false).unwrap();
         let stat = volume.resolve(&mut image, ROOT_INODE, path).ok()?;
         let mut data = vec![0u8; stat.size as usize];
@@ -519,4 +526,50 @@ fn a_write_only_handle_neither_reads_nor_opens_for_reading() {
         .0,
         Status::AccessDenied
     );
+}
+
+#[test]
+fn a_journaled_volume_commits_on_sync_and_retires_clean() {
+    let (world, disk, launched, root, server) = start(image_with_journal(1024));
+    let mut fs = Fs {
+        world,
+        disk,
+        launched,
+        server: server.unwrap_or_else(|step| panic!("ext4d did not start: {step}")),
+        root,
+        transaction: 1,
+    };
+    let (file, status, _) = fs.open(
+        root,
+        OPEN_READ | OPEN_WRITE | OPEN_FILE | OPEN_CREATE,
+        b"etc/journaled.txt",
+    );
+    assert_eq!(status, Status::Ok);
+    let data = pattern(20_000);
+    for (index, chunk) in data.chunks(8192).enumerate() {
+        let (status, written) = fs.status(
+            file,
+            Body::Write {
+                offset: (index * 8192) as u64,
+                data: chunk,
+            },
+        );
+        assert_eq!((status, written), (Status::Ok, chunk.len() as u64));
+    }
+    assert_eq!(fs.read_all(file), data);
+    // Uncommitted: a crash now leaves the volume as it was.
+    assert_eq!(fs.on_disk(b"etc/journaled.txt"), None);
+    assert_eq!(fs.on_disk(b"etc/motd").unwrap(), b"welcome\n");
+    assert_eq!(fs.status(file, Body::Sync).0, Status::Ok);
+    assert_eq!(fs.on_disk(b"etc/journaled.txt"), Some(data.clone()));
+
+    fs.server.retire(&mut fs.world);
+    // Clean: it mounts without recovery.
+    let mut bytes = fs.disk.borrow().image.clone();
+    let mut image = Image(&mut bytes);
+    assert_eq!(
+        wyrmroot_ext4::recover(&mut image, IMAGE_BYTES as u64),
+        Ok(false)
+    );
+    Volume::mount(&mut image, IMAGE_BYTES as u64, false).unwrap();
 }

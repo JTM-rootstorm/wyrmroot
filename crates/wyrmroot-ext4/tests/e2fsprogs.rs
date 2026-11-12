@@ -94,6 +94,7 @@ const PARAMS: FormatParams = FormatParams {
     uuid: *b"\x5e\x10\x0d\x2a\x91\x44\x4c\x0b\x83\x1e\x6f\x50\x22\x13\x77\x01",
     label: *b"wyrmroot\0\0\0\0\0\0\0\0",
     time: 1_700_000_000,
+    journal_blocks: 0,
 };
 
 #[test]
@@ -330,4 +331,463 @@ fn a_mke2fs_volume_mounts_reads_and_accepts_writes() {
         let listing = String::from_utf8(debugfs(&path, "ls /docs")).unwrap();
         assert!(!listing.contains("readme.txt"), "{listing}");
     }
+}
+
+// The journal (`src/journal.rs`).
+
+use wyrmroot_ext4::journal::TRANSACTION_FULL;
+use wyrmroot_ext4::{Journal, Journaled, Store, Transaction, recover};
+
+const SLOTS: usize = 64;
+
+struct VecStore(Vec<u8>);
+
+impl Store for VecStore {
+    fn load(&mut self, offset: usize, out: &mut [u8]) -> bool {
+        match self.0.get(offset..offset + out.len()) {
+            Some(bytes) => {
+                out.copy_from_slice(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+    fn save(&mut self, offset: usize, data: &[u8]) -> bool {
+        match self.0.get_mut(offset..offset + data.len()) {
+            Some(bytes) => {
+                bytes.copy_from_slice(data);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The image, with power lost after `flushes` more flushes: every later
+/// write fails and never lands.
+struct Crashing {
+    image: Image,
+    flushes: Option<usize>,
+}
+
+impl Device for Crashing {
+    fn read(&mut self, offset: u64, out: &mut [u8]) -> Result<(), DeviceError> {
+        self.image.read(offset, out)
+    }
+    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), DeviceError> {
+        if self.flushes == Some(0) {
+            return Err(DeviceError(99));
+        }
+        self.image.write(offset, data)
+    }
+    fn flush(&mut self) -> Result<(), DeviceError> {
+        if self.flushes == Some(0) {
+            return Err(DeviceError(99));
+        }
+        self.flushes = self.flushes.map(|left| left - 1);
+        self.image.flush()
+    }
+}
+
+fn open_image(path: &Path) -> Image {
+    Image(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap(),
+    )
+}
+
+fn journaled_format(name: &str, block_size: u32, bytes: u64) -> PathBuf {
+    let path = scratch(name);
+    let mut disk = image(&path, bytes);
+    format(
+        &mut disk,
+        bytes,
+        &FormatParams {
+            block_size,
+            journal_blocks: 1024,
+            ..PARAMS
+        },
+    )
+    .unwrap();
+    path
+}
+
+/// A mounted volume with its journal open and an empty transaction.
+fn journaled(
+    path: &Path,
+    flushes: Option<usize>,
+) -> (Crashing, Volume, Journal, Transaction<VecStore, SLOTS>) {
+    let bytes = fs::metadata(path).unwrap().len();
+    let mut disk = Crashing {
+        image: open_image(path),
+        flushes: None,
+    };
+    recover(&mut disk, bytes).unwrap();
+    let mut volume = Volume::mount(&mut disk, bytes, true).unwrap();
+    let journal = Journal::open(&mut volume, &mut disk).unwrap().unwrap();
+    let store = VecStore(vec![0; SLOTS * volume.block_size() as usize]);
+    let transaction = Transaction::new(store, &journal);
+    disk.flushes = flushes;
+    (disk, volume, journal, transaction)
+}
+
+fn dumpe2fs(path: &Path) -> String {
+    let output = tool("dumpe2fs").arg("-h").arg(path).output().unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// `e2fsck -fy` on a copy: replays the journal, then must leave the copy
+/// clean.
+fn e2fsck_replayed(path: &Path, name: &str) -> PathBuf {
+    let copy = scratch(name);
+    fs::copy(path, &copy).unwrap();
+    let output = tool("e2fsck").arg("-fy").arg(&copy).output().unwrap();
+    assert!(
+        output.status.code().is_some_and(|code| code <= 1),
+        "e2fsck -fy:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    fsck_clean(&copy);
+    copy
+}
+
+fn block_of(path: &Path, block: u64, size: usize) -> Vec<u8> {
+    let mut out = vec![0; size];
+    open_image(path)
+        .0
+        .read_exact_at(&mut out, block * size as u64)
+        .unwrap();
+    out
+}
+
+#[test]
+fn a_journaled_volume_commits_and_passes_e2fsck() {
+    for (block_size, bytes) in [(4096u32, 32u64 << 20), (1024, 16 << 20)] {
+        let path = journaled_format(&format!("journaled-{block_size}.img"), block_size, bytes);
+        fsck_clean(&path);
+        let header = dumpe2fs(&path);
+        assert!(header.contains("has_journal"), "{header}");
+        assert!(
+            header.contains("journal_64bit journal_checksum_v3"),
+            "{header}"
+        );
+
+        let (mut disk, mut volume, mut journal, mut transaction) = journaled(&path, None);
+        assert!(dumpe2fs(&path).contains("needs_recovery"));
+        let mut view = Journaled {
+            device: &mut disk,
+            transaction: &mut transaction,
+        };
+        let etc = volume
+            .create(&mut view, ROOT_INODE, b"etc", Kind::Directory)
+            .unwrap();
+        let motd = volume
+            .create(&mut view, etc.inode, b"motd", Kind::File)
+            .unwrap();
+        volume
+            .write(&mut view, motd.inode, 0, b"journaled hello\n")
+            .unwrap();
+        assert!(!transaction.is_empty());
+        journal
+            .commit(&volume, &mut disk, &mut transaction)
+            .unwrap();
+        assert!(transaction.is_empty());
+        let mut view = Journaled {
+            device: &mut disk,
+            transaction: &mut transaction,
+        };
+        let big = volume
+            .create(&mut view, ROOT_INODE, b"big", Kind::File)
+            .unwrap();
+        let data = pattern(200_000, 3);
+        for (index, chunk) in data.chunks(8192).enumerate() {
+            volume
+                .write(&mut view, big.inode, (index * 8192) as u64, chunk)
+                .unwrap();
+        }
+        volume.unlink(&mut view, etc.inode, b"motd").unwrap();
+        journal
+            .close(&mut volume, &mut disk, &mut transaction)
+            .unwrap();
+        drop(disk);
+
+        fsck_clean(&path);
+        assert!(!dumpe2fs(&path).contains("needs_recovery"));
+        assert_eq!(debugfs(&path, "cat /big"), data);
+        let listing = String::from_utf8(debugfs(&path, "ls /etc")).unwrap();
+        assert!(!listing.contains("motd"), "{listing}");
+        let log = String::from_utf8(debugfs(&path, "logdump")).unwrap();
+        assert!(log.contains("Journal starts at block 0"), "{log}");
+    }
+}
+
+#[test]
+fn a_crash_after_the_commit_block_is_replayed_by_e2fsck_and_by_recover() {
+    let path = journaled_format("crash-committed.img", 4096, 32 << 20);
+    let (mut disk, mut volume, mut journal, mut transaction) = journaled(&path, Some(3));
+    let mut view = Journaled {
+        device: &mut disk,
+        transaction: &mut transaction,
+    };
+    let note = volume
+        .create(&mut view, ROOT_INODE, b"note", Kind::File)
+        .unwrap();
+    volume
+        .write(&mut view, note.inode, 0, &pattern(10_000, 7))
+        .unwrap();
+    volume
+        .create(&mut view, ROOT_INODE, b"dir", Kind::Directory)
+        .unwrap();
+    // The checkpoint's first write is lost.
+    assert!(
+        journal
+            .commit(&volume, &mut disk, &mut transaction)
+            .is_err()
+    );
+    drop(disk);
+    let header = dumpe2fs(&path);
+    assert!(header.contains("needs_recovery"), "{header}");
+    assert!(!header.contains("Journal start:            0"), "{header}");
+
+    let by_e2fsck = e2fsck_replayed(&path, "crash-committed-e2fsck.img");
+    assert_eq!(debugfs(&by_e2fsck, "cat /note"), pattern(10_000, 7));
+
+    let bytes = fs::metadata(&path).unwrap().len();
+    let mut disk = open_image(&path);
+    assert_eq!(recover(&mut disk, bytes), Ok(true));
+    assert_eq!(recover(&mut disk, bytes), Ok(false));
+    drop(disk);
+    fsck_clean(&path);
+    assert_eq!(debugfs(&path, "cat /note"), pattern(10_000, 7));
+    assert!(
+        String::from_utf8(debugfs(&path, "ls /"))
+            .unwrap()
+            .contains("dir")
+    );
+}
+
+#[test]
+fn a_crash_before_the_commit_block_leaves_the_last_commit() {
+    let path = journaled_format("crash-uncommitted.img", 4096, 32 << 20);
+    let (mut disk, mut volume, mut journal, mut transaction) = journaled(&path, Some(2));
+    let mut view = Journaled {
+        device: &mut disk,
+        transaction: &mut transaction,
+    };
+    let uncommitted = volume
+        .create(&mut view, ROOT_INODE, b"uncommitted", Kind::File)
+        .unwrap();
+    volume
+        .write(&mut view, uncommitted.inode, 0, &pattern(10_000, 8))
+        .unwrap();
+    assert!(
+        journal
+            .commit(&volume, &mut disk, &mut transaction)
+            .is_err()
+    );
+    drop(disk);
+
+    let by_e2fsck = e2fsck_replayed(&path, "crash-uncommitted-e2fsck.img");
+    let listing = String::from_utf8(debugfs(&by_e2fsck, "ls /")).unwrap();
+    assert!(!listing.contains("uncommitted"), "{listing}");
+
+    let bytes = fs::metadata(&path).unwrap().len();
+    let mut disk = open_image(&path);
+    assert_eq!(recover(&mut disk, bytes), Ok(false));
+    drop(disk);
+    fsck_clean(&path);
+    let listing = String::from_utf8(debugfs(&path, "ls /")).unwrap();
+    assert!(!listing.contains("uncommitted"), "{listing}");
+}
+
+#[test]
+fn blocks_freed_in_a_transaction_are_not_reused_before_it_commits() {
+    let path = journaled_format("no-reuse.img", 4096, 32 << 20);
+    let (mut disk, mut volume, mut journal, mut transaction) = journaled(&path, None);
+    let mut view = Journaled {
+        device: &mut disk,
+        transaction: &mut transaction,
+    };
+    let old = volume
+        .create(&mut view, ROOT_INODE, b"old", Kind::File)
+        .unwrap();
+    volume
+        .write(&mut view, old.inode, 0, &pattern(8 * 4096, 1))
+        .unwrap();
+    journal
+        .commit(&volume, &mut disk, &mut transaction)
+        .unwrap();
+    let old_blocks = String::from_utf8(debugfs(&path, "blocks /old")).unwrap();
+    let mut view = Journaled {
+        device: &mut disk,
+        transaction: &mut transaction,
+    };
+    volume.unlink(&mut view, ROOT_INODE, b"old").unwrap();
+    let new = volume
+        .create(&mut view, ROOT_INODE, b"new", Kind::File)
+        .unwrap();
+    volume
+        .write(&mut view, new.inode, 0, &pattern(8 * 4096, 2))
+        .unwrap();
+    journal
+        .close(&mut volume, &mut disk, &mut transaction)
+        .unwrap();
+    drop(disk);
+    fsck_clean(&path);
+    let new_blocks = String::from_utf8(debugfs(&path, "blocks /new")).unwrap();
+    for block in new_blocks.split_whitespace() {
+        assert!(
+            !old_blocks.split_whitespace().any(|old| old == block),
+            "block {block} of /new was /old's: {old_blocks}"
+        );
+    }
+}
+
+#[test]
+fn a_full_transaction_refuses_the_write() {
+    let path = journaled_format("full.img", 1024, 16 << 20);
+    let (mut disk, mut volume, _journal, mut transaction) = journaled(&path, None);
+    let mut view = Journaled {
+        device: &mut disk,
+        transaction: &mut transaction,
+    };
+    let mut result = Ok(());
+    for index in 0..10_000 {
+        let name = format!("file-{index}");
+        if let Err(error) = volume.create(&mut view, ROOT_INODE, name.as_bytes(), Kind::File) {
+            result = Err(error);
+            break;
+        }
+    }
+    assert_eq!(result, Err(wyrmroot_ext4::Error::Device(TRANSACTION_FULL)));
+}
+
+/// Writes `transactions` with debugfs's own journal writer (`jo -c`, `jw`).
+fn debugfs_journal(path: &Path, requests: &[&str]) {
+    let commands = scratch("debugfs-journal.cmds");
+    let mut script = String::from("jo -c\n");
+    for request in requests {
+        script.push_str(request);
+        script.push('\n');
+    }
+    script.push_str("jc\n");
+    fs::write(&commands, script).unwrap();
+    let output = tool("debugfs")
+        .arg("-w")
+        .arg("-f")
+        .arg(&commands)
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_journal_written_by_debugfs_replays_as_e2fsck_replays_it() {
+    let path = journaled_format("debugfs-journal.img", 4096, 32 << 20);
+    let mut payload = pattern(3 * 4096, 11);
+    // The second block starts with the journal magic, so it is escaped.
+    payload[4096..4100].copy_from_slice(&0xC03B_3998u32.to_be_bytes());
+    let blocks = scratch("debugfs-journal.bin");
+    fs::write(&blocks, &payload).unwrap();
+    let blocks = blocks.display().to_string();
+    debugfs_journal(
+        &path,
+        &[
+            &format!("jw -b 3000,3001 {blocks}"),
+            &format!("jw -b 3002 {blocks}"),
+            "jw -r 3002",
+        ],
+    );
+    assert!(dumpe2fs(&path).contains("needs_recovery"));
+    let by_e2fsck = e2fsck_replayed(&path, "debugfs-journal-e2fsck.img");
+
+    let bytes = fs::metadata(&path).unwrap().len();
+    let mut disk = open_image(&path);
+    assert_eq!(recover(&mut disk, bytes), Ok(true));
+    drop(disk);
+    fsck_clean(&path);
+    for block in 3000..3003 {
+        assert_eq!(
+            block_of(&path, block, 4096),
+            block_of(&by_e2fsck, block, 4096),
+            "block {block}"
+        );
+    }
+    assert_eq!(block_of(&path, 3000, 4096), payload[..4096]);
+    assert_eq!(block_of(&path, 3001, 4096), payload[4096..8192]);
+    // Logged in the second transaction, revoked in the third.
+    assert_eq!(block_of(&path, 3002, 4096), vec![0; 4096]);
+}
+
+#[test]
+fn an_escaped_block_this_journal_wrote_is_replayed_by_e2fsck() {
+    let path = journaled_format("escaped.img", 4096, 32 << 20);
+    let (mut disk, volume, mut journal, mut transaction) = journaled(&path, Some(3));
+    let mut block = pattern(4096, 12);
+    block[..4].copy_from_slice(&0xC03B_3998u32.to_be_bytes());
+    Journaled {
+        device: &mut disk,
+        transaction: &mut transaction,
+    }
+    .write(3000 * 4096, &block)
+    .unwrap();
+    assert!(
+        journal
+            .commit(&volume, &mut disk, &mut transaction)
+            .is_err()
+    );
+    drop(disk);
+    let by_e2fsck = e2fsck_replayed(&path, "escaped-e2fsck.img");
+    assert_eq!(block_of(&by_e2fsck, 3000, 4096), block);
+    let bytes = fs::metadata(&path).unwrap().len();
+    let mut disk = open_image(&path);
+    assert_eq!(recover(&mut disk, bytes), Ok(true));
+    drop(disk);
+    assert_eq!(block_of(&path, 3000, 4096), block);
+}
+
+#[test]
+fn a_mke2fs_journal_takes_commits_that_e2fsck_replays() {
+    let path = mke2fs_image("mke2fs-journal", &[]);
+    let (mut disk, mut volume, mut journal, mut transaction) = journaled(&path, Some(3));
+    let mut view = Journaled {
+        device: &mut disk,
+        transaction: &mut transaction,
+    };
+    let docs = volume.resolve(&mut view, ROOT_INODE, b"docs").unwrap();
+    let new = volume
+        .create(&mut view, docs.inode, b"journaled.txt", Kind::File)
+        .unwrap();
+    volume
+        .write(&mut view, new.inode, 0, &pattern(30_000, 6))
+        .unwrap();
+    volume.unlink(&mut view, docs.inode, b"readme.txt").unwrap();
+    assert!(
+        journal
+            .commit(&volume, &mut disk, &mut transaction)
+            .is_err()
+    );
+    drop(disk);
+    let by_e2fsck = e2fsck_replayed(&path, "mke2fs-journal-e2fsck.img");
+    assert_eq!(
+        debugfs(&by_e2fsck, "cat /docs/journaled.txt"),
+        pattern(30_000, 6)
+    );
+    let bytes = fs::metadata(&path).unwrap().len();
+    let mut disk = open_image(&path);
+    assert_eq!(recover(&mut disk, bytes), Ok(true));
+    drop(disk);
+    fsck_clean(&path);
+    assert_eq!(
+        debugfs(&path, "cat /docs/journaled.txt"),
+        pattern(30_000, 6)
+    );
 }

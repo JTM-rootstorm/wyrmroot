@@ -1,11 +1,13 @@
 //! A formatter for the one feature set this implementation writes:
 //! `filetype`, `extents` and `64bit` (incompatible), `sparse_super`,
 //! `large_file`, `dir_nlink`, `extra_isize` and `metadata_csum`
-//! (read-only compatible), no journal. Every group's bitmaps and inode table
-//! live in the group and are written in full, so no group is uninitialised.
-//! The root holds `lost+found`.
+//! (read-only compatible), and optionally a journal (`has_journal`, in inode
+//! 8, contiguous in group 0, with v3 checksums and 64-bit tags). Every
+//! group's bitmaps and inode table live in the group and are written in full,
+//! so no group is uninitialised. The root holds `lost+found`.
 
 use crate::dir::TYPE_DIRECTORY;
+use crate::journal::{COMPAT_HAS_JOURNAL, JOURNAL_INODE};
 use crate::{
     Device, Error, INCOMPAT_64BIT, INCOMPAT_EXTENTS, INCOMPAT_FILETYPE, MAGIC, MAX_BLOCK_BYTES,
     RO_COMPAT_DIR_NLINK, RO_COMPAT_EXTRA_ISIZE, RO_COMPAT_LARGE_FILE, RO_COMPAT_METADATA_CSUM,
@@ -31,7 +33,13 @@ pub struct FormatParams {
     pub label: [u8; 16],
     /// Seconds since the epoch, stamped on everything created.
     pub time: u32,
+    /// The journal's length in blocks, 0 for none. It must fit in group 0
+    /// and be at least [`MIN_JOURNAL_BLOCKS`].
+    pub journal_blocks: u32,
 }
+
+/// The shortest journal formatted.
+pub const MIN_JOURNAL_BLOCKS: u32 = 1024;
 
 struct Layout {
     bs: u32,
@@ -166,6 +174,15 @@ pub fn format<D: Device>(device: &mut D, bytes: u64, params: &FormatParams) -> R
     // metadata.
     let root_block = layout.group_start(0) + u64::from(layout.overhead(0));
     let lost_block = root_block + 1;
+    let journal_block = lost_block + 1;
+    let journal_blocks = params.journal_blocks;
+    if journal_blocks != 0
+        && (!(MIN_JOURNAL_BLOCKS..=32768).contains(&journal_blocks)
+            || journal_block + u64::from(journal_blocks) + 16
+                > layout.group_start(0) + u64::from(layout.group_blocks(0)))
+    {
+        return Err(Error::Unsupported);
+    }
     let used_inodes = FIRST_INODE;
 
     let mut sb = [0u8; SUPERBLOCK_BYTES];
@@ -174,7 +191,7 @@ pub fn format<D: Device>(device: &mut D, bytes: u64, params: &FormatParams) -> R
     for number in 0..layout.groups {
         free_blocks += u64::from(layout.group_blocks(number) - layout.overhead(number));
     }
-    free_blocks -= 2;
+    free_blocks -= 2 + u64::from(journal_blocks);
     put32(&mut sb, 0x0, inodes);
     put32(&mut sb, 0x4, layout.blocks as u32);
     put32(&mut sb, 0xC, free_blocks as u32);
@@ -219,6 +236,17 @@ pub fn format<D: Device>(device: &mut D, bytes: u64, params: &FormatParams) -> R
     put16(&mut sb, 0x15E, 32);
     sb[0x175] = 1;
     put32(&mut sb, 0x268, LOST_FOUND);
+    let journal_inode = (journal_blocks != 0).then(|| {
+        let inode = journal_inode(journal_block, journal_blocks, layout.bs, params.time);
+        put32(&mut sb, 0x5C, COMPAT_HAS_JOURNAL);
+        put32(&mut sb, 0xE0, JOURNAL_INODE);
+        // s_jnl_blocks: i_block, then i_size_high and i_size.
+        sb[0xFD] = 1;
+        sb[0x10C..0x10C + 60].copy_from_slice(inode.root());
+        put32(&mut sb, 0x10C + 60, (inode.size() >> 32) as u32);
+        put32(&mut sb, 0x10C + 64, inode.size() as u32);
+        inode
+    });
     let seed = crc::update(!0, &params.uuid);
 
     // Bitmaps and descriptors.
@@ -229,8 +257,9 @@ pub fn format<D: Device>(device: &mut D, bytes: u64, params: &FormatParams) -> R
         let mut used = layout.overhead(number);
         if number == 0 {
             // Block 0 at 1 KiB (the boot block) is outside the groups; the
-            // root and lost+found blocks follow the metadata.
-            used += 2;
+            // root and lost+found blocks follow the metadata, then the
+            // journal.
+            used += 2 + journal_blocks;
         }
         let count = layout.group_blocks(number);
         block.fill(0);
@@ -330,8 +359,54 @@ pub fn format<D: Device>(device: &mut D, bytes: u64, params: &FormatParams) -> R
         None,
         params.time,
     )?;
+    if let Some(mut inode) = journal_inode {
+        volume.write_inode(device, &mut inode)?;
+        write_journal(device, &layout, journal_block, journal_blocks, &params.uuid)?;
+    }
     device.flush()?;
     Ok(())
+}
+
+/// The journal inode: a regular file of `blocks` blocks from `first`.
+fn journal_inode(first: u64, blocks: u32, bs: u32, time: u32) -> crate::Inode {
+    let mut node = crate::Inode {
+        number: JOURNAL_INODE,
+        raw: [0; crate::MAX_INODE_BYTES],
+    };
+    put16(&mut node.raw, 0x0, crate::S_IFREG | 0o600);
+    for at in [0x8, 0xC, 0x10, 0x90] {
+        put32(&mut node.raw, at, time);
+    }
+    node.set_links(1);
+    node.set_flags(crate::EXT4_EXTENTS_FL);
+    put16(&mut node.raw, 0x80, 32);
+    let root = node.root_mut();
+    crate::extent::empty_root(root);
+    put16(root, 2, 1);
+    put32(root, 12, 0);
+    put16(root, 16, blocks as u16);
+    put16(root, 18, (first >> 32) as u16);
+    put32(root, 20, first as u32);
+    node.set_size(u64::from(blocks) * u64::from(bs));
+    node.set_sectors(u64::from(blocks) * u64::from(bs / 512));
+    node
+}
+
+/// Zeroes the journal and writes its superblock: empty, sequence 1.
+fn write_journal<D: Device>(
+    device: &mut D,
+    layout: &Layout,
+    first: u64,
+    blocks: u32,
+    uuid: &[u8; 16],
+) -> Result<(), Error> {
+    let mut block = [0u8; MAX_BLOCK_BYTES];
+    let block = &mut block[..layout.bs as usize];
+    for index in 1..u64::from(blocks) {
+        write_at(device, layout, first + index, block)?;
+    }
+    crate::journal::empty_superblock(block, layout.bs, blocks, uuid);
+    write_at(device, layout, first, block)
 }
 
 fn write_gdt_block<D: Device>(

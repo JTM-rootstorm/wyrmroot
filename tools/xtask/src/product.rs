@@ -941,6 +941,7 @@ fn root_disk() -> Result<Vec<u8>, Failure> {
         uuid: *b"wyrmroot-devroot",
         label: *b"wyrmroot-root\0\0\0",
         time: 1_700_000_000,
+        journal_blocks: wyrmroot_ext4::MIN_JOURNAL_BLOCKS,
     };
     wyrmroot_ext4::format(&mut disk, ROOT_DISK_BYTES, &params)
         .map_err(|error| failed(format!("{error:?}")))?;

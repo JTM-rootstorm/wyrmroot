@@ -52,6 +52,7 @@ fn params(block_size: u32) -> FormatParams {
         uuid: *b"wyrmroot-ext4-ut",
         label: *b"test\0\0\0\0\0\0\0\0\0\0\0\0",
         time: 1_700_000_000,
+        journal_blocks: 0,
     }
 }
 

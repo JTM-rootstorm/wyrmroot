@@ -14,19 +14,20 @@
 //!   `filetype`, `extents`, `64bit`, `flex_bg` and `metadata_csum_seed`
 //!   incompatible features, and every checksum `metadata_csum` defines for
 //!   the structures it touches. An unknown incompatible feature, a journal
-//!   that needs recovery, `meta_bg`, `bigalloc` or a non-Linux creator is
-//!   refused; an unknown read-only-compatible feature, an orphan list or
+//!   that still needs recovery ([`recover`] replays it first), `meta_bg`,
+//!   `bigalloc` or a non-Linux creator is refused; an unknown read-only-compatible feature, an orphan list or
 //!   recorded errors mount read-only.
 //! - Reads directories linearly (htree index blocks look empty to a linear
 //!   reader) and files through extent trees of any legal depth.
 //! - Writes files, creates files and directories, truncates and unlinks,
 //!   allocating from initialised groups only. Directories with an htree
 //!   index and extent trees deeper than one level are not modified.
-//! - Formats a volume ([`format`]) with a fixed modern feature set.
-//!
-//! There is no journal: a mutation writes data blocks first and metadata
-//! after, and a crash part-way may leave work for `e2fsck`. A mounted
-//! volume's journal, if any, is left untouched and must be clean.
+//! - Formats a volume ([`format`]) with a fixed modern feature set and,
+//!   optionally, a journal.
+//! - Journals metadata in `data=ordered` mode ([`journal`]): through a
+//!   [`Journaled`] device, a crash leaves the volume as of the last commit.
+//!   Used directly, a mutation writes data blocks first and metadata after,
+//!   and a crash part-way may leave work for `e2fsck`.
 //!
 //! Every on-disk value is checked before use, every walk is bounded, and a
 //! checksum mismatch is [`Error::Corrupt`].
@@ -41,9 +42,11 @@ pub mod crc;
 mod dir;
 mod extent;
 mod format;
+pub mod journal;
 mod write;
 
-pub use format::{FormatParams, format};
+pub use format::{FormatParams, MIN_JOURNAL_BLOCKS, format};
+pub use journal::{Journal, Journaled, Store, Transaction, recover};
 
 /// A failed device transfer, carrying a source-defined code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,6 +60,15 @@ pub trait Device {
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), DeviceError>;
     /// Makes every completed write durable.
     fn flush(&mut self) -> Result<(), DeviceError>;
+    /// Writes file data. Through a [`Journaled`] device it goes straight to
+    /// the volume, never through the journal.
+    fn write_data(&mut self, offset: u64, data: &[u8]) -> Result<(), DeviceError> {
+        self.write(offset, data)
+    }
+    /// Reads what the last commit left, ignoring uncommitted metadata.
+    fn read_committed(&mut self, offset: u64, out: &mut [u8]) -> Result<(), DeviceError> {
+        self.read(offset, out)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -320,6 +332,17 @@ impl Volume {
         device_bytes: u64,
         writable: bool,
     ) -> Result<Self, Error> {
+        Self::mount_inner(device, device_bytes, writable, false)
+    }
+
+    /// [`Volume::mount`]; `recovering` also takes a volume whose journal
+    /// needs recovery, read-only, for [`recover`] to replay it.
+    pub(crate) fn mount_inner<D: Device>(
+        device: &mut D,
+        device_bytes: u64,
+        writable: bool,
+        recovering: bool,
+    ) -> Result<Self, Error> {
         let mut sb = [0u8; SUPERBLOCK_BYTES];
         device.read(SUPERBLOCK_OFFSET, &mut sb)?;
         if get16(&sb, 0x38) != MAGIC {
@@ -335,7 +358,7 @@ impl Volume {
         let rev = get32(&sb, 0x4C);
         if incompat & !INCOMPAT_KNOWN != 0
             || incompat & INCOMPAT_FILETYPE == 0
-            || incompat & INCOMPAT_RECOVER != 0
+            || (incompat & INCOMPAT_RECOVER != 0 && !recovering)
             || incompat & INCOMPAT_META_BG != 0
             || ro_compat & RO_COMPAT_BIGALLOC != 0
             || get32(&sb, 0x48) != 0
@@ -418,6 +441,7 @@ impl Volume {
         }
         let state = get16(&sb, 0x3A);
         let writable = writable
+            && !recovering
             && ro_compat & !RO_COMPAT_WRITABLE == 0
             && !gdt_csum_only
             && state & STATE_ERRORS == 0
@@ -453,6 +477,21 @@ impl Volume {
     /// Whether mutations are refused.
     pub fn read_only(&self) -> bool {
         !self.writable
+    }
+
+    /// Refuses mutations from now on.
+    pub fn set_read_only(&mut self) {
+        self.writable = false;
+    }
+
+    pub(crate) fn set_needs_recovery(&mut self, needed: bool) {
+        let incompat = get32(&self.sb, 0x60);
+        let incompat = if needed {
+            incompat | INCOMPAT_RECOVER
+        } else {
+            incompat & !INCOMPAT_RECOVER
+        };
+        put32(&mut self.sb, 0x60, incompat);
     }
 
     pub fn block_size(&self) -> u32 {
@@ -514,6 +553,20 @@ impl Volume {
             return Err(Error::Corrupt);
         }
         device.write(block * u64::from(self.block_size), data)?;
+        Ok(())
+    }
+
+    /// Writes a file data block ([`Device::write_data`]).
+    pub(crate) fn write_data_block<D: Device>(
+        &self,
+        device: &mut D,
+        block: u64,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        if block == 0 || block >= self.blocks || data.len() != self.bs() {
+            return Err(Error::Corrupt);
+        }
+        device.write_data(block * u64::from(self.block_size), data)?;
         Ok(())
     }
 

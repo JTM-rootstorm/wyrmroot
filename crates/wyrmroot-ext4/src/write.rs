@@ -48,7 +48,7 @@ impl Volume {
     }
 
     /// Writes the superblock (free counts, write time) with its checksum.
-    fn commit<D: Device>(&mut self, device: &mut D) -> Result<(), Error> {
+    pub(crate) fn write_superblock<D: Device>(&mut self, device: &mut D) -> Result<(), Error> {
         put32(&mut self.sb, 0x30, self.now);
         if self.csum.is_some() {
             let sum = crc::update(!0, &self.sb[..0x3FC]);
@@ -58,7 +58,10 @@ impl Volume {
         Ok(())
     }
 
-    /// Allocates one block, preferring `goal` and the blocks after it.
+    /// Allocates one block, preferring `goal` and the blocks after it. A
+    /// block freed since the last commit stays taken until it commits
+    /// ([`Device::read_committed`]): reused for data before then, a crash
+    /// would show it in the file that still owns it.
     pub(crate) fn alloc_block<D: Device>(
         &mut self,
         device: &mut D,
@@ -73,6 +76,8 @@ impl Volume {
             ((goal - u64::from(self.first_data_block)) / u64::from(self.blocks_per_group)) as u32;
         let mut bitmap = [0u8; MAX_BLOCK_BYTES];
         let bitmap = &mut bitmap[..self.bs()];
+        let mut committed = [0u8; MAX_BLOCK_BYTES];
+        let committed = &mut committed[..self.bs()];
         for step in 0..self.groups {
             let number = (start + step) % self.groups;
             let mut group = self.group(device, number)?;
@@ -92,12 +97,16 @@ impl Volume {
             } else {
                 0
             };
-            let found = (from..count)
-                .chain(0..from)
-                .find(|&index| !bit(bitmap, index));
-            let Some(index) = found else {
+            if !(0..count).any(|index| !bit(bitmap, index)) {
                 // The descriptor said there was room.
                 return Err(Error::Corrupt);
+            }
+            device.read_committed(location * u64::from(self.block_size), committed)?;
+            let found = (from..count)
+                .chain(0..from)
+                .find(|&index| !bit(bitmap, index) && !bit(committed, index));
+            let Some(index) = found else {
+                continue;
             };
             set_bit(bitmap, index, true);
             self.set_bitmap_checksum(&mut group, true, &bitmap[..bytes]);
@@ -309,7 +318,7 @@ impl Volume {
                         }
                         block[within..within + take].copy_from_slice(&data[done..done + take]);
                         goal = mapped.physical + 1;
-                        self.write_block(device, mapped.physical, block)
+                        self.write_data_block(device, mapped.physical, block)
                     }
                     None => {
                         if goal == 0 && logical > 0 {
@@ -325,7 +334,7 @@ impl Volume {
                         block.fill(0);
                         block[within..within + take].copy_from_slice(&data[done..done + take]);
                         if let Err(error) = self
-                            .write_block(device, physical, block)
+                            .write_data_block(device, physical, block)
                             .and_then(|()| self.map_insert(device, &mut node, logical, physical))
                         {
                             let _ = self.free_blocks_range(device, physical, 1);
@@ -349,7 +358,7 @@ impl Volume {
         }
         node.set_times(self.now, true, true);
         self.write_inode(device, &mut node)?;
-        self.commit(device)?;
+        self.write_superblock(device)?;
         match failure {
             Some(error) if done == 0 => Err(error),
             _ => Ok(done),
@@ -370,7 +379,7 @@ impl Volume {
         self.truncate_node(device, &mut node, size)?;
         node.set_times(self.now, true, true);
         self.write_inode(device, &mut node)?;
-        self.commit(device)
+        self.write_superblock(device)
     }
 
     fn truncate_node<D: Device>(
@@ -394,7 +403,7 @@ impl Volume {
                 let block = &mut block[..self.bs()];
                 self.read_block(device, mapped.physical, block)?;
                 block[within..].fill(0);
-                self.write_block(device, mapped.physical, block)?;
+                self.write_data_block(device, mapped.physical, block)?;
             }
         }
         node.set_size(size);
@@ -479,10 +488,10 @@ impl Volume {
             // Give back what was taken; the entry was the last step.
             let _ = self.map_truncate(device, &mut node, 0);
             let _ = self.free_inode(device, number, directory);
-            let _ = self.commit(device);
+            let _ = self.write_superblock(device);
             return Err(error);
         }
-        self.commit(device)?;
+        self.write_superblock(device)?;
         Ok(Stat {
             inode: number,
             kind,
@@ -532,6 +541,6 @@ impl Volume {
             node.set_times(self.now, true, false);
             self.write_inode(device, &mut node)?;
         }
-        self.commit(device)
+        self.write_superblock(device)
     }
 }

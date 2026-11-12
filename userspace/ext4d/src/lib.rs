@@ -9,9 +9,17 @@
 //! closes, vfsd drops the mount, and `/` falls back to vfsd's own directory
 //! with `/boot` beneath it.
 //!
-//! The buffer is a cache of [`LINES`] 4 KiB lines with write-through: every
-//! write reaches the device before its request is answered, and SYNC flushes
-//! the device. A handle's access is what it was opened with; writing,
+//! The buffer is a cache of [`LINES`] 4 KiB lines with write-through. A
+//! volume with a journal is replayed before it mounts and then journaled
+//! (`wyrmroot_ext4::journal`, `data=ordered`): file data is written before
+//! its request is answered, and metadata collects in a transaction of up to
+//! [`TRANSACTION_SLOTS`] blocks in a second buffer, committed on SYNC, once
+//! it is half full, [`COMMIT_INTERVAL_NS`] after its first change, and when
+//! the role retires. A crash loses at most the uncommitted transaction. An
+//! operation that would overflow the transaction, or a failed commit, turns
+//! the volume read-only with the last commit on disk. Without a journal
+//! every write reaches the device before its request is answered, and SYNC
+//! flushes the device. A handle's access is what it was opened with; writing,
 //! creating, truncating and unlinking need WRITE. A node that is open
 //! somewhere cannot be unlinked (BUSY), so no inode is freed under a handle.
 //! A filesystem inconsistency or device error answers the one request with
@@ -27,9 +35,14 @@ use wyrmroot_loader as _;
 
 use deepwyrm_syscall::{
     DW_DEADLINE_INFINITE, DW_HANDLE_INVALID, DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_PEER_CLOSED,
-    DW_SIGNAL_READABLE, DwHandle, DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
+    DW_SIGNAL_READABLE, DW_STATUS_TIMED_OUT, DwDeadline, DwHandle, DwReceivedHandleInfoV1,
+    DwRights, DwSignals, DwWaitItemV1,
 };
-use wyrmroot_ext4::{DeviceError, Error as Ext4Error, Kind as Ext4Kind, ROOT_INODE, Stat, Volume};
+use wyrmroot_ext4::journal::TRANSACTION_FULL;
+use wyrmroot_ext4::{
+    DeviceError, Error as Ext4Error, Journal, Journaled, Kind as Ext4Kind, ROOT_INODE, Stat, Store,
+    Transaction, Volume,
+};
 use wyrmroot_fs_proto::node::{
     self, ACCESS_READ, ACCESS_WRITE, Attr, Body, EntryWriter, FS_DURABLE_SYNC, FS_HARD_LINKS,
     FS_READ_ONLY, FsInfo, Kind, MAX_DIRENT_BYTES, MAX_IO_BYTES,
@@ -38,7 +51,7 @@ use wyrmroot_fs_proto::{
     MAX_HANDLES, MAX_NAME_BYTES, OPEN_CREATE, OPEN_DIRECTORY, OPEN_EXCLUSIVE, OPEN_FILE,
     OPEN_MUTATING, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE, Status,
 };
-use wyrmroot_runtime::{MemoryPlatform, WYR0_I_SUPERVISION_POLICY};
+use wyrmroot_runtime::{MemoryPlatform, NativeError, WYR0_I_SUPERVISION_POLICY};
 use wyrmroot_service::block::BlockClient;
 use wyrmroot_service::memory::{Mapper, View, create_buffer};
 use wyrmroot_service::{
@@ -55,6 +68,12 @@ pub const LINE_BYTES: u64 = 4096;
 pub const LINES: usize = 16;
 /// The attached buffer.
 pub const BUFFER_BYTES: u64 = LINE_BYTES * LINES as u64;
+/// Journal transaction blocks held in memory.
+pub const TRANSACTION_SLOTS: usize = 256;
+/// The transaction's buffer.
+pub const TRANSACTION_BYTES: u64 = LINE_BYTES * TRANSACTION_SLOTS as u64;
+/// How long a change may wait for its commit.
+pub const COMMIT_INTERVAL_NS: u64 = 5_000_000_000;
 /// How long the root volume may take to appear.
 pub const VOLUME_TIMEOUT_NS: u64 = 60_000_000_000;
 const LEND_TO_VOLUME: DwRights = wyrmroot_service::memory::LEND_RIGHTS;
@@ -223,6 +242,78 @@ impl<P: Ext4Platform + ?Sized, V: View> wyrmroot_ext4::Device for VolumeDevice<'
     }
 }
 
+/// The transaction's blocks, in a mapped buffer.
+pub struct ViewStore<V>(V);
+
+impl<V: View> Store for ViewStore<V> {
+    fn load(&mut self, offset: usize, out: &mut [u8]) -> bool {
+        self.0.read(offset as u64, out)
+    }
+    fn save(&mut self, offset: usize, data: &[u8]) -> bool {
+        self.0.write(offset as u64, data)
+    }
+}
+
+type Running<V> = Transaction<ViewStore<V>, TRANSACTION_SLOTS>;
+
+/// What requests see: the volume, through the running transaction when it
+/// is journaled. A write that overflows the transaction sets `full`.
+struct ServerDevice<'a, P: ?Sized, V> {
+    volume: VolumeDevice<'a, P, V>,
+    transaction: Option<&'a mut Running<V>>,
+    full: &'a mut bool,
+}
+
+impl<P: Ext4Platform + ?Sized, V: View> ServerDevice<'_, P, V> {
+    fn noting<T>(&mut self, result: Result<T, DeviceError>) -> Result<T, DeviceError> {
+        if result.as_ref().err() == Some(&TRANSACTION_FULL) {
+            *self.full = true;
+        }
+        result
+    }
+}
+
+impl<P: Ext4Platform + ?Sized, V: View> wyrmroot_ext4::Device for ServerDevice<'_, P, V> {
+    fn read(&mut self, offset: u64, out: &mut [u8]) -> Result<(), DeviceError> {
+        match self.transaction.as_deref_mut() {
+            Some(transaction) => Journaled {
+                device: &mut self.volume,
+                transaction,
+            }
+            .read(offset, out),
+            None => self.volume.read(offset, out),
+        }
+    }
+    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), DeviceError> {
+        let result = match self.transaction.as_deref_mut() {
+            Some(transaction) => Journaled {
+                device: &mut self.volume,
+                transaction,
+            }
+            .write(offset, data),
+            None => self.volume.write(offset, data),
+        };
+        self.noting(result)
+    }
+    fn write_data(&mut self, offset: u64, data: &[u8]) -> Result<(), DeviceError> {
+        let result = match self.transaction.as_deref_mut() {
+            Some(transaction) => Journaled {
+                device: &mut self.volume,
+                transaction,
+            }
+            .write_data(offset, data),
+            None => self.volume.write(offset, data),
+        };
+        self.noting(result)
+    }
+    fn read_committed(&mut self, offset: u64, out: &mut [u8]) -> Result<(), DeviceError> {
+        self.volume.read(offset, out)
+    }
+    fn flush(&mut self) -> Result<(), DeviceError> {
+        self.volume.flush()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct OpenNode {
     channel: DwHandle,
@@ -238,6 +329,10 @@ pub struct Server<V> {
     view: V,
     cache: Cache,
     nodes: [Option<OpenNode>; MAX_NODES],
+    journal: Option<(Journal, Running<V>)>,
+    /// When the running transaction must commit, in monotonic nanoseconds.
+    commit_due: Option<u64>,
+    full: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -260,7 +355,10 @@ pub fn ext4d_main<P: Ext4Platform, M: Mapper<P>>(
     loop {
         match server.step(platform, DW_DEADLINE_INFINITE) {
             Ok(true) => {}
-            Ok(false) => return 0,
+            Ok(false) => {
+                server.retire(platform);
+                return 0;
+            }
             Err(step) => return FAILURE_BASE | step,
         }
     }
@@ -329,22 +427,44 @@ impl<V: View> Server<V> {
             .checked_mul(u64::from(size))
             .ok_or(84u32)?;
         let read_only_device = client.info.flags & wyrmroot_block_proto::INFO_READ_ONLY != 0;
-        let volume = Volume::mount(
-            &mut VolumeDevice {
-                platform: &mut *platform,
-                client: &mut client,
-                view: &mut view,
-                cache: &mut cache,
-            },
-            volume_bytes,
-            !read_only_device,
-        )
-        .map_err(|error| match error {
+        let mut device = VolumeDevice {
+            platform: &mut *platform,
+            client: &mut client,
+            view: &mut view,
+            cache: &mut cache,
+        };
+        let mount_error = |error| match error {
             Ext4Error::NotExt4 => 85u32,
             Ext4Error::Device(_) => 86,
             Ext4Error::Unsupported => 89,
             _ => 87,
-        })?;
+        };
+        if !read_only_device {
+            wyrmroot_ext4::recover(&mut device, volume_bytes).map_err(mount_error)?;
+        }
+        let mut volume =
+            Volume::mount(&mut device, volume_bytes, !read_only_device).map_err(mount_error)?;
+        let journal = match Journal::open(&mut volume, &mut device) {
+            Ok(journal) => journal,
+            Err(Ext4Error::Unsupported) => {
+                // A journal this role cannot write: the volume stays as it is.
+                volume.set_read_only();
+                None
+            }
+            Err(error) => return Err(mount_error(error)),
+        };
+        let journal = match journal {
+            Some(journal) => {
+                let (keep, lend) = create_buffer(platform, TRANSACTION_BYTES).map_err(|_| 90u32)?;
+                let _ = platform.close_handle(lend);
+                let store = mapper
+                    .map(platform, launch.self_root, keep, TRANSACTION_BYTES)
+                    .map_err(|_| 91u32)?;
+                let transaction = Transaction::new(ViewStore(store), &journal);
+                Some((journal, transaction))
+            }
+            None => None,
+        };
         Ok(Self {
             launch,
             root,
@@ -353,6 +473,9 @@ impl<V: View> Server<V> {
             view,
             cache,
             nodes: [const { None }; MAX_NODES],
+            journal,
+            commit_due: None,
+            full: false,
         })
     }
 
@@ -388,9 +511,24 @@ impl<V: View> Server<V> {
                 count += 1;
             }
         }
-        let observed = platform
-            .wait_many(&items[..count], deadline)
-            .map_err(|_| 100u32)?;
+        let now = platform.monotonic_active_now().map_err(|_| 104u32)?;
+        if self.commit_due.is_some_and(|due| due <= now) {
+            let _ = self.commit(platform);
+        }
+        let deadline = match self.commit_due {
+            Some(due) if due < deadline.0 => DwDeadline(due),
+            _ => deadline,
+        };
+        let observed = match platform.wait_many(&items[..count], deadline) {
+            Ok(observed) => observed,
+            Err(NativeError::Status(status))
+                if status == DW_STATUS_TIMED_OUT && self.commit_due.is_some() =>
+            {
+                let _ = self.commit(platform);
+                return Ok(true);
+            }
+            Err(_) => return Err(100),
+        };
         let index = observed.index as usize;
         if index >= count {
             return Err(101);
@@ -427,6 +565,67 @@ impl<V: View> Server<V> {
         Ok(true)
     }
 
+    /// Commits the running transaction (or flushes an unjournaled volume).
+    /// A failed commit leaves the volume read-only.
+    fn commit<P: Ext4Platform>(&mut self, platform: &mut P) -> Result<(), Ext4Error> {
+        let mut device = VolumeDevice {
+            platform,
+            client: &mut self.client,
+            view: &mut self.view,
+            cache: &mut self.cache,
+        };
+        self.commit_due = None;
+        let result = match self.journal.as_mut() {
+            Some((journal, transaction)) => journal.commit(&self.volume, &mut device, transaction),
+            None => self.volume.sync(&mut device),
+        };
+        if result.is_err() {
+            self.volume.set_read_only();
+        }
+        result
+    }
+
+    /// After a request: a transaction that overflowed is dropped (the volume
+    /// turns read-only on its last commit); one half full commits; one with
+    /// changes gets a commit deadline.
+    fn settle<P: Ext4Platform>(&mut self, platform: &mut P) {
+        let Some((_, transaction)) = self.journal.as_mut() else {
+            return;
+        };
+        if core::mem::take(&mut self.full) {
+            transaction.discard();
+            self.commit_due = None;
+            self.volume.set_read_only();
+            return;
+        }
+        if transaction.len() > transaction.limit() / 2 {
+            let _ = self.commit(platform);
+        } else if !transaction.is_empty() && self.commit_due.is_none() {
+            self.commit_due = platform
+                .monotonic_active_now()
+                .ok()
+                .and_then(|now| now.checked_add(COMMIT_INTERVAL_NS));
+            if self.commit_due.is_none() {
+                let _ = self.commit(platform);
+            }
+        }
+    }
+
+    /// Commits what is left and marks the volume clean.
+    pub fn retire<P: Ext4Platform>(&mut self, platform: &mut P) {
+        let mut device = VolumeDevice {
+            platform,
+            client: &mut self.client,
+            view: &mut self.view,
+            cache: &mut self.cache,
+        };
+        if let Some((journal, transaction)) = self.journal.as_mut()
+            && !self.volume.read_only()
+        {
+            let _ = journal.close(&mut self.volume, &mut device, transaction);
+        }
+    }
+
     fn root_access(&self) -> u32 {
         if self.volume.read_only() {
             ACCESS_READ
@@ -440,12 +639,18 @@ impl<V: View> Server<V> {
         client: &'a mut BlockClient,
         view: &'a mut V,
         cache: &'a mut Cache,
-    ) -> VolumeDevice<'a, P, V> {
-        VolumeDevice {
-            platform,
-            client,
-            view,
-            cache,
+        journal: &'a mut Option<(Journal, Running<V>)>,
+        full: &'a mut bool,
+    ) -> ServerDevice<'a, P, V> {
+        ServerDevice {
+            volume: VolumeDevice {
+                platform,
+                client,
+                view,
+                cache,
+            },
+            transaction: journal.as_mut().map(|(_, transaction)| transaction),
+            full,
         }
     }
 
@@ -484,7 +689,14 @@ impl<V: View> Server<V> {
         let readable = here.access & ACCESS_READ != 0;
         let mut listing = [0u8; MAX_DIRENT_BYTES];
         let mut data = [0u8; MAX_IO_BYTES];
-        let mut device = Self::device(platform, &mut self.client, &mut self.view, &mut self.cache);
+        let mut device = Self::device(
+            platform,
+            &mut self.client,
+            &mut self.view,
+            &mut self.cache,
+            &mut self.journal,
+            &mut self.full,
+        );
         let reply = match message.body {
             Body::Open { flags, path } => {
                 let server = received[0];
@@ -497,6 +709,7 @@ impl<V: View> Server<V> {
                     return false;
                 }
                 self.open(platform, transaction_id, here, flags, path, server.handle);
+                self.settle(platform);
                 return true;
             }
             Body::GetAttr => match self.volume.stat(&mut device, here.inode) {
@@ -569,7 +782,7 @@ impl<V: View> Server<V> {
                     Status::AccessDenied
                 })
             }
-            Body::Sync => status(match self.volume.sync(&mut device) {
+            Body::Sync => status(match self.commit(platform) {
                 Ok(()) => Status::Ok,
                 Err(error) => status_of(error),
             }),
@@ -589,6 +802,7 @@ impl<V: View> Server<V> {
             }
             _ => return false,
         };
+        self.settle(platform);
         send(platform, here.channel, transaction_id, reply)
     }
 
@@ -612,7 +826,14 @@ impl<V: View> Server<V> {
                 return Err(Status::AccessDenied);
             }
         }
-        let mut device = Self::device(platform, &mut self.client, &mut self.view, &mut self.cache);
+        let mut device = Self::device(
+            platform,
+            &mut self.client,
+            &mut self.view,
+            &mut self.cache,
+            &mut self.journal,
+            &mut self.full,
+        );
         let found = if flags & OPEN_CREATE != 0 {
             let (parent_path, name) = match path.iter().rposition(|&byte| byte == b'/') {
                 Some(at) => (&path[..at], &path[at + 1..]),
