@@ -197,3 +197,25 @@ fn random_operations_match_a_byte_model() {
         }
     }
 }
+
+#[test]
+fn an_owner_s_limit_holds_however_the_change_splits() {
+    let mut table = LockTable::<16>::with_owner_limit(2);
+    table.set(1, 10, lock(0, 100, LockMode::Shared)).unwrap();
+    table.set(2, 10, lock(0, 1, LockMode::Shared)).unwrap();
+    // A split would make three; another owner still has room.
+    assert_eq!(
+        table.set(1, 10, lock(40, 20, LockMode::Unlock)),
+        Err(LockError::NoRoom)
+    );
+    assert_eq!(
+        table.set(3, 10, lock(0, 1, LockMode::Shared)),
+        Err(LockError::NoRoom)
+    );
+    table.set(3, 11, lock(0, 1, LockMode::Shared)).unwrap();
+    assert_eq!(held(&table).len(), 3);
+    // Replacing in place stays within the limit.
+    table.set(1, 10, lock(0, 0, LockMode::Exclusive)).unwrap();
+    table.set(2, 10, lock(0, 0, LockMode::Unlock)).unwrap();
+    table.set(3, 10, lock(0, 1, LockMode::Shared)).unwrap();
+}

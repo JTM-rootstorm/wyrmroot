@@ -6,8 +6,10 @@
 //! Channel the lock was taken on). An owner's locks on a node never
 //! overlap and same-mode neighbours are merged, so a lock replaces the
 //! owner's own locks where it overlaps them, as POSIX `fcntl` and Linux
-//! open-file-description locks do. A change that would not fit is refused
-//! whole, before anything moves.
+//! open-file-description locks do. A change that would not fit, in the
+//! table or in the owner's limit, is refused whole, before anything moves.
+//! A server that sizes the table to the sum of its owners' limits can never
+//! have it filled by one owner (W10 review D1).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -55,12 +57,14 @@ impl Held {
 pub enum LockError {
     /// Another owner holds a conflicting lock.
     Conflict,
-    /// The table has no room for the change.
+    /// The table, or the owner's limit, has no room for the change.
     NoRoom,
 }
 
 pub struct LockTable<const N: usize> {
     entries: [Option<Held>; N],
+    /// The most locks one owner holds at once.
+    owner_limit: usize,
 }
 
 impl<const N: usize> Default for LockTable<N> {
@@ -76,8 +80,17 @@ fn range(lock: Lock) -> Option<(u64, u64)> {
 }
 
 impl<const N: usize> LockTable<N> {
+    /// A table whose owners may hold up to `N` locks each.
     pub const fn new() -> Self {
-        Self { entries: [None; N] }
+        Self::with_owner_limit(N)
+    }
+
+    /// A table whose owners may hold up to `owner_limit` locks each.
+    pub const fn with_owner_limit(owner_limit: usize) -> Self {
+        Self {
+            entries: [None; N],
+            owner_limit,
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Held> {
@@ -149,7 +162,8 @@ impl<const N: usize> LockTable<N> {
         }
         let added = piece_count + usize::from(granting);
         let free = self.entries.iter().filter(|held| held.is_none()).count();
-        if free + removed_count < added {
+        let owned = self.iter().filter(|held| held.owner == owner).count();
+        if free + removed_count < added || owned - removed_count + added > self.owner_limit {
             return Err(LockError::NoRoom);
         }
         for (slot, remove) in self.entries.iter_mut().zip(removed) {

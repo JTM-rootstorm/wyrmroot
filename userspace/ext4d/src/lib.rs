@@ -66,8 +66,11 @@ use wyrmroot_service_proto::roles::{EXT4D_ROLE_ID, ROOT_VOLUME, SLOT_FS_ROOT};
 pub const FAILURE_BASE: u32 = 0xE470_0000;
 /// Nodes open at once besides the root.
 pub const MAX_NODES: usize = 32;
-/// The most advisory locks held across all nodes (WRFS 1.1).
-pub const MAX_LOCKS: usize = 128;
+/// The most advisory locks one Channel holds (WRFS 1.1).
+pub const LOCKS_PER_NODE: usize = 8;
+/// Room for every node and the root at their limit, so no client can fill
+/// the table for the others (W10 review D1).
+pub const MAX_LOCKS: usize = (MAX_NODES + 1) * LOCKS_PER_NODE;
 /// One cache line: the largest block size `wyrmroot-ext4` mounts.
 pub const LINE_BYTES: u64 = 4096;
 /// Cache lines in the attached buffer.
@@ -498,7 +501,7 @@ impl<V: View> Server<V> {
             commit_due: None,
             full: false,
             failed: false,
-            locks: LockTable::new(),
+            locks: LockTable::with_owner_limit(LOCKS_PER_NODE),
             filesystem,
         })
     }
@@ -896,7 +899,7 @@ impl<V: View> Server<V> {
             Body::Lock(lock) => {
                 let node = u64::from(here.inode);
                 let mut result = self.locks.set(node, here.channel.0, lock);
-                if result == Err(LockError::Conflict) {
+                if result.is_err() {
                     self.reap_closed(platform, here.channel);
                     result = self.locks.set(node, here.channel.0, lock);
                 }

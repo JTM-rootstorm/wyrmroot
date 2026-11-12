@@ -710,23 +710,55 @@ fn locks_belong_to_their_channel_and_go_with_it() {
 }
 
 #[test]
-fn a_full_lock_table_refuses_without_dropping_the_node() {
+fn one_channel_cannot_take_the_lock_table_from_the_others() {
+    // W10 review D1: the table holds every Channel's limit, so one that
+    // fills its own share leaves the others theirs.
     let mut fs = fs();
     let root = fs.root;
-    let (file, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
-    for index in 0..MAX_LOCKS as u64 {
+    let (greedy, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    let (other, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    for index in 0..LOCKS_PER_NODE as u64 {
         assert_eq!(
-            fs.status(file, Body::Lock(lock(index * 2, 1, LockMode::Shared)))
+            fs.status(greedy, Body::Lock(lock(index * 2, 1, LockMode::Shared)))
                 .0,
             Status::Ok
         );
     }
     assert_eq!(
-        fs.status(file, Body::Lock(lock(1_000_000, 1, LockMode::Shared)))
+        fs.status(greedy, Body::Lock(lock(1_000_000, 1, LockMode::Shared)))
             .0,
         Status::NoResources
     );
-    assert_eq!(fs.read_all(file), b"welcome\n");
+    assert_eq!(fs.read_all(greedy), b"welcome\n");
+    for index in 0..LOCKS_PER_NODE as u64 {
+        assert_eq!(
+            fs.status(other, Body::Lock(lock(index * 2, 1, LockMode::Shared)))
+                .0,
+            Status::Ok
+        );
+    }
+}
+
+#[test]
+fn a_file_opened_again_is_another_lock_owner() {
+    // What the POSIX layer's lock Channels are (W10 review Q1).
+    let mut fs = fs();
+    let root = fs.root;
+    let (file, _, attr) = fs.open(root, OPEN_READ, b"etc/motd");
+    let (again, status, again_attr) = fs.open(file, OPEN_READ, b"");
+    assert_eq!(status, Status::Ok);
+    assert_eq!(attr.unwrap().id, again_attr.unwrap().id);
+    let (_, status, _) = fs.open(file, OPEN_READ | OPEN_WRITE, b"");
+    assert_eq!(status, Status::AccessDenied, "access never grows");
+    assert_eq!(
+        fs.status(again, Body::Lock(lock(0, 0, LockMode::Exclusive)))
+            .0,
+        Status::Ok
+    );
+    assert_eq!(
+        fs.status(file, Body::Lock(lock(0, 1, LockMode::Shared))).0,
+        Status::Busy
+    );
 }
 
 #[test]
