@@ -5,7 +5,7 @@ use std::vec::Vec;
 use crate::namespace::{self, MOUNT_READ_ONLY};
 use crate::node::{
     self, ACCESS_READ, ACCESS_WRITE, Attr, Body, Entries, EntryWriter, FS_DURABLE_SYNC,
-    FS_READ_ONLY, FsInfo, Kind, MAX_BYTES, MAX_DIRENT_BYTES, MAX_IO_BYTES, Message,
+    FS_READ_ONLY, FsInfo, Kind, Lock, LockMode, MAX_BYTES, MAX_DIRENT_BYTES, MAX_IO_BYTES, Message,
 };
 use crate::*;
 
@@ -14,6 +14,13 @@ const ATTR: Attr = Attr {
     access: ACCESS_READ | ACCESS_WRITE,
     size: 0x1_0000_0001,
     id: 42,
+    filesystem: 0x1234_5678_9abc_def0,
+};
+
+const LOCK: Lock = Lock {
+    start: 100,
+    length: 0,
+    mode: LockMode::Exclusive,
 };
 
 fn node_bytes(body: Body<'_>) -> Vec<u8> {
@@ -108,6 +115,19 @@ fn every_node_message_round_trips_with_its_handle_count() {
             total_bytes: 100,
             free_bytes: 100,
         }),
+        Body::Lock(LOCK),
+        Body::Lock(Lock {
+            start: 0,
+            length: u64::MAX,
+            mode: LockMode::Unlock,
+        }),
+        Body::TestLock(Lock {
+            mode: LockMode::Shared,
+            length: 9,
+            ..LOCK
+        }),
+        Body::LockInfo(Some(LOCK)),
+        Body::LockInfo(None),
     ];
     for body in bodies {
         let bytes = node_bytes(body);
@@ -241,7 +261,9 @@ fn header_damage_is_refused_before_the_body_is_read() {
     };
     assert_eq!(damaged(0, b'X'), Err(Error::WrongMagic));
     assert_eq!(damaged(4, 2), Err(Error::WrongVersion));
-    assert_eq!(damaged(6, 1), Err(Error::WrongVersion));
+    // A 1.0 peer is refused, as is a later minor.
+    assert_eq!(damaged(6, 0), Err(Error::WrongVersion));
+    assert_eq!(damaged(6, 2), Err(Error::WrongVersion));
     assert_eq!(damaged(8, 99), Err(Error::UnknownMessage));
     assert_eq!(damaged(12, 47), Err(Error::WrongSize));
     assert_eq!(damaged(16, 1), Err(Error::WrongHandleCount));
@@ -294,7 +316,37 @@ fn node_bodies_with_bad_fields_are_refused_both_ways() {
         )
     };
     let big = [0u8; MAX_IO_BYTES + 1];
-    let cases: [(Body<'_>, Error); 12] = [
+    let cases: [(Body<'_>, Error); 16] = [
+        (
+            Body::Lock(Lock {
+                start: 1,
+                length: u64::MAX,
+                mode: LockMode::Shared,
+            }),
+            Error::InvalidField,
+        ),
+        (
+            Body::TestLock(Lock {
+                mode: LockMode::Unlock,
+                ..LOCK
+            }),
+            Error::InvalidField,
+        ),
+        (
+            Body::LockInfo(Some(Lock {
+                mode: LockMode::Unlock,
+                ..LOCK
+            })),
+            Error::InvalidField,
+        ),
+        (
+            Body::LockInfo(Some(Lock {
+                start: u64::MAX,
+                length: 1,
+                mode: LockMode::Shared,
+            })),
+            Error::InvalidField,
+        ),
         (
             Body::Open {
                 flags: OPEN_READ,
@@ -429,6 +481,19 @@ fn node_bodies_with_bad_fields_are_refused_both_ways() {
     });
     listing[50] = b'/';
     assert_eq!(node::parse(&listing, 0), Err(Error::InvalidField));
+    let mut lock = node_bytes(Body::Lock(LOCK));
+    lock[32] = 3;
+    assert_eq!(node::parse(&lock, 0), Err(Error::InvalidField));
+    let mut lock = node_bytes(Body::Lock(LOCK));
+    lock[36] = 1;
+    assert_eq!(node::parse(&lock, 0), Err(Error::NonzeroReserved));
+    let mut lock = node_bytes(Body::Lock(LOCK));
+    lock[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+    lock[48] = 2;
+    assert_eq!(node::parse(&lock, 0), Err(Error::InvalidField));
+    let mut none = node_bytes(Body::LockInfo(None));
+    none[48] = 1;
+    assert_eq!(node::parse(&none, 0), Err(Error::NonzeroReserved));
 }
 
 #[test]

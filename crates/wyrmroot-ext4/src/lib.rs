@@ -498,6 +498,13 @@ impl Volume {
         self.block_size
     }
 
+    /// The volume's UUID (`s_uuid`).
+    pub fn uuid(&self) -> [u8; 16] {
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(&self.sb[0x68..0x78]);
+        uuid
+    }
+
     /// The time stamped on what this volume changes, in seconds since the
     /// epoch. It starts as the superblock's latest recorded time.
     pub fn set_now(&mut self, now: u32) {

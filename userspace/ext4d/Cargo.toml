@@ -24,6 +24,7 @@ native-ext4d = ["dep:wyrmroot-loader"]
 deepwyrm-syscall.workspace = true
 wyrmroot-block-proto = { path = "../../crates/wyrmroot-block-proto" }
 wyrmroot-ext4 = { path = "../../crates/wyrmroot-ext4" }
+wyrmroot-fs-lock = { path = "../../crates/wyrmroot-fs-lock" }
 wyrmroot-fs-proto = { path = "../../crates/wyrmroot-fs-proto" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }

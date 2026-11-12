@@ -11,6 +11,7 @@ members = [
     "crates/wyrmroot-ext4",
     "crates/wyrmroot-fat",
     "crates/wyrmroot-fs-proto",
+    "crates/wyrmroot-fs-lock",
     "crates/wyrmroot-loader",
     "crates/wyrmroot-launch-proto",
     "crates/wyrmroot-partition",

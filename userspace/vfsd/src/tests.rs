@@ -261,6 +261,7 @@ const SYNTHETIC: Attr = Attr {
     access: ACCESS_READ,
     size: 0,
     id: 0,
+    filesystem: 0,
 };
 
 // ---------------------------------------------------------------- tests
@@ -316,6 +317,7 @@ fn opens_reach_the_longest_covering_mount_with_the_rest_of_the_path() {
                 access: ACCESS_READ,
                 size: 3,
                 id: 9,
+                filesystem: 0,
             }),
         });
         h.send(server.handle, &ok, None);
@@ -759,6 +761,7 @@ mod role {
                             access: ACCESS_READ,
                             size: 1,
                             id: 2,
+                            filesystem: 0,
                         }),
                     },
                 },

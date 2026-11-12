@@ -12,7 +12,7 @@ use deepwyrm_syscall::{DW_DEADLINE_INFINITE, DwHandle};
 use wyrmroot_channel_model::fakes::{DiskState, FakeRegistry, Launched, launch, serve_disk, stage};
 use wyrmroot_channel_model::fat_image::{Entry, FatImage, MIN_CLUSTERS};
 use wyrmroot_channel_model::{Memory, World};
-use wyrmroot_fs_proto::node::{self, Attr, Body, Kind};
+use wyrmroot_fs_proto::node::{self, Attr, Body, Kind, Lock, LockMode};
 use wyrmroot_fs_proto::{
     OPEN_CREATE, OPEN_DIRECTORY, OPEN_FILE, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE, Status,
 };
@@ -307,6 +307,23 @@ fn opens_report_missing_wrong_kind_and_mutation() {
         (Body::Truncate { size: 0 }, Status::ReadOnly),
         (Body::ReadDir { cookie: 0 }, Status::NotDirectory),
         (Body::Sync, Status::Ok),
+        // No locks on FAT; the node stays open (W10).
+        (
+            Body::Lock(Lock {
+                start: 0,
+                length: 0,
+                mode: LockMode::Shared,
+            }),
+            Status::NotSupported,
+        ),
+        (
+            Body::TestLock(Lock {
+                start: 0,
+                length: 0,
+                mode: LockMode::Shared,
+            }),
+            Status::NotSupported,
+        ),
     ] {
         let reply = fs.request(readme, body);
         assert_eq!(

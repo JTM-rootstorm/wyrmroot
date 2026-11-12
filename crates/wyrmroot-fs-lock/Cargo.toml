@@ -1,0 +1,17 @@
+[package]
+name = "wyrmroot-fs-lock"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later WITH Classpath-exception-2.0"
+publish = false
+description = "Allocation-free table of WRFS advisory byte-range locks for filesystem servers"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+wyrmroot-fs-proto = { path = "../wyrmroot-fs-proto" }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_crate_dependencies = "deny"

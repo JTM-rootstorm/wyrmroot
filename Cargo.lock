@@ -273,6 +273,7 @@ dependencies = [
  "wyrmroot-block-proto",
  "wyrmroot-channel-model",
  "wyrmroot-ext4",
+ "wyrmroot-fs-lock",
  "wyrmroot-fs-proto",
  "wyrmroot-loader",
  "wyrmroot-runtime",
@@ -297,6 +298,13 @@ dependencies = [
  "wyrmroot-runtime",
  "wyrmroot-service",
  "wyrmroot-service-proto",
+]
+
+[[package]]
+name = "wyrmroot-fs-lock"
+version = "0.0.0"
+dependencies = [
+ "wyrmroot-fs-proto",
 ]
 
 [[package]]

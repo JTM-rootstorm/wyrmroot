@@ -14,7 +14,7 @@ use deepwyrm_syscall::{DW_DEADLINE_INFINITE, DwHandle};
 use wyrmroot_channel_model::fakes::{DiskState, FakeRegistry, Launched, launch, serve_disk, stage};
 use wyrmroot_channel_model::{Memory, World};
 use wyrmroot_ext4::{FormatParams, Kind as Ext4Kind};
-use wyrmroot_fs_proto::node::{self, Attr, Body, Kind};
+use wyrmroot_fs_proto::node::{self, Attr, Body, Kind, Lock, LockMode};
 use wyrmroot_fs_proto::{
     OPEN_CREATE, OPEN_DIRECTORY, OPEN_EXCLUSIVE, OPEN_FILE, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE,
     Status,
@@ -629,4 +629,102 @@ fn space_freed_since_the_last_commit_is_used_after_committing() {
     assert_eq!(fs.status(small, Body::Sync).0, Status::Ok);
     assert_eq!(fs.on_disk(b"small"), Some(data));
     assert_eq!(fs.on_disk(b"big"), Some(Vec::new()));
+}
+
+fn lock(start: u64, length: u64, mode: LockMode) -> Lock {
+    Lock {
+        start,
+        length,
+        mode,
+    }
+}
+
+impl Fs {
+    fn test_lock(&mut self, channel: DwHandle, lock: Lock) -> Option<Lock> {
+        let reply = self.request(channel, Body::TestLock(lock));
+        match node::parse(&reply, 0).unwrap().body {
+            Body::LockInfo(held) => held,
+            other => panic!("expected LOCK_INFO, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn locks_belong_to_their_channel_and_go_with_it() {
+    let mut fs = fs();
+    let root = fs.root;
+    let (first, _, first_attr) = fs.open(root, OPEN_READ | OPEN_WRITE, b"etc/motd");
+    let (second, _, second_attr) = fs.open(root, OPEN_READ, b"etc/motd");
+    let (other, _, other_attr) = fs.open(root, OPEN_READ, b"etc");
+    let (first_attr, second_attr) = (first_attr.unwrap(), second_attr.unwrap());
+    assert_ne!(first_attr.filesystem, 0);
+    assert_eq!(first_attr.filesystem, other_attr.unwrap().filesystem);
+    assert_eq!(first_attr.id, second_attr.id);
+
+    // Any access may lock; another Channel on the same file conflicts.
+    assert_eq!(
+        fs.status(second, Body::Lock(lock(0, 0, LockMode::Exclusive)))
+            .0,
+        Status::Ok
+    );
+    assert_eq!(
+        fs.status(first, Body::Lock(lock(10, 1, LockMode::Shared)))
+            .0,
+        Status::Busy
+    );
+    assert_eq!(
+        fs.test_lock(first, lock(10, 1, LockMode::Shared)),
+        Some(lock(0, 0, LockMode::Exclusive))
+    );
+    assert_eq!(fs.test_lock(second, lock(10, 1, LockMode::Exclusive)), None);
+    // Another node is not affected.
+    assert_eq!(
+        fs.status(other, Body::Lock(lock(0, 0, LockMode::Exclusive)))
+            .0,
+        Status::Ok
+    );
+    // Unlocking part leaves the rest; closing the Channel releases it all.
+    assert_eq!(
+        fs.status(second, Body::Lock(lock(0, 100, LockMode::Unlock)))
+            .0,
+        Status::Ok
+    );
+    assert_eq!(
+        fs.status(first, Body::Lock(lock(10, 1, LockMode::Exclusive)))
+            .0,
+        Status::Ok
+    );
+    assert_eq!(
+        fs.status(first, Body::Lock(lock(100, 1, LockMode::Shared)))
+            .0,
+        Status::Busy
+    );
+    fs.world.close_handle(second).unwrap();
+    fs.step();
+    assert_eq!(fs.test_lock(first, lock(0, 0, LockMode::Exclusive)), None);
+    assert_eq!(
+        fs.status(first, Body::Lock(lock(0, 0, LockMode::Exclusive)))
+            .0,
+        Status::Ok
+    );
+}
+
+#[test]
+fn a_full_lock_table_refuses_without_dropping_the_node() {
+    let mut fs = fs();
+    let root = fs.root;
+    let (file, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    for index in 0..MAX_LOCKS as u64 {
+        assert_eq!(
+            fs.status(file, Body::Lock(lock(index * 2, 1, LockMode::Shared)))
+                .0,
+            Status::Ok
+        );
+    }
+    assert_eq!(
+        fs.status(file, Body::Lock(lock(1_000_000, 1, LockMode::Shared)))
+            .0,
+        Status::NoResources
+    );
+    assert_eq!(fs.read_all(file), b"welcome\n");
 }

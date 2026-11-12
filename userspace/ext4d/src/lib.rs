@@ -46,6 +46,7 @@ use wyrmroot_ext4::{
     DeviceError, Error as Ext4Error, Journal, Journaled, Kind as Ext4Kind, ROOT_INODE, Stat, Store,
     Transaction, Volume,
 };
+use wyrmroot_fs_lock::{LockError, LockTable};
 use wyrmroot_fs_proto::node::{
     self, ACCESS_READ, ACCESS_WRITE, Attr, Body, EntryWriter, FS_DURABLE_SYNC, FS_HARD_LINKS,
     FS_READ_ONLY, FsInfo, Kind, MAX_DIRENT_BYTES, MAX_IO_BYTES,
@@ -65,6 +66,8 @@ use wyrmroot_service_proto::roles::{EXT4D_ROLE_ID, ROOT_VOLUME, SLOT_FS_ROOT};
 pub const FAILURE_BASE: u32 = 0xE470_0000;
 /// Nodes open at once besides the root.
 pub const MAX_NODES: usize = 32;
+/// The most advisory locks held across all nodes (WRFS 1.1).
+pub const MAX_LOCKS: usize = 128;
 /// One cache line: the largest block size `wyrmroot-ext4` mounts.
 pub const LINE_BYTES: u64 = 4096;
 /// Cache lines in the attached buffer.
@@ -338,6 +341,18 @@ pub struct Server<V> {
     full: bool,
     /// A commit failed: no more are tried, and SYNC fails (W11 review R4).
     failed: bool,
+    /// Advisory locks, owned by the Channel each was taken on (W10).
+    locks: LockTable<MAX_LOCKS>,
+    /// The filesystem identity every Attr carries, from the volume's UUID.
+    filesystem: u64,
+}
+
+/// A nonzero filesystem identity folded from a volume UUID.
+fn filesystem_identity(uuid: [u8; 16]) -> u64 {
+    let (high, low) = uuid.split_at(8);
+    let folded = u64::from_le_bytes(high.try_into().unwrap_or([0; 8]))
+        ^ u64::from_le_bytes(low.try_into().unwrap_or([0; 8]));
+    folded.max(1)
 }
 
 #[derive(Clone, Copy)]
@@ -470,6 +485,7 @@ impl<V: View> Server<V> {
             }
             None => None,
         };
+        let filesystem = filesystem_identity(volume.uuid());
         Ok(Self {
             launch,
             root,
@@ -482,6 +498,8 @@ impl<V: View> Server<V> {
             commit_due: None,
             full: false,
             failed: false,
+            locks: LockTable::new(),
+            filesystem,
         })
     }
 
@@ -552,6 +570,7 @@ impl<V: View> Server<V> {
                 if !readable || !self.serve(platform, here) {
                     // Unmounted, or vfsd broke WRFS: no new path opens, but
                     // the open nodes keep working.
+                    self.locks.release(self.root.0);
                     let _ = platform.close_handle(self.root);
                     self.root = DW_HANDLE_INVALID;
                 }
@@ -563,7 +582,10 @@ impl<V: View> Server<V> {
                     return Err(103);
                 };
                 if !readable || !self.serve(platform, node) {
+                    // A closed node releases its locks, so a job that ends
+                    // releases all of its own.
                     self.nodes[slot] = None;
+                    self.locks.release(node.channel.0);
                     let _ = platform.close_handle(node.channel);
                 }
             }
@@ -676,7 +698,7 @@ impl<V: View> Server<V> {
         }
     }
 
-    fn attr(stat: Stat, access: u32) -> Attr {
+    fn attr(stat: Stat, access: u32, filesystem: u64) -> Attr {
         Attr {
             kind: match stat.kind {
                 Ext4Kind::Directory => Kind::Directory,
@@ -685,6 +707,7 @@ impl<V: View> Server<V> {
             access,
             size: stat.size,
             id: u64::from(stat.inode),
+            filesystem,
         }
     }
 
@@ -735,7 +758,7 @@ impl<V: View> Server<V> {
                 return true;
             }
             Body::GetAttr => match self.volume.stat(&mut device, here.inode) {
-                Ok(stat) => Body::Attr(Self::attr(stat, here.access)),
+                Ok(stat) => Body::Attr(Self::attr(stat, here.access, self.filesystem)),
                 Err(error) => status(status_of(error)),
             },
             Body::ReadDir { cookie } if readable => {
@@ -828,6 +851,18 @@ impl<V: View> Server<V> {
                     Status::AccessDenied
                 })
             }
+            Body::Lock(lock) => status(
+                match self.locks.set(u64::from(here.inode), here.channel.0, lock) {
+                    Ok(()) => Status::Ok,
+                    Err(LockError::Conflict) => Status::Busy,
+                    Err(LockError::NoRoom) => Status::NoResources,
+                },
+            ),
+            Body::TestLock(lock) => Body::LockInfo(
+                self.locks
+                    .conflict(u64::from(here.inode), here.channel.0, lock)
+                    .map(|held| held.lock()),
+            ),
             Body::Sync => status(match self.commit(platform) {
                 Ok(()) => Status::Ok,
                 Err(error) => status_of(error),
@@ -957,7 +992,7 @@ impl<V: View> Server<V> {
             0
         });
         let (status, attr) = match found {
-            Ok(stat) => (Status::Ok, Some(Self::attr(stat, access))),
+            Ok(stat) => (Status::Ok, Some(Self::attr(stat, access, self.filesystem))),
             Err(status) => (status, None),
         };
         let sent = send(

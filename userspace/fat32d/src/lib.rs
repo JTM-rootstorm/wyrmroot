@@ -347,6 +347,7 @@ impl<V: View> Server<V> {
             access: ACCESS_READ,
             size: u64::from(node.size),
             id: u64::from(node.first_cluster),
+            filesystem: 0,
         }
     }
 
@@ -421,6 +422,9 @@ impl<V: View> Server<V> {
                 status(Status::ReadOnly)
             }
             Body::Sync => status(Status::Ok),
+            // FAT has no stable file identity to hang a lock on (an empty
+            // file has no cluster), and this volume never changes.
+            Body::Lock(_) | Body::TestLock(_) => status(Status::NotSupported),
             Body::QueryFilesystem => Body::FsInfo(FsInfo {
                 flags: FS_READ_ONLY,
                 name_max: MAX_NAME_BYTES as u32,

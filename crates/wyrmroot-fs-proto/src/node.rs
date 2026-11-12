@@ -1,4 +1,4 @@
-//! WRFS 1.0: the node protocol, on a Channel to one directory or file.
+//! WRFS 1.1: the node protocol, on a Channel to one directory or file.
 //!
 //! ```text
 //! client -> server  OPEN (+ new node Channel)   (one-way; ON_OPEN on that Channel)
@@ -8,8 +8,20 @@
 //! client -> server  WRITE                       -> STATUS (value: bytes written)
 //! client -> server  TRUNCATE | UNLINK | SYNC    -> STATUS
 //! client -> server  QUERY_FILESYSTEM            -> FS_INFO
+//! client -> server  LOCK                        -> STATUS
+//! client -> server  TEST_LOCK                   -> LOCK_INFO
 //! server -> client  ON_OPEN                     (event, first on a new Channel)
 //! ```
+//!
+//! Locks (1.1) are advisory byte-range locks on a file, shared or
+//! exclusive. A lock belongs to the Channel it was taken on: locks on one
+//! Channel never conflict with each other, a new lock replaces that
+//! Channel's own locks where they overlap, and closing the Channel releases
+//! them, so a job that ends releases its locks. LOCK that conflicts with
+//! another Channel's lock is answered BUSY at once; nothing waits. Locks
+//! affect only other LOCK and TEST_LOCK requests, never reads or writes, and
+//! need no particular access. TEST_LOCK reports one lock of another Channel
+//! that the described lock would conflict with.
 //!
 //! A request that does not apply to the node (READ on a directory, UNLINK
 //! on a file) is answered with STATUS and the matching error. Replies echo
@@ -40,12 +52,15 @@ const TYPE_TRUNCATE: u32 = 6;
 const TYPE_UNLINK: u32 = 7;
 const TYPE_SYNC: u32 = 8;
 const TYPE_QUERY_FILESYSTEM: u32 = 9;
+const TYPE_LOCK: u32 = 10;
+const TYPE_TEST_LOCK: u32 = 11;
 const TYPE_ON_OPEN: u32 = 16;
 const TYPE_STATUS: u32 = 17;
 const TYPE_ATTR: u32 = 18;
 const TYPE_DIRENTS: u32 = 19;
 const TYPE_DATA: u32 = 20;
 const TYPE_FS_INFO: u32 = 21;
+const TYPE_LOCK_INFO: u32 = 22;
 
 /// Attribute access bit: the handle may read or list.
 pub const ACCESS_READ: u32 = 1 << 0;
@@ -62,6 +77,50 @@ pub const FS_HARD_LINKS: u32 = 1 << 2;
 /// FS_INFO flag: the filesystem stores symbolic links.
 pub const FS_SYMLINKS: u32 = 1 << 3;
 const FS_FLAGS: u32 = FS_READ_ONLY | FS_DURABLE_SYNC | FS_HARD_LINKS | FS_SYMLINKS;
+
+/// What a LOCK request does to its range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum LockMode {
+    /// Releases the Channel's locks in the range.
+    Unlock = 0,
+    /// Conflicts only with another Channel's exclusive lock.
+    Shared = 1,
+    /// Conflicts with any lock of another Channel.
+    Exclusive = 2,
+}
+
+impl LockMode {
+    fn parse(value: u32) -> Result<Self, Error> {
+        match value {
+            0 => Ok(Self::Unlock),
+            1 => Ok(Self::Shared),
+            2 => Ok(Self::Exclusive),
+            _ => Err(Error::InvalidField),
+        }
+    }
+}
+
+/// A byte range of a file and how it is locked. `length` 0 runs to the end
+/// of any file size; otherwise `start + length` must not pass `u64::MAX`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Lock {
+    pub start: u64,
+    pub length: u64,
+    pub mode: LockMode,
+}
+
+impl Lock {
+    /// The end of the range, exclusive, or `None` for one that runs to the
+    /// end of any file size.
+    pub fn end(&self) -> Option<u64> {
+        if self.length == 0 {
+            None
+        } else {
+            Some(self.start.saturating_add(self.length))
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -91,6 +150,10 @@ pub struct Attr {
     /// A filesystem-chosen identity, stable while the node is open; zero if
     /// the filesystem has none.
     pub id: u64,
+    /// The filesystem's identity (1.1): the same for every node it serves,
+    /// derived from the volume so distinct volumes differ in practice; zero
+    /// if it has none. With `id` it names a file within a namespace.
+    pub filesystem: u64,
 }
 
 /// What a filesystem reports about itself.
@@ -139,6 +202,11 @@ pub enum Body<'a> {
     },
     Sync,
     QueryFilesystem,
+    /// Locks, or with [`LockMode::Unlock`] unlocks, a range (1.1).
+    Lock(Lock),
+    /// Asks for a lock of another Channel that `Lock` (shared or exclusive)
+    /// would conflict with (1.1).
+    TestLock(Lock),
     /// `attr` is present exactly when `status` is OK.
     OnOpen {
         status: Status,
@@ -157,6 +225,8 @@ pub enum Body<'a> {
     /// At most the requested length; empty at or past the end of the file.
     Data(&'a [u8]),
     FsInfo(FsInfo),
+    /// TEST_LOCK's answer: a conflicting lock, or `None`.
+    LockInfo(Option<Lock>),
 }
 
 impl Body<'_> {
@@ -173,6 +243,8 @@ impl Body<'_> {
                 | Self::Unlink { .. }
                 | Self::Sync
                 | Self::QueryFilesystem
+                | Self::Lock(_)
+                | Self::TestLock(_)
         )
     }
 
@@ -187,8 +259,9 @@ impl Body<'_> {
                 Self::Read { .. } | Self::Status { .. } => 16,
                 Self::Write { data, .. } => 16 + data.len(),
                 Self::Dirents { entries, .. } => 16 + entries.bytes.len(),
-                Self::Attr(_) => 24,
-                Self::OnOpen { .. } | Self::FsInfo(_) => 32,
+                Self::Lock(_) | Self::TestLock(_) | Self::LockInfo(_) => 24,
+                Self::Attr(_) | Self::FsInfo(_) => 32,
+                Self::OnOpen { .. } => 40,
             }
     }
 
@@ -216,6 +289,9 @@ impl Body<'_> {
             Self::Dirents { .. } => TYPE_DIRENTS,
             Self::Data(_) => TYPE_DATA,
             Self::FsInfo(_) => TYPE_FS_INFO,
+            Self::Lock(_) => TYPE_LOCK,
+            Self::TestLock(_) => TYPE_TEST_LOCK,
+            Self::LockInfo(_) => TYPE_LOCK_INFO,
         }
     }
 }
@@ -388,6 +464,12 @@ pub fn encode(message: &Message<'_>, output: &mut [u8]) -> Result<usize, Error> 
             put64(output, 48, info.total_bytes);
             put64(output, 56, info.free_bytes);
         }
+        Body::Lock(lock) | Body::TestLock(lock) => put_lock(output, lock),
+        Body::LockInfo(lock) => {
+            if let Some(lock) = lock {
+                put_lock(output, lock);
+            }
+        }
     }
     Ok(size)
 }
@@ -460,12 +542,12 @@ pub fn parse(bytes: &[u8], handle_count: usize) -> Result<Message<'_>, Error> {
             Body::QueryFilesystem
         }
         TYPE_ON_OPEN => {
-            fixed(32)?;
+            fixed(40)?;
             zero32(36)?;
             let status = Status::parse(get32(bytes, 32))?;
             let attr = if status == Status::Ok {
                 Some(get_attr(bytes, 40)?)
-            } else if bytes[40..64].iter().all(|&byte| byte == 0) {
+            } else if bytes[40..72].iter().all(|&byte| byte == 0) {
                 None
             } else {
                 return Err(Error::NonzeroReserved);
@@ -481,7 +563,7 @@ pub fn parse(bytes: &[u8], handle_count: usize) -> Result<Message<'_>, Error> {
             }
         }
         TYPE_ATTR => {
-            fixed(24)?;
+            fixed(32)?;
             Body::Attr(get_attr(bytes, 32)?)
         }
         TYPE_DIRENTS => {
@@ -507,6 +589,25 @@ pub fn parse(bytes: &[u8], handle_count: usize) -> Result<Message<'_>, Error> {
                 total_bytes: get64(bytes, 48),
                 free_bytes: get64(bytes, 56),
             })
+        }
+        TYPE_LOCK => {
+            fixed(24)?;
+            Body::Lock(get_lock(bytes)?)
+        }
+        TYPE_TEST_LOCK => {
+            fixed(24)?;
+            Body::TestLock(get_lock(bytes)?)
+        }
+        TYPE_LOCK_INFO => {
+            fixed(24)?;
+            if get32(bytes, 32) == LockMode::Unlock as u32 {
+                if bytes[32..56].iter().any(|&byte| byte != 0) {
+                    return Err(Error::NonzeroReserved);
+                }
+                Body::LockInfo(None)
+            } else {
+                Body::LockInfo(Some(get_lock(bytes)?))
+            }
         }
         _ => return Err(Error::UnknownMessage),
     };
@@ -573,6 +674,21 @@ fn validate(body: &Body<'_>) -> Result<(), Error> {
                 return Err(Error::InvalidField);
             }
         }
+        Body::Lock(lock) => check_lock(lock)?,
+        Body::TestLock(lock) => {
+            check_lock(lock)?;
+            if lock.mode == LockMode::Unlock {
+                return Err(Error::InvalidField);
+            }
+        }
+        Body::LockInfo(lock) => {
+            if let Some(lock) = lock {
+                check_lock(lock)?;
+                if lock.mode == LockMode::Unlock {
+                    return Err(Error::InvalidField);
+                }
+            }
+        }
         Body::GetAttr
         | Body::ReadDir { .. }
         | Body::Truncate { .. }
@@ -596,6 +712,32 @@ fn put_attr(output: &mut [u8], offset: usize, attr: Attr) {
     put32(output, offset + 4, attr.access);
     put64(output, offset + 8, attr.size);
     put64(output, offset + 16, attr.id);
+    put64(output, offset + 24, attr.filesystem);
+}
+
+fn check_lock(lock: Lock) -> Result<(), Error> {
+    if lock.length != 0 && lock.start.checked_add(lock.length).is_none() {
+        Err(Error::InvalidField)
+    } else {
+        Ok(())
+    }
+}
+
+fn put_lock(output: &mut [u8], lock: Lock) {
+    put32(output, 32, lock.mode as u32);
+    put64(output, 40, lock.start);
+    put64(output, 48, lock.length);
+}
+
+fn get_lock(bytes: &[u8]) -> Result<Lock, Error> {
+    if get32(bytes, 36) != 0 {
+        return Err(Error::NonzeroReserved);
+    }
+    Ok(Lock {
+        mode: LockMode::parse(get32(bytes, 32))?,
+        start: get64(bytes, 40),
+        length: get64(bytes, 48),
+    })
 }
 
 fn get_attr(bytes: &[u8], offset: usize) -> Result<Attr, Error> {
@@ -604,5 +746,6 @@ fn get_attr(bytes: &[u8], offset: usize) -> Result<Attr, Error> {
         access: get32(bytes, offset + 4),
         size: get64(bytes, offset + 8),
         id: get64(bytes, offset + 16),
+        filesystem: get64(bytes, offset + 24),
     })
 }
