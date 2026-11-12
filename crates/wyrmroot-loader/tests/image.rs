@@ -1,11 +1,12 @@
 use wyrmroot_loader::{
     elf::{
-        LoadSegment, PAGE_SIZE, STACK_BOTTOM, STACK_BYTES, STACK_GUARD_BYTES, STACK_GUARD_START,
-        STACK_TOP, SegmentProtection,
+        LoadSegment, PAGE_SIZE, ProgramHeaderTable, STACK_BOTTOM, STACK_BYTES, STACK_GUARD_BYTES,
+        STACK_GUARD_START, STACK_TOP, SegmentProtection,
     },
     image::{
-        INITIAL_STACK, INITIAL_STACK_POINTER, MaterializationPlan, STARTUP_V2_BLOCK_ADDRESS,
-        STARTUP_V2_BLOCK_BYTES, StartupBlockError, write_startup_block, write_startup_block_v2,
+        AT_ENTRY, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM, INITIAL_STACK, INITIAL_STACK_POINTER,
+        ImageAuxv, MaterializationPlan, STARTUP_V2_BLOCK_ADDRESS, STARTUP_V2_BLOCK_BYTES,
+        StartupBlockError, write_startup_block, write_startup_block_v2,
     },
 };
 
@@ -87,13 +88,18 @@ fn startup_v2_uses_five_pages_and_canonical_vectors() {
         "bin/hello",
         &["bin/hello", "kobold"],
         &["MODE=gate"],
+        &NO_TABLE,
     )
     .unwrap();
     assert_eq!(get64(&block, 0), 2);
-    assert_eq!(get64(&block, 8), STARTUP_V2_BLOCK_ADDRESS + 64);
-    assert_eq!(&block[64..74], b"bin/hello\0");
-    assert_eq!(&block[74..81], b"kobold\0");
-    assert_eq!(&block[81..91], b"MODE=gate\0");
+    // argc, two argv words and NULL, one envp word and NULL, then AT_PAGESZ,
+    // AT_ENTRY and the terminal pair: strings start at word 12.
+    assert_eq!(get64(&block, 8), STARTUP_V2_BLOCK_ADDRESS + 96);
+    let auxv: Vec<u64> = (6..12).map(|word| get64(&block, word * 8)).collect();
+    assert_eq!(auxv, [AT_PAGESZ, 4096, AT_ENTRY, 0x40_0080, 0, 0]);
+    assert_eq!(&block[96..106], b"bin/hello\0");
+    assert_eq!(&block[106..113], b"kobold\0");
+    assert_eq!(&block[113..123], b"MODE=gate\0");
     assert_eq!(
         write_startup_block_v2(
             &mut block,
@@ -101,6 +107,7 @@ fn startup_v2_uses_five_pages_and_canonical_vectors() {
             "bin/hello",
             &["wrong"],
             &[],
+            &NO_TABLE,
         ),
         Err(StartupBlockError::Argv0Mismatch)
     );
@@ -118,10 +125,51 @@ fn startup_v2_uses_five_pages_and_canonical_vectors() {
                 "bin/hello",
                 argv,
                 environment,
+                &NO_TABLE,
             ),
             Err(StartupBlockError::StringContainsNul)
         );
     }
+}
+
+/// An image whose program headers no PT_LOAD maps.
+const NO_TABLE: ImageAuxv = ImageAuxv {
+    entry: 0x40_0080,
+    program_headers: None,
+};
+
+/// W2: a mapped program-header table adds `AT_PHDR`, `AT_PHENT` and
+/// `AT_PHNUM` ahead of `AT_PAGESZ` and `AT_ENTRY`.
+#[test]
+fn startup_v2_auxv_names_the_mapped_program_headers() {
+    let auxv = ImageAuxv {
+        entry: 0x40_1000,
+        program_headers: Some(ProgramHeaderTable {
+            address: 0x40_0040,
+            count: 4,
+        }),
+    };
+    let mut block = [0xaa; STARTUP_V2_BLOCK_BYTES];
+    write_startup_block_v2(
+        &mut block,
+        STARTUP_V2_BLOCK_ADDRESS,
+        "bin/c",
+        &["bin/c"],
+        &[],
+        &auxv,
+    )
+    .unwrap();
+    // argc, argv[0], NULL, envp NULL, five pairs and the terminal pair.
+    let words: Vec<u64> = (4..16).map(|word| get64(&block, word * 8)).collect();
+    assert_eq!(
+        words,
+        [
+            AT_PHDR, 0x40_0040, AT_PHENT, 56, AT_PHNUM, 4, AT_PAGESZ, 4096, AT_ENTRY, 0x40_1000, 0,
+            0
+        ]
+    );
+    assert_eq!(get64(&block, 8), STARTUP_V2_BLOCK_ADDRESS + 16 * 8);
+    assert_eq!(&block[128..134], b"bin/c\0");
 }
 
 fn get64(bytes: &[u8], offset: usize) -> u64 {

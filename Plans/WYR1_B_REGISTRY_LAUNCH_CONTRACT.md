@@ -91,6 +91,16 @@ argv/environment strings. Encoding is canonical and checked before child
 publication. The runtime rejects wrong ABI version, count, pointer,
 terminator, overlap, non-UTF-8, missing NUL, range, alignment, or arithmetic.
 
+**Auxiliary vector** (2026-11-11, root `TOOLCHAIN_POSIX_LAYER_DESIGN.md`
+request W2). Every version 2 block carries, in this order and before the
+terminal pair: `AT_PHDR` (3), `AT_PHENT` (4, value 56) and `AT_PHNUM` (5) when
+one `PT_LOAD` maps the whole program-header table from the file, then
+`AT_PAGESZ` (6, value 4096) and `AT_ENTRY` (9, the ELF entry point). The
+strings still start immediately after the terminal pair. `AT_RANDOM` is absent
+until Deepwyrm gives userspace an entropy source; a C library must cope
+without it. The loader builds no TLS block: a program with `PT_TLS` sets up
+its own from `AT_PHDR` and its thread pointer (`thread_set_fs_base`).
+
 `argv[0]` is required and must exactly equal the launch-policy bootfs path.
 Environment entries are `NAME=VALUE`; `NAME` matches
 `[A-Z_][A-Z0-9_]{0,63}` and duplicate names are rejected. No value is treated
@@ -109,7 +119,13 @@ rights before use.
 | `BootstrapService` | self root; publication-authority Channel |
 | `RegistryClient` | self root; registry-client Channel |
 | `LaunchClient` | self root; launch-session Channel |
-| `JobV2` | zero or exactly three stream Channels in stdin, stdout, stderr order |
+| `JobV2` | self root; then zero or exactly three stream Channels in stdin, stdout, stderr order (WRLP 1.12, below) |
+
+Jobs moved to WRLP minor `12` on 2026-11-11 (root
+`TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W1): a job's INIT names its own
+root AddressRegion first, with the self-root rights below, so a POSIX layer
+can map memory (`mmap`, `malloc`). The 1.3 job shape is no longer accepted. A
+job that maps nothing closes the handle; `bin/hello` and `bin/cpu-hog` do.
 
 The WRRM v1 startup-profile field truthfully encodes `BootstrapRegistry` as
 wire value `2`. WYR1-A manifests continue to encode `EarlyBootStub` as `1`;

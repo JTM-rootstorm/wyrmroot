@@ -45,6 +45,9 @@ const MINOR_V1_8_TEST: u16 = 8;
 const MINOR_V1_9: u16 = 9;
 const MINOR_V1_10: u16 = 10;
 const MINOR_V1_11: u16 = 11;
+/// Jobs receive their self root ahead of their stream roles (root
+/// `TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W1).
+const MINOR_V1_12: u16 = 12;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
@@ -142,9 +145,10 @@ pub enum LaunchProfile {
     /// nested launch-session Channels. It receives no self-root or loader
     /// construction authority.
     Wyrmsh,
-    /// WYR1-B launched job with no startup stream roles.
+    /// Launched job with its self root and no startup stream roles.
     JobV2,
-    /// WYR1-B launched job with exact stdin/stdout/stderr Channel roles.
+    /// Launched job with its self root and exact stdin/stdout/stderr Channel
+    /// roles.
     JobV2Streams,
     /// Selector-26-only progress peer with exactly one test data Channel.
     Dw1bProgress,
@@ -171,18 +175,18 @@ impl LaunchProfile {
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Supervisor => 3,
             Self::SupervisorResourceDomain => 4,
             Self::D6ResourceOwner => 1,
-            Self::ProbeChild | Self::Dw1bProgress => 1,
+            Self::ProbeChild | Self::Dw1bProgress | Self::JobV2 => 1,
             Self::BootstrapRegistry
             | Self::BootstrapService
             | Self::RegistryClient
             | Self::LaunchClient => 2,
             Self::Consoled => 3,
             Self::Wyrmsh => 6,
-            Self::JobV2Streams => 3,
+            Self::JobV2Streams => 4,
             Self::DeviceCoordinator => 3,
             Self::DeviceCoordinatorResourceDomain => 4,
             Self::DeviceDriver => 2,
-            Self::Hello | Self::EarlyBootStub | Self::JobV2 => 0,
+            Self::Hello | Self::EarlyBootStub => 0,
         }
     }
 
@@ -195,9 +199,8 @@ impl LaunchProfile {
             Self::BootstrapRegistry
             | Self::BootstrapService
             | Self::RegistryClient
-            | Self::LaunchClient
-            | Self::JobV2
-            | Self::JobV2Streams => MINOR_V1_3,
+            | Self::LaunchClient => MINOR_V1_3,
+            Self::JobV2 | Self::JobV2Streams => MINOR_V1_12,
             Self::Dw1bProgress => MINOR_V1_4_TEST,
             Self::DeviceCoordinator => MINOR_V1_5,
             Self::DeviceCoordinatorResourceDomain => MINOR_V1_9,
@@ -393,17 +396,17 @@ fn encode_init_inner(
         }
     } else if profile == LaunchProfile::Dw1bProgress {
         put_u32(output, HEADER_BYTES, ROLE_DW1B_PROGRESS_DATA);
-    } else if profile.needs_self_root() {
-        put_u32(output, HEADER_BYTES, ROLE_SELF_ROOT);
-        if let Some(role) = profile.channel_role() {
-            put_u32(output, HEADER_BYTES + 8, role);
-        }
     } else if profile == LaunchProfile::JobV2Streams {
-        for (index, role) in [ROLE_STDIN, ROLE_STDOUT, ROLE_STDERR]
+        for (index, role) in [ROLE_SELF_ROOT, ROLE_STDIN, ROLE_STDOUT, ROLE_STDERR]
             .into_iter()
             .enumerate()
         {
             put_u32(output, HEADER_BYTES + index * 8, role);
+        }
+    } else if profile.needs_self_root() {
+        put_u32(output, HEADER_BYTES, ROLE_SELF_ROOT);
+        if let Some(role) = profile.channel_role() {
+            put_u32(output, HEADER_BYTES + 8, role);
         }
     }
     Ok(size)
@@ -731,6 +734,27 @@ pub fn parse_init(
             return Err(LaunchError::BadCapabilityRole { index: 0 });
         }
         validate_handle(handles[0], DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS, 0)?;
+    } else if profile == LaunchProfile::JobV2Streams {
+        for (index, (role, object_type, rights)) in [
+            (
+                ROLE_SELF_ROOT,
+                DW_OBJECT_TYPE_ADDRESS_REGION,
+                SELF_ROOT_RIGHTS,
+            ),
+            (ROLE_STDIN, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+            (ROLE_STDOUT, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+            (ROLE_STDERR, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if get_u32(bytes, HEADER_BYTES + index * 8) != role
+                || get_u32(bytes, HEADER_BYTES + index * 8 + 4) != 0
+            {
+                return Err(LaunchError::BadCapabilityRole { index });
+            }
+            validate_handle(handles[index], object_type, rights, index)?;
+        }
     } else if profile.needs_self_root() {
         if get_u32(bytes, HEADER_BYTES) != ROLE_SELF_ROOT || get_u32(bytes, HEADER_BYTES + 4) != 0 {
             return Err(LaunchError::BadCapabilityRole { index: 0 });
@@ -746,23 +770,6 @@ pub fn parse_init(
                 return Err(LaunchError::BadCapabilityRole { index: 1 });
             }
             validate_handle(handles[1], DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS, 1)?;
-        }
-    } else if profile == LaunchProfile::JobV2Streams {
-        for (index, role) in [ROLE_STDIN, ROLE_STDOUT, ROLE_STDERR]
-            .into_iter()
-            .enumerate()
-        {
-            if get_u32(bytes, HEADER_BYTES + index * 8) != role
-                || get_u32(bytes, HEADER_BYTES + index * 8 + 4) != 0
-            {
-                return Err(LaunchError::BadCapabilityRole { index });
-            }
-            validate_handle(
-                handles[index],
-                DW_OBJECT_TYPE_CHANNEL,
-                CHILD_CHANNEL_RIGHTS,
-                index,
-            )?;
         }
     }
     Ok(ParsedMessage {
@@ -903,6 +910,8 @@ impl LaunchProfile {
                     | Self::DeviceCoordinatorResourceDomain
                     | Self::DeviceDriver
                     | Self::Consoled
+                    | Self::JobV2
+                    | Self::JobV2Streams
             )
     }
 

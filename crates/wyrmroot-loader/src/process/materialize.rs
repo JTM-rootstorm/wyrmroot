@@ -132,12 +132,14 @@ pub(crate) fn load_job_v2_process_materialized<P: LoaderPlatform>(
     delegated_channels_consumed: &mut bool,
     plan: elf::ElfLoadPlan<'_>,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
+    let auxv = image::ImageAuxv::from_plan(&plan);
     let startup = image::StartupBlockV2Plan::new(
         image::STARTUP_V2_BLOCK_BYTES,
         image::STARTUP_V2_BLOCK_ADDRESS,
         path,
         argv,
         environment,
+        &auxv,
     )
     .map_err(LoadError::Startup)?;
     load_process_materialized(
@@ -575,18 +577,19 @@ pub(crate) fn load_process_materialized<P: LoaderPlatform>(
         transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
         transfers[1] = transfer(request.channels[0], launch::CHILD_CHANNEL_RIGHTS);
         2
+    } else if request.profile == LaunchProfile::JobV2Streams {
+        transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
+        for (index, handle) in request.channels.iter().copied().enumerate() {
+            transaction.delegated_channels[index] = Some(handle);
+            transfers[index + 1] = transfer(handle, launch::CHILD_CHANNEL_RIGHTS);
+        }
+        4
     } else if request.profile.needs_self_root() {
-        // WYR0-I probe children receive only their own mapping authority at
-        // startup. Shared MemoryObjects are a typed controller protocol after
+        // WYR0-I probe children and stream-less jobs receive only their own
+        // mapping authority at startup. Shared MemoryObjects are a typed controller protocol after
         // startup, not a loader launch capability.
         transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
         1
-    } else if request.profile == LaunchProfile::JobV2Streams {
-        for (index, handle) in request.channels.iter().copied().enumerate() {
-            transaction.delegated_channels[index] = Some(handle);
-            transfers[index] = transfer(handle, launch::CHILD_CHANNEL_RIGHTS);
-        }
-        3
     } else {
         0
     };

@@ -1124,10 +1124,22 @@ fn consoled_stream_descriptors_survive_init_then_reduce_at_actual_loader_move() 
         },
     )
     .unwrap();
-    assert_eq!(loader.sent_transfers.len(), 3);
-    let mut received = [DwReceivedHandleInfoV1::default(); 3];
-    for (index, transfer) in loader.sent_transfers.iter().enumerate() {
-        assert_eq!(transfer.handle, streams[index]);
+    // The job's own root comes first (WRLP 1.12), then the three streams.
+    assert_eq!(loader.sent_transfers.len(), 4);
+    let root = loader.sent_transfers[0];
+    assert_eq!(
+        root.requested_rights,
+        wyrmroot_loader::launch::SELF_ROOT_RIGHTS
+    );
+    let mut received = [DwReceivedHandleInfoV1::default(); 4];
+    received[0] = DwReceivedHandleInfoV1 {
+        handle: root.handle,
+        rights: root.requested_rights,
+        object_type: deepwyrm_syscall::DW_OBJECT_TYPE_ADDRESS_REGION,
+        ..DwReceivedHandleInfoV1::default()
+    };
+    for (index, transfer) in loader.sent_transfers.iter().enumerate().skip(1) {
+        assert_eq!(transfer.handle, streams[index - 1]);
         assert_eq!(transfer.operation, DW_HANDLE_TRANSFER_MOVE);
         assert_eq!(transfer.requested_rights, CHILD_CHANNEL_RIGHTS);
         assert_eq!(

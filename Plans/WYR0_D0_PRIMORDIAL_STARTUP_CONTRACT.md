@@ -76,7 +76,8 @@ The concrete primordial startup is:
 - `argv[0]` is NUL-terminated UTF-8 `wyrmroot-bootstrap` inside the startup block;
 - `argv[1] = 0`;
 - environment is empty and immediately terminated by zero;
-- auxv has no entries before terminal `(0, 0)`;
+- auxv has no entries before terminal `(0, 0)` (startup ABI 1; version 2 blocks
+  carry the image auxv, `WYR1_B_REGISTRY_LAUNCH_CONTRACT.md` §3);
 - `RSP` is 16-byte aligned; and
 - unused startup-block bytes are zero.
 

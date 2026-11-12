@@ -67,9 +67,13 @@ impl StreamEndpoint {
     }
 }
 
-/// The exact stdin, stdout, stderr tuple transferred by JobV2Streams.
+/// The job's self root and the exact stdin, stdout, stderr tuple
+/// transferred by JobV2Streams (WRLP 1.12).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobV2Streams {
+    /// The job's own root AddressRegion (`MAP | MODIFY | INSPECT`). A job
+    /// that maps nothing closes it.
+    pub self_root: DwHandle,
     pub stdin: StreamEndpoint,
     pub stdout: StreamEndpoint,
     pub stderr: StreamEndpoint,
@@ -82,9 +86,10 @@ pub fn extract_job_v2_streams(
 ) -> Result<JobV2Streams, LaunchError> {
     parse_init(LaunchProfile::JobV2Streams, bytes, handles)?;
     Ok(JobV2Streams {
-        stdin: StreamEndpoint(handles[0].handle),
-        stdout: StreamEndpoint(handles[1].handle),
-        stderr: StreamEndpoint(handles[2].handle),
+        self_root: handles[0].handle,
+        stdin: StreamEndpoint(handles[1].handle),
+        stdout: StreamEndpoint(handles[2].handle),
+        stderr: StreamEndpoint(handles[3].handle),
     })
 }
 

@@ -557,29 +557,65 @@ fn wyr1_b_profiles_are_exact_wrlp_1_3_shapes() {
         ];
         assert!(launch::parse_init(profile, &init, &handles).is_ok());
     }
+}
 
-    let mut no_streams = [0xaa; HEADER_BYTES];
+/// Root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W1: WRLP 1.12 jobs receive their
+/// self root ahead of any stream roles, and nothing else may stand in for it.
+#[test]
+fn jobs_receive_their_self_root_first_under_wrlp_1_12() {
+    let root = received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS);
+    let mut no_streams = [0xaa; HEADER_BYTES + 8];
     launch::encode_init(LaunchProfile::JobV2, 0x1301, &mut no_streams).unwrap();
-    assert_eq!((get16(&no_streams, 6), get32(&no_streams, 20)), (3, 0));
-    assert!(launch::parse_init(LaunchProfile::JobV2, &no_streams, &[]).is_ok());
+    assert_eq!(
+        (
+            get16(&no_streams, 6),
+            get32(&no_streams, 16),
+            get32(&no_streams, 20)
+        ),
+        (12, 48, 1)
+    );
+    assert_eq!(get32(&no_streams, 40), 1);
+    assert!(launch::parse_init(LaunchProfile::JobV2, &no_streams, &[root]).is_ok());
+    assert_eq!(
+        launch::parse_init(LaunchProfile::JobV2, &no_streams, &[]),
+        Err(LaunchError::HandleCount)
+    );
 
-    let mut streams = [0xaa; 64];
+    let mut streams = [0xaa; HEADER_BYTES + 32];
     launch::encode_init(LaunchProfile::JobV2Streams, 0x1302, &mut streams).unwrap();
-    assert_eq!((get16(&streams, 6), get32(&streams, 20)), (3, 3));
+    assert_eq!((get16(&streams, 6), get32(&streams, 20)), (12, 4));
     assert_eq!(
         [
             get32(&streams, 40),
             get32(&streams, 48),
-            get32(&streams, 56)
+            get32(&streams, 56),
+            get32(&streams, 64)
         ],
-        [8, 9, 10]
+        [1, 8, 9, 10]
     );
-    let handles = [
-        received(3, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
-        received(4, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
-        received(5, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
-    ];
+    let channel = |id| received(id, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS);
+    let handles = [root, channel(3), channel(4), channel(5)];
     assert!(launch::parse_init(LaunchProfile::JobV2Streams, &streams, &handles).is_ok());
+
+    // A Channel in the self-root slot, or a root with extra rights, is refused.
+    let swapped = [channel(2), channel(3), channel(4), channel(5)];
+    assert_eq!(
+        launch::parse_init(LaunchProfile::JobV2Streams, &streams, &swapped),
+        Err(LaunchError::HandleMetadata { index: 0 })
+    );
+    let mut wide = handles;
+    wide[0].rights = deepwyrm_syscall::DwRights(SELF_ROOT_RIGHTS.0 | CHILD_CHANNEL_RIGHTS.0);
+    assert_eq!(
+        launch::parse_init(LaunchProfile::JobV2Streams, &streams, &wide),
+        Err(LaunchError::HandleMetadata { index: 0 })
+    );
+    // The WRLP 1.3 job shape is no longer accepted.
+    let mut old = streams;
+    old[6..8].copy_from_slice(&3u16.to_le_bytes());
+    assert_eq!(
+        launch::parse_init(LaunchProfile::JobV2Streams, &old, &handles),
+        Err(LaunchError::BadVersion)
+    );
 }
 
 #[test]

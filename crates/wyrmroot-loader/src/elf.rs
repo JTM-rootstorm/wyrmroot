@@ -73,7 +73,33 @@ pub struct ElfLoadPlan<'segments> {
     pub entry: u64,
     pub segments: &'segments [LoadSegment],
     pub mapped_bytes: u64,
+    /// The program-header table's child address, when a `PT_LOAD` maps it
+    /// from the file (`AT_PHDR`), and its entry count (`AT_PHNUM`).
+    pub program_headers: Option<ProgramHeaderTable>,
+    /// The static TLS template, when the image has one. The loader only
+    /// checks it; the program's own startup builds the TLS block from it.
+    pub tls: Option<TlsTemplate>,
 }
+
+/// Where the child finds its own program headers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgramHeaderTable {
+    pub address: u64,
+    pub count: u16,
+}
+
+/// A checked `PT_TLS` record: the initialization image lies wholly inside a
+/// `PT_LOAD`'s file-backed bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TlsTemplate {
+    pub address: u64,
+    pub file_size: u64,
+    pub memory_size: u64,
+    pub alignment: u64,
+}
+
+/// The ELF64 program-header entry size (`AT_PHENT`).
+pub const PROGRAM_HEADER_ENTRY_BYTES: u64 = PROGRAM_HEADER_BYTES as u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ElfError {
@@ -97,28 +123,81 @@ pub enum ElfError {
     ProgramHeaderTableTruncated,
     ProgramHeaderTableOverlapsElfHeader,
     ProgramHeaderTableMisaligned,
-    UnsupportedProgramHeaderType { index: u16, header_type: u32 },
+    UnsupportedProgramHeaderType {
+        index: u16,
+        header_type: u32,
+    },
     DuplicateProgramHeaderType(u32),
-    UnknownSegmentFlags { index: u16, flags: u32 },
-    InvalidStackHeader { index: u16 },
-    InvalidPhdrHeader { index: u16 },
+    UnknownSegmentFlags {
+        index: u16,
+        flags: u32,
+    },
+    InvalidStackHeader {
+        index: u16,
+    },
+    InvalidPhdrHeader {
+        index: u16,
+    },
+    /// A `PT_TLS` record with wrong flags, sizes or alignment, or whose
+    /// initialization image no `PT_LOAD` maps from the file.
+    InvalidTlsHeader {
+        index: u16,
+    },
     TooManyLoadSegments(usize),
-    OutputTooSmall { required: usize, supplied: usize },
-    EmptyLoadSegment { index: u16 },
-    FileSizeExceedsMemorySize { index: u16 },
-    SegmentFileRangeOverflow { index: u16 },
-    SegmentFileRangeTruncated { index: u16 },
-    SegmentVirtualRangeOverflow { index: u16 },
-    SegmentMappingRangeOverflow { index: u16 },
-    InvalidSegmentAlignment { index: u16, alignment: u64 },
-    SegmentAlignmentBelowPolicy { index: u16, alignment: u64 },
-    SegmentAddressAlignmentMismatch { index: u16 },
-    SegmentVirtualRangeOutsidePolicy { index: u16 },
-    SegmentOverlapsInitialStack { index: u16 },
-    WritableExecutableSegment { index: u16 },
-    UnsupportedSegmentProtection { index: u16, flags: u32 },
-    OverlappingVirtualSegments { first: u16, second: u16 },
-    OverlappingVirtualMappingRanges { first: u16, second: u16 },
+    OutputTooSmall {
+        required: usize,
+        supplied: usize,
+    },
+    EmptyLoadSegment {
+        index: u16,
+    },
+    FileSizeExceedsMemorySize {
+        index: u16,
+    },
+    SegmentFileRangeOverflow {
+        index: u16,
+    },
+    SegmentFileRangeTruncated {
+        index: u16,
+    },
+    SegmentVirtualRangeOverflow {
+        index: u16,
+    },
+    SegmentMappingRangeOverflow {
+        index: u16,
+    },
+    InvalidSegmentAlignment {
+        index: u16,
+        alignment: u64,
+    },
+    SegmentAlignmentBelowPolicy {
+        index: u16,
+        alignment: u64,
+    },
+    SegmentAddressAlignmentMismatch {
+        index: u16,
+    },
+    SegmentVirtualRangeOutsidePolicy {
+        index: u16,
+    },
+    SegmentOverlapsInitialStack {
+        index: u16,
+    },
+    WritableExecutableSegment {
+        index: u16,
+    },
+    UnsupportedSegmentProtection {
+        index: u16,
+        flags: u32,
+    },
+    OverlappingVirtualSegments {
+        first: u16,
+        second: u16,
+    },
+    OverlappingVirtualMappingRanges {
+        first: u16,
+        second: u16,
+    },
     MappedImageLimit,
     ZeroEntryPoint,
     EntryPointOutsideExecutableSegment,
@@ -136,6 +215,7 @@ pub fn required_segment_count(image: &[u8]) -> Result<usize, ElfError> {
     let mut count = 0_usize;
     let mut saw_phdr = false;
     let mut saw_stack = false;
+    let mut saw_tls = false;
     for index in 0..header.program_count {
         let ph = program_header(image, header, index)?;
         let header_type = get_u32(ph, 0);
@@ -160,7 +240,14 @@ pub fn required_segment_count(image: &[u8]) -> Result<usize, ElfError> {
                 validate_stack_header(ph, index as u16)?;
                 saw_stack = true;
             }
-            PT_INTERP | PT_DYNAMIC | PT_TLS | PT_NOTE | PT_GNU_RELRO => {
+            PT_TLS => {
+                if saw_tls {
+                    return Err(ElfError::DuplicateProgramHeaderType(PT_TLS));
+                }
+                validate_tls_header(ph, index as u16)?;
+                saw_tls = true;
+            }
+            PT_INTERP | PT_DYNAMIC | PT_NOTE | PT_GNU_RELRO => {
                 return Err(ElfError::UnsupportedProgramHeaderType {
                     index: index as u16,
                     header_type,
@@ -221,10 +308,66 @@ pub fn plan<'segments>(
     }) {
         return Err(ElfError::EntryPointOutsideExecutableSegment);
     }
+    let segments = &output[..len];
+    let mut program_headers = None;
+    let mut tls = None;
+    let table_offset = header.program_offset as u64;
+    let table_bytes = (header.program_count * PROGRAM_HEADER_BYTES) as u64;
+    for index in 0..header.program_count {
+        let ph = program_header(image, header, index)?;
+        match get_u32(ph, 0) {
+            PT_PHDR => {
+                // The record must name exactly where a PT_LOAD maps the table.
+                let address = get_u64(ph, 16);
+                if file_backed_address(segments, table_offset, table_bytes) != Some(address) {
+                    return Err(ElfError::InvalidPhdrHeader {
+                        index: index as u16,
+                    });
+                }
+            }
+            PT_TLS => {
+                let template = TlsTemplate {
+                    address: get_u64(ph, 16),
+                    file_size: get_u64(ph, 32),
+                    memory_size: get_u64(ph, 40),
+                    alignment: get_u64(ph, 48),
+                };
+                if template.file_size != 0
+                    && file_backed_address(segments, get_u64(ph, 8), template.file_size)
+                        != Some(template.address)
+                {
+                    return Err(ElfError::InvalidTlsHeader {
+                        index: index as u16,
+                    });
+                }
+                tls = Some(template);
+            }
+            _ => {}
+        }
+    }
+    if let Some(address) = file_backed_address(segments, table_offset, table_bytes) {
+        program_headers = Some(ProgramHeaderTable {
+            address,
+            count: header.program_count as u16,
+        });
+    }
     Ok(ElfLoadPlan {
         entry: header.entry,
-        segments: &output[..len],
+        segments,
         mapped_bytes,
+        program_headers,
+        tls,
+    })
+}
+
+/// The child address of file bytes `[offset, offset + length)` when one
+/// `PT_LOAD` maps all of them from the file (not from its zero-filled tail).
+fn file_backed_address(segments: &[LoadSegment], offset: u64, length: u64) -> Option<u64> {
+    let end = offset.checked_add(length)?;
+    segments.iter().find_map(|segment| {
+        let segment_end = segment.file_offset.checked_add(segment.file_size)?;
+        (offset >= segment.file_offset && end <= segment_end)
+            .then(|| segment.virtual_address + (offset - segment.file_offset))
     })
 }
 
@@ -419,6 +562,28 @@ fn validate_stack_header(ph: &[u8], index: u16) -> Result<(), ElfError> {
         || get_u64(ph, 40) != 0
     {
         return Err(ElfError::InvalidStackHeader { index });
+    }
+    Ok(())
+}
+
+/// A `PT_TLS` record on its own: read-only, `filesz <= memsz`, a power-of-two
+/// alignment no larger than a page (0 means 1), and no address overflow.
+/// Whether a `PT_LOAD` maps its image is checked once the segments are known.
+fn validate_tls_header(ph: &[u8], index: u16) -> Result<(), ElfError> {
+    let address = get_u64(ph, 16);
+    let file_size = get_u64(ph, 32);
+    let memory_size = get_u64(ph, 40);
+    let alignment = get_u64(ph, 48);
+    if get_u32(ph, 4) != PF_R
+        || file_size > memory_size
+        || memory_size > MAX_MAPPED_IMAGE_BYTES
+        || (alignment != 0 && !alignment.is_power_of_two())
+        || alignment > PAGE_SIZE
+        || address
+            .checked_add(memory_size)
+            .is_none_or(|end| end > USER_END_EXCLUSIVE)
+    {
+        return Err(ElfError::InvalidTlsHeader { index });
     }
     Ok(())
 }

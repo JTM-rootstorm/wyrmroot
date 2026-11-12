@@ -320,6 +320,7 @@ fn wyrmsh_moves_six_roles_in_order_with_exact_abi2_startup() {
         "system/wyrmsh",
         &["system/wyrmsh"],
         &[],
+        &auxv_of(&image),
     )
     .unwrap();
     assert_eq!(platform.materialized.last(), Some(&expected));
@@ -565,6 +566,7 @@ fn a_launch_client_receives_its_self_root_session_arguments_and_correlation() {
             "WYR_REGISTRY_ENDPOINT_ID=5",
             "WYR_REGISTRY_ENDPOINT_GENERATION=1",
         ],
+        &auxv_of(&image),
     )
     .unwrap();
     assert_eq!(platform.materialized.last(), Some(&expected));
@@ -1390,6 +1392,7 @@ fn bootstrap_service_uses_startup_v2_for_controller_correlation_environment() {
         display_path,
         &argv,
         &environment,
+        &auxv_of(&image),
     )
     .unwrap();
     assert_eq!(platform.materialized.last().unwrap(), &expected);
@@ -1532,15 +1535,52 @@ fn job_v2_selects_zero_or_three_stream_profile_and_retains_streams_on_failed_mov
         },
     )
     .unwrap();
+    // W1: the child's own root goes first, reduced to the self-root rights,
+    // then the three streams.
+    let transfers = &platform.sent_transfers;
+    assert_eq!(transfers.len(), 4);
     assert_eq!(
-        platform
-            .sent_transfers
+        transfers[0].requested_rights,
+        wyrmroot_loader::launch::SELF_ROOT_RIGHTS
+    );
+    assert!(!streams.contains(&transfers[0].handle));
+    assert_eq!(
+        transfers[1..]
             .iter()
             .map(|transfer| transfer.handle)
             .collect::<Vec<_>>(),
         streams
     );
-    assert_eq!(&platform.sent_init[6..8], &3_u16.to_le_bytes());
+    assert!(transfers[1..].iter().all(|transfer| {
+        transfer.requested_rights == wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
+    }));
+    assert_eq!(&platform.sent_init[6..8], &12_u16.to_le_bytes());
+    // The parent keeps no handle to the child's root once INIT moved it.
+    assert!(
+        !platform
+            .events
+            .contains(&Event::Close(transfers[0].handle.0))
+    );
+
+    let mut alone = Mock::new(None);
+    load_job_process(
+        &mut alone,
+        authority(),
+        JobLoadRequest {
+            image: &image,
+            policy_path: "bin/hello",
+            argv: &argv,
+            environment: &[],
+            streams: &[],
+            transaction_id: 0x1304,
+        },
+    )
+    .unwrap();
+    assert_eq!(alone.sent_transfers.len(), 1);
+    assert_eq!(
+        alone.sent_transfers[0].requested_rights,
+        wyrmroot_loader::launch::SELF_ROOT_RIGHTS
+    );
 
     let mut failing = Mock::new(Some("send"));
     let error = load_job_process(
@@ -2019,6 +2059,27 @@ fn wyrmsh_request(image: &[u8]) -> WyrmshLoadRequest<'_> {
 }
 fn position(events: &[Event], predicate: impl Fn(&Event) -> bool) -> usize {
     events.iter().position(predicate).unwrap()
+}
+
+fn empty_load_segment() -> wyrmroot_loader::elf::LoadSegment {
+    wyrmroot_loader::elf::LoadSegment {
+        header_index: 0,
+        file_offset: 0,
+        file_size: 0,
+        memory_size: 0,
+        virtual_address: 0,
+        mapping_start: 0,
+        mapping_size: 0,
+        leading_bytes: 0,
+        protection: wyrmroot_loader::elf::SegmentProtection::Read,
+    }
+}
+
+/// The auxv the loader derives from `image`.
+fn auxv_of(image: &[u8]) -> wyrmroot_loader::image::ImageAuxv {
+    let mut segments = [empty_load_segment(); wyrmroot_loader::elf::MAX_LOAD_SEGMENTS];
+    let plan = wyrmroot_loader::elf::plan(image, &mut segments).unwrap();
+    wyrmroot_loader::image::ImageAuxv::from_plan(&plan)
 }
 
 fn executable() -> Vec<u8> {

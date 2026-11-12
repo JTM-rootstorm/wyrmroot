@@ -132,7 +132,7 @@ fn malformed_ident_and_header_table_fail_closed() {
 
 #[test]
 fn unsupported_program_headers_and_executable_stack_are_rejected() {
-    for kind in [2, 3, 4, 7, 0x6474_e552, 0x7000_0000] {
+    for kind in [2, 3, 4, 0x6474_e552, 0x7000_0000] {
         let bytes = image(
             &[load(5, 0x1000, 0x400000, 1, 1), Ph { kind, ..stack() }],
             0x400000,
@@ -253,6 +253,169 @@ fn entry_and_output_capacity_are_checked() {
     assert_eq!(
         elf::plan(&bytes, &mut output),
         Err(ElfError::EntryPointOutsideExecutableSegment)
+    );
+}
+
+fn tls(offset: u64, address: u64, file_size: u64, memory_size: u64) -> Ph {
+    Ph {
+        kind: 7,
+        flags: 4,
+        offset,
+        address,
+        file_size,
+        memory_size,
+        alignment: 8,
+    }
+}
+
+/// An RX segment that maps the file from offset 0 (so the ELF header and the
+/// program headers too), and an RW segment holding `.tdata`.
+fn with_tls(tls_header: Ph) -> Vec<u8> {
+    image(
+        &[
+            load(5, 0, 0x400000, 0x1000, 0x1000),
+            load(6, 0x1000, 0x401000, 0x100, 0x200),
+            tls_header,
+        ],
+        0x400800,
+        0x2000,
+    )
+}
+
+/// W2: a static TLS template is accepted when a PT_LOAD maps its image from
+/// the file, and the plan names it and the mapped program-header table.
+#[test]
+fn a_tls_template_inside_a_load_segment_is_accepted() {
+    let bytes = with_tls(tls(0x1010, 0x401010, 0x20, 0x48));
+    let mut output = [empty_segment(); MAX_LOAD_SEGMENTS];
+    let plan = elf::plan(&bytes, &mut output).unwrap();
+    assert_eq!(
+        plan.tls,
+        Some(elf::TlsTemplate {
+            address: 0x401010,
+            file_size: 0x20,
+            memory_size: 0x48,
+            alignment: 8,
+        })
+    );
+    // The first segment maps file offset 0, so the table is at 0x400040.
+    assert_eq!(
+        plan.program_headers,
+        Some(elf::ProgramHeaderTable {
+            address: 0x400040,
+            count: 3,
+        })
+    );
+    // A template with no initialized bytes needs no file backing.
+    let bss_only = with_tls(tls(0, 0x401200, 0, 0x10));
+    assert!(elf::plan(&bss_only, &mut output).unwrap().tls.is_some());
+}
+
+#[test]
+fn malformed_or_unmapped_tls_templates_are_rejected() {
+    let mut output = [empty_segment(); MAX_LOAD_SEGMENTS];
+    let index = 2;
+    for (case, header) in [
+        // Writable, larger image than memory, a non-power-of-two and an
+        // over-page alignment.
+        (
+            "writable",
+            Ph {
+                flags: 6,
+                ..tls(0x1010, 0x401010, 0x20, 0x48)
+            },
+        ),
+        ("filesz > memsz", tls(0x1010, 0x401010, 0x50, 0x48)),
+        (
+            "alignment 12",
+            Ph {
+                alignment: 12,
+                ..tls(0x1010, 0x401010, 0x20, 0x48)
+            },
+        ),
+        (
+            "alignment 8192",
+            Ph {
+                alignment: 8192,
+                ..tls(0x1010, 0x401010, 0x20, 0x48)
+            },
+        ),
+    ] {
+        assert_eq!(
+            elf::required_segment_count(&with_tls(header)),
+            Err(ElfError::InvalidTlsHeader { index }),
+            "{case}"
+        );
+    }
+    for (case, header) in [
+        // Past the RW segment's file bytes, into its zero-filled tail.
+        ("tail", tls(0x10f0, 0x4010f0, 0x20, 0x20)),
+        // Address and file offset disagree with the segment's mapping.
+        ("skewed", tls(0x1010, 0x401020, 0x20, 0x48)),
+        // Nowhere near a segment.
+        ("unmapped", tls(0x1010, 0x500000, 0x20, 0x48)),
+    ] {
+        assert_eq!(
+            elf::plan(&with_tls(header), &mut output),
+            Err(ElfError::InvalidTlsHeader { index }),
+            "{case}"
+        );
+    }
+    let twice = image(
+        &[
+            load(5, 0, 0x400000, 0x1000, 0x1000),
+            load(6, 0x1000, 0x401000, 0x100, 0x200),
+            tls(0x1010, 0x401010, 0x20, 0x48),
+            tls(0x1010, 0x401010, 0x20, 0x48),
+        ],
+        0x400800,
+        0x2000,
+    );
+    assert_eq!(
+        elf::required_segment_count(&twice),
+        Err(ElfError::DuplicateProgramHeaderType(7))
+    );
+}
+
+/// A PT_PHDR must name exactly where a PT_LOAD maps the table; with no such
+/// segment the plan carries no table (no `AT_PHDR`).
+#[test]
+fn program_header_table_address_follows_the_mapping() {
+    let mut output = [empty_segment(); MAX_LOAD_SEGMENTS];
+    let phdr = |address| Ph {
+        kind: 6,
+        flags: 4,
+        offset: PH_OFFSET as u64,
+        address,
+        file_size: 2 * PH_SIZE as u64,
+        memory_size: 2 * PH_SIZE as u64,
+        alignment: 8,
+    };
+    let mapped = image(
+        &[load(5, 0, 0x400000, 0x1000, 0x1000), phdr(0x400040)],
+        0x400800,
+        0x1000,
+    );
+    assert_eq!(
+        elf::plan(&mapped, &mut output).unwrap().program_headers,
+        Some(elf::ProgramHeaderTable {
+            address: 0x400040,
+            count: 2
+        })
+    );
+    let wrong = image(
+        &[load(5, 0, 0x400000, 0x1000, 0x1000), phdr(0x400080)],
+        0x400800,
+        0x1000,
+    );
+    assert_eq!(
+        elf::plan(&wrong, &mut output),
+        Err(ElfError::InvalidPhdrHeader { index: 1 })
+    );
+    // valid() maps nothing below file offset 0x1000.
+    assert_eq!(
+        elf::plan(&valid(), &mut output).unwrap().program_headers,
+        None
     );
 }
 

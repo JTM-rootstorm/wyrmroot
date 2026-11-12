@@ -173,8 +173,8 @@ pub fn run_stream_hello<System: StreamHelloSystem>(
         })?;
     validate_bootstrap_channel(channel, BOOTSTRAP_CHANNEL_EXPECTATION)
         .map_err(HelloError::BootstrapChannel)?;
-    let mut init = [0_u8; 64];
-    let mut handles = [DwReceivedHandleInfoV1::default(); 3];
+    let mut init = [0_u8; 72];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 4];
     let counts = system
         .receive_channel(bootstrap_channel, &mut init, &mut handles)
         .map_err(|cause| HelloError::Native {
@@ -186,6 +186,13 @@ pub fn run_stream_hello<System: StreamHelloSystem>(
     }
     let streams = extract_job_v2_streams(&init[..counts.bytes], &handles)
         .map_err(HelloError::StreamLaunch)?;
+    // Hello maps nothing, so its self root goes at once.
+    system
+        .close_handle(streams.self_root)
+        .map_err(|cause| HelloError::Native {
+            operation: HelloNativeOperation::CloseBootstrapChannel,
+            cause,
+        })?;
     let mut stdout = NativeOutput::new(streams.stdout);
     if stdout
         .write(system, b"hello from native stdout\n")
@@ -258,19 +265,31 @@ fn run_profile_ready<System: HelloSystem>(
     validate_bootstrap_channel(channel, BOOTSTRAP_CHANNEL_EXPECTATION)
         .map_err(HelloError::BootstrapChannel)?;
 
-    let mut init = [0_u8; HEADER_BYTES];
-    let mut handles = [];
+    // A JobV2 INIT carries the job's self root (WRLP 1.12); the WYR0-G
+    // profile carries nothing.
+    let mut init = [0_u8; HEADER_BYTES + 8];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let expected = profile.capability_count();
     let counts = system
         .receive_channel(bootstrap_channel, &mut init, &mut handles)
         .map_err(|cause| HelloError::Native {
             operation: HelloNativeOperation::ReceiveInit,
             cause,
         })?;
-    if counts.bytes > init.len() || counts.handles != 0 {
+    if counts.bytes > init.len() || counts.handles != expected {
         return Err(HelloError::ReceiveCounts(counts));
     }
-    let parsed =
-        parse_init(profile, &init[..counts.bytes], &handles).map_err(HelloError::Launch)?;
+    let parsed = parse_init(profile, &init[..counts.bytes], &handles[..expected]);
+    // Hello maps nothing: the self root is closed whatever INIT said.
+    for info in &handles[..expected] {
+        system
+            .close_handle(info.handle)
+            .map_err(|cause| HelloError::Native {
+                operation: HelloNativeOperation::CloseBootstrapChannel,
+                cause,
+            })?;
+    }
+    let parsed = parsed.map_err(HelloError::Launch)?;
 
     let mut ready = [0_u8; HEADER_BYTES];
     let ready_size = encode_ready_for_profile(profile, parsed.transaction_id, &mut ready)

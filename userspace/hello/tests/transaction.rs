@@ -39,8 +39,19 @@ fn live_exit_code_preserves_native_operation_and_cause() {
     );
 }
 
+const ROOT: DwHandle = DwHandle(20);
+
+fn root() -> DwReceivedHandleInfoV1 {
+    DwReceivedHandleInfoV1 {
+        handle: ROOT,
+        object_type: deepwyrm_syscall::DW_OBJECT_TYPE_ADDRESS_REGION,
+        rights: wyrmroot_loader::launch::SELF_ROOT_RIGHTS,
+        ..DwReceivedHandleInfoV1::default()
+    }
+}
+
 struct Fixture {
-    init: [u8; 40],
+    init: Vec<u8>,
     wait_signals: DwSignals,
     wait_count: usize,
     received_handles: usize,
@@ -55,13 +66,13 @@ impl Fixture {
     }
 
     fn profile(profile: LaunchProfile) -> Self {
-        let mut init = [0_u8; 40];
+        let mut init = vec![0_u8; profile.init_size()];
         encode_init(profile, 2, &mut init).unwrap();
         Self {
             init,
             wait_signals: DW_SIGNAL_PEER_CLOSED,
             wait_count: 0,
-            received_handles: 0,
+            received_handles: profile.capability_count(),
             channel_rights: BOOTSTRAP_CHANNEL_EXPECTATION.rights,
             sent: Vec::new(),
             closed: Vec::new(),
@@ -88,10 +99,13 @@ impl HelloSystem for Fixture {
         &mut self,
         channel: DwHandle,
         bytes: &mut [u8],
-        _: &mut [DwReceivedHandleInfoV1],
+        handles: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, NativeError> {
         assert_eq!(channel, CHANNEL);
-        bytes.copy_from_slice(&self.init);
+        bytes[..self.init.len()].copy_from_slice(&self.init);
+        if let Some(slot) = handles.first_mut() {
+            *slot = root();
+        }
         Ok(ReceiveCounts {
             bytes: self.init.len(),
             handles: self.received_handles,
@@ -135,14 +149,14 @@ fn hello_acknowledges_the_parent_channel_then_closes_it() {
 }
 
 #[test]
-fn job_hello_uses_the_handle_free_wrlp_1_3_profile() {
+fn job_hello_takes_and_closes_its_self_root_under_wrlp_1_12() {
     let mut fixture = Fixture::profile(LaunchProfile::JobV2);
     assert_eq!(run_job_hello(&mut fixture, CHANNEL), Ok(()));
     assert_eq!(
         parse_ready_for_profile(LaunchProfile::JobV2, &fixture.sent, 2),
         Ok(())
     );
-    assert_eq!(fixture.closed, [CHANNEL]);
+    assert_eq!(fixture.closed, [ROOT, CHANNEL]);
     assert_eq!(fixture.wait_count, 1);
 }
 
@@ -154,7 +168,7 @@ fn job_hello_rejects_readable_post_ready_data() {
         run_job_hello(&mut fixture, CHANNEL),
         Err(HelloError::PostReadySignals(DW_SIGNAL_READABLE))
     );
-    assert!(fixture.closed.is_empty());
+    assert_eq!(fixture.closed, [ROOT]);
 }
 
 #[test]
@@ -194,8 +208,8 @@ fn hello_rejects_bootstrap_channel_excess_rights() {
 }
 
 struct StreamFixture {
-    init: [u8; 64],
-    handles: [DwReceivedHandleInfoV1; 3],
+    init: [u8; 72],
+    handles: [DwReceivedHandleInfoV1; 4],
     wait_signals: DwSignals,
     wait_count: usize,
     sent: Vec<Vec<u8>>,
@@ -204,7 +218,7 @@ struct StreamFixture {
 }
 impl StreamFixture {
     fn new() -> Self {
-        let mut init = [0; 64];
+        let mut init = [0; 72];
         encode_init(LaunchProfile::JobV2Streams, 9, &mut init).unwrap();
         let handle = |raw| DwReceivedHandleInfoV1 {
             handle: DwHandle(raw),
@@ -214,7 +228,7 @@ impl StreamFixture {
         };
         Self {
             init,
-            handles: [handle(21), handle(22), handle(23)],
+            handles: [root(), handle(21), handle(22), handle(23)],
             wait_signals: DW_SIGNAL_PEER_CLOSED,
             wait_count: 0,
             sent: vec![],
@@ -239,11 +253,11 @@ impl HelloSystem for StreamFixture {
         bytes: &mut [u8],
         handles: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, NativeError> {
-        bytes[..64].copy_from_slice(&self.init);
+        bytes[..72].copy_from_slice(&self.init);
         handles.copy_from_slice(&self.handles);
         Ok(ReceiveCounts {
-            bytes: 64,
-            handles: 3,
+            bytes: 72,
+            handles: 4,
         })
     }
     fn send_channel(&mut self, _: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
@@ -255,6 +269,7 @@ impl HelloSystem for StreamFixture {
         self.events.push(match handle {
             CHANNEL => "close-bootstrap",
             DwHandle(21..=23) => "close-stream",
+            ROOT => "close-root",
             _ => "close-other",
         });
         self.closed.push(handle);
@@ -312,12 +327,13 @@ fn stream_hello_uses_only_a_validated_native_stdout_record() {
     );
     assert_eq!(
         fixture.closed,
-        [DwHandle(21), DwHandle(22), DwHandle(23), CHANNEL]
+        [ROOT, DwHandle(21), DwHandle(22), DwHandle(23), CHANNEL]
     );
     assert_eq!(fixture.wait_count, 1);
     assert_eq!(
         fixture.events,
         [
+            "close-root",
             "stdout-data",
             "close-stream",
             "close-stream",
@@ -338,6 +354,9 @@ fn stream_hello_rejects_readable_post_ready_data() {
         Err(HelloError::PostReadySignals(DW_SIGNAL_READABLE))
     );
     assert_eq!(fixture.wait_count, 1);
-    assert_eq!(fixture.closed, [DwHandle(21), DwHandle(22), DwHandle(23)]);
+    assert_eq!(
+        fixture.closed,
+        [ROOT, DwHandle(21), DwHandle(22), DwHandle(23)]
+    );
     assert_eq!(fixture.events.last(), Some(&"wait-release"));
 }

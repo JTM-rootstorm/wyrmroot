@@ -1,6 +1,56 @@
 //! Checked segment and initial-stack materialization plans.
 
-use crate::elf::{LoadSegment, PAGE_SIZE, STACK_BYTES, STACK_TOP, SegmentProtection};
+use crate::elf::{
+    ElfLoadPlan, LoadSegment, PAGE_SIZE, PROGRAM_HEADER_ENTRY_BYTES, STACK_BYTES, STACK_TOP,
+    SegmentProtection,
+};
+
+/// Auxiliary-vector types the loader fills (System V ABI, as Linux numbers
+/// them, which is what musl reads).
+pub const AT_PHDR: u64 = 3;
+pub const AT_PHENT: u64 = 4;
+pub const AT_PHNUM: u64 = 5;
+pub const AT_PAGESZ: u64 = 6;
+pub const AT_ENTRY: u64 = 9;
+/// At most this many auxv entries before the terminal pair.
+pub const MAX_AUXV_ENTRIES: usize = 5;
+
+/// What a startup ABI v2 block's auxv says about the image (root
+/// `TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W2). `AT_RANDOM` is absent:
+/// Deepwyrm offers userspace no entropy source yet, and musl copes without it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageAuxv {
+    pub entry: u64,
+    pub program_headers: Option<crate::elf::ProgramHeaderTable>,
+}
+
+impl ImageAuxv {
+    pub fn from_plan(plan: &ElfLoadPlan<'_>) -> Self {
+        Self {
+            entry: plan.entry,
+            program_headers: plan.program_headers,
+        }
+    }
+
+    /// The entries in order: `AT_PHDR`, `AT_PHENT` and `AT_PHNUM` when the
+    /// table is mapped, then `AT_PAGESZ` and `AT_ENTRY`.
+    pub fn entries(&self) -> ([(u64, u64); MAX_AUXV_ENTRIES], usize) {
+        let mut entries = [(0, 0); MAX_AUXV_ENTRIES];
+        let mut count = 0;
+        let mut push = |kind, value| {
+            entries[count] = (kind, value);
+            count += 1;
+        };
+        if let Some(table) = self.program_headers {
+            push(AT_PHDR, table.address);
+            push(AT_PHENT, PROGRAM_HEADER_ENTRY_BYTES);
+            push(AT_PHNUM, u64::from(table.count));
+        }
+        push(AT_PAGESZ, PAGE_SIZE);
+        push(AT_ENTRY, self.entry);
+        (entries, count)
+    }
+}
 
 pub const STARTUP_ABI_VERSION: u64 = 1;
 pub const STARTUP_ABI_V2: u64 = 2;
@@ -111,8 +161,9 @@ pub fn write_startup_block_v2(
     path: &str,
     argv: &[&str],
     environment: &[&str],
+    auxv: &ImageAuxv,
 ) -> Result<(), StartupBlockError> {
-    let plan = StartupBlockV2Plan::new(block.len(), block_address, path, argv, environment)?;
+    let plan = StartupBlockV2Plan::new(block.len(), block_address, path, argv, environment, auxv)?;
     plan.write(block);
     Ok(())
 }
@@ -121,6 +172,8 @@ pub(crate) struct StartupBlockV2Plan<'a> {
     block_address: u64,
     argv: &'a [&'a str],
     environment: &'a [&'a str],
+    auxv: [(u64, u64); MAX_AUXV_ENTRIES],
+    auxv_count: usize,
     string_start: usize,
 }
 
@@ -131,7 +184,9 @@ impl<'a> StartupBlockV2Plan<'a> {
         path: &str,
         argv: &'a [&'a str],
         environment: &'a [&'a str],
+        auxv: &ImageAuxv,
     ) -> Result<Self, StartupBlockError> {
+        let (auxv, auxv_count) = auxv.entries();
         const MAX_ARGV: usize = 64;
         const MAX_ENVIRONMENT: usize = 64;
         const MAX_STRING_BYTES: usize = 16 * 1024;
@@ -188,7 +243,7 @@ impl<'a> StartupBlockV2Plan<'a> {
             .checked_add(argv.len())
             .and_then(|value| value.checked_add(1))
             .and_then(|value| value.checked_add(environment.len()))
-            .and_then(|value| value.checked_add(1 + 2))
+            .and_then(|value| value.checked_add(1 + 2 * (auxv_count + 1)))
             .ok_or(StartupBlockError::StringBytesExceeded)?;
         let string_start = vector_words
             .checked_mul(8)
@@ -203,6 +258,8 @@ impl<'a> StartupBlockV2Plan<'a> {
             block_address,
             argv,
             environment,
+            auxv,
+            auxv_count,
             string_start,
         })
     }
@@ -234,7 +291,15 @@ impl<'a> StartupBlockV2Plan<'a> {
             block[string_offset..string_offset + value.len()].copy_from_slice(value.as_bytes());
             string_offset += value.len() + 1;
         }
-        // envp NULL and terminal auxv pair remain zero.
+        // The envp NULL stays zero, then the auxv entries; the terminal
+        // pair stays zero.
+        word_offset += 8;
+        for &(kind, value) in &self.auxv[..self.auxv_count] {
+            put_u64(block, word_offset, kind);
+            put_u64(block, word_offset + 8, value);
+            word_offset += 16;
+        }
+        debug_assert_eq!(word_offset + 16, self.string_start);
     }
 }
 

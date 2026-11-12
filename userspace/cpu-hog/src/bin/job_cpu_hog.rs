@@ -7,8 +7,8 @@ use core::panic::PanicInfo;
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwSignals};
 use wyrmroot_cpu_hog::{
     JobActorSystem, WITNESS_BYTES, WITNESS_MXCSR, WitnessFailure, fs_anchor_value,
-    is_initial_entry_state, prepare_job_cpu_hog, validate_job_cpu_hog_entry, witness_pattern,
-    witness_selectors,
+    is_initial_entry_state, prepare_job_cpu_hog, validate_job_cpu_hog_auxv,
+    validate_job_cpu_hog_entry, witness_pattern, witness_selectors,
 };
 use wyrmroot_loader as _;
 use wyrmroot_runtime::{
@@ -59,6 +59,19 @@ fn job_cpu_hog_main(startup: StartupBlock<'_>) -> u32 {
         startup.argc(),
         startup.arg(0).map(|argument| argument.as_str()),
         startup.envc(),
+    ) {
+        return error.exit_code();
+    }
+    #[allow(
+        unsafe_code,
+        reason = "names the entry shim's own `_start` only to take its address; it is never called"
+    )]
+    unsafe extern "C" {
+        fn _start();
+    }
+    if let Err(error) = validate_job_cpu_hog_auxv(
+        (0..startup.auxc()).filter_map(|index| startup.aux(index)),
+        _start as unsafe extern "C" fn() as usize as u64,
     ) {
         return error.exit_code();
     }

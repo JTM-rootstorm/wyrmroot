@@ -60,11 +60,20 @@ satisfy all rules below:
 - input length `1..=16 MiB`;
 - program-header entry size exactly the ELF64 size, at most 16 program headers,
   and at most 8 `PT_LOAD` segments;
-- only `PT_LOAD`, optional `PT_PHDR`, and optional `PT_GNU_STACK` are accepted;
-- `PT_INTERP`, `PT_DYNAMIC`, `PT_TLS`, `PT_NOTE`, `PT_GNU_RELRO`, runtime
-  relocations, and every unrecognized program-header type are rejected;
-- at most one `PT_PHDR` and one `PT_GNU_STACK`; if present, the stack record must
-  not request execute permission;
+- only `PT_LOAD`, optional `PT_PHDR`, optional `PT_TLS`, and optional
+  `PT_GNU_STACK` are accepted;
+- `PT_INTERP`, `PT_DYNAMIC`, `PT_NOTE`, `PT_GNU_RELRO`, runtime relocations,
+  and every unrecognized program-header type are rejected;
+- at most one `PT_PHDR`, one `PT_TLS` and one `PT_GNU_STACK`; if present, the
+  stack record must not request execute permission;
+- a `PT_PHDR` must name exactly the address at which one `PT_LOAD` maps the
+  program-header table from the file (2026-11-11);
+- a `PT_TLS` (2026-11-11, root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W2) is
+  read-only, has `filesz <= memsz <= 32 MiB`, an alignment of 0 or a power of
+  two no larger than 4096, and a range inside lower-canonical userspace; a
+  nonempty initialization image must lie wholly inside one `PT_LOAD`'s
+  file-backed bytes at the matching address. The loader only checks it: the
+  program builds its own TLS block;
 - every `PT_LOAD` has `filesz <= memsz`, a nonzero memory size, valid power-of-two
   alignment no smaller than 4096, and congruent file offset/virtual address;
 - all file, raw virtual, page-rounded virtual, and aggregate-size arithmetic is

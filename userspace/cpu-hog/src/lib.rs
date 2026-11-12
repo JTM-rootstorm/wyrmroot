@@ -19,6 +19,8 @@ use wyrmroot_runtime::{
 };
 
 pub const JOB_CPU_HOG_PATH: &str = "bin/cpu-hog";
+/// A JobV2 INIT: the header and the self-root role.
+const JOB_INIT_BYTES: usize = HEADER_BYTES + 8;
 
 pub trait JobActorSystem {
     fn query_capability_info(
@@ -47,6 +49,8 @@ pub enum JobActorError {
     Init,
     Release,
     Cleanup,
+    /// The startup auxv lacked the page size or named another entry point.
+    Auxv,
 }
 
 impl JobActorError {
@@ -59,6 +63,7 @@ impl JobActorError {
                 Self::Init => 3,
                 Self::Release => 4,
                 Self::Cleanup => 5,
+                Self::Auxv => 6,
             }
     }
 }
@@ -80,6 +85,31 @@ pub fn validate_job_cpu_hog_entry(
     }
 }
 
+/// The auxv a job's startup block carries (root
+/// `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W2): exactly one `AT_PAGESZ` of 4096 and
+/// one `AT_ENTRY` naming the job's own entry point.
+pub fn validate_job_cpu_hog_auxv(
+    entries: impl Iterator<Item = (u64, u64)>,
+    entry_point: u64,
+) -> Result<(), JobActorError> {
+    const AT_PAGESZ: u64 = 6;
+    const AT_ENTRY: u64 = 9;
+    let (mut page_size, mut entry) = (0usize, 0usize);
+    for (kind, value) in entries {
+        match kind {
+            AT_PAGESZ if value == 4096 => page_size += 1,
+            AT_ENTRY if value == entry_point => entry += 1,
+            AT_PAGESZ | AT_ENTRY => return Err(JobActorError::Auxv),
+            _ => {}
+        }
+    }
+    if (page_size, entry) == (1, 1) {
+        Ok(())
+    } else {
+        Err(JobActorError::Auxv)
+    }
+}
+
 pub fn prepare_job_cpu_hog<System: JobActorSystem>(
     system: &mut System,
     bootstrap: DwHandle,
@@ -91,29 +121,29 @@ pub fn prepare_job_cpu_hog<System: JobActorSystem>(
         validate_bootstrap_channel(info, BOOTSTRAP_CHANNEL_EXPECTATION)
             .map_err(|_| JobActorError::Bootstrap)?;
 
-        let mut bytes = [0u8; HEADER_BYTES];
-        let mut unexpected = [DwReceivedHandleInfoV1::default(); 1];
+        // INIT carries exactly the job's self root (WRLP 1.12). The hog maps
+        // nothing, so it checks the root and closes it at once.
+        let mut bytes = [0u8; JOB_INIT_BYTES];
+        let mut received = [DwReceivedHandleInfoV1::default(); 2];
         let counts = system
-            .receive_channel(bootstrap, &mut bytes, &mut unexpected)
+            .receive_channel(bootstrap, &mut bytes, &mut received)
             .map_err(|_| JobActorError::Native)?;
-        if counts.bytes != HEADER_BYTES || counts.handles != 0 {
-            let mut cleanup_failed = false;
-            for info in unexpected[..counts.handles.min(unexpected.len())]
-                .iter()
-                .rev()
-            {
-                if info.handle.0 != 0 {
-                    cleanup_failed |= system.close_handle(info.handle).is_err();
-                }
+        let received = &received[..counts.handles.min(received.len())];
+        let init = if counts.bytes == JOB_INIT_BYTES && received.len() == 1 {
+            parse_init(LaunchProfile::JobV2, &bytes, received).map_err(|_| JobActorError::Init)
+        } else {
+            Err(JobActorError::Init)
+        };
+        let mut cleanup_failed = false;
+        for info in received.iter().rev() {
+            if info.handle.0 != 0 {
+                cleanup_failed |= system.close_handle(info.handle).is_err();
             }
-            return Err(if cleanup_failed {
-                JobActorError::Cleanup
-            } else {
-                JobActorError::Init
-            });
         }
-        let init =
-            parse_init(LaunchProfile::JobV2, &bytes, &[]).map_err(|_| JobActorError::Init)?;
+        if cleanup_failed {
+            return Err(JobActorError::Cleanup);
+        }
+        let init = init?;
         let mut ready = [0u8; HEADER_BYTES];
         let size = encode_ready_for_profile(LaunchProfile::JobV2, init.transaction_id, &mut ready)
             .map_err(|_| JobActorError::Init)?;
@@ -247,21 +277,23 @@ mod tests {
 
     const CHANNEL: DwHandle = DwHandle(11);
 
+    const ROOT: DwHandle = DwHandle(20);
+
     struct JobFixture {
-        init: [u8; HEADER_BYTES],
+        init: [u8; JOB_INIT_BYTES],
         rights: DwRights,
         unexpected: Option<DwHandle>,
         signals: DwSignals,
         sent: [u8; HEADER_BYTES],
         sent_len: usize,
-        closes: [DwHandle; 2],
+        closes: [DwHandle; 4],
         close_count: usize,
         wait_count: usize,
     }
 
     impl JobFixture {
         fn new(transaction: u64) -> Self {
-            let mut init = [0; HEADER_BYTES];
+            let mut init = [0; JOB_INIT_BYTES];
             wyrmroot_loader::launch::encode_init(LaunchProfile::JobV2, transaction, &mut init)
                 .unwrap();
             Self {
@@ -271,7 +303,7 @@ mod tests {
                 signals: DW_SIGNAL_PEER_CLOSED,
                 sent: [0; HEADER_BYTES],
                 sent_len: 0,
-                closes: [DwHandle(0); 2],
+                closes: [DwHandle(0); 4],
                 close_count: 0,
                 wait_count: 0,
             }
@@ -300,8 +332,14 @@ mod tests {
         ) -> Result<ReceiveCounts, NativeError> {
             assert_eq!(channel, CHANNEL);
             bytes.copy_from_slice(&self.init);
+            handles[0] = DwReceivedHandleInfoV1 {
+                handle: ROOT,
+                object_type: deepwyrm_syscall::DW_OBJECT_TYPE_ADDRESS_REGION,
+                rights: wyrmroot_loader::launch::SELF_ROOT_RIGHTS,
+                ..DwReceivedHandleInfoV1::default()
+            };
             if let Some(handle) = self.unexpected {
-                handles[0] = DwReceivedHandleInfoV1 {
+                handles[1] = DwReceivedHandleInfoV1 {
                     handle,
                     object_type: DW_OBJECT_TYPE_CHANNEL,
                     rights: BOOTSTRAP_CHANNEL_EXPECTATION.rights,
@@ -310,7 +348,7 @@ mod tests {
             }
             Ok(ReceiveCounts {
                 bytes: self.init.len(),
-                handles: usize::from(self.unexpected.is_some()),
+                handles: 1 + usize::from(self.unexpected.is_some()),
             })
         }
 
@@ -364,7 +402,29 @@ mod tests {
             Ok(())
         );
         assert_eq!(fixture.wait_count, 1);
-        assert_eq!(fixture.closes[..fixture.close_count], [CHANNEL]);
+        // The unused self root is closed before READY, the bootstrap last.
+        assert_eq!(fixture.closes[..fixture.close_count], [ROOT, CHANNEL]);
+    }
+
+    #[test]
+    fn the_auxv_must_carry_the_page_size_and_this_entry_point() {
+        let entry = 0x40_1000;
+        let good = [(3, 0x40_0040), (6, 4096), (9, entry)];
+        assert_eq!(validate_job_cpu_hog_auxv(good.into_iter(), entry), Ok(()));
+        for bad in [
+            &[(6, 4096)][..],
+            &[(9, entry)][..],
+            &[(6, 8192), (9, entry)][..],
+            &[(6, 4096), (9, entry + 1)][..],
+            &[(6, 4096), (6, 4096), (9, entry)][..],
+            &[][..],
+        ] {
+            assert_eq!(
+                validate_job_cpu_hog_auxv(bad.iter().copied(), entry),
+                Err(JobActorError::Auxv),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -385,7 +445,7 @@ mod tests {
         );
         assert_eq!(
             delegated.closes[..delegated.close_count],
-            [DwHandle(21), CHANNEL]
+            [DwHandle(21), ROOT, CHANNEL]
         );
 
         let mut readable = JobFixture::new(90);
@@ -394,7 +454,7 @@ mod tests {
             prepare_job_cpu_hog(&mut readable, CHANNEL),
             Err(JobActorError::Release)
         );
-        assert_eq!(readable.closes[..readable.close_count], [CHANNEL]);
+        assert_eq!(readable.closes[..readable.close_count], [ROOT, CHANNEL]);
     }
 
     #[test]
