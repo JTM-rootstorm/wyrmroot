@@ -612,13 +612,17 @@ fn connections_and_synthetic_nodes_are_bounded() {
     }
     assert_eq!(nodes.len(), MAX_NODES);
 
-    // A connection's nodes still count after it closes, and its successor
-    // in the same slot starts with a full share of its own.
+    // A closed connection's nodes keep their slots: its successor in the
+    // same slot is refused while the table is full of them (review L1),
+    // and gets its own share once other nodes close.
     let first = connections[0];
     h.world.close_handle(first).unwrap();
     h.settle();
     let (successor, server) = h.world.create_channel(ROOT_CHANNEL_RIGHTS).unwrap();
     assert!(h.vfs.accept_client(&mut h.world, server));
+    let refused = h.open_on(successor, OPEN_READ, b"/");
+    h.settle();
+    h.assert_refused(refused, Status::NoResources);
     h.world.close_handle(nodes.pop().unwrap()).unwrap();
     h.world.close_handle(nodes.pop().unwrap()).unwrap();
     h.settle();

@@ -43,11 +43,16 @@ use wyrmroot_loader as _;
 pub const MAX_CLIENTS: usize = wyrmroot_service_proto::roles::SYSTEM_VFS_MAX_CLIENTS;
 /// The synthetic directory nodes one connection may hold open, counted
 /// for as long as the nodes live, even after the connection closes.
-/// Connections are never renumbered, so no client can take another's
+/// Connections are never renumbered, so no client can take more than its
 /// share (security review M2, 2026-11-12: jobs can now open nodes).
 pub const MAX_NODES_PER_CONNECTION: usize = 2;
-/// The most synthetic directory nodes open at once: every live connection's
-/// full share, the admin connection's included.
+/// The most synthetic directory nodes open at once: one full share per
+/// client slot, the admin connection's included. Nodes a closed connection
+/// left open keep their slots until they close, so a new connection in a
+/// refilled slot is guaranteed its share only when no such nodes are held.
+/// Only resident roles can open connections, and each job has one for life
+/// (2 nodes at most), so jobs alone can never fill the table (review
+/// 2026-11-12, L1).
 pub const MAX_NODES: usize = MAX_NODES_PER_CONNECTION * (MAX_CLIENTS + 1);
 /// The most caller wait items [`server::Vfs::step`] adds to its own.
 pub const MAX_EXTRA_WAITS: usize = 4;

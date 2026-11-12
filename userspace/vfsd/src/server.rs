@@ -104,9 +104,15 @@ impl Vfs {
             .position(|slot| *slot == DW_HANDLE_INVALID)
         {
             Some(slot) => {
+                // Ids are never reused, and id 0 is the admin's: refuse
+                // rather than wrap (review 2026-11-12, I1).
+                let Some(next) = self.next_client_id.checked_add(1) else {
+                    let _ = platform.close_handle(channel);
+                    return false;
+                };
                 self.clients[slot] = channel;
                 self.client_ids[slot] = self.next_client_id;
-                self.next_client_id += 1;
+                self.next_client_id = next;
                 true
             }
             None => {
