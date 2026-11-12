@@ -79,7 +79,7 @@ const JOB_OUTPUT: &[u8] = b"hello from native stdout";
 const SDK_RUNS: [(&str, &[u8]); 3] = [
     (
         "run /boot/EFI/WYRMROOT/SDKHELLO.ELF",
-        b"hello from musl: 1 argument, 6*7=42, pi=3.14159, pages=64",
+        b"hello from musl: 1 argument, 6*7=42, pi=3.14159, pages=2048",
     ),
     // zlib's own test/example.c, with its gzip file on the root filesystem.
     (
