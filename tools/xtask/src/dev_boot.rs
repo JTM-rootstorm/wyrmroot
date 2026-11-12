@@ -217,9 +217,13 @@ fn qemu_arguments(
         vcpus.to_string(),
         // The default TCG model lacks what large-memory support relies on:
         // 1 GiB pages for the kernel's direct map, SMEP and SMAP
-        // (Deepwyrm DW2 M2).
+        // (Deepwyrm DW2 M2). It also calls itself Intel, which makes the
+        // kernel read IA32_ARCH_CAPABILITIES for its Meltdown check; TCG
+        // makes that one read cost about 20 s of the run. The development
+        // hosts are AMD, where the kernel skips the read, so the guest is
+        // too.
         "-cpu".into(),
-        "qemu64,+pdpe1gb,+smep,+smap".into(),
+        "qemu64,vendor=AuthenticAMD,+pdpe1gb,+smep,+smap".into(),
         "-nodefaults".into(),
         "-display".into(),
         "none".into(),
@@ -726,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn the_guest_cpu_has_gigabyte_pages_smep_and_smap() {
+    fn the_guest_cpu_is_amd_with_gigabyte_pages_smep_and_smap() {
         let args = qemu_arguments(
             false,
             Path::new("product"),
@@ -739,7 +743,7 @@ mod tests {
             .find(|pair| pair[0] == "-cpu")
             .map(|pair| pair[1].clone())
             .expect("a CPU model is chosen");
-        for feature in ["+pdpe1gb", "+smep", "+smap"] {
+        for feature in ["vendor=AuthenticAMD", "+pdpe1gb", "+smep", "+smap"] {
             assert!(
                 cpu.split(',').any(|part| part == feature),
                 "{feature} in {cpu}"
