@@ -573,3 +573,60 @@ fn a_journaled_volume_commits_on_sync_and_retires_clean() {
     );
     Volume::mount(&mut image, IMAGE_BYTES as u64, false).unwrap();
 }
+
+#[test]
+fn space_freed_since_the_last_commit_is_used_after_committing() {
+    // W11 review R7: the allocator passes over blocks freed in the running
+    // transaction, so a full volume whose space was just freed reported
+    // NoSpace until the next commit.
+    let (world, disk, launched, root, server) = start(image_with_journal(1024));
+    let mut fs = Fs {
+        world,
+        disk,
+        launched,
+        server: server.unwrap_or_else(|step| panic!("ext4d did not start: {step}")),
+        root,
+        transaction: 1,
+    };
+    let flags = OPEN_READ | OPEN_WRITE | OPEN_FILE | OPEN_CREATE;
+    let (big, status, _) = fs.open(root, flags, b"big");
+    assert_eq!(status, Status::Ok);
+    let chunk = pattern(8192);
+    let mut offset = 0u64;
+    loop {
+        match fs.status(
+            big,
+            Body::Write {
+                offset,
+                data: &chunk,
+            },
+        ) {
+            (Status::Ok, written) if written > 0 => offset += written,
+            (Status::NoSpace, _) => break,
+            other => panic!("filling the volume: {other:?}"),
+        }
+    }
+    assert!(offset > 1 << 20, "the volume held only {offset} bytes");
+    assert_eq!(fs.status(big, Body::Sync).0, Status::Ok);
+    // Freed in the running transaction, not yet committed.
+    assert_eq!(fs.status(big, Body::Truncate { size: 0 }).0, Status::Ok);
+    let (small, status, _) = fs.open(root, flags, b"small");
+    assert_eq!(status, Status::Ok);
+    let data = pattern(64 << 10);
+    for (index, part) in data.chunks(8192).enumerate() {
+        assert_eq!(
+            fs.status(
+                small,
+                Body::Write {
+                    offset: (index * 8192) as u64,
+                    data: part,
+                },
+            ),
+            (Status::Ok, part.len() as u64)
+        );
+    }
+    assert_eq!(fs.read_all(small), data);
+    assert_eq!(fs.status(small, Body::Sync).0, Status::Ok);
+    assert_eq!(fs.on_disk(b"small"), Some(data));
+    assert_eq!(fs.on_disk(b"big"), Some(Vec::new()));
+}

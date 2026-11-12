@@ -15,7 +15,10 @@
 //! its request is answered, and metadata collects in a transaction of up to
 //! [`TRANSACTION_SLOTS`] blocks in a second buffer, committed on SYNC, once
 //! it is half full, [`COMMIT_INTERVAL_NS`] after its first change, and when
-//! the role retires. A crash loses at most the uncommitted transaction. An
+//! the role retires. A crash loses at most the uncommitted transaction.
+//! Space freed in the running transaction is reused only after it commits,
+//! so a write, create or truncate that runs out of space commits and tries
+//! once more. An
 //! operation that would overflow the transaction, or a failed commit, turns
 //! the volume read-only with the last commit on disk. Without a journal
 //! every write reaches the device before its request is answered, and SYNC
@@ -592,6 +595,15 @@ impl<V: View> Server<V> {
         result
     }
 
+    /// Commits so a request that ran out of space can try once more. The
+    /// allocator passes over blocks freed in the running transaction until
+    /// it commits, so a volume whose free space was all freed since the last
+    /// commit reports NoSpace early (W11 review R7). Whether a retry may help.
+    fn commit_for_space<P: Ext4Platform>(&mut self, platform: &mut P) -> bool {
+        let pending = matches!(&self.journal, Some((_, transaction)) if !transaction.is_empty());
+        pending && self.commit(platform).is_ok()
+    }
+
     /// After a request: a transaction that overflowed is dropped (the volume
     /// turns read-only on its last commit); one half full commits; one with
     /// changes gets a commit deadline.
@@ -759,7 +771,19 @@ impl<V: View> Server<V> {
                 }
             }
             Body::Write { offset, data } if writable => {
-                match self.volume.write(&mut device, here.inode, offset, data) {
+                let mut written = self.volume.write(&mut device, here.inode, offset, data);
+                if matches!(written, Err(Ext4Error::NoSpace)) && self.commit_for_space(platform) {
+                    let mut device = Self::device(
+                        platform,
+                        &mut self.client,
+                        &mut self.view,
+                        &mut self.cache,
+                        &mut self.journal,
+                        &mut self.full,
+                    );
+                    written = self.volume.write(&mut device, here.inode, offset, data);
+                }
+                match written {
                     Ok(written) => Body::Status {
                         status: Status::Ok,
                         value: written as u64,
@@ -768,7 +792,19 @@ impl<V: View> Server<V> {
                 }
             }
             Body::Truncate { size } if writable => {
-                status(match self.volume.truncate(&mut device, here.inode, size) {
+                let mut truncated = self.volume.truncate(&mut device, here.inode, size);
+                if matches!(truncated, Err(Ext4Error::NoSpace)) && self.commit_for_space(platform) {
+                    let mut device = Self::device(
+                        platform,
+                        &mut self.client,
+                        &mut self.view,
+                        &mut self.cache,
+                        &mut self.journal,
+                        &mut self.full,
+                    );
+                    truncated = self.volume.truncate(&mut device, here.inode, size);
+                }
+                status(match truncated {
                     Ok(()) => Status::Ok,
                     Err(error) => status_of(error),
                 })
@@ -903,7 +939,12 @@ impl<V: View> Server<V> {
     ) {
         let slot = self.nodes.iter().position(Option::is_none);
         let found = match slot {
-            Some(_) => self.resolve_for_open(platform, dir, flags, path),
+            Some(_) => match self.resolve_for_open(platform, dir, flags, path) {
+                Err(Status::NoSpace) if self.commit_for_space(platform) => {
+                    self.resolve_for_open(platform, dir, flags, path)
+                }
+                found => found,
+            },
             None => Err(Status::NoResources),
         };
         let access = (if flags & OPEN_READ != 0 {
