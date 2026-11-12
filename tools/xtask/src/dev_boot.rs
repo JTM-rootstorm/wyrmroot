@@ -518,9 +518,10 @@ fn monitor_socket(com1: &Path) -> PathBuf {
     com1.with_extension("monitor")
 }
 
-/// Stops the guest and writes every CPU's registers and the top of each
-/// stack, from QEMU's monitor at `socket`, to `output`. Best effort: a
-/// failed check is reported either way.
+/// Stops the guest and writes, from QEMU's monitor at `socket`, every
+/// CPU's registers and the top of its stack, the interrupt controllers, and
+/// the shell UART's (COM2) registers to `output`. Best effort: a failed
+/// check is reported either way.
 fn record_cpu_state(socket: &Path, output: &Path) {
     let Ok(mut monitor) = std::os::unix::net::UnixStream::connect(socket) else {
         return;
@@ -536,25 +537,42 @@ fn record_cpu_state(socket: &Path, output: &Path) {
             state.extend_from_slice(&buffer[..read]);
         }
     };
+    let send = |monitor: &mut std::os::unix::net::UnixStream,
+                    state: &mut Vec<u8>,
+                    command: &str| {
+        let sent = monitor.write_all(format!("{command}\n").as_bytes()).is_ok();
+        read_all(monitor, state);
+        sent
+    };
     read_all(&mut monitor, &mut state);
-    let mut commands = vec![
-        "stop".to_owned(),
-        "info status".to_owned(),
-        "info cpus".to_owned(),
-        "info registers -a".to_owned(),
-    ];
-    for cpu in 0..SMP_VCPUS {
-        commands.push(format!("cpu {cpu}"));
-        commands.push("x /96gx $rsp".to_owned());
-    }
-    for command in commands {
-        if monitor
-            .write_all(format!("{command}\n").as_bytes())
-            .is_err()
-        {
+    for command in [
+        "stop",
+        "info status",
+        "info cpus",
+        "info registers -a",
+        "info pic",
+        "info lapic",
+        "info irq",
+        // COM2 at 0x2f8: IER, LSR, MSR, then IIR last, since reading IIR
+        // clears a pending transmit interrupt.
+        "i /b 0x2f9",
+        "i /b 0x2fd",
+        "i /b 0x2fe",
+        "i /b 0x2fa",
+    ] {
+        if !send(&mut monitor, &mut state, command) {
             break;
         }
-        read_all(&mut monitor, &mut state);
+    }
+    let registers = String::from_utf8_lossy(&state).into_owned();
+    for (cpu, stack) in registers
+        .split("RSP=")
+        .skip(1)
+        .filter_map(|tail| tail.get(..16))
+        .enumerate()
+    {
+        let _ = send(&mut monitor, &mut state, &format!("cpu {cpu}"));
+        let _ = send(&mut monitor, &mut state, &format!("x /128gx 0x{stack}"));
     }
     let _ = fs::write(output, strip_escapes(&state));
 }
