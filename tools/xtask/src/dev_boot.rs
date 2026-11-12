@@ -76,7 +76,7 @@ const JOB_OUTPUT: &[u8] = b"hello from native stdout";
 /// The SDK's test programs (`wyrmroot-sdk/programs`, on the ESP as
 /// [`crate::product::SDK_FILES`]): each command and the line it must print
 /// before exiting normally with status 0.
-const SDK_RUNS: [(&str, &[u8]); 3] = [
+const SDK_RUNS: [(&str, &[u8]); 5] = [
     (
         "run /boot/EFI/WYRMROOT/SDKHELLO.ELF",
         b"hello from musl: 1 argument, 6*7=42, pi=3.14159, pages=2048",
@@ -90,6 +90,13 @@ const SDK_RUNS: [(&str, &[u8]); 3] = [
     (
         "run /boot/EFI/WYRMROOT/LUA.ELF /boot/EFI/WYRMROOT/TEST.LUA",
         b"lua tests passed: ",
+    ),
+    // The sqlite3 shell, then `wyrmroot-sdk/programs/sqlite-test.c`, which
+    // removes its own database.
+    ("run /boot/EFI/WYRMROOT/SQLITE3.ELF -version", b"3.54.1 "),
+    (
+        "run /boot/EFI/WYRMROOT/SQLTEST.ELF",
+        b"sqlite tests passed: ",
     ),
 ];
 /// Files the SDK programs leave on the root filesystem.

@@ -179,11 +179,13 @@ const fn native(
 /// Builds the product into `output`, which must not exist yet.
 /// The SDK's test files dev-boot runs from `/EFI/WYRMROOT`: each file in
 /// `<sdk>/programs` and its 8.3 name on the ESP.
-pub(crate) const SDK_FILES: [(&str, [u8; 11]); 4] = [
+pub(crate) const SDK_FILES: [(&str, [u8; 11]); 6] = [
     ("hello.elf", *b"SDKHELLOELF"),
     ("zlib-example.elf", *b"ZEXAMPLEELF"),
     ("lua.elf", *b"LUA     ELF"),
     ("test.lua", *b"TEST    LUA"),
+    ("sqlite3.elf", *b"SQLITE3 ELF"),
+    ("sqlite-test.elf", *b"SQLTEST ELF"),
 ];
 /// The largest SDK file the ESP takes; init reads at most 8 MiB.
 const MAX_SDK_PROGRAM_BYTES: u64 = 8 << 20;
