@@ -10,8 +10,8 @@ Usage:
 dev-boot builds the current product from both working trees and boots it in
 local QEMU; COM2 is the `wyrmsh` console. --check drives the prompt, sends
 Ctrl-D and requires the kernel's power-off line instead. --sdk names a built
-Wyrmroot SDK (`wyrmroot-sdk/out`): its C hello goes on the ESP, and --check
-runs it.
+Wyrmroot SDK (`wyrmroot-sdk/out`): its test programs (hello, zlib, Lua) go
+on the ESP, and --check runs them.
 
 product builds the same product into a directory: artifacts/esp.img plus the
 loader, kernel, bootstrap, natives, bootfs and OVMF pair.

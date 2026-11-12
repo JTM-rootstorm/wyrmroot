@@ -49,8 +49,8 @@ pub(crate) struct DevBoot {
     pub(crate) check: bool,
     pub(crate) smp: bool,
     pub(crate) deep_repository: Option<String>,
-    /// A built Wyrmroot SDK (`wyrmroot-sdk/out`) whose C hello goes on the
-    /// ESP and, under `--check`, runs (root `TOOLCHAIN_PLAN.md` step 2).
+    /// A built Wyrmroot SDK (`wyrmroot-sdk/out`) whose test programs go on
+    /// the ESP and, under `--check`, run (root `TOOLCHAIN_PLAN.md` step 2).
     pub(crate) sdk: Option<String>,
 }
 
@@ -73,8 +73,27 @@ const SERVICES: [&[u8]; 5] = [
 const ESP_LISTING: [&[u8]; 2] = [b"bootstrap.elf\r\n", b"README.TXT\r\n"];
 const ESP_README: &[u8] = b"This is the Wyrmroot EFI System Partition.";
 const JOB_OUTPUT: &[u8] = b"hello from native stdout";
-/// What `wyrmroot-sdk/programs/hello.c` prints when run with no arguments.
-const SDK_HELLO_OUTPUT: &[u8] = b"hello from musl: 1 argument, 6*7=42, pi=3.14159, pages=64";
+/// The SDK's test programs (`wyrmroot-sdk/programs`, on the ESP as
+/// [`crate::product::SDK_FILES`]): each command and the line it must print
+/// before exiting normally with status 0.
+const SDK_RUNS: [(&str, &[u8]); 3] = [
+    (
+        "run /boot/EFI/WYRMROOT/SDKHELLO.ELF",
+        b"hello from musl: 1 argument, 6*7=42, pi=3.14159, pages=64",
+    ),
+    // zlib's own test/example.c, with its gzip file on the root filesystem.
+    (
+        "run /boot/EFI/WYRMROOT/ZEXAMPLE.ELF /zlib-example.gz",
+        b"inflate with dictionary: hello, hello!",
+    ),
+    // The Lua interpreter running `wyrmroot-sdk/programs/test.lua`.
+    (
+        "run /boot/EFI/WYRMROOT/LUA.ELF /boot/EFI/WYRMROOT/TEST.LUA",
+        b"lua tests passed: ",
+    ),
+];
+/// Files the SDK programs leave on the root filesystem.
+const SDK_LEFTOVERS: [&str; 1] = ["/zlib-example.gz"];
 /// Services and mounts come up beside the shell, so their checks are retried.
 const ATTEMPTS: usize = 20;
 /// What the first boot writes and the second reads back.
@@ -278,17 +297,22 @@ fn first_boot(shell: &mut Shell<'_>, token: &str, sdk: bool) -> Result<(), Failu
     // fat32d instead of bootfs.
     shell.expect("run /boot/EFI/WYRMROOT/HELLO.ELF", JOB_OUTPUT)?;
     if sdk {
-        // A static C program built against the SDK: musl over the POSIX
-        // layer, started from the ESP like the hello above, ending in a
-        // normal exit with status 0.
-        let output = shell.run("run /boot/EFI/WYRMROOT/SDKHELLO.ELF")?;
-        if !contains(&output, SDK_HELLO_OUTPUT)
-            || !contains(&output, b"classification=normal application=0 ")
-        {
-            return Err(Failure::task(format!(
-                "dev-boot check: the SDK hello printed {:?}",
-                String::from_utf8_lossy(&output)
-            )));
+        // Static C programs built against the SDK: musl over the POSIX
+        // layer, started from the ESP like the hello above, each ending in
+        // a normal exit with status 0.
+        for (command, expected) in SDK_RUNS {
+            let output = shell.run(command)?;
+            if !contains(&output, expected)
+                || !contains(&output, b"classification=normal application=0 ")
+            {
+                return Err(Failure::task(format!(
+                    "dev-boot check: `{command}` printed {:?}",
+                    String::from_utf8_lossy(&output)
+                )));
+            }
+        }
+        for path in SDK_LEFTOVERS {
+            shell.quiet(&format!("rm {path}"))?;
         }
     }
     for job in hogs {

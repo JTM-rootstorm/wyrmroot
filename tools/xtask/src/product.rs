@@ -177,14 +177,20 @@ const fn native(
 }
 
 /// Builds the product into `output`, which must not exist yet.
-/// An SDK program on the ESP: `/EFI/WYRMROOT/SDKHELLO.ELF`.
-pub(crate) const SDK_HELLO_SHORT: [u8; 11] = *b"SDKHELLOELF";
-/// The largest SDK program the ESP takes; init reads at most 8 MiB.
+/// The SDK's test files dev-boot runs from `/EFI/WYRMROOT`: each file in
+/// `<sdk>/programs` and its 8.3 name on the ESP.
+pub(crate) const SDK_FILES: [(&str, [u8; 11]); 4] = [
+    ("hello.elf", *b"SDKHELLOELF"),
+    ("zlib-example.elf", *b"ZEXAMPLEELF"),
+    ("lua.elf", *b"LUA     ELF"),
+    ("test.lua", *b"TEST    LUA"),
+];
+/// The largest SDK file the ESP takes; init reads at most 8 MiB.
 const MAX_SDK_PROGRAM_BYTES: u64 = 8 << 20;
 
 /// Builds the product into `output`. With `sdk`, a built Wyrmroot SDK
-/// (`wyrmroot-sdk/out`), its C hello goes on the ESP as
-/// [`SDK_HELLO_SHORT`] for dev-boot to run.
+/// (`wyrmroot-sdk/out`), its [`SDK_FILES`] go on the ESP for dev-boot to
+/// run.
 pub(crate) fn build(
     output: &Path,
     deep_repository: &Path,
@@ -264,15 +270,17 @@ pub(crate) fn build(
             read_regular_bounded(Path::new(OVMF_VARS_PATH), MAX_FIRMWARE_BYTES, "OVMF vars")?;
         let device_table = boot_device_table();
         let root_disk = root_disk()?;
-        let sdk_hello = sdk
-            .map(|sdk| {
-                read_regular_bounded(
-                    &sdk.join("programs").join("hello.elf"),
+        let mut sdk_files = Vec::new();
+        if let Some(sdk) = sdk {
+            for (name, short_name) in SDK_FILES {
+                let bytes = read_regular_bounded(
+                    &sdk.join("programs").join(name),
                     MAX_SDK_PROGRAM_BYTES,
-                    "SDK hello",
-                )
-            })
-            .transpose()?;
+                    "SDK test file",
+                )?;
+                sdk_files.push((format!("sdk-{name}"), short_name, bytes));
+            }
+        }
         for (name, bytes) in [
             ("loader.efi", uefi.loader_bytes.as_slice()),
             ("deepwyrm.elf", kernel.as_slice()),
@@ -302,12 +310,15 @@ pub(crate) fn build(
         ] {
             write_new(&artifacts.join(name), bytes, name)?;
         }
-        if let Some(bytes) = &sdk_hello {
-            write_new(&artifacts.join("sdk-hello.elf"), bytes, "sdk-hello.elf")?;
+        for (artifact, _, bytes) in &sdk_files {
+            write_new(&artifacts.join(artifact), bytes, artifact)?;
         }
         let path = |name: &str| artifacts.join(name).display().to_string();
         let (readme_path, hello_path) = (path("esp-readme.txt"), path("hello.elf"));
-        let sdk_hello_path = path("sdk-hello.elf");
+        let sdk_paths: Vec<([u8; 11], String)> = sdk_files
+            .iter()
+            .map(|(artifact, short_name, _)| (*short_name, path(artifact)))
+            .collect();
         let mut extras = vec![
             g3_image::EspExtra {
                 short_name: *b"README  TXT",
@@ -318,10 +329,10 @@ pub(crate) fn build(
                 path: &hello_path,
             },
         ];
-        if sdk_hello.is_some() {
+        for (short_name, path) in &sdk_paths {
             extras.push(g3_image::EspExtra {
-                short_name: SDK_HELLO_SHORT,
-                path: &sdk_hello_path,
+                short_name: *short_name,
+                path,
             });
         }
         g3_image::build_d6(
