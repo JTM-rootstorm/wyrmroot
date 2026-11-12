@@ -16,11 +16,12 @@
 //! README through vfsd, fat32d and blockmgr; spawns two `bin/cpu-hog` jobs,
 //! which hold their own FP registers and FS base while they preempt each
 //! other; runs `bin/hello` (a shell job under its TaskGroup limits) and the
-//! same ELF from the ESP to their output and the next prompt; terminates the
-//! hogs and requires each to have been still running; then writes a file and makes a directory on the root
-//! (W7) and shuts down with Ctrl-D. The second boot `cat`s the file back,
-//! removes it and shuts down. Each boot must end with the kernel's power-off
-//! line on its COM1 log. That is the smoke check for development commits.
+//! same ELF from the ESP to their output and the next prompt (with `--sdk`,
+//! also the SDK's hello); terminates the hogs and requires each to have been
+//! still running; with `--sdk`, runs the SDK's other programs; then writes a
+//! file and makes a directory on the root (W7) and shuts down with Ctrl-D.
+//! The second boot `cat`s the file back, removes it and shuts down. Each
+//! boot must end with the kernel's power-off line on its COM1 log. That is the smoke check for development commits.
 //!
 //! The persistent root is a second, writable virtio disk at 00:02.0: a copy
 //! of the product's empty ext4 `root.img`. `--check` makes a fresh copy per
@@ -75,7 +76,11 @@ const ESP_README: &[u8] = b"This is the Wyrmroot EFI System Partition.";
 const JOB_OUTPUT: &[u8] = b"hello from native stdout";
 /// The SDK's test programs (`wyrmroot-sdk/programs`, on the ESP as
 /// [`crate::product::SDK_FILES`]): each command and the line it must print
-/// before exiting normally with status 0.
+/// before exiting normally with status 0. The first [`SDK_CONTENDED_RUNS`]
+/// run while the CPU hogs preempt them, so a C program's SSE state is also
+/// witnessed across preemption; the rest, which use the disk, run after the
+/// hogs end. Each disk request crosses ext4d, blockmgr and virtio-blkd, and
+/// under the hogs every hop waits out a time slice (about 15 times slower).
 const SDK_RUNS: [(&str, &[u8]); 5] = [
     (
         "run /boot/EFI/WYRMROOT/SDKHELLO.ELF",
@@ -99,6 +104,7 @@ const SDK_RUNS: [(&str, &[u8]); 5] = [
         b"sqlite tests passed: ",
     ),
 ];
+const SDK_CONTENDED_RUNS: usize = 1;
 /// Files the SDK programs leave on the root filesystem.
 const SDK_LEFTOVERS: [&str; 1] = ["/zlib-example.gz"];
 /// Services and mounts come up beside the shell, so their checks are retried.
@@ -305,22 +311,8 @@ fn first_boot(shell: &mut Shell<'_>, token: &str, sdk: bool) -> Result<(), Failu
     shell.expect("run /boot/EFI/WYRMROOT/HELLO.ELF", JOB_OUTPUT)?;
     if sdk {
         // Static C programs built against the SDK: musl over the POSIX
-        // layer, started from the ESP like the hello above, each ending in
-        // a normal exit with status 0.
-        for (command, expected) in SDK_RUNS {
-            let output = shell.run(command)?;
-            if !contains(&output, expected)
-                || !contains(&output, b"classification=normal application=0 ")
-            {
-                return Err(Failure::task(format!(
-                    "dev-boot check: `{command}` printed {:?}",
-                    String::from_utf8_lossy(&output)
-                )));
-            }
-        }
-        for path in SDK_LEFTOVERS {
-            shell.quiet(&format!("rm {path}"))?;
-        }
+        // layer, started from the ESP like the hello above.
+        run_sdk(shell, &SDK_RUNS[..SDK_CONTENDED_RUNS])?;
     }
     for job in hogs {
         // A hog that already exited makes this `invalid-state`; `wait` then
@@ -349,10 +341,33 @@ fn first_boot(shell: &mut Shell<'_>, token: &str, sdk: bool) -> Result<(), Failu
             )));
         }
     }
+    if sdk {
+        run_sdk(shell, &SDK_RUNS[SDK_CONTENDED_RUNS..])?;
+        for path in SDK_LEFTOVERS {
+            shell.quiet(&format!("rm {path}"))?;
+        }
+    }
     shell.quiet(&format!("write {PERSISTED_PATH} {token}"))?;
     shell.quiet("mkdir /home")?;
     shell.expect(&format!("cat {PERSISTED_PATH}"), token.as_bytes())?;
     shell.expect("ls /", b"home/\r\n")
+}
+
+/// Runs SDK programs, each of which must print its line and end in a normal
+/// exit with status 0.
+fn run_sdk(shell: &mut Shell<'_>, runs: &[(&str, &[u8])]) -> Result<(), Failure> {
+    for (command, expected) in runs {
+        let output = shell.run(command)?;
+        if !contains(&output, expected)
+            || !contains(&output, b"classification=normal application=0 ")
+        {
+            return Err(Failure::task(format!(
+                "dev-boot check: `{command}` printed {:?}",
+                String::from_utf8_lossy(&output)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The second boot reads the first boot's file back and removes it.
