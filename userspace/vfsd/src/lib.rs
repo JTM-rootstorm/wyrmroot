@@ -41,8 +41,14 @@ use wyrmroot_loader as _;
 
 /// The most WRNS client connections served at once.
 pub const MAX_CLIENTS: usize = wyrmroot_service_proto::roles::SYSTEM_VFS_MAX_CLIENTS;
-/// The most synthetic directory nodes open at once.
-pub const MAX_NODES: usize = 8;
+/// The synthetic directory nodes one connection may hold open, counted
+/// for as long as the nodes live, even after the connection closes.
+/// Connections are never renumbered, so no client can take another's
+/// share (security review M2, 2026-11-12: jobs can now open nodes).
+pub const MAX_NODES_PER_CONNECTION: usize = 2;
+/// The most synthetic directory nodes open at once: every live connection's
+/// full share, the admin connection's included.
+pub const MAX_NODES: usize = MAX_NODES_PER_CONNECTION * (MAX_CLIENTS + 1);
 /// The most caller wait items [`server::Vfs::step`] adds to its own.
 pub const MAX_EXTRA_WAITS: usize = 4;
 

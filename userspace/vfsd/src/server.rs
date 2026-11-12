@@ -16,7 +16,10 @@ use wyrmroot_fs_proto::{
 use wyrmroot_runtime::{ChannelPlatform, HandlePlatform, NativeError, WaitPlatform};
 
 use crate::mounts::{MAX_MOUNTS, MountTable, PathBuf, Resolution};
-use crate::{MAX_CLIENTS, MAX_EXTRA_WAITS, MAX_NODES, OPEN_CHANNEL_RIGHTS, ROOT_CHANNEL_RIGHTS};
+use crate::{
+    MAX_CLIENTS, MAX_EXTRA_WAITS, MAX_NODES, MAX_NODES_PER_CONNECTION, OPEN_CHANNEL_RIGHTS,
+    ROOT_CHANNEL_RIGHTS,
+};
 
 /// The platform traits vfsd uses.
 pub trait VfsPlatform: HandlePlatform + ChannelPlatform + WaitPlatform {}
@@ -41,7 +44,13 @@ pub enum Event {
 struct Node {
     channel: DwHandle,
     path: PathBuf,
+    /// The connection that opened it.
+    owner: u64,
 }
+
+/// The admin connection's identity; clients are numbered from 1 and never
+/// reuse a number.
+const ADMIN_ID: u64 = 0;
 
 #[derive(Clone, Copy)]
 enum Target {
@@ -55,6 +64,8 @@ enum Target {
 pub struct Vfs {
     admin: DwHandle,
     clients: [DwHandle; MAX_CLIENTS],
+    client_ids: [u64; MAX_CLIENTS],
+    next_client_id: u64,
     nodes: [Option<Node>; MAX_NODES],
     mounts: MountTable,
 }
@@ -66,6 +77,8 @@ impl Vfs {
         Self {
             admin,
             clients: [DW_HANDLE_INVALID; MAX_CLIENTS],
+            client_ids: [ADMIN_ID; MAX_CLIENTS],
+            next_client_id: ADMIN_ID + 1,
             nodes: [const { None }; MAX_NODES],
             mounts: MountTable::new(),
         }
@@ -87,11 +100,13 @@ impl Vfs {
     pub fn accept_client<P: VfsPlatform>(&mut self, platform: &mut P, channel: DwHandle) -> bool {
         match self
             .clients
-            .iter_mut()
-            .find(|slot| **slot == DW_HANDLE_INVALID)
+            .iter()
+            .position(|slot| *slot == DW_HANDLE_INVALID)
         {
             Some(slot) => {
-                *slot = channel;
+                self.clients[slot] = channel;
+                self.client_ids[slot] = self.next_client_id;
+                self.next_client_id += 1;
                 true
             }
             None => {
@@ -154,7 +169,7 @@ impl Vfs {
                 }));
             }
             Target::Admin if readable => {
-                if !self.serve_namespace(platform, self.admin, true) {
+                if !self.serve_namespace(platform, self.admin, ADMIN_ID) {
                     let _ = platform.close_handle(self.admin);
                     self.admin = DW_HANDLE_INVALID;
                     return Ok(Some(Event::AdminClosed));
@@ -166,8 +181,8 @@ impl Vfs {
                 return Ok(Some(Event::AdminClosed));
             }
             Target::Client(slot) => {
-                let channel = self.clients[slot];
-                if !readable || !self.serve_namespace(platform, channel, false) {
+                let (channel, owner) = (self.clients[slot], self.client_ids[slot]);
+                if !readable || !self.serve_namespace(platform, channel, owner) {
                     let _ = platform.close_handle(channel);
                     self.clients[slot] = DW_HANDLE_INVALID;
                 }
@@ -214,8 +229,9 @@ impl Vfs {
         &mut self,
         platform: &mut P,
         channel: DwHandle,
-        admin: bool,
+        owner: u64,
     ) -> bool {
+        let admin = owner == ADMIN_ID;
         let mut bytes = [0u8; namespace::MAX_BYTES];
         let mut handles = [DwReceivedHandleInfoV1::default(); MAX_HANDLES];
         let Ok(counts) = platform.receive_channel(channel, &mut bytes, &mut handles) else {
@@ -238,6 +254,7 @@ impl Vfs {
                 }
                 self.open(
                     platform,
+                    owner,
                     message.transaction_id,
                     flags,
                     path,
@@ -299,6 +316,7 @@ impl Vfs {
     fn open<P: VfsPlatform>(
         &mut self,
         platform: &mut P,
+        owner: u64,
         transaction_id: u64,
         flags: u32,
         path: &[u8],
@@ -319,7 +337,7 @@ impl Vfs {
                 } else if flags & OPEN_MUTATING != 0 {
                     Status::ReadOnly
                 } else {
-                    match self.add_node(platform, transaction_id, path, server) {
+                    match self.add_node(platform, owner, transaction_id, path, server) {
                         Ok(()) => return,
                         Err(status) => status,
                     }
@@ -388,11 +406,21 @@ impl Vfs {
     fn add_node<P: VfsPlatform>(
         &mut self,
         platform: &mut P,
+        owner: u64,
         transaction_id: u64,
         path: &[u8],
         server: DwHandle,
     ) -> Result<(), Status> {
         let path = PathBuf::new(path).ok_or(Status::InvalidPath)?;
+        let held = self
+            .nodes
+            .iter()
+            .flatten()
+            .filter(|node| node.owner == owner)
+            .count();
+        if held >= MAX_NODES_PER_CONNECTION {
+            return Err(Status::NoResources);
+        }
         let slot = self
             .nodes
             .iter()
@@ -411,6 +439,7 @@ impl Vfs {
             self.nodes[slot] = Some(Node {
                 channel: server,
                 path,
+                owner,
             });
         } else {
             // The client went away before its ON_OPEN arrived.
@@ -430,7 +459,8 @@ impl Vfs {
         let Some(node) = self.nodes[slot].as_ref() else {
             return false;
         };
-        let (channel, base) = (node.channel, node.path);
+        // Opens through a node count against the connection that opened it.
+        let (channel, base, owner) = (node.channel, node.path, node.owner);
         let mut bytes = [0u8; node::MAX_BYTES];
         let mut handles = [DwReceivedHandleInfoV1::default(); MAX_HANDLES];
         let Ok(counts) = platform.receive_channel(channel, &mut bytes, &mut handles) else {
@@ -466,6 +496,7 @@ impl Vfs {
                 } else if let Some(full) = PathBuf::join(base.as_bytes(), path) {
                     self.open(
                         platform,
+                        owner,
                         transaction_id,
                         flags,
                         full.as_bytes(),

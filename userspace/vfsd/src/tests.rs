@@ -20,7 +20,9 @@ use wyrmroot_runtime::{ChannelPlatform, HandlePlatform, NativeError, WaitPlatfor
 
 use crate::mounts::MAX_MOUNTS;
 use crate::server::{Event, Vfs};
-use crate::{MAX_CLIENTS, MAX_NODES, OPEN_CHANNEL_RIGHTS, ROOT_CHANNEL_RIGHTS};
+use crate::{
+    MAX_CLIENTS, MAX_NODES, MAX_NODES_PER_CONNECTION, OPEN_CHANNEL_RIGHTS, ROOT_CHANNEL_RIGHTS,
+};
 
 // ---------------------------------------------------------------- harness
 
@@ -339,7 +341,11 @@ fn synthetic_directories_list_mount_points_and_open_through_to_them() {
     let root = h.open(OPEN_READ | OPEN_DIRECTORY, b"/");
     assert_eq!(h.on_open(root).0, Status::Ok);
     assert_eq!(h.list(root), [&b"alpha"[..], b"boot", b"srv"]);
-    let srv = h.open(OPEN_READ, b"/srv");
+    // On the admin connection: each connection holds at most two
+    // synthetic nodes, and this test holds three at once.
+    let admin = h.admin;
+    let srv = h.open_on(admin, OPEN_READ, b"/srv");
+    h.settle();
     assert_eq!(h.on_open(srv), (Status::Ok, Some(SYNTHETIC)));
     assert_eq!(h.list(srv), [&b"data"[..], b"web"]);
 
@@ -574,19 +580,53 @@ fn connections_and_synthetic_nodes_are_bounded() {
     assert!(!h.vfs.accept_client(&mut h.world, server));
     assert!(h.peer_closed(spare));
 
+    // Each connection holds at most its own share of synthetic nodes.
     let mut nodes = Vec::new();
-    for _ in 0..MAX_NODES {
+    for _ in 0..MAX_NODES_PER_CONNECTION {
         let node_channel = h.open(OPEN_READ, b"/");
         assert_eq!(h.on_open(node_channel).0, Status::Ok);
         nodes.push(node_channel);
     }
     let refused = h.open(OPEN_READ, b"/");
     h.assert_refused(refused, Status::NoResources);
-    // Closing one frees its slot.
+    // Closing one frees its share.
     h.world.close_handle(nodes.pop().unwrap()).unwrap();
     h.settle();
     let again = h.open(OPEN_READ, b"/");
     assert_eq!(h.on_open(again).0, Status::Ok);
+    nodes.push(again);
+
+    // Every other connection, the admin's included, still gets its full
+    // share: one client cannot starve another (security review M2).
+    let admin = h.admin;
+    for &connection in connections.iter().chain([&admin]) {
+        for _ in 0..MAX_NODES_PER_CONNECTION {
+            let node_channel = h.open_on(connection, OPEN_READ, b"/");
+            h.settle();
+            assert_eq!(h.on_open(node_channel).0, Status::Ok);
+            nodes.push(node_channel);
+        }
+        let refused = h.open_on(connection, OPEN_READ, b"/");
+        h.settle();
+        h.assert_refused(refused, Status::NoResources);
+    }
+    assert_eq!(nodes.len(), MAX_NODES);
+
+    // A connection's nodes still count after it closes, and its successor
+    // in the same slot starts with a full share of its own.
+    let first = connections[0];
+    h.world.close_handle(first).unwrap();
+    h.settle();
+    let (successor, server) = h.world.create_channel(ROOT_CHANNEL_RIGHTS).unwrap();
+    assert!(h.vfs.accept_client(&mut h.world, server));
+    h.world.close_handle(nodes.pop().unwrap()).unwrap();
+    h.world.close_handle(nodes.pop().unwrap()).unwrap();
+    h.settle();
+    for _ in 0..MAX_NODES_PER_CONNECTION {
+        let node_channel = h.open_on(successor, OPEN_READ, b"/");
+        h.settle();
+        assert_eq!(h.on_open(node_channel).0, Status::Ok);
+    }
 }
 
 #[test]
