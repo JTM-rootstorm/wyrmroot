@@ -37,9 +37,9 @@ extern crate std;
 use wyrmroot_loader as _;
 
 use deepwyrm_syscall::{
-    DW_DEADLINE_INFINITE, DW_HANDLE_INVALID, DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_PEER_CLOSED,
-    DW_SIGNAL_READABLE, DW_STATUS_TIMED_OUT, DwDeadline, DwHandle, DwReceivedHandleInfoV1,
-    DwRights, DwSignals, DwWaitItemV1,
+    DW_DEADLINE_INFINITE, DW_DEADLINE_NOW, DW_HANDLE_INVALID, DW_OBJECT_TYPE_CHANNEL,
+    DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_STATUS_TIMED_OUT, DwDeadline, DwHandle,
+    DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
 };
 use wyrmroot_ext4::journal::TRANSACTION_FULL;
 use wyrmroot_ext4::{
@@ -593,6 +593,33 @@ impl<V: View> Server<V> {
         Ok(true)
     }
 
+    /// Drops the nodes, other than `serving`, whose client closed its end
+    /// and left nothing to read, releasing their locks. A client's close
+    /// completes before it can send anything else, so a request that
+    /// follows a close (UNLINK of a file just closed, a lock a close just
+    /// released) sees it, however this server has ordered its wakeups.
+    fn reap_closed<P: Ext4Platform>(&mut self, platform: &mut P, serving: DwHandle) {
+        for slot in &mut self.nodes {
+            let Some(node) = *slot else {
+                continue;
+            };
+            if node.channel == serving {
+                continue;
+            }
+            let closed = platform
+                .wait_one(node.channel, READABLE_OR_CLOSED, DW_DEADLINE_NOW)
+                .is_ok_and(|result| {
+                    result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0
+                        && result.observed.0 & DW_SIGNAL_READABLE.0 == 0
+                });
+            if closed {
+                *slot = None;
+                self.locks.release(node.channel.0);
+                let _ = platform.close_handle(node.channel);
+            }
+        }
+    }
+
     /// Commits the running transaction (or flushes an unjournaled volume).
     /// A failed commit leaves the volume read-only.
     fn commit<P: Ext4Platform>(&mut self, platform: &mut P) -> Result<(), Ext4Error> {
@@ -833,7 +860,22 @@ impl<V: View> Server<V> {
                 })
             }
             Body::Unlink { name } if writable => {
-                let found = self.volume.lookup(&mut device, here.inode, name);
+                let mut found = self.volume.lookup(&mut device, here.inode, name);
+                if found
+                    .as_ref()
+                    .is_ok_and(|stat| is_open(&self.nodes, stat.inode))
+                {
+                    self.reap_closed(platform, here.channel);
+                    device = Self::device(
+                        platform,
+                        &mut self.client,
+                        &mut self.view,
+                        &mut self.cache,
+                        &mut self.journal,
+                        &mut self.full,
+                    );
+                    found = self.volume.lookup(&mut device, here.inode, name);
+                }
                 status(match found {
                     Ok(stat) if is_open(&self.nodes, stat.inode) => Status::Busy,
                     Ok(_) => match self.volume.unlink(&mut device, here.inode, name) {
@@ -851,18 +893,28 @@ impl<V: View> Server<V> {
                     Status::AccessDenied
                 })
             }
-            Body::Lock(lock) => status(
-                match self.locks.set(u64::from(here.inode), here.channel.0, lock) {
+            Body::Lock(lock) => {
+                let node = u64::from(here.inode);
+                let mut result = self.locks.set(node, here.channel.0, lock);
+                if result == Err(LockError::Conflict) {
+                    self.reap_closed(platform, here.channel);
+                    result = self.locks.set(node, here.channel.0, lock);
+                }
+                status(match result {
                     Ok(()) => Status::Ok,
                     Err(LockError::Conflict) => Status::Busy,
                     Err(LockError::NoRoom) => Status::NoResources,
-                },
-            ),
-            Body::TestLock(lock) => Body::LockInfo(
-                self.locks
-                    .conflict(u64::from(here.inode), here.channel.0, lock)
-                    .map(|held| held.lock()),
-            ),
+                })
+            }
+            Body::TestLock(lock) => {
+                let node = u64::from(here.inode);
+                let mut held = self.locks.conflict(node, here.channel.0, lock);
+                if held.is_some() {
+                    self.reap_closed(platform, here.channel);
+                    held = self.locks.conflict(node, here.channel.0, lock);
+                }
+                Body::LockInfo(held.map(|held| held.lock()))
+            }
             Body::Sync => status(match self.commit(platform) {
                 Ok(()) => Status::Ok,
                 Err(error) => status_of(error),

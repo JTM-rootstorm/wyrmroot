@@ -728,3 +728,45 @@ fn a_full_lock_table_refuses_without_dropping_the_node() {
     );
     assert_eq!(fs.read_all(file), b"welcome\n");
 }
+
+#[test]
+fn a_request_after_a_close_sees_the_close() {
+    // The root's wakeup comes before every node's, so without reaping the
+    // closed node, UNLINK of a file whose last handle just closed answered
+    // BUSY (SQLite's journal delete, dev-boot 2026-11-12), and a lock the
+    // close released still conflicted.
+    let mut fs = fs();
+    let root = fs.root;
+    let (file, status, _) = fs.open(
+        root,
+        OPEN_READ | OPEN_WRITE | OPEN_FILE | OPEN_CREATE,
+        b"journal",
+    );
+    assert_eq!(status, Status::Ok);
+    let (holder, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    let (other, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    assert_eq!(
+        fs.status(holder, Body::Lock(lock(0, 0, LockMode::Exclusive)))
+            .0,
+        Status::Ok
+    );
+    fs.world.close_handle(file).unwrap();
+    fs.world.close_handle(holder).unwrap();
+    assert_eq!(
+        fs.status(root, Body::Unlink { name: b"journal" }).0,
+        Status::Ok
+    );
+    assert_eq!(
+        fs.status(other, Body::Lock(lock(0, 0, LockMode::Exclusive)))
+            .0,
+        Status::Ok
+    );
+    // A node that is still open is still BUSY.
+    let (open, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    let (etc, _, _) = fs.open(root, OPEN_READ | OPEN_WRITE, b"etc");
+    assert_eq!(
+        fs.status(etc, Body::Unlink { name: b"motd" }).0,
+        Status::Busy
+    );
+    let _ = open;
+}
