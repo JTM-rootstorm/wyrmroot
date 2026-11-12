@@ -139,9 +139,10 @@ handle is launcher-supplied and init does not verify where it leads: init
 forwards it without using it, and the loader admits only a Channel with
 exactly the child rights. A job therefore reaches at most what its launcher
 could. A job that opens no paths closes it. Each running file job holds one
-`vfsd` client connection; init's `MAX_SHELL_JOBS` (4) plus the shell's own
-connection stays below `vfsd`'s `MAX_CLIENTS` (8), and raising the first
-needs the second checked. Its working directory is not a
+`vfsd` client connection, so jobs could otherwise shut shells and services
+out of `system.vfs`. `vfsd` serves `SYSTEM_VFS_MAX_CLIENTS` (16,
+`wyrmroot-service-proto`), and init fails to build unless its
+`MAX_SHELL_JOBS` (4, orphans included) is at most half of that. Its working directory is not a
 startup role: a POSIX program takes it from its `PWD` environment entry and
 starts at `/` without one. Bootfs launches keep WRLP 1.12 and receive no
 namespace.

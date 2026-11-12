@@ -47,6 +47,11 @@ pub const SYSTEM_VFS: ServiceName = ServiceName {
     minor: 0,
     supervisor_role_id: 5,
 };
+/// The most WRNS client connections `vfsd` serves at once. Every running job
+/// launched from a file holds one as its namespace (root
+/// `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W5), so init admits at most half this
+/// many shell jobs and the rest stays free for shells and services.
+pub const SYSTEM_VFS_MAX_CLIENTS: usize = 16;
 
 pub const BLOCKMGR_ROLE_ID: u64 = 0x100;
 pub const BLOCKMGR_PATH: &str = "system/blockmgr";

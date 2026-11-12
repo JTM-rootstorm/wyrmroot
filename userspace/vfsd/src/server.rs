@@ -25,6 +25,8 @@ impl<P> VfsPlatform for P where P: HandlePlatform + ChannelPlatform + WaitPlatfo
 
 const READABLE_OR_CLOSED: DwSignals = DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0);
 const WAIT_ITEMS: usize = 1 + MAX_CLIENTS + MAX_NODES + MAX_MOUNTS + MAX_EXTRA_WAITS;
+// One wait_many covers every slot.
+const _: () = assert!(WAIT_ITEMS <= deepwyrm_syscall::DW_WAIT_MANY_MAX_ITEMS as usize);
 
 /// What one step saw that is the caller's to handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

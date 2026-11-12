@@ -29,6 +29,10 @@ pub(crate) const MAX_ORPHAN_CONNECTIONS: usize = 8;
 /// is refused here rather than draining a pool a service needs to restart
 /// (F4 DW1-F4-M1).
 pub(crate) const MAX_SHELL_JOBS: usize = 4;
+// Every running file job holds one of vfsd's client connections as its
+// namespace (WRLP 1.13). Jobs may take at most half of them, so they can
+// never shut the shells and services out of `system.vfs`.
+const _: () = assert!(MAX_SHELL_JOBS <= wyrmroot_service_proto::roles::SYSTEM_VFS_MAX_CLIENTS / 2);
 /// Live orphan jobs across every closed connection. The rest of
 /// `MAX_SHELL_JOBS` stays free for the live shell.
 pub(crate) const MAX_ORPHAN_JOBS: usize = MAX_SHELL_JOBS / 2;

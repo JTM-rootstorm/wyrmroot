@@ -40,7 +40,7 @@ extern crate std;
 use wyrmroot_loader as _;
 
 /// The most WRNS client connections served at once.
-pub const MAX_CLIENTS: usize = 8;
+pub const MAX_CLIENTS: usize = wyrmroot_service_proto::roles::SYSTEM_VFS_MAX_CLIENTS;
 /// The most synthetic directory nodes open at once.
 pub const MAX_NODES: usize = 8;
 /// The most caller wait items [`server::Vfs::step`] adds to its own.
