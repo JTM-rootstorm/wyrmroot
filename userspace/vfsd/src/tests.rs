@@ -149,7 +149,11 @@ impl Harness {
     /// WRFS OPEN relative to `dir`, then vfsd runs.
     fn open_at(&mut self, dir: DwHandle, flags: u32, path: &[u8]) -> DwHandle {
         let (node, server) = self.world.create_channel(OPEN_CHANNEL_RIGHTS).unwrap();
-        let bytes = self.node_message(Body::Open { flags, path });
+        let bytes = self.node_message(Body::Open {
+            flags,
+            path,
+            client: 0,
+        });
         self.send(dir, &bytes, Some((server, OPEN_CHANNEL_RIGHTS)));
         self.settle();
         node
@@ -209,9 +213,17 @@ impl Harness {
     fn forwarded(&mut self, filesystem: DwHandle) -> (u32, Vec<u8>, u64, DwReceivedHandleInfoV1) {
         let (bytes, handles) = self.receive(filesystem);
         let message = node::parse(&bytes, handles.len()).unwrap();
-        let Body::Open { flags, path } = message.body else {
+        let Body::Open {
+            flags,
+            path,
+            client,
+        } = message.body
+        else {
             panic!("expected OPEN, got {:?}", message.body);
         };
+        // Every forwarded open names the client connection it came
+        // through (WRFS 1.2); clients are numbered from 1.
+        assert_ne!(client, 0);
         (flags, path.to_vec(), message.transaction_id, handles[0])
     }
 
@@ -746,7 +758,7 @@ mod role {
             }
             let (bytes, handles) = world.receive(fs_root);
             let message = node::parse(&bytes, handles.len()).unwrap();
-            let Body::Open { flags, path } = message.body else {
+            let Body::Open { flags, path, .. } = message.body else {
                 panic!("vfsd sends only OPEN on a root");
             };
             fs_seen.borrow_mut().forwarded.push((flags, path.to_vec()));

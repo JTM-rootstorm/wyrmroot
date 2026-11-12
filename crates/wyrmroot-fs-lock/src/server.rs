@@ -1,14 +1,16 @@
-//! Lock groups, waiting and deadlocks (WRFS 1.2) over a [`LockTable`].
+//! Waiting and deadlocks (WRFS 1.2) over a [`LockTable`].
 //!
-//! Every owner that has made a lock request is recorded with its lock
-//! group and, while its LOCK waits, the request it waits with. A waiting
-//! request is granted when nothing conflicts any more, oldest first. Before
-//! a request waits, the wait-for graph between groups is walked: the groups
+//! Every owner that has made a lock request is recorded with the group the
+//! caller gives it (for a WRFS server, the node's client; the caller must
+//! not let a client choose it) and, while its LOCK waits, the request it
+//! waits with. A waiting request is granted when nothing conflicts any
+//! more, oldest first. Before a request waits, and again whenever waiters
+//! are granted, the wait-for graph between groups is walked: the groups
 //! holding what it waits for, the groups holding what their waiting owners
 //! wait for, and so on. Reaching the request's own group means the wait
-//! would never end, and the request is answered [`Outcome::Deadlock`]
-//! instead. Each group is visited once, so the walk is bounded by the
-//! number of owners.
+//! would never end, and the request is answered [`Outcome::Deadlock`].
+//! Each group is visited once, so the walk is bounded by the number of
+//! owners.
 
 use wyrmroot_fs_proto::node::{LOCK_WAIT, Lock};
 
@@ -17,8 +19,8 @@ use crate::{LockError, LockTable};
 /// What a lock request comes to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outcome {
-    /// Done; the owner's lock group.
-    Granted(u64),
+    /// Done.
+    Granted,
     /// It waits; [`LockServer::take_granted`] reports it later.
     Waiting,
     /// Another owner holds a conflicting lock, and the request does not
@@ -28,8 +30,7 @@ pub enum Outcome {
     Deadlock,
     /// No room for the change, or for another owner.
     NoRoom,
-    /// The group is neither 0, the owner's own, nor a live group; or the
-    /// owner is already waiting.
+    /// The owner is already waiting.
     Invalid,
 }
 
@@ -55,7 +56,6 @@ struct Owner {
 pub struct LockServer<const N: usize, const OWNERS: usize> {
     table: LockTable<N>,
     owners: [Option<Owner>; OWNERS],
-    next_group: u64,
     next_sequence: u64,
 }
 
@@ -71,7 +71,6 @@ impl<const N: usize, const OWNERS: usize> LockServer<N, OWNERS> {
         Self {
             table: LockTable::with_owner_limit(owner_limit),
             owners: [None; OWNERS],
-            next_group: 1,
             next_sequence: 0,
         }
     }
@@ -101,14 +100,16 @@ impl<const N: usize, const OWNERS: usize> LockServer<N, OWNERS> {
         self.record(owner).map(|record| record.group)
     }
 
-    /// LOCK from `owner` on `node`; `token` comes back with a later grant.
+    /// LOCK from `owner`, of `group`, on `node`; `token` comes back with
+    /// a later grant. An owner's group is the one it was first recorded
+    /// with.
     pub fn request(
         &mut self,
         owner: u64,
+        group: u64,
         node: u64,
         lock: Lock,
         flags: u32,
-        group: u64,
         token: u64,
     ) -> Outcome {
         let index = match self
@@ -117,26 +118,14 @@ impl<const N: usize, const OWNERS: usize> LockServer<N, OWNERS> {
             .position(|record| record.is_some_and(|record| record.owner == owner))
         {
             Some(index) => {
-                let record = self.owners[index].expect("found above");
-                if record.waiting.is_some() || (group != 0 && group != record.group) {
+                if self.owners[index].is_some_and(|record| record.waiting.is_some()) {
                     return Outcome::Invalid;
                 }
                 index
             }
             None => {
-                let live = group == 0 || self.owners.iter().flatten().any(|r| r.group == group);
-                if !live {
-                    return Outcome::Invalid;
-                }
                 let Some(index) = self.owners.iter().position(Option::is_none) else {
                     return Outcome::NoRoom;
-                };
-                let group = if group == 0 {
-                    let fresh = self.next_group;
-                    self.next_group = fresh.wrapping_add(1).max(1);
-                    fresh
-                } else {
-                    group
                 };
                 self.owners[index] = Some(Owner {
                     owner,
@@ -148,7 +137,7 @@ impl<const N: usize, const OWNERS: usize> LockServer<N, OWNERS> {
         };
         let group = self.owners[index].expect("recorded above").group;
         match self.table.set(node, owner, lock) {
-            Ok(()) => Outcome::Granted(group),
+            Ok(()) => Outcome::Granted,
             Err(LockError::NoRoom) => Outcome::NoRoom,
             Err(LockError::Conflict) if flags & LOCK_WAIT == 0 => Outcome::Busy,
             Err(LockError::Conflict) => {
@@ -226,8 +215,9 @@ impl<const N: usize, const OWNERS: usize> LockServer<N, OWNERS> {
     }
 
     /// The oldest waiting request that can now be answered: its owner, its
-    /// token and its outcome ([`Outcome::Granted`] or [`Outcome::NoRoom`]).
-    /// Call until `None` after anything that releases locks.
+    /// token and its outcome ([`Outcome::Granted`], [`Outcome::NoRoom`], or
+    /// [`Outcome::Deadlock`] for one whose wait has since become endless).
+    /// Call until `None` after anything that changes locks or waits.
     pub fn take_granted(&mut self) -> Option<(u64, u64, Outcome)> {
         let mut order: [(u64, usize); OWNERS] = [(u64::MAX, usize::MAX); OWNERS];
         let mut count = 0;
@@ -242,8 +232,20 @@ impl<const N: usize, const OWNERS: usize> LockServer<N, OWNERS> {
             let record = self.owners[index].expect("waiting owners are recorded");
             let waiter = record.waiting.expect("collected as waiting");
             let outcome = match self.table.set(waiter.node, record.owner, waiter.lock) {
-                Ok(()) => Outcome::Granted(record.group),
+                Ok(()) => Outcome::Granted,
                 Err(LockError::NoRoom) => Outcome::NoRoom,
+                // Locks granted since it began may close a cycle through
+                // it, as Linux checks each time a waiter blocks again.
+                Err(LockError::Conflict)
+                    if self.would_deadlock(
+                        record.group,
+                        waiter.node,
+                        record.owner,
+                        waiter.lock,
+                    ) =>
+                {
+                    Outcome::Deadlock
+                }
                 Err(LockError::Conflict) => continue,
             };
             if let Some(record) = self.owners[index].as_mut() {

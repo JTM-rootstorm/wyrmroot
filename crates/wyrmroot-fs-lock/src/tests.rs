@@ -232,39 +232,39 @@ mod server {
         lock(0, 0, LockMode::Exclusive)
     }
 
+    // Owners are Channels; groups are the clients the caller names.
+    const A: u64 = 100;
+    const B: u64 = 200;
+    const C: u64 = 300;
+
     #[test]
     fn a_waiting_lock_is_granted_in_arrival_order_when_the_holder_goes() {
         let mut server = Server::with_owner_limit(8);
-        let Outcome::Granted(holder) = server.request(1, 7, exclusive(), 0, 0, 100) else {
-            panic!("first lock");
-        };
-        assert_eq!(server.request(2, 7, exclusive(), 0, 0, 200), Outcome::Busy);
         assert_eq!(
-            server.request(2, 7, exclusive(), LOCK_WAIT, 0, 201),
+            server.request(1, A, 7, exclusive(), 0, 100),
+            Outcome::Granted
+        );
+        assert_eq!(server.request(2, B, 7, exclusive(), 0, 200), Outcome::Busy);
+        assert_eq!(
+            server.request(2, B, 7, exclusive(), LOCK_WAIT, 201),
             Outcome::Waiting
         );
         assert_eq!(
-            server.request(3, 7, exclusive(), LOCK_WAIT, 0, 300),
+            server.request(3, C, 7, exclusive(), LOCK_WAIT, 300),
             Outcome::Waiting
         );
         assert!(server.is_waiting(2));
         // A waiting owner's other requests are refused.
         assert_eq!(
-            server.request(2, 8, exclusive(), 0, 0, 202),
+            server.request(2, B, 8, exclusive(), 0, 202),
             Outcome::Invalid
         );
         assert_eq!(server.take_granted(), None);
         server.release(1);
-        let Some((2, 201, Outcome::Granted(group))) = server.take_granted() else {
-            panic!("the first waiter");
-        };
-        assert_ne!(group, holder);
+        assert_eq!(server.take_granted(), Some((2, 201, Outcome::Granted)));
         assert_eq!(server.take_granted(), None);
-        server.request(2, 7, lock(0, 0, LockMode::Unlock), 0, 0, 203);
-        assert!(matches!(
-            server.take_granted(),
-            Some((3, 300, Outcome::Granted(_)))
-        ));
+        server.request(2, B, 7, lock(0, 0, LockMode::Unlock), 0, 203);
+        assert_eq!(server.take_granted(), Some((3, 300, Outcome::Granted)));
         assert!(!server.is_waiting(3));
     }
 
@@ -272,118 +272,135 @@ mod server {
     fn waiters_are_granted_by_arrival_not_by_slot() {
         let mut server = Server::with_owner_limit(8);
         // Owner 3 is recorded first, so it has the earlier slot.
-        server.request(3, 9, lock(0, 0, LockMode::Unlock), 0, 0, 0);
-        server.request(1, 7, exclusive(), 0, 0, 0);
+        server.request(3, C, 9, lock(0, 0, LockMode::Unlock), 0, 0);
+        server.request(1, A, 7, exclusive(), 0, 0);
         assert_eq!(
-            server.request(2, 7, exclusive(), LOCK_WAIT, 0, 20),
+            server.request(2, B, 7, exclusive(), LOCK_WAIT, 20),
             Outcome::Waiting
         );
         assert_eq!(
-            server.request(3, 7, exclusive(), LOCK_WAIT, 0, 30),
+            server.request(3, C, 7, exclusive(), LOCK_WAIT, 30),
             Outcome::Waiting
         );
         server.release(1);
-        assert!(matches!(
-            server.take_granted(),
-            Some((2, 20, Outcome::Granted(_)))
-        ));
+        assert_eq!(server.take_granted(), Some((2, 20, Outcome::Granted)));
     }
 
     #[test]
-    fn two_groups_waiting_for_each_other_are_refused_the_second_wait() {
-        // Process A holds file 1 and waits for file 2; process B holds
-        // file 2 and asks to wait for file 1. Each process has one Channel
-        // per file, in one group.
+    fn two_clients_waiting_for_each_other_are_refused_the_second_wait() {
+        // Client A holds file 1 and waits for file 2; client B holds file 2
+        // and asks to wait for file 1, each through one Channel per file.
         let mut server = Server::with_owner_limit(8);
-        let Outcome::Granted(a) = server.request(10, 1, exclusive(), 0, 0, 0) else {
-            panic!();
-        };
-        let Outcome::Granted(b) = server.request(20, 2, exclusive(), 0, 0, 0) else {
-            panic!();
-        };
         assert_eq!(
-            server.request(11, 2, exclusive(), LOCK_WAIT, a, 1),
+            server.request(10, A, 1, exclusive(), 0, 0),
+            Outcome::Granted
+        );
+        assert_eq!(
+            server.request(20, B, 2, exclusive(), 0, 0),
+            Outcome::Granted
+        );
+        assert_eq!(
+            server.request(11, A, 2, exclusive(), LOCK_WAIT, 1),
             Outcome::Waiting
         );
         assert_eq!(
-            server.request(21, 1, exclusive(), LOCK_WAIT, b, 2),
+            server.request(21, B, 1, exclusive(), LOCK_WAIT, 2),
             Outcome::Deadlock
         );
         // A wait that closes no cycle still waits.
         assert_eq!(
-            server.request(30, 1, exclusive(), LOCK_WAIT, 0, 3),
+            server.request(30, C, 1, exclusive(), LOCK_WAIT, 3),
             Outcome::Waiting
         );
     }
 
     #[test]
-    fn a_cycle_through_a_third_group_is_found() {
+    fn a_cycle_through_a_third_client_is_found() {
         let mut server = Server::with_owner_limit(8);
-        let group = |outcome| match outcome {
-            Outcome::Granted(group) => group,
-            other => panic!("{other:?}"),
-        };
-        let a = group(server.request(10, 1, exclusive(), 0, 0, 0));
-        let b = group(server.request(20, 2, exclusive(), 0, 0, 0));
-        let c = group(server.request(30, 3, exclusive(), 0, 0, 0));
+        server.request(10, A, 1, exclusive(), 0, 0);
+        server.request(20, B, 2, exclusive(), 0, 0);
+        server.request(30, C, 3, exclusive(), 0, 0);
         assert_eq!(
-            server.request(11, 2, exclusive(), LOCK_WAIT, a, 0),
+            server.request(11, A, 2, exclusive(), LOCK_WAIT, 0),
             Outcome::Waiting
         );
         assert_eq!(
-            server.request(21, 3, exclusive(), LOCK_WAIT, b, 0),
+            server.request(21, B, 3, exclusive(), LOCK_WAIT, 0),
             Outcome::Waiting
         );
         assert_eq!(
-            server.request(31, 1, exclusive(), LOCK_WAIT, c, 0),
+            server.request(31, C, 1, exclusive(), LOCK_WAIT, 0),
             Outcome::Deadlock
         );
     }
 
     #[test]
-    fn waiting_on_one_s_own_group_is_a_deadlock() {
+    fn waiting_on_one_s_own_client_is_a_deadlock() {
         // A process's description lock blocks its own classic lock: Linux
         // waits for ever, this refuses.
         let mut server = Server::with_owner_limit(8);
-        let Outcome::Granted(group) = server.request(10, 1, exclusive(), 0, 0, 0) else {
-            panic!();
-        };
         assert_eq!(
-            server.request(11, 1, exclusive(), LOCK_WAIT, group, 0),
+            server.request(10, A, 1, exclusive(), 0, 0),
+            Outcome::Granted
+        );
+        assert_eq!(
+            server.request(11, A, 1, exclusive(), LOCK_WAIT, 0),
             Outcome::Deadlock
         );
     }
 
     #[test]
-    fn groups_are_joined_only_while_alive_and_never_changed() {
+    fn a_cycle_closed_by_a_grant_ends_a_wait_at_the_next_pass() {
         let mut server = Server::with_owner_limit(8);
         assert_eq!(
-            server.request(1, 1, exclusive(), 0, 99, 0),
-            Outcome::Invalid
+            server.request(20, B, 2, exclusive(), 0, 0),
+            Outcome::Granted
         );
-        let Outcome::Granted(group) = server.request(1, 1, exclusive(), 0, 0, 0) else {
-            panic!();
-        };
+        // A waits for B.
         assert_eq!(
-            server.request(2, 2, exclusive(), 0, group, 0),
-            Outcome::Granted(group)
+            server.request(11, A, 2, exclusive(), LOCK_WAIT, 1),
+            Outcome::Waiting
         );
-        let Outcome::Granted(other) = server.request(3, 3, exclusive(), 0, 0, 0) else {
-            panic!();
-        };
+        // B waits for file 3, which only C holds: no cycle yet.
         assert_eq!(
-            server.request(2, 2, exclusive(), 0, other, 0),
-            Outcome::Invalid
+            server.request(30, C, 3, lock(0, 10, LockMode::Shared), 0, 0),
+            Outcome::Granted
         );
         assert_eq!(
-            server.request(2, 2, exclusive(), 0, 0, 0),
-            Outcome::Granted(group)
+            server.request(22, B, 3, exclusive(), LOCK_WAIT, 2),
+            Outcome::Waiting
         );
-        server.release(1);
-        server.release(2);
+        // A takes a shared lock B's wait now also needs, without waiting:
+        // B now waits for A, which waits for B.
         assert_eq!(
-            server.request(4, 4, exclusive(), 0, group, 0),
-            Outcome::Invalid
+            server.request(12, A, 3, lock(20, 10, LockMode::Shared), 0, 3),
+            Outcome::Granted
+        );
+        // The oldest waiter in the cycle is refused, which breaks it.
+        assert_eq!(server.take_granted(), Some((11, 1, Outcome::Deadlock)));
+        assert!(server.is_waiting(22), "B still waits, now only for C and A");
+        assert_eq!(server.take_granted(), None);
+    }
+
+    #[test]
+    fn an_owner_keeps_the_group_it_was_first_recorded_with() {
+        let mut server = Server::with_owner_limit(8);
+        assert_eq!(
+            server.request(10, A, 1, exclusive(), 0, 0),
+            Outcome::Granted
+        );
+        // A later request naming another group does not move it.
+        assert_eq!(
+            server.request(20, B, 2, exclusive(), 0, 0),
+            Outcome::Granted
+        );
+        assert_eq!(
+            server.request(10, B, 2, exclusive(), LOCK_WAIT, 0),
+            Outcome::Waiting
+        );
+        assert_eq!(
+            server.request(21, B, 1, exclusive(), LOCK_WAIT, 0),
+            Outcome::Deadlock
         );
     }
 }

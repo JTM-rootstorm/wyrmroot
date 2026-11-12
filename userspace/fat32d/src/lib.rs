@@ -380,7 +380,7 @@ impl<V: View> Server<V> {
         let mut listing = [0u8; MAX_DIRENT_BYTES];
         let mut data = [0u8; MAX_IO_BYTES];
         let reply = match message.body {
-            Body::Open { flags, path } => {
+            Body::Open { flags, path, .. } => {
                 let server = received[0];
                 if server.object_type != DW_OBJECT_TYPE_CHANNEL
                     || server.rights != OPEN_CHANNEL_RIGHTS

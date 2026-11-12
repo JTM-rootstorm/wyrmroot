@@ -67,10 +67,12 @@ fn every_node_message_round_trips_with_its_handle_count() {
         Body::Open {
             flags: OPEN_READ | OPEN_FILE,
             path: b"EFI/BOOT/BOOTX64.EFI",
+            client: 7,
         },
         Body::Open {
             flags: OPEN_READ,
             path: b"",
+            client: 0,
         },
         Body::GetAttr,
         Body::ReadDir { cookie: 3 },
@@ -119,7 +121,6 @@ fn every_node_message_round_trips_with_its_handle_count() {
         Body::Lock {
             lock: LOCK,
             flags: LOCK_WAIT,
-            group: 9,
         },
         Body::Lock {
             lock: Lock {
@@ -128,7 +129,6 @@ fn every_node_message_round_trips_with_its_handle_count() {
                 mode: LockMode::Unlock,
             },
             flags: 0,
-            group: 0,
         },
         Body::TestLock(Lock {
             mode: LockMode::Shared,
@@ -302,6 +302,7 @@ fn header_damage_is_refused_before_the_body_is_read() {
     let mut open = node_bytes(Body::Open {
         flags: OPEN_READ,
         path: b"abc",
+        client: 0,
     });
     open[36] = 4;
     assert_eq!(node::parse(&open, 1), Err(Error::WrongSize));
@@ -334,7 +335,6 @@ fn node_bodies_with_bad_fields_are_refused_both_ways() {
                     mode: LockMode::Shared,
                 },
                 flags: 0,
-                group: 0,
             },
             Error::InvalidField,
         ),
@@ -345,7 +345,6 @@ fn node_bodies_with_bad_fields_are_refused_both_ways() {
                     ..LOCK
                 },
                 flags: LOCK_WAIT,
-                group: 0,
             },
             Error::InvalidField,
         ),
@@ -353,7 +352,6 @@ fn node_bodies_with_bad_fields_are_refused_both_ways() {
             Body::Lock {
                 lock: LOCK,
                 flags: 2,
-                group: 0,
             },
             Error::UnknownFlags,
         ),
@@ -383,6 +381,7 @@ fn node_bodies_with_bad_fields_are_refused_both_ways() {
             Body::Open {
                 flags: OPEN_READ,
                 path: b"/abs",
+                client: 0,
             },
             Error::InvalidPath,
         ),
@@ -390,6 +389,7 @@ fn node_bodies_with_bad_fields_are_refused_both_ways() {
             Body::Open {
                 flags: 0,
                 path: b"a",
+                client: 0,
             },
             Error::UnknownFlags,
         ),
@@ -504,8 +504,9 @@ fn node_bodies_with_bad_fields_are_refused_both_ways() {
     let mut open = node_bytes(Body::Open {
         flags: OPEN_READ,
         path: b"a/b",
+        client: 0,
     });
-    open[42] = b'.';
+    open[50] = b'.';
     assert_eq!(node::parse(&open, 1), Err(Error::InvalidPath));
     let mut listing = node_bytes(Body::Dirents {
         next_cookie: 1,
@@ -516,7 +517,6 @@ fn node_bodies_with_bad_fields_are_refused_both_ways() {
     let plain = Body::Lock {
         lock: LOCK,
         flags: 0,
-        group: 0,
     };
     let mut lock = node_bytes(plain);
     lock[32] = 3;

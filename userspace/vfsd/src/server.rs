@@ -330,7 +330,7 @@ impl Vfs {
     ) {
         let status = match self.mounts.resolve(path) {
             Resolution::Mount { index, rest } => {
-                match self.forward(platform, transaction_id, flags, index, rest, server) {
+                match self.forward(platform, owner, transaction_id, flags, index, rest, server) {
                     Ok(()) => return,
                     Err(status) => status,
                 }
@@ -354,11 +354,13 @@ impl Vfs {
         fail_open(platform, transaction_id, server, status);
     }
 
-    /// Passes an open on to mount `index`; on `Err` the caller still owns
+    /// Passes an open on to mount `index`, naming the client connection
+    /// `owner` it came through (WRFS 1.2); on `Err` the caller still owns
     /// `server`.
     fn forward<P: VfsPlatform>(
         &mut self,
         platform: &mut P,
+        owner: u64,
         transaction_id: u64,
         mut flags: u32,
         index: usize,
@@ -381,7 +383,11 @@ impl Vfs {
         let size = node::encode(
             &node::Message {
                 transaction_id,
-                body: NodeBody::Open { flags, path: rest },
+                body: NodeBody::Open {
+                    flags,
+                    path: rest,
+                    client: owner,
+                },
             },
             &mut bytes,
         )
@@ -484,11 +490,20 @@ impl Vfs {
         let status = |status| NodeBody::Status { status, value: 0 };
         let mut listing = [0u8; MAX_DIRENT_BYTES];
         let reply = match message.body {
-            NodeBody::Open { flags, path } => {
+            NodeBody::Open {
+                flags,
+                path,
+                client,
+            } => {
                 let server = received[0];
                 if !admitted(server, OPEN_CHANNEL_RIGHTS) {
                     close_all(platform, received);
                     return false;
+                }
+                // Only vfsd names a client connection (WRFS 1.2).
+                if client != 0 {
+                    fail_open(platform, transaction_id, server.handle, Status::Invalid);
+                    return true;
                 }
                 // A synthetic directory is only listed, so nothing opened
                 // through it may be written (access never grows).

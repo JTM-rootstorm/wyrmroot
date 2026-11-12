@@ -328,6 +328,20 @@ struct OpenNode {
     channel: DwHandle,
     inode: u32,
     access: u32,
+    /// The `vfsd` client connection it was opened through, or 0 (WRFS 1.2).
+    client: u64,
+}
+
+impl OpenNode {
+    /// Whose waits this node's locks belong to when deadlocks are looked
+    /// for: its client, or the node alone when it has none.
+    fn lock_group(&self) -> u64 {
+        if self.client != 0 {
+            self.client
+        } else {
+            (1 << 63) | self.channel.0
+        }
+    }
 }
 
 pub struct Server<V> {
@@ -569,6 +583,7 @@ impl<V: View> Server<V> {
                     channel: self.root,
                     inode: ROOT_INODE,
                     access: self.root_access(),
+                    client: 0,
                 };
                 if !readable || !self.serve(platform, here) {
                     // Unmounted, or vfsd broke WRFS: no new path opens, but
@@ -601,14 +616,24 @@ impl<V: View> Server<V> {
     /// Answers every waiting LOCK that can now be granted.
     fn grant_waiters<P: Ext4Platform>(&mut self, platform: &mut P) {
         while let Some((owner, transaction_id, outcome)) = self.locks.take_granted() {
-            // A Channel that cannot be answered is gone or broken; its close
-            // releases what it was just granted.
-            let _ = send(
-                platform,
-                DwHandle(owner),
-                transaction_id,
-                lock_reply(outcome),
-            );
+            let channel = DwHandle(owner);
+            if send(platform, channel, transaction_id, lock_reply(outcome)) {
+                continue;
+            }
+            // A Channel that cannot be answered is dropped, as a failed
+            // reply drops it in `serve`, with what it was just granted.
+            self.locks.release(owner);
+            if channel == self.root {
+                let _ = platform.close_handle(self.root);
+                self.root = DW_HANDLE_INVALID;
+            } else if let Some(slot) = self
+                .nodes
+                .iter()
+                .position(|node| node.is_some_and(|node| node.channel == channel))
+            {
+                self.nodes[slot] = None;
+                let _ = platform.close_handle(channel);
+            }
         }
     }
 
@@ -801,7 +826,11 @@ impl<V: View> Server<V> {
             );
         }
         let reply = match message.body {
-            Body::Open { flags, path } => {
+            Body::Open {
+                flags,
+                path,
+                client,
+            } => {
                 let server = received[0];
                 if server.object_type != DW_OBJECT_TYPE_CHANNEL
                     || server.rights != OPEN_CHANNEL_RIGHTS
@@ -811,7 +840,39 @@ impl<V: View> Server<V> {
                     let _ = platform.close_handle(server.handle);
                     return false;
                 }
-                self.open(platform, transaction_id, here, flags, path, server.handle);
+                // Only vfsd, on the root Channel, names a client; a node
+                // opened through another node is that node's client's.
+                let client = if here.channel == self.root {
+                    client
+                } else if client == 0 {
+                    here.client
+                } else {
+                    let _ = send(
+                        platform,
+                        server.handle,
+                        transaction_id,
+                        Body::OnOpen {
+                            status: Status::Invalid,
+                            attr: None,
+                        },
+                    );
+                    let _ = platform.close_handle(server.handle);
+                    return send(
+                        platform,
+                        here.channel,
+                        transaction_id,
+                        status(Status::Invalid),
+                    );
+                };
+                self.open(
+                    platform,
+                    transaction_id,
+                    here,
+                    flags,
+                    path,
+                    server.handle,
+                    client,
+                );
                 self.settle(platform);
                 return true;
             }
@@ -924,17 +985,18 @@ impl<V: View> Server<V> {
                     Status::AccessDenied
                 })
             }
-            Body::Lock { lock, flags, group } => {
+            Body::Lock { lock, flags } => {
+                let group = here.lock_group();
                 let node = u64::from(here.inode);
                 let owner = here.channel.0;
                 let mut outcome =
                     self.locks
-                        .request(owner, node, lock, flags, group, transaction_id);
+                        .request(owner, group, node, lock, flags, transaction_id);
                 if matches!(outcome, Outcome::Busy | Outcome::Deadlock | Outcome::NoRoom) {
                     self.reap_closed(platform, here.channel);
                     outcome = self
                         .locks
-                        .request(owner, node, lock, flags, group, transaction_id);
+                        .request(owner, group, node, lock, flags, transaction_id);
                 }
                 match outcome {
                     // Answered when it is granted (`grant_waiters`).
@@ -1062,6 +1124,7 @@ impl<V: View> Server<V> {
         flags: u32,
         path: &[u8],
         server: DwHandle,
+        client: u64,
     ) {
         let slot = self.nodes.iter().position(Option::is_none);
         let found = match slot {
@@ -1098,6 +1161,7 @@ impl<V: View> Server<V> {
                     channel: server,
                     inode: stat.inode,
                     access,
+                    client,
                 });
             }
             _ => {
@@ -1110,9 +1174,9 @@ impl<V: View> Server<V> {
 /// LOCK's answer for an outcome other than waiting.
 fn lock_reply(outcome: Outcome) -> Body<'static> {
     match outcome {
-        Outcome::Granted(group) => Body::Status {
+        Outcome::Granted => Body::Status {
             status: Status::Ok,
-            value: group,
+            value: 0,
         },
         outcome => Body::Status {
             status: match outcome {

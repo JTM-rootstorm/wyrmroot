@@ -220,6 +220,17 @@ impl Fs {
     }
 
     fn open(&mut self, dir: DwHandle, flags: u32, path: &[u8]) -> (DwHandle, Status, Option<Attr>) {
+        self.open_as(dir, flags, path, 0)
+    }
+
+    /// OPEN naming `client`, as vfsd does on the root Channel.
+    fn open_as(
+        &mut self,
+        dir: DwHandle,
+        flags: u32,
+        path: &[u8],
+        client: u64,
+    ) -> (DwHandle, Status, Option<Attr>) {
         self.transaction += 1;
         let (near, far) = self.world.pair();
         assert_eq!(self.world.rights(far), Some(OPEN_CHANNEL_RIGHTS));
@@ -227,7 +238,11 @@ impl Fs {
         let size = node::encode(
             &node::Message {
                 transaction_id: self.transaction,
-                body: Body::Open { flags, path },
+                body: Body::Open {
+                    flags,
+                    path,
+                    client,
+                },
             },
             &mut bytes,
         )
@@ -668,7 +683,6 @@ fn locks_belong_to_their_channel_and_go_with_it() {
             Body::Lock {
                 lock: lock(0, 0, LockMode::Exclusive),
                 flags: 0,
-                group: 0,
             }
         )
         .0,
@@ -680,7 +694,6 @@ fn locks_belong_to_their_channel_and_go_with_it() {
             Body::Lock {
                 lock: lock(10, 1, LockMode::Shared),
                 flags: 0,
-                group: 0,
             }
         )
         .0,
@@ -698,7 +711,6 @@ fn locks_belong_to_their_channel_and_go_with_it() {
             Body::Lock {
                 lock: lock(0, 0, LockMode::Exclusive),
                 flags: 0,
-                group: 0,
             }
         )
         .0,
@@ -711,7 +723,6 @@ fn locks_belong_to_their_channel_and_go_with_it() {
             Body::Lock {
                 lock: lock(0, 100, LockMode::Unlock),
                 flags: 0,
-                group: 0,
             }
         )
         .0,
@@ -723,7 +734,6 @@ fn locks_belong_to_their_channel_and_go_with_it() {
             Body::Lock {
                 lock: lock(10, 1, LockMode::Exclusive),
                 flags: 0,
-                group: 0,
             }
         )
         .0,
@@ -735,7 +745,6 @@ fn locks_belong_to_their_channel_and_go_with_it() {
             Body::Lock {
                 lock: lock(100, 1, LockMode::Shared),
                 flags: 0,
-                group: 0,
             }
         )
         .0,
@@ -750,7 +759,6 @@ fn locks_belong_to_their_channel_and_go_with_it() {
             Body::Lock {
                 lock: lock(0, 0, LockMode::Exclusive),
                 flags: 0,
-                group: 0,
             }
         )
         .0,
@@ -773,7 +781,6 @@ fn one_channel_cannot_take_the_lock_table_from_the_others() {
                 Body::Lock {
                     lock: lock(index * 2, 1, LockMode::Shared),
                     flags: 0,
-                    group: 0,
                 }
             )
             .0,
@@ -786,7 +793,6 @@ fn one_channel_cannot_take_the_lock_table_from_the_others() {
             Body::Lock {
                 lock: lock(1_000_000, 1, LockMode::Shared),
                 flags: 0,
-                group: 0,
             }
         )
         .0,
@@ -800,7 +806,6 @@ fn one_channel_cannot_take_the_lock_table_from_the_others() {
                 Body::Lock {
                     lock: lock(index * 2, 1, LockMode::Shared),
                     flags: 0,
-                    group: 0,
                 }
             )
             .0,
@@ -826,7 +831,6 @@ fn a_file_opened_again_is_another_lock_owner() {
             Body::Lock {
                 lock: lock(0, 0, LockMode::Exclusive),
                 flags: 0,
-                group: 0,
             }
         )
         .0,
@@ -838,7 +842,6 @@ fn a_file_opened_again_is_another_lock_owner() {
             Body::Lock {
                 lock: lock(0, 1, LockMode::Shared),
                 flags: 0,
-                group: 0,
             }
         )
         .0,
@@ -868,7 +871,6 @@ fn a_request_after_a_close_sees_the_close() {
             Body::Lock {
                 lock: lock(0, 0, LockMode::Exclusive),
                 flags: 0,
-                group: 0,
             }
         )
         .0,
@@ -886,7 +888,6 @@ fn a_request_after_a_close_sees_the_close() {
             Body::Lock {
                 lock: lock(0, 0, LockMode::Exclusive),
                 flags: 0,
-                group: 0,
             }
         )
         .0,
@@ -904,13 +905,13 @@ fn a_request_after_a_close_sees_the_close() {
 
 impl Fs {
     /// Sends a LOCK and lets the server run once; its transaction.
-    fn lock_send(&mut self, channel: DwHandle, lock: Lock, flags: u32, group: u64) -> u64 {
+    fn lock_send(&mut self, channel: DwHandle, lock: Lock, flags: u32) -> u64 {
         self.transaction += 1;
         let mut bytes = vec![0u8; node::MAX_BYTES];
         let size = node::encode(
             &node::Message {
                 transaction_id: self.transaction,
-                body: Body::Lock { lock, flags, group },
+                body: Body::Lock { lock, flags },
             },
             &mut bytes,
         )
@@ -938,42 +939,70 @@ fn a_waiting_lock_is_answered_when_the_holder_closes() {
     let root = fs.root;
     let (holder, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
     let (waiter, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
-    let taken = fs.lock_send(holder, lock(0, 0, LockMode::Exclusive), 0, 0);
+    let taken = fs.lock_send(holder, lock(0, 0, LockMode::Exclusive), 0);
     assert_eq!(fs.answer(holder, taken).0, Status::Ok);
-    let waiting = fs.lock_send(waiter, lock(0, 1, LockMode::Shared), LOCK_WAIT, 0);
+    let waiting = fs.lock_send(waiter, lock(0, 1, LockMode::Shared), LOCK_WAIT);
     assert!(!fs.world.readable(waiter), "no answer while it waits");
     // Its other requests are refused while it waits.
     assert_eq!(fs.status(waiter, Body::GetAttr).0, Status::Invalid);
     fs.world.close_handle(holder).unwrap();
     fs.step();
-    let (status, group) = fs.answer(waiter, waiting);
-    assert_eq!(status, Status::Ok);
-    assert_ne!(group, 0);
+    assert_eq!(fs.answer(waiter, waiting), (Status::Ok, 0));
     assert_eq!(fs.read_all(waiter), b"welcome\n");
 }
 
 #[test]
-fn a_wait_that_would_close_a_cycle_is_a_deadlock() {
+fn a_wait_that_would_close_a_cycle_between_clients_is_a_deadlock() {
+    // Clients 1 and 2 are two jobs' vfsd connections; each has one Channel
+    // per file.
     let mut fs = fs();
     let root = fs.root;
-    let open = |fs: &mut Fs, path: &[u8]| fs.open(root, OPEN_READ, path).0;
+    let open = |fs: &mut Fs, path: &[u8], client| fs.open_as(root, OPEN_READ, path, client).0;
     let (a_motd, a_etc, b_motd, b_etc) = (
-        open(&mut fs, b"etc/motd"),
-        open(&mut fs, b"etc"),
-        open(&mut fs, b"etc/motd"),
-        open(&mut fs, b"etc"),
+        open(&mut fs, b"etc/motd", 1),
+        open(&mut fs, b"etc", 1),
+        open(&mut fs, b"etc/motd", 2),
+        open(&mut fs, b"etc", 2),
     );
     let whole = lock(0, 0, LockMode::Exclusive);
-    let sent = fs.lock_send(a_motd, whole, 0, 0);
-    let (_, a) = fs.answer(a_motd, sent);
-    let sent = fs.lock_send(b_etc, whole, 0, 0);
-    let (_, b) = fs.answer(b_etc, sent);
-    let a_waits = fs.lock_send(a_etc, whole, LOCK_WAIT, a);
+    let sent = fs.lock_send(a_motd, whole, 0);
+    assert_eq!(fs.answer(a_motd, sent).0, Status::Ok);
+    let sent = fs.lock_send(b_etc, whole, 0);
+    assert_eq!(fs.answer(b_etc, sent).0, Status::Ok);
+    let a_waits = fs.lock_send(a_etc, whole, LOCK_WAIT);
     assert!(!fs.world.readable(a_etc));
-    let sent = fs.lock_send(b_motd, whole, LOCK_WAIT, b);
+    let sent = fs.lock_send(b_motd, whole, LOCK_WAIT);
     assert_eq!(fs.answer(b_motd, sent).0, Status::Deadlock);
     // B gives up its lock; A's wait ends.
     fs.world.close_handle(b_etc).unwrap();
     fs.step();
-    assert_eq!(fs.answer(a_etc, a_waits), (Status::Ok, a));
+    assert_eq!(fs.answer(a_etc, a_waits), (Status::Ok, 0));
+}
+
+#[test]
+fn a_node_s_client_is_inherited_and_never_named_by_a_client() {
+    let mut fs = fs();
+    let root = fs.root;
+    let (etc, _, _) = fs.open_as(root, OPEN_READ, b"etc", 1);
+    // Opened through client 1's directory: client 1's, so its wait on
+    // client 1's own lock is a deadlock.
+    let (motd, status, _) = fs.open(etc, OPEN_READ, b"motd");
+    assert_eq!(status, Status::Ok);
+    let (held, _, _) = fs.open_as(root, OPEN_READ, b"etc/motd", 1);
+    let sent = fs.lock_send(held, lock(0, 0, LockMode::Exclusive), 0);
+    assert_eq!(fs.answer(held, sent).0, Status::Ok);
+    let sent = fs.lock_send(motd, lock(0, 0, LockMode::Exclusive), LOCK_WAIT);
+    assert_eq!(fs.answer(motd, sent).0, Status::Deadlock);
+    // Only the root Channel (vfsd) names a client.
+    let (forged, status, _) = fs.open_as(etc, OPEN_READ, b"motd", 2);
+    assert_eq!(status, Status::Invalid);
+    assert!(fs.world.peer_closed(forged));
+    let (reply, _) = fs.world.receive(etc);
+    assert!(matches!(
+        node::parse(&reply, 0).unwrap().body,
+        Body::Status {
+            status: Status::Invalid,
+            ..
+        }
+    ));
 }

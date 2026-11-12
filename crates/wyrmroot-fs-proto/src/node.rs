@@ -8,7 +8,7 @@
 //! client -> server  WRITE                       -> STATUS (value: bytes written)
 //! client -> server  TRUNCATE | UNLINK | SYNC    -> STATUS
 //! client -> server  QUERY_FILESYSTEM            -> FS_INFO
-//! client -> server  LOCK                        -> STATUS (value: lock group)
+//! client -> server  LOCK                        -> STATUS
 //! client -> server  TEST_LOCK                   -> LOCK_INFO
 //! server -> client  ON_OPEN                     (event, first on a new Channel)
 //! ```
@@ -28,17 +28,16 @@
 //! abandons its wait. A waiting Channel's other requests are refused
 //! INVALID until its LOCK is answered.
 //!
-//! Every Channel that locks belongs to one lock group, fixed by its first
-//! LOCK: group 0 asks the server for a new group, any other joins that
-//! group while some Channel of it is open (else INVALID). LOCK's STATUS
-//! carries the Channel's group, so a client puts all of its Channels in one
-//! group. Groups only decide deadlocks: a waiting LOCK is answered DEADLOCK
-//! instead of waiting when the locks it waits for are held by its own group,
-//! or by a group whose Channels wait, directly or through further groups,
-//! for locks of its own group. A group number is not a secret: a Channel
-//! that joins another client's group can turn that client's waits into
-//! DEADLOCK, but only on a file it has open, where it could already make it
-//! wait for ever by holding a lock.
+//! A waiting LOCK is answered DEADLOCK instead when it would wait for
+//! ever: when the locks it waits for are held by its own client, or by a
+//! client whose Channels wait, directly or through further clients, for
+//! locks of its own client. A node's client is the `vfsd` client connection
+//! it was opened through, which `vfsd` writes into the OPEN it forwards on
+//! the filesystem's root Channel and a node opened through another node
+//! inherits; a running job holds one connection. No client names its own,
+//! so none can stand in for another in this walk. A node with no client (0)
+//! is a client of its own. The answer is checked when a LOCK starts to wait
+//! and again whenever waiters are granted.
 //!
 //! A request that does not apply to the node (READ on a directory, UNLINK
 //! on a file) is answered with STATUS and the matching error. Replies echo
@@ -197,6 +196,11 @@ pub enum Body<'a> {
         flags: u32,
         /// Canonical relative; empty opens this node again.
         path: &'a [u8],
+        /// The `vfsd` client connection the open came through (1.2): set
+        /// only by `vfsd` on a filesystem's root Channel, and 0 from anyone
+        /// else. A node opened through another node belongs to that node's
+        /// client.
+        client: u64,
     },
     GetAttr,
     /// `cookie` 0 starts a listing; later calls pass the last DIRENTS'
@@ -225,11 +229,9 @@ pub enum Body<'a> {
     QueryFilesystem,
     /// Locks, or with [`LockMode::Unlock`] unlocks, a range (1.1). `flags`
     /// is a set of `LOCK_*` bits (1.2); [`LOCK_WAIT`] needs a lock mode.
-    /// `group` is the Channel's lock group, or 0 for a new one (1.2).
     Lock {
         lock: Lock,
         flags: u32,
-        group: u64,
     },
     /// Asks for a lock of another Channel that `Lock` (shared or exclusive)
     /// would conflict with (1.1).
@@ -280,14 +282,14 @@ impl Body<'_> {
             + match self {
                 Self::GetAttr | Self::Sync | Self::QueryFilesystem => 0,
                 Self::ReadDir { .. } | Self::Truncate { .. } => 8,
-                Self::Open { path, .. } => 8 + path.len(),
+                Self::Open { path, .. } => 16 + path.len(),
                 Self::Unlink { name } => 8 + name.len(),
                 Self::Data(data) => 8 + data.len(),
                 Self::Read { .. } | Self::Status { .. } => 16,
                 Self::Write { data, .. } => 16 + data.len(),
                 Self::Dirents { entries, .. } => 16 + entries.bytes.len(),
-                Self::TestLock(_) | Self::LockInfo(_) => 24,
-                Self::Lock { .. } | Self::Attr(_) | Self::FsInfo(_) => 32,
+                Self::Lock { .. } | Self::TestLock(_) | Self::LockInfo(_) => 24,
+                Self::Attr(_) | Self::FsInfo(_) => 32,
                 Self::OnOpen { .. } => 40,
             }
     }
@@ -441,10 +443,15 @@ pub fn encode(message: &Message<'_>, output: &mut [u8]) -> Result<usize, Error> 
     );
     match *body {
         Body::GetAttr | Body::Sync | Body::QueryFilesystem => {}
-        Body::Open { flags, path } => {
+        Body::Open {
+            flags,
+            path,
+            client,
+        } => {
             put32(output, 32, flags);
             put32(output, 36, path.len() as u32);
-            output[40..].copy_from_slice(path);
+            put64(output, 40, client);
+            output[48..].copy_from_slice(path);
         }
         Body::ReadDir { cookie } => put64(output, 32, cookie),
         Body::Read { offset, length } => {
@@ -491,10 +498,9 @@ pub fn encode(message: &Message<'_>, output: &mut [u8]) -> Result<usize, Error> 
             put64(output, 48, info.total_bytes);
             put64(output, 56, info.free_bytes);
         }
-        Body::Lock { lock, flags, group } => {
+        Body::Lock { lock, flags } => {
             put_lock(output, lock);
             put32(output, 36, flags);
-            put64(output, 56, group);
         }
         Body::TestLock(lock) => put_lock(output, lock),
         Body::LockInfo(lock) => {
@@ -525,8 +531,9 @@ pub fn parse(bytes: &[u8], handle_count: usize) -> Result<Message<'_>, Error> {
     };
     let body = match header.message_type {
         TYPE_OPEN => Body::Open {
-            path: tail(bytes, 8, 36, MAX_PATH_BYTES)?,
+            path: tail(bytes, 16, 36, MAX_PATH_BYTES)?,
             flags: get32(bytes, 32),
+            client: get64(bytes, 40),
         },
         TYPE_GET_ATTR => {
             fixed(0)?;
@@ -623,14 +630,13 @@ pub fn parse(bytes: &[u8], handle_count: usize) -> Result<Message<'_>, Error> {
             })
         }
         TYPE_LOCK => {
-            fixed(32)?;
+            fixed(24)?;
             let mut unflagged = [0u8; HEADER_BYTES + 24];
-            unflagged.copy_from_slice(&bytes[..HEADER_BYTES + 24]);
+            unflagged.copy_from_slice(bytes);
             put32(&mut unflagged, 36, 0);
             Body::Lock {
                 lock: get_lock(&unflagged)?,
                 flags: get32(bytes, 36),
-                group: get64(bytes, 56),
             }
         }
         TYPE_TEST_LOCK => {
@@ -662,7 +668,7 @@ pub fn parse(bytes: &[u8], handle_count: usize) -> Result<Message<'_>, Error> {
 
 fn validate(body: &Body<'_>) -> Result<(), Error> {
     match *body {
-        Body::Open { flags, path } => {
+        Body::Open { flags, path, .. } => {
             check_relative(path)?;
             check_open_flags(flags, path)?;
         }

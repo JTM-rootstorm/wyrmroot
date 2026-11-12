@@ -164,7 +164,11 @@ impl Fs {
         let size = node::encode(
             &node::Message {
                 transaction_id: self.transaction,
-                body: Body::Open { flags, path },
+                body: Body::Open {
+                    flags,
+                    path,
+                    client: 0,
+                },
             },
             &mut bytes,
         )
@@ -316,7 +320,6 @@ fn opens_report_missing_wrong_kind_and_mutation() {
                     mode: LockMode::Shared,
                 },
                 flags: 0,
-                group: 0,
             },
             Status::NotSupported,
         ),
