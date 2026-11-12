@@ -120,6 +120,7 @@ mod entry_capture {
 /// DS, ES and GS selectors, then spins checking them and the word at its FS
 /// base, and leaves only when one changed. It never yields, blocks or makes a
 /// syscall in that loop, and puts MXCSR and the selectors back on the way out.
+/// It also keeps RFLAGS.AC set while it spins, and clears it on the way out.
 #[allow(
     unsafe_code,
     reason = "loads and checks XMM0-15, MXCSR, DS/ES/GS and the word at the FS base, and reads the entry capture"
@@ -239,6 +240,13 @@ mod registers {
                 "mov {t}, qword ptr fs:[0]",
                 "cmp {t}, {anchor}",
                 "jne 5f",
+                // RFLAGS.AC is set on every pass, so every interrupt that
+                // preempts the hog arrives with it set: the kernel must
+                // clear it on entry, or SMAP is off in its handlers
+                // (Deepwyrm DW2 M2), and it fails closed if it is not.
+                "pushfq",
+                "or qword ptr [rsp], 0x40000",
+                "popfq",
                 "pause",
                 "jmp 2b",
                 "4:",
@@ -250,6 +258,9 @@ mod registers {
                 "5:",
                 "mov {lost:e}, 2",
                 "6:",
+                "pushfq",
+                "and qword ptr [rsp], -0x40001",
+                "popfq",
                 "ldmxcsr dword ptr [{scr} + 272]",
                 "mov ds, word ptr [{scr} + 276]",
                 "mov es, word ptr [{scr} + 278]",
@@ -266,7 +277,6 @@ mod registers {
                 out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
                 out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
                 out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
-                options(nostack)
             );
         }
         match lost {

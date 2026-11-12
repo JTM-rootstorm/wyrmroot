@@ -62,6 +62,9 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(180);
 const PROMPT: &[u8] = b"wyrmsh> ";
 const END_OF_INPUT: u8 = 0x04;
 const POWER_OFF: &[u8] = b"no process remains; powering off";
+/// The kernel's record that every CPU runs with SMEP and SMAP (Deepwyrm
+/// DW2 M2): the guest CPU has both, so the kernel must have turned them on.
+const SUPERVISOR_PROTECTIONS_ON: &[u8] = b"[DW0][INFO][cpu] smep and smap on";
 /// Every service the storage spine publishes (root `STORAGE_PLAN.md` W2-W7).
 const SERVICES: [&[u8]; 5] = [
     b"service name=device.block.virtio0 ",
@@ -563,6 +566,12 @@ fn drive(
     if !contains(&log, POWER_OFF) {
         return Err(Failure::task(format!(
             "dev-boot check: QEMU exited without the kernel power-off line; see {}",
+            com1.display()
+        )));
+    }
+    if !contains(&log, SUPERVISOR_PROTECTIONS_ON) {
+        return Err(Failure::task(format!(
+            "dev-boot check: the kernel did not report SMEP and SMAP on; see {}",
             com1.display()
         )));
     }
