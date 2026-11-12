@@ -1,0 +1,17 @@
+[package]
+name = "wyrmroot-startup-proto"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later WITH Classpath-exception-2.0"
+publish = false
+description = "Wyrmroot launch protocol (WRLP): the startup exchange between a loader and its child"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

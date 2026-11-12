@@ -10,6 +10,7 @@ The full license texts carried by this repository are:
 
 - `LICENSES/GPL-2.0-or-later.txt`
 - `LICENSES/GPL-3.0-or-later.txt`
+- `LICENSES/Classpath-exception-2.0.txt`
 - `LICENSES/Unicode-3.0.txt`
 
 ## Current GPL-3.0-or-later components
@@ -41,6 +42,16 @@ That narrow data file
 retains the `Unicode-3.0` license and copyright notice. The surrounding decoder
 remains `GPL-3.0-or-later`; the package metadata records the combined
 `GPL-3.0-or-later AND Unicode-3.0` distribution terms.
+
+## Codecs linked into SDK programs
+
+These protocol crates are linked into every program built with the Wyrmroot SDK (`../wyrmroot-sdk`), so they are `GPL-3.0-or-later WITH Classpath-exception-2.0`, like the SDK runtime (root `LICENSING_POLICY.md`; Mike, 2026-11-12). Wyrmroot uses the same crates, so each encoding is defined once:
+
+- `crates/wyrmroot-startup-proto/**` — the WRLP launch protocol, split out of `wyrmroot-loader`, which re-exports it as `wyrmroot_loader::launch`. Wholly first-party (every commit to it is Mike's), so it moved from the loader's `GPL-2.0-or-later`;
+- `crates/wyrmroot-stream-proto/**` — WRST byte streams; and
+- `crates/wyrmroot-fs-proto/**` — the WRNS namespace and WRFS node protocols.
+
+The exception lets a program link these and be distributed under its own terms; changes to the crates themselves stay under the GPL.
 
 ## Current GPL-2.0-or-later components
 

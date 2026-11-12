@@ -5,5 +5,7 @@
 
 pub mod elf;
 pub mod image;
-pub mod launch;
+/// The launch protocol, which lives in its own crate so SDK programs can
+/// link it under the Classpath exception.
+pub use wyrmroot_startup_proto as launch;
 pub mod process;

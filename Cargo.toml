@@ -18,6 +18,7 @@ members = [
     "crates/wyrmroot-rrc-manifest",
     "crates/wyrmroot-service",
     "crates/wyrmroot-service-proto",
+    "crates/wyrmroot-startup-proto",
     "crates/wyrmroot-runtime",
     "crates/wyrmroot-stream-proto",
     "crates/wyrmroot-uart16550-core",

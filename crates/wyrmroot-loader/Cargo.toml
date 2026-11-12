@@ -11,4 +11,5 @@ path = "src/lib.rs"
 
 [dependencies]
 deepwyrm-syscall.workspace = true
+wyrmroot-startup-proto = { path = "../wyrmroot-startup-proto" }
 wyrmroot-registry-proto = { path = "../wyrmroot-registry-proto" }

@@ -1,9 +1,18 @@
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 //! Wyrmroot parent/child launch protocol (`WRLP`) encoding and validation.
+//!
+//! The child's half of this protocol is linked into every program built
+//! with the Wyrmroot SDK, so this crate carries the Classpath exception
+//! (root `LICENSING_POLICY.md`). `wyrmroot-loader` re-exports it as
+//! `wyrmroot_loader::launch`.
 //!
 //! Existing launch profiles retain the WRLP 1.0 wire shape. WYR0-I probe
 //! children use the explicit WRLP 1.1 profile for both INIT and READY so a
 //! self-root-only startup grant cannot be confused with the controller's
 //! authority trio.
+
+#![no_std]
+#![forbid(unsafe_code)]
 
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_MEMORY_OBJECT,
@@ -11,6 +20,11 @@ use deepwyrm_syscall::{
     DW_RIGHT_READ, DW_RIGHT_RESOURCE, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
     DwObjectType, DwReceivedHandleInfoV1, DwRights,
 };
+
+/// The startup ABI versions a child receives in RSI: 1 for the original
+/// profiles, 2 for jobs (startup block with auxv).
+pub const STARTUP_ABI_VERSION: u64 = 1;
+pub const STARTUP_ABI_V2: u64 = 2;
 
 pub const HEADER_BYTES: usize = 40;
 pub const INIT0_BYTES: usize = 64;
@@ -909,19 +923,23 @@ pub fn parse_device_driver_init(
     })
 }
 
+/// Facts about each profile's INIT that the loader uses to build it.
 impl LaunchProfile {
-    pub(crate) const fn has_loader_authority_trio(self) -> bool {
+    /// INIT carries the self root, bootfs and loader TaskGroup.
+    pub const fn has_loader_authority_trio(self) -> bool {
         matches!(
             self,
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Supervisor
         )
     }
 
-    pub(crate) const fn has_loader_authority_quartet(self) -> bool {
+    /// INIT carries the trio and a resource domain.
+    pub const fn has_loader_authority_quartet(self) -> bool {
         matches!(self, Self::SupervisorResourceDomain)
     }
 
-    pub(crate) const fn needs_self_root(self) -> bool {
+    /// The child receives its own root AddressRegion.
+    pub const fn needs_self_root(self) -> bool {
         self.has_loader_authority_trio()
             || self.has_loader_authority_quartet()
             || matches!(
@@ -941,7 +959,8 @@ impl LaunchProfile {
             )
     }
 
-    pub(crate) const fn channel_role(self) -> Option<u32> {
+    /// The role of the one extra Channel this profile carries, if any.
+    pub const fn channel_role(self) -> Option<u32> {
         match self {
             Self::BootstrapRegistry => Some(ROLE_SUPERVISOR_CONTROL),
             Self::BootstrapService => Some(ROLE_PUBLICATION_AUTHORITY),

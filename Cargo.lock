@@ -323,6 +323,7 @@ version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-registry-proto",
+ "wyrmroot-startup-proto",
 ]
 
 [[package]]
@@ -375,6 +376,13 @@ dependencies = [
 [[package]]
 name = "wyrmroot-service-proto"
 version = "0.0.0"
+
+[[package]]
+name = "wyrmroot-startup-proto"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+]
 
 [[package]]
 name = "wyrmroot-stream-proto"

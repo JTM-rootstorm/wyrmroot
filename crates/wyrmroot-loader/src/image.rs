@@ -52,8 +52,7 @@ impl ImageAuxv {
     }
 }
 
-pub const STARTUP_ABI_VERSION: u64 = 1;
-pub const STARTUP_ABI_V2: u64 = 2;
+pub use wyrmroot_startup_proto::{STARTUP_ABI_V2, STARTUP_ABI_VERSION};
 pub const STARTUP_PAGE_ADDRESS: u64 = STACK_TOP - PAGE_SIZE;
 pub const INITIAL_STACK_POINTER: u64 = STARTUP_PAGE_ADDRESS;
 pub const STARTUP_V2_BLOCK_BYTES: usize = 5 * PAGE_SIZE as usize;
