@@ -46,7 +46,7 @@ use wyrmroot_ext4::{
     DeviceError, Error as Ext4Error, Journal, Journaled, Kind as Ext4Kind, ROOT_INODE, Stat, Store,
     Transaction, Volume,
 };
-use wyrmroot_fs_lock::{LockError, LockTable};
+use wyrmroot_fs_lock::{LockServer, Outcome};
 use wyrmroot_fs_proto::node::{
     self, ACCESS_READ, ACCESS_WRITE, Attr, Body, EntryWriter, FS_DURABLE_SYNC, FS_HARD_LINKS,
     FS_READ_ONLY, FsInfo, Kind, MAX_DIRENT_BYTES, MAX_IO_BYTES,
@@ -345,7 +345,7 @@ pub struct Server<V> {
     /// A commit failed: no more are tried, and SYNC fails (W11 review R4).
     failed: bool,
     /// Advisory locks, owned by the Channel each was taken on (W10).
-    locks: LockTable<MAX_LOCKS>,
+    locks: LockServer<MAX_LOCKS, { MAX_NODES + 1 }>,
     /// The filesystem identity every Attr carries, from the volume's UUID.
     filesystem: u64,
 }
@@ -501,7 +501,7 @@ impl<V: View> Server<V> {
             commit_due: None,
             full: false,
             failed: false,
-            locks: LockTable::with_owner_limit(LOCKS_PER_NODE),
+            locks: LockServer::with_owner_limit(LOCKS_PER_NODE),
             filesystem,
         })
     }
@@ -593,7 +593,23 @@ impl<V: View> Server<V> {
                 }
             }
         }
+        // Whatever was served or closed may have released a lock.
+        self.grant_waiters(platform);
         Ok(true)
+    }
+
+    /// Answers every waiting LOCK that can now be granted.
+    fn grant_waiters<P: Ext4Platform>(&mut self, platform: &mut P) {
+        while let Some((owner, transaction_id, outcome)) = self.locks.take_granted() {
+            // A Channel that cannot be answered is gone or broken; its close
+            // releases what it was just granted.
+            let _ = send(
+                platform,
+                DwHandle(owner),
+                transaction_id,
+                lock_reply(outcome),
+            );
+        }
     }
 
     /// Drops the nodes, other than `serving`, whose client closed its end
@@ -772,6 +788,18 @@ impl<V: View> Server<V> {
             &mut self.journal,
             &mut self.full,
         );
+        // A Channel whose LOCK waits has nothing else to ask (WRFS 1.2).
+        if self.locks.is_waiting(here.channel.0) {
+            for info in received {
+                let _ = platform.close_handle(info.handle);
+            }
+            return send(
+                platform,
+                here.channel,
+                transaction_id,
+                status(Status::Invalid),
+            );
+        }
         let reply = match message.body {
             Body::Open { flags, path } => {
                 let server = received[0];
@@ -896,18 +924,26 @@ impl<V: View> Server<V> {
                     Status::AccessDenied
                 })
             }
-            Body::Lock(lock) => {
+            Body::Lock { lock, flags, group } => {
                 let node = u64::from(here.inode);
-                let mut result = self.locks.set(node, here.channel.0, lock);
-                if result.is_err() {
+                let owner = here.channel.0;
+                let mut outcome =
+                    self.locks
+                        .request(owner, node, lock, flags, group, transaction_id);
+                if matches!(outcome, Outcome::Busy | Outcome::Deadlock | Outcome::NoRoom) {
                     self.reap_closed(platform, here.channel);
-                    result = self.locks.set(node, here.channel.0, lock);
+                    outcome = self
+                        .locks
+                        .request(owner, node, lock, flags, group, transaction_id);
                 }
-                status(match result {
-                    Ok(()) => Status::Ok,
-                    Err(LockError::Conflict) => Status::Busy,
-                    Err(LockError::NoRoom) => Status::NoResources,
-                })
+                match outcome {
+                    // Answered when it is granted (`grant_waiters`).
+                    Outcome::Waiting => {
+                        self.grant_waiters(platform);
+                        return true;
+                    }
+                    outcome => lock_reply(outcome),
+                }
             }
             Body::TestLock(lock) => {
                 let node = u64::from(here.inode);
@@ -1068,6 +1104,25 @@ impl<V: View> Server<V> {
                 let _ = platform.close_handle(server);
             }
         }
+    }
+}
+
+/// LOCK's answer for an outcome other than waiting.
+fn lock_reply(outcome: Outcome) -> Body<'static> {
+    match outcome {
+        Outcome::Granted(group) => Body::Status {
+            status: Status::Ok,
+            value: group,
+        },
+        outcome => Body::Status {
+            status: match outcome {
+                Outcome::Busy => Status::Busy,
+                Outcome::Deadlock => Status::Deadlock,
+                Outcome::NoRoom => Status::NoResources,
+                _ => Status::Invalid,
+            },
+            value: 0,
+        },
     }
 }
 

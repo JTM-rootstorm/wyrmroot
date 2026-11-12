@@ -309,11 +309,15 @@ fn opens_report_missing_wrong_kind_and_mutation() {
         (Body::Sync, Status::Ok),
         // No locks on FAT; the node stays open (W10).
         (
-            Body::Lock(Lock {
-                start: 0,
-                length: 0,
-                mode: LockMode::Shared,
-            }),
+            Body::Lock {
+                lock: Lock {
+                    start: 0,
+                    length: 0,
+                    mode: LockMode::Shared,
+                },
+                flags: 0,
+                group: 0,
+            },
             Status::NotSupported,
         ),
         (

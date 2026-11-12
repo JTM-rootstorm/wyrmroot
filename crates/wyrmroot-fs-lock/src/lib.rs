@@ -16,8 +16,11 @@
 
 use wyrmroot_fs_proto::node::{Lock, LockMode};
 
+mod server;
 #[cfg(test)]
 mod tests;
+
+pub use server::{LockServer, Outcome};
 
 /// One granted lock. `end` is exclusive; `u64::MAX` runs to the end of any
 /// file size.
@@ -100,14 +103,22 @@ impl<const N: usize> LockTable<N> {
     /// A lock of another owner on `node` that `lock` (shared or exclusive)
     /// would conflict with.
     pub fn conflict(&self, node: u64, owner: u64, lock: Lock) -> Option<Held> {
-        let (start, end) = range(lock)?;
+        self.conflicts(node, owner, lock).next()
+    }
+
+    /// Every lock of another owner on `node` that `lock` would conflict
+    /// with.
+    pub fn conflicts(&self, node: u64, owner: u64, lock: Lock) -> impl Iterator<Item = Held> + '_ {
+        let range = range(lock).filter(|_| lock.mode != LockMode::Unlock);
         let exclusive = lock.mode == LockMode::Exclusive;
         self.iter()
-            .find(|held| {
-                held.node == node
-                    && held.owner != owner
-                    && held.overlaps(start, end)
-                    && (exclusive || held.exclusive)
+            .filter(move |held| {
+                range.is_some_and(|(start, end)| {
+                    held.node == node
+                        && held.owner != owner
+                        && held.overlaps(start, end)
+                        && (exclusive || held.exclusive)
+                })
             })
             .copied()
     }

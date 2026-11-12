@@ -1,4 +1,4 @@
-//! WRFS 1.1: the node protocol, on a Channel to one directory or file.
+//! WRFS 1.2: the node protocol, on a Channel to one directory or file.
 //!
 //! ```text
 //! client -> server  OPEN (+ new node Channel)   (one-way; ON_OPEN on that Channel)
@@ -8,20 +8,37 @@
 //! client -> server  WRITE                       -> STATUS (value: bytes written)
 //! client -> server  TRUNCATE | UNLINK | SYNC    -> STATUS
 //! client -> server  QUERY_FILESYSTEM            -> FS_INFO
-//! client -> server  LOCK                        -> STATUS
+//! client -> server  LOCK                        -> STATUS (value: lock group)
 //! client -> server  TEST_LOCK                   -> LOCK_INFO
 //! server -> client  ON_OPEN                     (event, first on a new Channel)
 //! ```
 //!
-//! Locks (1.1) are advisory byte-range locks on a file, shared or
-//! exclusive. A lock belongs to the Channel it was taken on: locks on one
-//! Channel never conflict with each other, a new lock replaces that
+//! Locks (1.1, waiting 1.2) are advisory byte-range locks on a file,
+//! shared or exclusive. A lock belongs to the Channel it was taken on: locks
+//! on one Channel never conflict with each other, a new lock replaces that
 //! Channel's own locks where they overlap, and closing the Channel releases
-//! them, so a job that ends releases its locks. LOCK that conflicts with
-//! another Channel's lock is answered BUSY at once; nothing waits. Locks
-//! affect only other LOCK and TEST_LOCK requests, never reads or writes, and
-//! need no particular access. TEST_LOCK reports one lock of another Channel
-//! that the described lock would conflict with.
+//! them, so a job that ends releases its locks. Locks affect only other LOCK
+//! and TEST_LOCK requests, never reads or writes, and need no particular
+//! access. TEST_LOCK reports one lock of another Channel that the described
+//! lock would conflict with.
+//!
+//! LOCK that conflicts with another Channel's lock is answered BUSY, or
+//! with [`LOCK_WAIT`] is answered once it is granted: waiters are granted in
+//! the order they arrived whenever a lock goes. Closing a waiting Channel
+//! abandons its wait. A waiting Channel's other requests are refused
+//! INVALID until its LOCK is answered.
+//!
+//! Every Channel that locks belongs to one lock group, fixed by its first
+//! LOCK: group 0 asks the server for a new group, any other joins that
+//! group while some Channel of it is open (else INVALID). LOCK's STATUS
+//! carries the Channel's group, so a client puts all of its Channels in one
+//! group. Groups only decide deadlocks: a waiting LOCK is answered DEADLOCK
+//! instead of waiting when the locks it waits for are held by its own group,
+//! or by a group whose Channels wait, directly or through further groups,
+//! for locks of its own group. A group number is not a secret: a Channel
+//! that joins another client's group can turn that client's waits into
+//! DEADLOCK, but only on a file it has open, where it could already make it
+//! wait for ever by holding a lock.
 //!
 //! A request that does not apply to the node (READ on a directory, UNLINK
 //! on a file) is answered with STATUS and the matching error. Replies echo
@@ -77,6 +94,10 @@ pub const FS_HARD_LINKS: u32 = 1 << 2;
 /// FS_INFO flag: the filesystem stores symbolic links.
 pub const FS_SYMLINKS: u32 = 1 << 3;
 const FS_FLAGS: u32 = FS_READ_ONLY | FS_DURABLE_SYNC | FS_HARD_LINKS | FS_SYMLINKS;
+
+/// LOCK flag: wait for a conflicting lock to go instead of answering BUSY
+/// (1.2).
+pub const LOCK_WAIT: u32 = 1 << 0;
 
 /// What a LOCK request does to its range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -202,8 +223,14 @@ pub enum Body<'a> {
     },
     Sync,
     QueryFilesystem,
-    /// Locks, or with [`LockMode::Unlock`] unlocks, a range (1.1).
-    Lock(Lock),
+    /// Locks, or with [`LockMode::Unlock`] unlocks, a range (1.1). `flags`
+    /// is a set of `LOCK_*` bits (1.2); [`LOCK_WAIT`] needs a lock mode.
+    /// `group` is the Channel's lock group, or 0 for a new one (1.2).
+    Lock {
+        lock: Lock,
+        flags: u32,
+        group: u64,
+    },
     /// Asks for a lock of another Channel that `Lock` (shared or exclusive)
     /// would conflict with (1.1).
     TestLock(Lock),
@@ -243,7 +270,7 @@ impl Body<'_> {
                 | Self::Unlink { .. }
                 | Self::Sync
                 | Self::QueryFilesystem
-                | Self::Lock(_)
+                | Self::Lock { .. }
                 | Self::TestLock(_)
         )
     }
@@ -259,8 +286,8 @@ impl Body<'_> {
                 Self::Read { .. } | Self::Status { .. } => 16,
                 Self::Write { data, .. } => 16 + data.len(),
                 Self::Dirents { entries, .. } => 16 + entries.bytes.len(),
-                Self::Lock(_) | Self::TestLock(_) | Self::LockInfo(_) => 24,
-                Self::Attr(_) | Self::FsInfo(_) => 32,
+                Self::TestLock(_) | Self::LockInfo(_) => 24,
+                Self::Lock { .. } | Self::Attr(_) | Self::FsInfo(_) => 32,
                 Self::OnOpen { .. } => 40,
             }
     }
@@ -289,7 +316,7 @@ impl Body<'_> {
             Self::Dirents { .. } => TYPE_DIRENTS,
             Self::Data(_) => TYPE_DATA,
             Self::FsInfo(_) => TYPE_FS_INFO,
-            Self::Lock(_) => TYPE_LOCK,
+            Self::Lock { .. } => TYPE_LOCK,
             Self::TestLock(_) => TYPE_TEST_LOCK,
             Self::LockInfo(_) => TYPE_LOCK_INFO,
         }
@@ -464,7 +491,12 @@ pub fn encode(message: &Message<'_>, output: &mut [u8]) -> Result<usize, Error> 
             put64(output, 48, info.total_bytes);
             put64(output, 56, info.free_bytes);
         }
-        Body::Lock(lock) | Body::TestLock(lock) => put_lock(output, lock),
+        Body::Lock { lock, flags, group } => {
+            put_lock(output, lock);
+            put32(output, 36, flags);
+            put64(output, 56, group);
+        }
+        Body::TestLock(lock) => put_lock(output, lock),
         Body::LockInfo(lock) => {
             if let Some(lock) = lock {
                 put_lock(output, lock);
@@ -591,8 +623,15 @@ pub fn parse(bytes: &[u8], handle_count: usize) -> Result<Message<'_>, Error> {
             })
         }
         TYPE_LOCK => {
-            fixed(24)?;
-            Body::Lock(get_lock(bytes)?)
+            fixed(32)?;
+            let mut unflagged = [0u8; HEADER_BYTES + 24];
+            unflagged.copy_from_slice(&bytes[..HEADER_BYTES + 24]);
+            put32(&mut unflagged, 36, 0);
+            Body::Lock {
+                lock: get_lock(&unflagged)?,
+                flags: get32(bytes, 36),
+                group: get64(bytes, 56),
+            }
         }
         TYPE_TEST_LOCK => {
             fixed(24)?;
@@ -674,7 +713,15 @@ fn validate(body: &Body<'_>) -> Result<(), Error> {
                 return Err(Error::InvalidField);
             }
         }
-        Body::Lock(lock) => check_lock(lock)?,
+        Body::Lock { lock, flags, .. } => {
+            check_lock(lock)?;
+            if flags & !LOCK_WAIT != 0 {
+                return Err(Error::UnknownFlags);
+            }
+            if flags & LOCK_WAIT != 0 && lock.mode == LockMode::Unlock {
+                return Err(Error::InvalidField);
+            }
+        }
         Body::TestLock(lock) => {
             check_lock(lock)?;
             if lock.mode == LockMode::Unlock {

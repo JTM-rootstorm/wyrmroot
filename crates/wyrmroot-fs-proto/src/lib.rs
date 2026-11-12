@@ -3,10 +3,10 @@
 //! Two protocols share one header layout, one status set and one path
 //! grammar:
 //!
-//! - [`node`] (`WRFS` 1.1) is spoken on a Channel to one opened directory or
+//! - [`node`] (`WRFS` 1.2) is spoken on a Channel to one opened directory or
 //!   file. A filesystem service serves it, and so does `vfsd` for the
 //!   synthetic directories above its mount points.
-//! - [`namespace`] (`WRNS` 1.1, unchanged from 1.0 but for the shared header's version) is spoken to `vfsd`: OPEN of an absolute
+//! - [`namespace`] (`WRNS` 1.2, unchanged from 1.0 but for the shared header's version) is spoken to `vfsd`: OPEN of an absolute
 //!   path through the mount table, and MOUNT/UNMOUNT on the administrative
 //!   connection.
 //!
@@ -41,7 +41,7 @@ pub mod namespace;
 pub mod node;
 
 pub const MAJOR: u16 = 1;
-pub const MINOR: u16 = 1;
+pub const MINOR: u16 = 2;
 pub const HEADER_BYTES: usize = 32;
 /// The longest path either protocol carries, in bytes.
 pub const MAX_PATH_BYTES: usize = 1024;
@@ -122,6 +122,8 @@ pub enum Status {
     NoResources = 13,
     /// The request could not be passed on now; it may be retried.
     Busy = 14,
+    /// Waiting for the lock would wait for ever (1.2).
+    Deadlock = 15,
 }
 
 impl Status {
@@ -142,6 +144,7 @@ impl Status {
             12 => Self::NotEmpty,
             13 => Self::NoResources,
             14 => Self::Busy,
+            15 => Self::Deadlock,
             _ => return Err(Error::UnknownStatus),
         })
     }

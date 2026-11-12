@@ -532,7 +532,7 @@ impl Vfs {
             }
             NodeBody::Unlink { .. } => status(Status::AccessDenied),
             NodeBody::Sync => status(Status::Ok),
-            NodeBody::Lock(_) | NodeBody::TestLock(_) => status(Status::NotSupported),
+            NodeBody::Lock { .. } | NodeBody::TestLock(_) => status(Status::NotSupported),
             NodeBody::QueryFilesystem => NodeBody::FsInfo(FsInfo {
                 flags: FS_READ_ONLY,
                 name_max: MAX_NAME_BYTES as u32,

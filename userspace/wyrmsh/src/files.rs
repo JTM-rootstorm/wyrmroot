@@ -50,6 +50,7 @@ fn status_text(status: Status) -> Failure {
         Status::NotEmpty => b"not empty",
         Status::NoResources => b"no resources",
         Status::Busy => b"busy",
+        Status::Deadlock => b"deadlock",
     }
 }
 
