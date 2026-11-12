@@ -22,10 +22,10 @@
 //! removes it and shuts down. Each boot must end with the kernel's power-off
 //! line on its COM1 log. That is the smoke check for development commits.
 //!
-//! The persistent root is a second, writable virtio disk at 00:02.0: an
-//! ext4 volume made by `wyrmroot-ext4` with a `boot` mount point. `--check`
-//! makes a fresh one per run; an interactive run keeps one at
-//! `OS-Project/.tmp/dev-boot/root.img` across runs.
+//! The persistent root is a second, writable virtio disk at 00:02.0: a copy
+//! of the product's empty ext4 `root.img`. `--check` makes a fresh copy per
+//! run; an interactive run keeps one at `OS-Project/.tmp/dev-boot/root.img`
+//! across runs.
 //!
 //! Nothing here is milestone evidence. It writes no request, receipt or result
 //! a gate could consume, and its output under `OS-Project/.tmp/dev-boot/` is
@@ -43,7 +43,6 @@ use std::{
 };
 
 use crate::{error::Failure, product, tasks};
-use wyrmroot_ext4::{Device, DeviceError, FormatParams, Kind, ROOT_INODE, Volume};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DevBoot {
@@ -67,10 +66,6 @@ const SERVICES: [&[u8]; 5] = [
     b"service name=volume.root0 ",
     b"service name=system.vfs ",
 ];
-/// The root disk's size.
-const ROOT_DISK_BYTES: u64 = 64 << 20;
-/// The persistent root disk an interactive run keeps.
-const ROOT_DISK_NAME: &str = "root.img";
 /// The ESP read back through vfsd, fat32d and blockmgr.
 const ESP_LISTING: [&[u8]; 2] = [b"bootstrap.elf\r\n", b"README.TXT\r\n"];
 const ESP_README: &[u8] = b"This is the Wyrmroot EFI System Partition.";
@@ -108,12 +103,15 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
         .map_err(|error| Failure::task(format!("could not open OVMF vars copy: {error}")))?;
     let com1 = root.join("com1.log");
     let root_disk = if boot.check {
-        root.join(ROOT_DISK_NAME)
+        root.join(product::ROOT_DISK_NAME)
     } else {
-        project.join(".tmp").join("dev-boot").join(ROOT_DISK_NAME)
+        project
+            .join(".tmp")
+            .join("dev-boot")
+            .join(product::ROOT_DISK_NAME)
     };
     if !root_disk.exists() {
-        create_root_disk(&root_disk)?;
+        create_root_disk(&product, &root_disk)?;
     }
     let args = qemu_arguments(boot.smp, &product, &vars, &com1, &root_disk);
 
@@ -137,51 +135,24 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
     }
 }
 
-/// Makes `path` an empty ext4 root with a `boot` mount point.
-fn create_root_disk(path: &Path) -> Result<(), Failure> {
-    struct File(fs::File);
-    impl Device for File {
-        fn read(&mut self, offset: u64, out: &mut [u8]) -> Result<(), DeviceError> {
-            std::os::unix::fs::FileExt::read_exact_at(&self.0, out, offset)
-                .map_err(|_| DeviceError(1))
-        }
-        fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), DeviceError> {
-            std::os::unix::fs::FileExt::write_all_at(&self.0, data, offset)
-                .map_err(|_| DeviceError(2))
-        }
-        fn flush(&mut self) -> Result<(), DeviceError> {
-            self.0.sync_data().map_err(|_| DeviceError(3))
-        }
-    }
-    let failed = |what: &str| {
+/// A writable copy of the product's empty root disk at `path`.
+fn create_root_disk(product: &Path, path: &Path) -> Result<(), Failure> {
+    let failed = |what: String| {
         Failure::task(format!(
             "could not make the root disk {}: {what}",
             path.display()
         ))
     };
-    let file = fs::OpenOptions::new()
-        .read(true)
+    let mut source = fs::File::open(product.join("artifacts").join(product::ROOT_DISK_NAME))
+        .map_err(|error| failed(error.to_string()))?;
+    let mut copy = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|error| failed(&error.to_string()))?;
-    file.set_len(ROOT_DISK_BYTES)
-        .map_err(|error| failed(&error.to_string()))?;
-    let mut disk = File(file);
-    let params = FormatParams {
-        block_size: 4096,
-        uuid: *b"wyrmroot-devroot",
-        label: *b"wyrmroot-root\0\0\0",
-        time: 1_700_000_000,
-    };
-    wyrmroot_ext4::format(&mut disk, ROOT_DISK_BYTES, &params)
-        .map_err(|error| failed(&format!("{error:?}")))?;
-    let mut volume = Volume::mount(&mut disk, ROOT_DISK_BYTES, true)
-        .map_err(|error| failed(&format!("{error:?}")))?;
-    volume
-        .create(&mut disk, ROOT_INODE, b"boot", Kind::Directory)
-        .and_then(|_| volume.sync(&mut disk))
-        .map_err(|error| failed(&format!("{error:?}")))
+        .map_err(|error| failed(error.to_string()))?;
+    std::io::copy(&mut source, &mut copy).map_err(|error| failed(error.to_string()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| failed(error.to_string()))
 }
 
 fn qemu_arguments(

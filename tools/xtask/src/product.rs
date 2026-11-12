@@ -3,7 +3,8 @@
 //! One pipeline, no phase history: the eight native roles, the bootstrap, the
 //! UEFI loader and the production Deepwyrm kernel are built, the bootfs and its
 //! manifests are assembled, and the ESP image is written. The output directory
-//! holds `artifacts/` with the ESP and the OVMF pair `dev-boot` boots.
+//! holds `artifacts/` with the ESP, the empty ext4 root disk and the OVMF pair
+//! that `dev-boot` and the VM gate boot.
 //!
 //! Builds come from the working trees of both repositories, not from a
 //! committed revision, and reuse persistent Cargo targets under
@@ -55,6 +56,10 @@ pub(crate) const OVMF_CODE_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
 pub(crate) const OVMF_VARS_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";
 pub(crate) const MAX_FIRMWARE_BYTES: u64 = 128 * 1024 * 1024;
 pub(crate) const ESP_NAME: &str = "esp.img";
+/// The empty persistent root (root `STORAGE_PLAN.md` W7): an ext4 volume
+/// with a `boot` mount point. Runs boot a writable copy, never the artifact.
+pub(crate) const ROOT_DISK_NAME: &str = "root.img";
+const ROOT_DISK_BYTES: u64 = 64 << 20;
 
 /// The shell's production rustflags: no jump tables, and the stack-size
 /// sections the native stack check reads.
@@ -246,6 +251,7 @@ pub(crate) fn build(output: &Path, deep_repository: &Path) -> Result<(), Failure
         let ovmf_vars =
             read_regular_bounded(Path::new(OVMF_VARS_PATH), MAX_FIRMWARE_BYTES, "OVMF vars")?;
         let device_table = boot_device_table();
+        let root_disk = root_disk()?;
         for (name, bytes) in [
             ("loader.efi", uefi.loader_bytes.as_slice()),
             ("deepwyrm.elf", kernel.as_slice()),
@@ -269,6 +275,7 @@ pub(crate) fn build(output: &Path, deep_repository: &Path) -> Result<(), Failure
             ("boot-device-table.bin", device_table.as_slice()),
             ("esp-readme.txt", ESP_README),
             ("bootfs.img", assembled.bootfs.as_slice()),
+            (ROOT_DISK_NAME, root_disk.as_slice()),
             ("OVMF_CODE.fd", ovmf_code.as_slice()),
             ("OVMF_VARS.fd", ovmf_vars.as_slice()),
         ] {
@@ -840,6 +847,81 @@ fn read_bounded_no_follow(
         return Err(Failure::task(format!("{label} changed while it was read")));
     }
     Ok(bytes)
+}
+
+/// A disk image held in memory, for formatting the root disk.
+struct MemoryDisk(Vec<u8>);
+
+impl MemoryDisk {
+    fn range(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Result<core::ops::Range<usize>, wyrmroot_ext4::DeviceError> {
+        let fail = wyrmroot_ext4::DeviceError(1);
+        let start = usize::try_from(offset).map_err(|_| fail)?;
+        let end = start.checked_add(len).ok_or(fail)?;
+        if end > self.0.len() {
+            return Err(fail);
+        }
+        Ok(start..end)
+    }
+}
+
+impl wyrmroot_ext4::Device for MemoryDisk {
+    fn read(&mut self, offset: u64, out: &mut [u8]) -> Result<(), wyrmroot_ext4::DeviceError> {
+        let range = self.range(offset, out.len())?;
+        out.copy_from_slice(&self.0[range]);
+        Ok(())
+    }
+    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), wyrmroot_ext4::DeviceError> {
+        let range = self.range(offset, data.len())?;
+        self.0[range].copy_from_slice(data);
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<(), wyrmroot_ext4::DeviceError> {
+        Ok(())
+    }
+}
+
+/// The empty root disk. Every field that could vary is fixed, so the image
+/// is reproducible.
+fn root_disk() -> Result<Vec<u8>, Failure> {
+    use wyrmroot_ext4::{FormatParams, Kind, ROOT_INODE, Volume};
+    let failed = |what: String| Failure::task(format!("could not make the root disk: {what}"));
+    let mut disk = MemoryDisk(vec![0; ROOT_DISK_BYTES as usize]);
+    let params = FormatParams {
+        block_size: 4096,
+        uuid: *b"wyrmroot-devroot",
+        label: *b"wyrmroot-root\0\0\0",
+        time: 1_700_000_000,
+    };
+    wyrmroot_ext4::format(&mut disk, ROOT_DISK_BYTES, &params)
+        .map_err(|error| failed(format!("{error:?}")))?;
+    let mut volume = Volume::mount(&mut disk, ROOT_DISK_BYTES, true)
+        .map_err(|error| failed(format!("{error:?}")))?;
+    volume
+        .create(&mut disk, ROOT_INODE, b"boot", Kind::Directory)
+        .and_then(|_| volume.sync(&mut disk))
+        .map_err(|error| failed(format!("{error:?}")))?;
+    Ok(disk.0)
+}
+
+#[cfg(test)]
+mod root_disk_tests {
+    use super::*;
+    use wyrmroot_ext4::{ROOT_INODE, Volume};
+
+    #[test]
+    fn the_root_disk_is_reproducible_and_has_a_boot_mount_point() {
+        let image = root_disk().unwrap();
+        assert_eq!(image.len() as u64, ROOT_DISK_BYTES);
+        assert_eq!(image, root_disk().unwrap());
+        let mut disk = MemoryDisk(image);
+        let volume = Volume::mount(&mut disk, ROOT_DISK_BYTES, false).unwrap();
+        let boot = volume.lookup(&mut disk, ROOT_INODE, b"boot").unwrap();
+        assert_eq!(boot.kind, wyrmroot_ext4::Kind::Directory);
+    }
 }
 
 fn write_new(path: &Path, bytes: &[u8], label: &str) -> Result<(), Failure> {
