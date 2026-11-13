@@ -942,7 +942,8 @@ fn startup_ready_release_and_local_builtins_use_the_real_stream_runtime() {
     );
     assert!(fixture.output(STDERR).is_empty());
     assert_eq!(fixture.closed[0], BOOTSTRAP);
-    assert_eq!(fixture.closed.len(), 7);
+    assert_eq!(fixture.closed.len(), 6);
+    assert!(!fixture.closed.contains(&SHELL_JOBS));
 }
 
 #[test]

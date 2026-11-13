@@ -39,6 +39,8 @@ use inspect_commands::*;
 use terminal_io::*;
 
 const HANDLE_COUNT: usize = 6;
+/// The role handle for the shell's job session; the last one received.
+const SHELL_JOBS_INDEX: usize = HANDLE_COUNT - 1;
 const CLEAR_DISPLAY: &[u8] = b"\x1b[2J\x1b[H";
 const SUBMISSION_NEWLINE: &[u8] = b"\n";
 const CONTROL_HANDLE_CAPACITY: usize = 4;
@@ -306,7 +308,7 @@ pub fn run_wyrmsh<System: WyrmshSystem>(
     let controls = Controls {
         console_status: handles[3].handle,
         registry: handles[4].handle,
-        shell_jobs: handles[5].handle,
+        shell_jobs: handles[SHELL_JOBS_INDEX].handle,
     };
     let mut shell = Shell::new(identity, endpoints, controls);
 
@@ -336,7 +338,14 @@ pub fn run_wyrmsh<System: WyrmshSystem>(
     } else {
         None
     };
-    let cleanup_error = close_received(system, &handles, handles.len());
+    // Every role handle but SHELL_JOBS, which is last and is left to process
+    // exit. system-init treats that session's close as this shell's end and
+    // tears down its job; closed here, before the exit syscall, that teardown
+    // can land first and record TASK_GROUP_TEARDOWN over the shell's own
+    // status. Ctrl-D's SHELL_SESSION_SHUTDOWN_STATUS was lost that way and
+    // consoled relaunched the shell (dev-boot hang, 2026-11-12). Process exit
+    // records the termination before it releases handles.
+    let cleanup_error = close_received(system, &handles, SHELL_JOBS_INDEX);
     if result.is_ok()
         && let Some(cause) = bootstrap_cleanup_error.or(cleanup_error)
     {

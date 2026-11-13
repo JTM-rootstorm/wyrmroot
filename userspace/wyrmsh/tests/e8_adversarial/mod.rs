@@ -83,10 +83,14 @@ fn assert_current_endpoint_reject_has_no_partial_committed_effects(fixture: &Fix
         before,
         "{label} committed partial effects before fatal rejection"
     );
-    assert_eq!(fixture.closed.len(), 7, "{label} cleanup cardinality");
-    for handle in [
-        BOOTSTRAP, STDIN, STDOUT, STDERR, STATUS, REGISTRY, SHELL_JOBS,
-    ] {
+    // SHELL_JOBS is left to process exit, so system-init cannot tear the
+    // shell's job down before its exit status is recorded.
+    assert_eq!(fixture.closed.len(), 6, "{label} cleanup cardinality");
+    assert!(
+        !fixture.closed.contains(&SHELL_JOBS),
+        "{label} closed SHELL_JOBS before exit"
+    );
+    for handle in [BOOTSTRAP, STDIN, STDOUT, STDERR, STATUS, REGISTRY] {
         assert_eq!(
             fixture
                 .closed
