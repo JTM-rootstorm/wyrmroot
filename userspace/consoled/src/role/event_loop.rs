@@ -222,7 +222,7 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                     discard_one_record(platform, child.stdin.endpoint().handle());
                     ChildFault::WrongDirection
                 };
-                recover_child(
+                if recover_child(
                     platform,
                     authorities,
                     transactions,
@@ -232,7 +232,10 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                     &mut input_pending,
                     &mut output_pending,
                     fault,
-                )?;
+                )? == TerminalOutcome::SessionEnded
+                {
+                    return Ok(SESSION_ENDED);
+                }
                 next_data = DataClass::Raw;
                 continue;
             }
@@ -259,7 +262,7 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                 } else {
                     StreamKind::Stderr
                 };
-                recover_child(
+                if recover_child(
                     platform,
                     authorities,
                     transactions,
@@ -269,7 +272,10 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                     &mut input_pending,
                     &mut output_pending,
                     ChildFault::Peer(kind),
-                )?;
+                )? == TerminalOutcome::SessionEnded
+                {
+                    return Ok(SESSION_ENDED);
+                }
                 next_data = DataClass::Raw;
                 continue;
             }
@@ -299,8 +305,8 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                 } else {
                     true
                 };
-                if failed {
-                    recover_child(
+                if failed
+                    && recover_child(
                         platform,
                         authorities,
                         transactions,
@@ -310,7 +316,9 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                         &mut input_pending,
                         &mut output_pending,
                         ChildFault::Status,
-                    )?;
+                    )? == TerminalOutcome::SessionEnded
+                {
+                    return Ok(SESSION_ENDED);
                 }
                 next_data = DataClass::Raw;
                 continue;
@@ -419,7 +427,7 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                             input_pending.clear();
                         }
                         Err(_) => {
-                            recover_child(
+                            if recover_child(
                                 platform,
                                 authorities,
                                 transactions,
@@ -429,7 +437,10 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                                 &mut input_pending,
                                 &mut output_pending,
                                 ChildFault::Peer(StreamKind::Stdin),
-                            )?;
+                            )? == TerminalOutcome::SessionEnded
+                            {
+                                return Ok(SESSION_ENDED);
+                            }
                             next_data = DataClass::Raw;
                         }
                     }
@@ -446,7 +457,7 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                     OutputSource::Stderr => &mut child.stderr,
                 };
                 if input.observe_wait(observed.observed).is_err() {
-                    recover_child(
+                    if recover_child(
                         platform,
                         authorities,
                         transactions,
@@ -456,7 +467,10 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                         &mut input_pending,
                         &mut output_pending,
                         ChildFault::Peer(output_kind(source)),
-                    )?;
+                    )? == TerminalOutcome::SessionEnded
+                    {
+                        return Ok(SESSION_ENDED);
+                    }
                     next_data = DataClass::Raw;
                     continue;
                 }
@@ -469,7 +483,7 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                     }
                     Err(StreamError::WouldBlock) => {}
                     Err(_) => {
-                        recover_child(
+                        if recover_child(
                             platform,
                             authorities,
                             transactions,
@@ -479,7 +493,10 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                             &mut input_pending,
                             &mut output_pending,
                             ChildFault::Peer(output_kind(source)),
-                        )?;
+                        )? == TerminalOutcome::SessionEnded
+                        {
+                            return Ok(SESSION_ENDED);
+                        }
                         next_data = DataClass::Raw;
                     }
                 }

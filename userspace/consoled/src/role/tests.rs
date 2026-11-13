@@ -285,3 +285,265 @@ fn historical_policy_remains_an_explicit_three_stream_launch() {
     assert_eq!(request.environment_count(), 0);
     assert_eq!(request.stream_count, 3);
 }
+
+// A shell that ends the session with Ctrl-D exits with
+// `SHELL_SESSION_SHUTDOWN_STATUS` and its streams close as it exits. When the
+// stream close reaches the data pump before the WAIT result, the pump calls
+// `recover_child`, which used to relaunch the shell regardless, so Ctrl-D
+// would leave a fresh prompt and the system would never power off. (Found
+// while chasing the 2026-11-12 dev-boot hang, which turned out to be wyrmsh
+// closing SHELL_JOBS before exit.) These drive `recover_child` through both
+// orders the launch replies can arrive in.
+
+const LAUNCH: DwHandle = DwHandle(0x50);
+const SHELL_JOB: u64 = 200;
+const NOW_NS: u64 = 7_000_000_000;
+
+fn launch_authorities() -> super::StartupAuthorities {
+    super::StartupAuthorities {
+        registry: DwHandle(0x51),
+        launch: LAUNCH,
+        registry_generation: 1,
+        registry_endpoint_id: 1,
+        registry_endpoint_generation: 1,
+        launch_connection_id: 7,
+        launch_connection_generation: 8,
+        startup_transaction: 10,
+    }
+}
+
+fn launch_reservation(transaction_id: u64) -> LaunchReservation {
+    LaunchReservation {
+        connection_id: 7,
+        generation: 8,
+        transaction_id,
+    }
+}
+
+fn endpoint(handle: u64) -> wyrmroot_runtime::StreamEndpoint {
+    wyrmroot_runtime::StreamEndpoint::from_validated_handle(DwHandle(handle)).unwrap()
+}
+
+/// A model with one live shell (job 200) on serial generation 1, and the
+/// role's matching child session whose WAIT is transaction 5.
+fn live_shell() -> (wyrmroot_consoled::ConsoleModel, super::ChildSession) {
+    use wyrmroot_consoled::{ConnectRequest, ConsoleModel, SerialCorrelation, StreamKind};
+    let mut model = ConsoleModel::new();
+    model
+        .begin_connect(ConnectRequest {
+            registry_generation: 1,
+            registry_endpoint_id: 1,
+            registry_endpoint_generation: 1,
+            requested_publication_generation: 1,
+            connector_client_transaction: 1,
+        })
+        .unwrap();
+    model
+        .attach_connected(
+            SerialCorrelation {
+                registry_generation: 1,
+                registry_endpoint_id: 1,
+                registry_endpoint_generation: 1,
+                publication_generation: 1,
+                connector_client_transaction: 1,
+                device_role: 1,
+                device_bundle: 1,
+                driver_attempt: 1,
+                driver_control_endpoint_id: 1,
+                driver_control_endpoint_generation: 1,
+                attach_transaction: 1,
+                stream_generation: 1,
+            },
+            0,
+        )
+        .unwrap();
+    let mut launch = model.begin_child_launch(100).unwrap();
+    for kind in [StreamKind::Stdin, StreamKind::Stdout, StreamKind::Stderr] {
+        launch.move_child_peer(kind).unwrap();
+    }
+    let event = model
+        .commit_child_launch(&mut launch, SHELL_JOB)
+        .unwrap()
+        .ids
+        .into();
+    let child = super::ChildSession {
+        job_id: SHELL_JOB,
+        event,
+        wait: Some(launch_reservation(5)),
+        session_shutdown: false,
+        stdin: wyrmroot_runtime::NativeOutput::new(endpoint(0x61)),
+        stdout: wyrmroot_runtime::NativeInput::new(endpoint(0x62)),
+        stderr: wyrmroot_runtime::NativeInput::new(endpoint(0x63)),
+        status: None,
+    };
+    (model, child)
+}
+
+fn idle_serial() -> super::SerialSession {
+    super::SerialSession {
+        identity: wyrmroot_device_proto::connector::ConnectorIdentity {
+            publication_generation: 1,
+            client_transaction_id: 1,
+            device_role_id: 1,
+            bundle_generation: 1,
+            driver_attempt_generation: 1,
+            driver_control_endpoint_id: 1,
+            driver_control_endpoint_generation: 1,
+            attach_transaction_id: 1,
+            stream_generation: 1,
+        },
+        watch: None,
+        raw_owned: true,
+        release_witness: None,
+        input: wyrmroot_runtime::NativeInput::new(endpoint(0x70)),
+        output: wyrmroot_runtime::NativeOutput::new(endpoint(0x70)),
+    }
+}
+
+fn now() -> Reply {
+    Reply::Value(Ok(NOW_NS))
+}
+
+/// One launch-channel reply as `receive_launch_any` reads it: the clock for
+/// its deadline, a readable wait, then the datagram.
+fn launch_reply(bytes: Vec<u8>) -> [Reply; 3] {
+    [
+        now(),
+        Reply::Wait(Ok(DwWaitResultV1 {
+            observed: DW_SIGNAL_READABLE,
+            ..DwWaitResultV1::default()
+        })),
+        Reply::Receive(Ok(Datagram {
+            bytes,
+            handles: Vec::new(),
+        })),
+    ]
+}
+
+fn shutdown_result(transaction_id: u64) -> Vec<u8> {
+    let mut bytes = [0u8; MAX_LAUNCH_MESSAGE_BYTES];
+    let size = wyrmroot_launch_proto::encode_job_result(
+        launch_reservation(transaction_id),
+        SHELL_JOB,
+        wyrmroot_launch_proto::TerminationResult {
+            classification: wyrmroot_launch_proto::TerminationClassification::NormalExit,
+            application_code: wyrmroot_launch_proto::SHELL_SESSION_SHUTDOWN_STATUS,
+            exception_class: 0,
+            exception_detail: 0,
+            exception_address: 0,
+            cleanup_result: 0,
+        },
+        &mut bytes,
+    )
+    .unwrap();
+    bytes[..size].to_vec()
+}
+
+fn launch_error(transaction_id: u64, code: wyrmroot_launch_proto::ErrorCode) -> Vec<u8> {
+    let mut bytes = [0u8; MAX_LAUNCH_MESSAGE_BYTES];
+    let size =
+        wyrmroot_launch_proto::encode_error(launch_reservation(transaction_id), code, &mut bytes)
+            .unwrap();
+    bytes[..size].to_vec()
+}
+
+fn job_message(
+    transaction_id: u64,
+    kind: wyrmroot_launch_proto::MessageType,
+    value: u64,
+) -> Vec<u8> {
+    let mut bytes = [0u8; MAX_LAUNCH_MESSAGE_BYTES];
+    let size = wyrmroot_launch_proto::encode_job_message(
+        launch_reservation(transaction_id),
+        kind,
+        value,
+        &mut bytes,
+    )
+    .unwrap();
+    bytes[..size].to_vec()
+}
+
+fn recover_from_stdout_close(
+    script: Vec<Reply>,
+) -> (Result<super::TerminalOutcome, u32>, RecordingPlatform) {
+    let (mut model, mut child) = live_shell();
+    let mut serial = idle_serial();
+    let mut transactions = super::TransactionIds::after(10).unwrap();
+    let mut input = super::Pending::new();
+    let mut output = super::Pending::new();
+    let mut platform = RecordingPlatform::scripted(script);
+    let outcome = super::recover_child(
+        &mut platform,
+        launch_authorities(),
+        &mut transactions,
+        &mut model,
+        &mut serial,
+        &mut child,
+        &mut input,
+        &mut output,
+        super::ChildFault::Peer(wyrmroot_consoled::StreamKind::Stdout),
+    );
+    (outcome, platform)
+}
+
+/// The WAIT result is already queued when the cancel goes out: it carries
+/// the shutdown status, and the cancel is refused as too late.
+#[test]
+fn a_shutdown_exit_seen_first_as_a_stream_close_ends_the_session() {
+    use wyrmroot_launch_proto::{ErrorCode, MessageType};
+    let mut script = vec![now(), Reply::Unit(Ok(()))];
+    script.extend(launch_reply(shutdown_result(5)));
+    script.extend(launch_reply(launch_error(
+        11,
+        ErrorCode::CancellationUnavailable,
+    )));
+    script.extend([
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+    ]);
+    script.extend([now(), now(), Reply::Unit(Ok(()))]);
+    script.extend(launch_reply(job_message(
+        12,
+        MessageType::Closed,
+        SHELL_JOB,
+    )));
+    script.push(now());
+
+    let (outcome, platform) = recover_from_stdout_close(script);
+
+    assert_eq!(outcome, Ok(super::TerminalOutcome::SessionEnded));
+    platform.assert_script_consumed();
+}
+
+/// The cancel wins: the launcher had not yet recorded the exit. Termination
+/// is then refused because the shell already exited, and the WAIT that
+/// follows still reports the shutdown status.
+#[test]
+fn a_shutdown_exit_whose_wait_was_cancelled_still_ends_the_session() {
+    use wyrmroot_launch_proto::{ErrorCode, MessageType};
+    let mut script = vec![now(), Reply::Unit(Ok(()))];
+    script.extend(launch_reply(job_message(11, MessageType::Cancelled, 5)));
+    script.extend([
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+    ]);
+    script.push(now());
+    script.push(Reply::Unit(Ok(())));
+    script.extend(launch_reply(launch_error(12, ErrorCode::InvalidState)));
+    script.push(Reply::Unit(Ok(())));
+    script.extend(launch_reply(shutdown_result(13)));
+    script.extend([now(), Reply::Unit(Ok(()))]);
+    script.extend(launch_reply(job_message(
+        14,
+        MessageType::Closed,
+        SHELL_JOB,
+    )));
+    script.push(now());
+
+    let (outcome, platform) = recover_from_stdout_close(script);
+
+    assert_eq!(outcome, Ok(super::TerminalOutcome::SessionEnded));
+    platform.assert_script_consumed();
+}

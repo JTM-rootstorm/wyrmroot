@@ -93,7 +93,7 @@ pub(crate) fn recover_child<P: ConsoledPlatform>(
     input_pending: &mut Pending,
     output_pending: &mut Pending,
     fault: ChildFault,
-) -> Result<(), u32> {
+) -> Result<TerminalOutcome, u32> {
     let action = match fault {
         ChildFault::Peer(kind) => model.child_peer_closed(child.event, kind, now_millis(platform)?),
         ChildFault::Status => model.status_peer_closed(child.event, now_millis(platform)?),
@@ -117,14 +117,19 @@ pub(crate) fn recover_child<P: ConsoledPlatform>(
     input_pending.clear();
     output_pending.clear();
     let cleanup = match wait_resolution {
-        ChildWaitResolution::Cancelled => cleanup_job(
-            platform,
-            authorities,
-            transactions,
-            model,
-            child.event,
-            child.job_id,
-        )?,
+        ChildWaitResolution::Cancelled => {
+            let cleaned = cleanup_job(
+                platform,
+                authorities,
+                transactions,
+                model,
+                child.event,
+                child.job_id,
+            )?;
+            child.session_shutdown = cleaned.session_shutdown;
+            cleaned.action
+        }
+        // `cancel_child_wait` recorded this result's session shutdown.
         ChildWaitResolution::Terminal => complete_terminal_reap(
             platform,
             authorities,
@@ -136,9 +141,16 @@ pub(crate) fn recover_child<P: ConsoledPlatform>(
     };
     match cleanup {
         RecoveryAction::ReplaceChild => {
+            // A shell that exited with the session-shutdown status closes its
+            // streams as it exits, and that close can reach us before its
+            // WAIT result does. Its result still decides, exactly as in
+            // `recover_terminal_child`; relaunching here would lose Ctrl-D.
+            if child.session_shutdown {
+                return Ok(TerminalOutcome::SessionEnded);
+            }
             *child = launch_child(platform, authorities, transactions, model, serial)?;
             observe_exact_ready_without_serial(platform, model, child, 65)?;
-            Ok(())
+            Ok(TerminalOutcome::Replaced)
         }
         RecoveryAction::Escalate => Err(66),
         _ => Err(67),
@@ -178,14 +190,17 @@ pub(crate) fn recover_serial<P: ConsoledPlatform>(
         return Err(70);
     }
     let retired = match wait_resolution {
-        ChildWaitResolution::Cancelled => cleanup_job(
-            platform,
-            authorities,
-            transactions,
-            model,
-            child.event,
-            child.job_id,
-        )?,
+        ChildWaitResolution::Cancelled => {
+            cleanup_job(
+                platform,
+                authorities,
+                transactions,
+                model,
+                child.event,
+                child.job_id,
+            )?
+            .action
+        }
         ChildWaitResolution::Terminal => complete_terminal_reap(
             platform,
             authorities,
@@ -226,7 +241,7 @@ pub(crate) fn cleanup_job<P: ConsoledPlatform>(
     model: &mut ConsoleModel,
     event: EventGeneration,
     job_id: u64,
-) -> Result<RecoveryAction, u32> {
+) -> Result<CleanedJob, u32> {
     let terminate = job_request(
         platform,
         authorities,
@@ -248,9 +263,13 @@ pub(crate) fn cleanup_job<P: ConsoledPlatform>(
         LaunchMessageType::Wait,
         job_id,
     )?;
-    if !matches!(waited, LaunchReply::JobResult { job_id: response, .. } if response == job_id) {
-        return Err(75);
-    }
+    let session_shutdown = match waited {
+        LaunchReply::JobResult {
+            job_id: response,
+            session_shutdown,
+        } if response == job_id => session_shutdown,
+        _ => return Err(75),
+    };
     if !matches!(model.child_terminated(event, now_millis(platform)?), Ok(RecoveryAction::ReapChild(job)) if job == job_id)
     {
         return Err(74);
@@ -265,9 +284,22 @@ pub(crate) fn cleanup_job<P: ConsoledPlatform>(
     if !matches!(closed, LaunchReply::Closed(response) if response == job_id) {
         return Err(76);
     }
-    model
+    let action = model
         .child_reaped(event, now_millis(platform)?)
-        .map_err(|_| 77)
+        .map_err(|_| 77u32)?;
+    Ok(CleanedJob {
+        action,
+        session_shutdown,
+    })
+}
+
+/// What [`cleanup_job`] reaped: the model's next step, and whether the job
+/// had already exited with `SHELL_SESSION_SHUTDOWN_STATUS` before the
+/// termination request reached it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CleanedJob {
+    pub(crate) action: RecoveryAction,
+    pub(crate) session_shutdown: bool,
 }
 
 pub(crate) fn complete_terminal_reap<P: ConsoledPlatform>(
@@ -399,9 +431,17 @@ pub(crate) fn cancel_child_wait<P: ConsoledPlatform>(
     let mut received = 0;
     while received < 2 {
         let (reservation, reply) = receive_launch_any(platform, authorities.launch)?;
-        if reservation == target
-            && matches!(reply, LaunchReply::JobResult { job_id, .. } if job_id == child.job_id)
+        if let LaunchReply::JobResult {
+            job_id,
+            session_shutdown,
+        } = reply
+            && reservation == target
+            && job_id == child.job_id
         {
+            // The shell may exit with the session-shutdown status after its
+            // stream close reached us first; this result is then the only
+            // place that says so.
+            child.session_shutdown = session_shutdown;
             terminal = true;
             received += 1;
             continue;
