@@ -85,6 +85,29 @@ transition page tables remain reserved until Deepwyrm has validated and
 copied or claimed the required information, switched to its own page tables,
 and switched to kernel-owned stack state.
 
+## Boot modules
+
+BootInfo's module table carries, in this fixed order:
+
+1. the Wyrmroot bootstrap ELF (`/EFI/Wyrmroot/bootstrap.elf`);
+2. the bootfs image (`/EFI/Wyrmroot/bootfs.img`), read-only;
+3. the x86_64 paging-handoff carrier the loader generates, read-only;
+4. the boot device table, kind `DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1`,
+   read-only, when the ESP has `/EFI/Wyrmroot/BDEVICE.BIN`.
+
+The loader reads `BDEVICE.BIN` as an optional file. When it is absent the
+table has exactly the first three modules; any other open or read failure
+fails the boot. The file is bounded by the generated ABI capacities (the
+table header plus the maximum resource count times the record stride) and
+counts toward the total artifact budget. The loader copies it into its own
+retained pages, which must not overlap any other module, and passes the
+bytes through unchanged: it does not interpret the records. Deepwyrm owns
+the table's format and validates its contents. The current product builder
+always writes the file, so current products hand off four modules.
+
+The loader refuses a module table with a duplicate, missing, unknown or
+out-of-order kind.
+
 ## Validation boundary
 
 The Wyrmroot loader must reject malformed or unsupported ELF input, mapping

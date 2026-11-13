@@ -1,4 +1,4 @@
-//! WRNS 1.2: the namespace protocol, spoken to `vfsd`.
+//! WRNS 1.3: the namespace protocol, spoken to `vfsd`.
 //!
 //! ```text
 //! client -> vfsd  OPEN (+ new node Channel)        (one-way; WRFS ON_OPEN on that Channel)

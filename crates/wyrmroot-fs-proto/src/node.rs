@@ -1,4 +1,4 @@
-//! WRFS 1.2: the node protocol, on a Channel to one directory or file.
+//! WRFS 1.3: the node protocol, on a Channel to one directory or file.
 //!
 //! ```text
 //! client -> server  OPEN (+ new node Channel)   (one-way; ON_OPEN on that Channel)

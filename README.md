@@ -49,19 +49,21 @@ Wyrmroot consumes generated Deepwyrm ABI definitions from an exact pinned Deepwy
 
 Architecture documents define design contracts. Validation and security evidence applies only to the revisions and artifacts each record names; it does not imply production, VM, or physical-hardware acceptance.
 
-## DW1-D6 product handoff
+## Building and running
 
-The selector-30 producer is preparation-only and creates a fresh immutable
-product plus root-verifier-compatible `smoke` (one vCPU) and `coexist` (four
-vCPU) handoffs. It does not run QEMU or libvirt:
+Development tasks run through one dispatcher, with the pinned toolchain:
 
 ```text
-tools/pinned-cargo xtask dw1d6 freeze --output <fresh-directory> --deep-repository <canonical-deepwyrm-path> --deep-revision <40-lowercase-hex> --evidence-nonce <16-uppercase-hex> --evidence-challenge <16-uppercase-hex>
+tools/pinned-cargo xtask dev-boot [--smp] [--check] [--deep-repository <path>] [--sdk <path>]
+tools/pinned-cargo xtask product --output <fresh-directory> [--deep-repository <path>]
+tools/pinned-cargo xtask test [all|fmt|clippy|unit|root]
 ```
 
-The producer requires the selected Wyrmroot revision to include the D6 EFI
-boot-device-table module handoff. It makes no claim about physical IRQ3/IOAPIC
-routing, UART RX/TX, selector-29, MMIO/DMA/IOMMU, or VM acceptance.
+- `dev-boot` builds the product from the Wyrmroot and Deepwyrm working trees and boots it in local QEMU; `--check` drives the shell prompt and requires a clean power-off instead of an interactive session.
+- `product` builds the same product into a fresh directory: the ESP image plus the loader, kernel, bootstrap, native services, bootfs and firmware pair.
+- `test` runs the host gate: formatting, warnings-denied Clippy, the workspace tests and the root Python suites.
+
+`product` and `dev-boot` refuse a Deepwyrm checkout whose semantic ABI fingerprint is not the one pinned in `toolchain/versions.toml`, because userspace is compiled against the pinned ABI.
 
 ## License
 

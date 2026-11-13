@@ -5,7 +5,22 @@
 
 This file defines the minimum architecture reading set for Wyrmroot implementation work. Codex coordinators and human contributors should read the applicable documents before changing kernel/userspace contracts.
 
-## Mandatory pre-WYR0 reading order
+## Current governing documents
+
+WYR0 and WYR1 are closed. Current work is governed by these documents in the OS-Project coordination root, above this repository:
+
+- [`BOOTSTRAP_AND_RECOVERY_ARCHITECTURE.md`](../../BOOTSTRAP_AND_RECOVERY_ARCHITECTURE.md) - canonical cross-repository architecture for bootstrap, storage/root recovery and recovery-scope policy.
+- [`STORAGE_PLAN.md`](../../STORAGE_PLAN.md) - the storage spine plan, block device to persistent ext4 root; closed 2026-11-11. [`STORAGE_W7_MILESTONE_RECORD.md`](../../STORAGE_W7_MILESTONE_RECORD.md) is its milestone record.
+- [`TOOLCHAIN_PLAN.md`](../../TOOLCHAIN_PLAN.md) - active plan for the SDK, libc, the LLVM fork and self-hosting.
+- [`TOOLCHAIN_POSIX_LAYER_DESIGN.md`](../../TOOLCHAIN_POSIX_LAYER_DESIGN.md) - design of the libc-neutral Wyrmroot POSIX layer for the toolchain plan's step 2 (file descriptors, paths, memory, time, spawn).
+- [`HARDWARE_BRINGUP_PLAN.md`](../../HARDWARE_BRINGUP_PLAN.md) - draft plan for a live USB boot on one named machine; nothing in it is built.
+- [`CARRIED_OPEN_ITEMS.md`](../../CARRIED_OPEN_ITEMS.md) - active ledger of the items closed records left open, each fixed, scheduled or awaiting a decision.
+- [`DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md`](../../DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md) - canonical contract for carrying failure causes across error, exit-code and evidence boundaries.
+
+## Mandatory reading order
+
+The WYR0-era foundation documents below still define the platform conventions.
+
 
 1. [`README.md`](../README.md) - project identity and broad system goals.
 2. [`Plans/WYRMROOT_PLATFORM_CONVENTIONS.md`](WYRMROOT_PLATFORM_CONVENTIONS.md) - system-wide conventions and pre-phase-0 locks.
@@ -38,7 +53,7 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 - [`Plans/WYR1_D5_IMPLEMENTATION_STATUS.md`](WYR1_D5_IMPLEMENTATION_STATUS.md) preserves the historical D5 selector-32 UP/SMP checkpoint, replacement joins, GDB-guided broad regression repairs and exact A5 evidence.
 - [`Plans/WYR1_D_VALIDATION.md`](WYR1_D_VALIDATION.md) records accepted WYR1-D6 and WYR1-D closure: exact selector31/32 UP/SMP products, selector30/29/28/27 regressions, independently recomputed certificates and actual COM2 sends, scoped review, cleanup and the released WYR1-E seam. It does not claim shell, physical-hardware, final security or DW1-wide closure.
 
-## Active implementation status
+## Closed and historical implementation records
 
 - [`Plans/WYR1_E4AB_VALIDATION.md`](WYR1_E4AB_VALIDATION.md) records the separate production wyrmsh startup/READY/release/editor runtime, local help/echo/clear/exit, shared startup-version accessor, stateful WRST harness, partial-output correction and accepted native compilation at the E4A/B checkpoint.
 - [`Plans/WYR1_E4C_VALIDATION.md`](WYR1_E4C_VALIDATION.md) closes E4 with scoped services/tasks/status, canonical LIST_JOBS encoding, finite inspection deadlines and their reviewed correction, 73 shell/core plus 250 protocol/server tests, and accepted native compilation.
