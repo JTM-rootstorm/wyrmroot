@@ -547,3 +547,52 @@ fn a_shutdown_exit_whose_wait_was_cancelled_still_ends_the_session() {
     assert_eq!(outcome, Ok(super::TerminalOutcome::SessionEnded));
     platform.assert_script_consumed();
 }
+
+/// The serial connection drops just as the shell exits with the shutdown
+/// status: the session still ends, instead of reattaching serial and
+/// launching a new shell.
+#[test]
+fn a_shutdown_exit_that_races_serial_loss_ends_the_session() {
+    use wyrmroot_launch_proto::{ErrorCode, MessageType};
+    let (mut model, mut child) = live_shell();
+    let mut serial = idle_serial();
+    let mut transactions = super::TransactionIds::after(10).unwrap();
+    let mut input = super::Pending::new();
+    let mut output = super::Pending::new();
+    // Serial loss is noticed, then the raw endpoint is closed.
+    let mut script = vec![now(), Reply::Unit(Ok(()))];
+    // The cancel finds the shell's WAIT result already queued.
+    script.push(Reply::Unit(Ok(())));
+    script.extend(launch_reply(shutdown_result(5)));
+    script.extend(launch_reply(launch_error(
+        11,
+        ErrorCode::CancellationUnavailable,
+    )));
+    script.extend([
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+        Reply::Unit(Ok(())),
+    ]);
+    script.extend([now(), now(), Reply::Unit(Ok(()))]);
+    script.extend(launch_reply(job_message(
+        12,
+        MessageType::Closed,
+        SHELL_JOB,
+    )));
+    script.push(now());
+    let mut platform = RecordingPlatform::scripted(script);
+
+    let outcome = super::recover_serial(
+        &mut platform,
+        launch_authorities(),
+        &mut transactions,
+        &mut model,
+        &mut serial,
+        &mut child,
+        &mut input,
+        &mut output,
+    );
+
+    assert_eq!(outcome, Ok(super::TerminalOutcome::SessionEnded));
+    platform.assert_script_consumed();
+}

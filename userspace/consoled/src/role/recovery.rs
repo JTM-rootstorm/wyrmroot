@@ -167,7 +167,7 @@ pub(crate) fn recover_serial<P: ConsoledPlatform>(
     child: &mut ChildSession,
     input_pending: &mut Pending,
     output_pending: &mut Pending,
-) -> Result<(), u32> {
+) -> Result<TerminalOutcome, u32> {
     let old_serial = child.event.serial;
     let old_console = child.event.console_generation;
     let action = model
@@ -191,15 +191,16 @@ pub(crate) fn recover_serial<P: ConsoledPlatform>(
     }
     let retired = match wait_resolution {
         ChildWaitResolution::Cancelled => {
-            cleanup_job(
+            let cleaned = cleanup_job(
                 platform,
                 authorities,
                 transactions,
                 model,
                 child.event,
                 child.job_id,
-            )?
-            .action
+            )?;
+            child.session_shutdown = cleaned.session_shutdown;
+            cleaned.action
         }
         ChildWaitResolution::Terminal => complete_terminal_reap(
             platform,
@@ -212,6 +213,13 @@ pub(crate) fn recover_serial<P: ConsoledPlatform>(
     };
     if retired != RecoveryAction::None {
         return Err(72);
+    }
+    // The shell may have ended the session just as the serial connection
+    // dropped; its result decides, as in `recover_child`. The serial
+    // session and its watch are already released, and releasing them again
+    // on the way out is a no-op.
+    if child.session_shutdown {
+        return Ok(TerminalOutcome::SessionEnded);
     }
     match model
         .complete_serial_cleanup(old_serial, old_console, now_millis(platform)?)
@@ -227,7 +235,7 @@ pub(crate) fn recover_serial<P: ConsoledPlatform>(
             )?;
             *child = launch_child(platform, authorities, transactions, model, serial)?;
             observe_exact_ready(platform, model, serial, child, 67)?;
-            Ok(())
+            Ok(TerminalOutcome::Replaced)
         }
         RecoveryAction::Escalate => Err(71),
         _ => Err(72),

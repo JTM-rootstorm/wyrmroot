@@ -143,7 +143,7 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                 {
                     continue;
                 }
-                recover_serial(
+                if recover_serial(
                     platform,
                     authorities,
                     transactions,
@@ -152,12 +152,15 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                     child,
                     &mut input_pending,
                     &mut output_pending,
-                )?;
+                )? == TerminalOutcome::SessionEnded
+                {
+                    return Ok(SESSION_ENDED);
+                }
                 next_data = DataClass::Raw;
                 continue;
             }
             1 => {
-                recover_serial(
+                if recover_serial(
                     platform,
                     authorities,
                     transactions,
@@ -166,7 +169,10 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                     child,
                     &mut input_pending,
                     &mut output_pending,
-                )?;
+                )? == TerminalOutcome::SessionEnded
+                {
+                    return Ok(SESSION_ENDED);
+                }
                 next_data = DataClass::Raw;
                 continue;
             }
@@ -341,7 +347,7 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                     let input_signals =
                         DwSignals(signals & (DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0));
                     if serial.input.observe_wait(input_signals).is_err() {
-                        recover_serial(
+                        if recover_serial(
                             platform,
                             authorities,
                             transactions,
@@ -350,7 +356,10 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                             child,
                             &mut input_pending,
                             &mut output_pending,
-                        )?;
+                        )? == TerminalOutcome::SessionEnded
+                        {
+                            return Ok(SESSION_ENDED);
+                        }
                         next_data = DataClass::Raw;
                         continue;
                     }
@@ -366,7 +375,7 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                         }
                         Err(StreamError::WouldBlock) => {}
                         Err(_) => {
-                            recover_serial(
+                            if recover_serial(
                                 platform,
                                 authorities,
                                 transactions,
@@ -375,7 +384,10 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                                 child,
                                 &mut input_pending,
                                 &mut output_pending,
-                            )?;
+                            )? == TerminalOutcome::SessionEnded
+                            {
+                                return Ok(SESSION_ENDED);
+                            }
                             next_data = DataClass::Raw;
                             continue;
                         }
@@ -396,7 +408,7 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                             output_pending.clear();
                         }
                         Err(_) => {
-                            recover_serial(
+                            if recover_serial(
                                 platform,
                                 authorities,
                                 transactions,
@@ -405,7 +417,10 @@ pub(crate) fn event_loop<P: ConsoledPlatform>(
                                 child,
                                 &mut input_pending,
                                 &mut output_pending,
-                            )?;
+                            )? == TerminalOutcome::SessionEnded
+                            {
+                                return Ok(SESSION_ENDED);
+                            }
                             next_data = DataClass::Raw;
                         }
                     }
