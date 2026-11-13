@@ -950,3 +950,62 @@ fn paused_listing_fails_when_the_catalog_changes_and_refuses_a_second_listing() 
     assert_eq!(pages(&mock).len(), 2);
     assert!(!mock.closed.contains(&141));
 }
+
+/// W7 review T2: over the wire, a client installed for one service that
+/// asks to connect to another published service is answered NOT_PUBLISHED,
+/// and the Channel it offered is closed, not moved to the publisher.
+#[test]
+fn a_lookup_of_another_published_service_is_refused_on_the_wire() {
+    let mut service = RegistryService::new(1);
+    let mut mock = Mock::default();
+    install_publication(&mut service, &mut mock, 31, 13);
+    install_publication_with(&mut service, &mut mock, 1);
+    install_client(&mut service, &mut mock);
+    for (index, endpoint) in [(0, 31), (1, 1_001)] {
+        drive(
+            &mut service,
+            &mut mock,
+            event(Some(index), true, false),
+            &empty(MessageType::Publish, endpoint, 1),
+            None,
+        )
+        .unwrap();
+    }
+    let lookup = |name: &[u8], tx: u64| {
+        let mut bytes = [0u8; 128];
+        let size = encode_lookup(
+            endpoint_header(MessageType::LookupConnect, 41, tx),
+            Lookup {
+                protocol_id: if name == b"echo" { 17 } else { 101 },
+                version: ProtocolVersion { major: 1, minor: 0 },
+                service_name: name,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        bytes[..size].to_vec()
+    };
+    let refused = lookup(b"p01", 2);
+    drive(
+        &mut service,
+        &mut mock,
+        event(Some(2), true, false),
+        &refused,
+        Some(handle(900, 2)),
+    )
+    .unwrap();
+    assert_eq!(error_codes(&mock), [ErrorCode::NotPublished]);
+    assert!(mock.moves.is_empty());
+    assert!(mock.closed.contains(&900));
+    // Its own service still connects.
+    let allowed = lookup(b"echo", 3);
+    drive(
+        &mut service,
+        &mut mock,
+        event(Some(2), true, false),
+        &allowed,
+        Some(handle(901, 2)),
+    )
+    .unwrap();
+    assert_eq!(mock.moves, [901]);
+}

@@ -510,6 +510,39 @@ mod tests {
         }
     }
 
+    /// W7 review T1: each role's registry client reaches exactly the one
+    /// service below it, so no filesystem server or shell reaches a raw
+    /// disk, and vfsd reaches nothing.
+    #[test]
+    fn each_role_reaches_only_the_service_beneath_it() {
+        use wyrmroot_device_proto::manifest::{BOOT_DISK_SERVICE_NAME, DATA_DISK_SERVICE_NAME};
+        let reach = |role_id: u64| {
+            SPECS
+                .iter()
+                .find(|spec| spec.role_id == role_id)
+                .expect("every service role has a spec")
+                .client
+        };
+        assert_eq!(reach(BLOCKMGR_ROLE_ID), Some(BOOT_DISK_SERVICE_NAME));
+        assert_eq!(reach(ROOT_BLOCKMGR_ROLE_ID), Some(DATA_DISK_SERVICE_NAME));
+        assert_eq!(reach(FAT32D_ROLE_ID), Some(BOOT_VOLUME.name));
+        assert_eq!(reach(EXT4D_ROLE_ID), Some(ROOT_VOLUME.name));
+        assert_eq!(reach(VFSD_ROLE_ID), None);
+        // A role reaches the volume its block manager publishes, never a disk
+        // another role is meant to mediate.
+        for spec in &SPECS {
+            if let Some(name) = spec.client {
+                let raw_disk = name == BOOT_DISK_SERVICE_NAME || name == DATA_DISK_SERVICE_NAME;
+                assert_eq!(
+                    raw_disk,
+                    spec.path == BLOCKMGR_PATH,
+                    "{}",
+                    spec.display_path
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_service_image_must_match_its_service_role_policy_entry() {
         let good = bootfs(service_entry(), FileMode::Executable, VFSD);
