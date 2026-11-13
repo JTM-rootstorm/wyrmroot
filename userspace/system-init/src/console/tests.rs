@@ -674,3 +674,169 @@ fn exact_queued_watch_requires_driver_to_be_running() {
     assert_eq!(platform.closed[..platform.close_count], [observed.client]);
     assert!(session.publication_observer.is_none());
 }
+
+mod session_faults {
+    extern crate std;
+
+    use super::*;
+    use crate::job_dispatch::isolation_tests::{
+        AUTHORITY, ChildWaits, FakeKernel, InitSendLoader, channel, session,
+    };
+    use crate::job_sessions::SessionOwner;
+
+    const GENERATION: u64 = 2;
+
+    fn resident_with(session: ConsoleState) -> ResidentSystemInit {
+        let (mut resident, _, _) = crate::recovery_fixture_resident(
+            [0x5A; 32],
+            GENERATION,
+            session,
+            RegistryTopology::new(GENERATION).unwrap(),
+            None,
+        )
+        .unwrap();
+        resident.authority = AUTHORITY;
+        resident
+    }
+
+    fn console_state(resident: &mut ResidentSystemInit) -> &mut ConsoleState {
+        resident.product.as_mut().unwrap().session.as_mut().unwrap()
+    }
+
+    fn poll_once(resident: &mut ResidentSystemInit, kernel: &mut FakeKernel) -> PollOutcome {
+        let now = kernel.now;
+        let mut waits = ChildWaits(kernel.children.clone());
+        poll(
+            resident,
+            kernel,
+            &mut InitSendLoader::new(),
+            &mut waits,
+            now,
+        )
+        .expect("a session client's fault never fails the tick")
+    }
+
+    /// A shell whose job session sends bytes that are no request.
+    fn faulting_shell(poisoned: bool) -> (ResidentSystemInit, FakeKernel) {
+        let mut state = ConsoleState::new(GENERATION).unwrap();
+        state
+            .jobs
+            .install_scoped_session(session(1), channel(1), LaunchSessionScope::ShellJobs)
+            .unwrap();
+        if poisoned {
+            state.shell.poison(GENERATION);
+        }
+        let mut kernel = FakeKernel::new();
+        kernel.deliver(channel(1), b"not a request", &[41]);
+        (resident_with(state), kernel)
+    }
+
+    /// With the registry healthy, a shell session retired for its own fault
+    /// is the whole of what happens: no recovery, and the tick is stable.
+    #[test]
+    fn a_faulted_shell_session_is_retired_and_the_tick_is_stable() {
+        let (mut resident, mut kernel) = faulting_shell(false);
+        assert_eq!(poll_once(&mut resident, &mut kernel), PollOutcome::Stable);
+        assert!(kernel.is_closed(41) && kernel.is_closed(channel(1).0));
+        let state = console_state(&mut resident);
+        assert!(state.jobs.session_handle(session(1)).is_err());
+        assert_eq!(poll_once(&mut resident, &mut kernel), PollOutcome::Stable);
+    }
+
+    /// With the registry poisoned, the same fault is what a dispatcher
+    /// failure always was there: a registry recovery.
+    #[test]
+    fn a_faulted_session_under_a_poisoned_registry_recovers_the_registry() {
+        let (mut resident, mut kernel) = faulting_shell(true);
+        assert_eq!(
+            poll_once(&mut resident, &mut kernel),
+            PollOutcome::RecoverRegistry(crate::abandoned::phase::DISPATCHER_POISONED)
+        );
+        assert!(kernel.is_closed(41) && kernel.is_closed(channel(1).0));
+    }
+
+    /// A console whose launcher session sends bytes that are no request.
+    fn faulting_console(poisoned: bool) -> (ResidentSystemInit, FakeKernel, InstalledPeer) {
+        let peer = console_peer();
+        let mut state = ConsoleState::new(GENERATION).unwrap();
+        state.console = Some(peer);
+        state
+            .jobs
+            .install_scoped_session(peer.grant, channel(7), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        state
+            .jobs
+            .attach_session_owner(
+                peer.grant,
+                SessionOwner {
+                    process: peer.loaded.process,
+                    launch_channel: peer.loaded.launch_channel,
+                    task_group: peer.task_group,
+                },
+            )
+            .unwrap();
+        if poisoned {
+            state.shell.poison(GENERATION);
+        }
+        let mut kernel = FakeKernel::new();
+        kernel
+            .children
+            .borrow_mut()
+            .group_of
+            .insert(peer.loaded.process.0, peer.task_group.0);
+        kernel.deliver(channel(7), b"not a request", &[41]);
+        (resident_with(state), kernel, peer)
+    }
+
+    /// The console launcher's own fault retires the console with its
+    /// session and asks for a fresh one -- and each fresh one is charged to
+    /// the console's launch budget, which a console that keeps faulting
+    /// exhausts exactly as one that keeps crashing does.
+    #[test]
+    fn a_faulted_console_launcher_is_retired_and_relaunched_within_its_budget() {
+        let (mut resident, mut kernel, peer) = faulting_console(false);
+        assert_eq!(
+            poll_once(&mut resident, &mut kernel),
+            PollOutcome::LaunchConsole
+        );
+        // The console process was ended and released with its session.
+        assert!(
+            kernel
+                .children
+                .borrow()
+                .terminated
+                .contains(&peer.task_group.0)
+        );
+        for handle in [
+            41,
+            channel(7).0,
+            peer.loaded.process.0,
+            peer.loaded.launch_channel.0,
+            peer.task_group.0,
+        ] {
+            assert!(kernel.is_closed(handle), "handle {handle} closed");
+        }
+        let state = console_state(&mut resident);
+        assert_eq!(state.console, None);
+        assert!(state.jobs.session_handle(peer.grant).is_err());
+        // What the relaunch draws on is finite, and is not replenished by
+        // the fault.
+        for _ in 0..WYR0_I_SUPERVISION_POLICY.max_attempts {
+            assert!(state.take_console_transaction().is_ok());
+        }
+        assert_eq!(state.take_console_transaction(), Err(InitError::Cleanup));
+    }
+
+    #[test]
+    fn a_faulted_console_launcher_under_a_poisoned_registry_recovers_the_registry() {
+        let (mut resident, mut kernel, peer) = faulting_console(true);
+        assert_eq!(
+            poll_once(&mut resident, &mut kernel),
+            PollOutcome::RecoverRegistry(crate::abandoned::phase::DISPATCHER_POISONED)
+        );
+        // The console is already retired, so the recovery finds none to
+        // retire a second time.
+        assert_eq!(console_state(&mut resident).console, None);
+        assert!(kernel.is_closed(peer.loaded.process.0));
+    }
+}

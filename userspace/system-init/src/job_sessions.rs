@@ -15,6 +15,12 @@ pub(crate) struct Session {
     pub(crate) owner: Option<SessionOwner>,
     pub(crate) scope: LaunchSessionScope,
     pub(crate) outer_job: Option<u64>,
+    /// A reply this session is owed and had no room for. While it is held
+    /// init reads no further request from the session.
+    pub(crate) held_reply: Option<crate::HeldReply>,
+    /// When this session's reply queue was first found full, until it is
+    /// found with room again.
+    pub(crate) blocked_since: Option<u64>,
 }
 
 /// Controller-owned authority for one installed launch session.
@@ -84,6 +90,16 @@ pub(crate) struct JobDispatcher {
     pub(crate) job_cursor: usize,
     pub(crate) pending_waits: [Option<PendingWait>; MAX_SESSIONS],
     pub(crate) wait_cursor: usize,
+    /// The one LAUNCH_IMAGE whose file is being read, between its request
+    /// and its child (`image_launch`).
+    pub(crate) image: Option<crate::image_launch::ParkedImageLaunch>,
+    /// A session the image read retired between polls, for the next poll to
+    /// report.
+    pub(crate) image_fault: Option<crate::SessionFault>,
+    /// The reply the last send found no room for, between that send and
+    /// whoever holds it for its session. Kept here, not in the error the
+    /// send returns, so no dispatch frame carries a reply by value.
+    pub(crate) staged_reply: Option<crate::HeldReply>,
 }
 
 impl JobDispatcher {
@@ -97,6 +113,9 @@ impl JobDispatcher {
             job_cursor: 0,
             pending_waits: [None; MAX_SESSIONS],
             wait_cursor: 0,
+            image: None,
+            image_fault: None,
+            staged_reply: None,
         }
     }
 
@@ -131,8 +150,18 @@ impl JobDispatcher {
             owner: None,
             scope,
             outer_job: None,
+            held_reply: None,
+            blocked_since: None,
         });
         Ok(())
+    }
+
+    pub(crate) fn session_mut(&mut self, grant: EndpointGrant) -> Result<&mut Session, JobError> {
+        self.sessions
+            .iter_mut()
+            .flatten()
+            .find(|session| session.grant == grant)
+            .ok_or(JobError::UnknownConnection)
     }
 
     pub(crate) fn session_scope(

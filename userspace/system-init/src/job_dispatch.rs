@@ -7,10 +7,10 @@ use crate::*;
 use deepwyrm_syscall::{DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_TASK_STATE_EXITED};
 use wyrmroot_launch_proto::{
     ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchMessageType,
-    Reservation as LaunchReservation, TerminationResult, encode_error as encode_launch_error,
-    encode_job_list, encode_job_message, encode_job_result, encode_job_state,
-    encode_shell_v1_accepted, parse_message as parse_launch_message, parse_reservation_prefix,
-    parse_shell_v1_request, parse_shell_v1_reservation_prefix,
+    Reservation as LaunchReservation, TerminationResult, encode_job_list, encode_job_message,
+    encode_job_result, encode_job_state, encode_shell_v1_accepted,
+    parse_message as parse_launch_message, parse_reservation_prefix, parse_shell_v1_request,
+    parse_shell_v1_reservation_prefix,
 };
 use wyrmroot_loader::{
     launch::LaunchProfile,
@@ -30,12 +30,12 @@ pub(crate) fn dispatch_reserved_operation_observed<S, W>(
     request_bytes: &[u8],
     scope: LaunchSessionScope,
     mut evidence: Option<&mut ShellControllerState>,
-) -> Result<(), InitError>
+) -> Result<(), DispatchError>
 where
     S: ResidentPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    let mut response = [0_u8; 320];
+    let mut response = [0_u8; MAX_REPLY_BYTES];
     let result: Result<Option<usize>, JobError> = match message {
         LaunchMessage::Query { job_id } => {
             jobs.jobs
@@ -75,12 +75,14 @@ where
             let resources = match jobs.jobs.authorize_terminate_reserved(ticket, job_id) {
                 Ok(resources) => resources,
                 Err(error) => {
-                    return send_observed_job_error(
+                    send_observed_job_error(
                         system,
+                        jobs,
                         session,
                         reservation,
                         job_error_code(error),
-                    );
+                    )?;
+                    return Ok(());
                 }
             };
             if system
@@ -90,12 +92,14 @@ where
                 jobs.jobs
                     .record_cleanup_bits(job_id, 1 << 0)
                     .map_err(InitError::Jobs)?;
-                return send_observed_job_error(
+                send_observed_job_error(
                     system,
+                    jobs,
                     session,
                     reservation,
                     LaunchErrorCode::CleanupFailure,
-                );
+                )?;
+                return Ok(());
             }
             jobs.jobs
                 .commit_terminate(job_id, resources)
@@ -138,12 +142,14 @@ where
                 .cancel_pending_wait(grant, target_transaction_id)
                 .is_none()
             {
-                return send_observed_job_error(
+                send_observed_job_error(
                     system,
+                    jobs,
                     session,
                     reservation,
                     LaunchErrorCode::CancellationUnavailable,
-                );
+                )?;
+                return Ok(());
             }
             encode_job_message(
                 reservation,
@@ -158,13 +164,14 @@ where
     };
     match result {
         Ok(Some(size)) => {
-            system
-                .send_channel(session, &response[..size])
-                .map_err(InitError::Native)?;
+            send_session_reply(system, jobs, session, &response[..size])?;
             Ok(())
         }
         Ok(None) => Ok(()),
-        Err(error) => send_observed_job_error(system, session, reservation, job_error_code(error)),
+        Err(error) => {
+            send_observed_job_error(system, jobs, session, reservation, job_error_code(error))?;
+            Ok(())
+        }
     }
 }
 
@@ -176,6 +183,10 @@ pub(crate) enum JobDispatchOutcome {
     /// published yet. Reset card R6B-2: the transaction is in the arena and the
     /// dispatcher has gone back to the event loop.
     Constructed,
+    /// A file image is being read. Nothing is constructed yet; the request
+    /// is parked in the dispatcher and the read goes on tick by tick
+    /// (`image_launch`).
+    ImageParked,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,7 +195,7 @@ pub(crate) enum JobWireVersion {
     ShellV1,
 }
 
-pub(crate) fn close_shell_session_for_job<S: InitPlatform>(
+pub(crate) fn close_shell_session_for_job<S: ResidentPlatform>(
     system: &mut S,
     jobs: &mut JobDispatcher,
     job_id: u64,
@@ -195,9 +206,12 @@ pub(crate) fn close_shell_session_for_job<S: InitPlatform>(
     let disconnected = jobs
         .disconnect_owned_session(grant)
         .map_err(InitError::Jobs)?;
+    // The shell is gone, and an image it was having read goes with it.
+    let image_cleanup_failed = crate::image_launch::cancel_parked_image(system, jobs, Some(grant));
     if disconnected.owner.is_some()
         || disconnected.outer_job != Some(job_id)
         || system.close_handle(disconnected.channel).is_err()
+        || image_cleanup_failed
     {
         return Err(InitError::Cleanup);
     }
@@ -547,14 +561,15 @@ where
 
 pub(crate) fn send_versioned_job_error<S: InitPlatform>(
     system: &mut S,
+    jobs: &mut JobDispatcher,
     session: DwHandle,
     reservation: LaunchReservation,
     version: JobWireVersion,
     code: LaunchErrorCode,
-) -> Result<(), InitError> {
+) -> Result<(), ReplyError> {
     match version {
-        JobWireVersion::Legacy => send_job_error(system, session, reservation, code),
-        JobWireVersion::ShellV1 => send_shell_v1_error(system, session, reservation, code),
+        JobWireVersion::Legacy => send_job_error(system, jobs, session, reservation, code),
+        JobWireVersion::ShellV1 => send_shell_v1_error(system, jobs, session, reservation, code),
     }
 }
 
@@ -568,7 +583,7 @@ pub(crate) fn dispatch_one_job_request<S, L, W>(
     jobs: &mut JobDispatcher,
     session: DwHandle,
     grant: EndpointGrant,
-) -> Result<JobDispatchOutcome, InitError>
+) -> Result<JobDispatchOutcome, DispatchError>
 where
     S: ResidentPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -590,7 +605,7 @@ pub(crate) fn dispatch_one_job_request_with_shell<S, L, W>(
     session: DwHandle,
     grant: EndpointGrant,
     shell: &mut ShellLaunchContext<'_>,
-) -> Result<JobDispatchOutcome, InitError>
+) -> Result<JobDispatchOutcome, DispatchError>
 where
     S: ResidentPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -620,7 +635,7 @@ pub(crate) fn dispatch_one_job_request_inner<S, L, W>(
     session: DwHandle,
     grant: EndpointGrant,
     mut shell: Option<&mut ShellLaunchContext<'_>>,
-) -> Result<JobDispatchOutcome, InitError>
+) -> Result<JobDispatchOutcome, DispatchError>
 where
     S: ResidentPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -631,15 +646,35 @@ where
     let mut bytes = [0_u8; wyrmroot_launch_proto::MAX_LAUNCH_MESSAGE_BYTES];
     let mut received =
         [DwReceivedHandleInfoV1::default(); wyrmroot_launch_proto::MAX_REQUEST_HANDLES];
-    let counts = system
-        .receive_channel(session, &mut bytes, &mut received)
-        .map_err(InitError::Native)?;
+    // Everything from here to the first reply is the client's to get wrong.
+    // A message with more bytes or handles than any request may carry is
+    // refused by the kernel receive and stays queued; one that is not WRLJ at
+    // all cannot even be answered, because an `ERROR` must repeat the
+    // request's own identity (9.5). Neither is init's failure. The request's
+    // handles are closed and the session is retired by the caller -- which
+    // closes the Channel, and with it whatever the client left queued there.
+    let counts = match system.receive_channel(session, &mut bytes, &mut received) {
+        Ok(counts) => counts,
+        Err(error) => {
+            return Err(match peer_cause(ChannelOperation::Receive, error) {
+                Some(PeerCause::MessageTooLarge) => {
+                    DispatchError::Client(FaultCause::RequestTooLarge)
+                }
+                Some(PeerCause::Closed) => DispatchError::Client(FaultCause::ClosedBeforeReceive),
+                // Not the client's: init's own handle, memory or handle
+                // table, or a kernel that broke its ABI.
+                Some(PeerCause::QueueFull) | None => DispatchError::Fatal(InitError::Native(error)),
+            });
+        }
+    };
     if counts.bytes > bytes.len() || counts.handles > received.len() {
         let failed = close_received_reverse(system, &received, counts.handles);
         return Err(if failed {
-            InitError::Cleanup
+            DispatchError::Fatal(InitError::Cleanup)
+        } else if counts.bytes > bytes.len() {
+            DispatchError::Client(FaultCause::OversizedBytes)
         } else {
-            InitError::Jobs(JobError::StreamPolicy)
+            DispatchError::Client(FaultCause::OversizedHandles)
         });
     }
     let (version, reservation) = match parse_reservation_prefix(&bytes[..counts.bytes]) {
@@ -649,11 +684,9 @@ where
             Err(_) => {
                 let failed = close_received_reverse(system, &received, counts.handles);
                 return Err(if failed {
-                    InitError::Cleanup
-                } else if counts.handles > legacy_handle_limit {
-                    InitError::Jobs(JobError::StreamPolicy)
+                    DispatchError::Fatal(InitError::Cleanup)
                 } else {
-                    InitError::Jobs(JobError::WrongState)
+                    DispatchError::Client(FaultCause::UnparseablePrefix)
                 });
             }
         },
@@ -668,23 +701,32 @@ where
     } else {
         legacy_handle_limit
     };
+    // "Any other handle count is malformed" (9.1), and a request whose
+    // envelope parsed can be told so: `ERROR` code 1 (9.5), not a retirement.
     if version == JobWireVersion::Legacy && counts.handles > handle_limit {
-        let failed = close_received_reverse(system, &received, counts.handles);
-        return Err(if failed {
-            InitError::Cleanup
-        } else {
-            InitError::Jobs(JobError::StreamPolicy)
-        });
+        if close_received_reverse(system, &received, counts.handles) {
+            return Err(DispatchError::Fatal(InitError::Cleanup));
+        }
+        send_versioned_job_error(
+            system,
+            jobs,
+            session,
+            reservation,
+            version,
+            LaunchErrorCode::MalformedRequest,
+        )?;
+        return Ok(JobDispatchOutcome::Responded);
     }
     if reservation.connection_id != grant.endpoint_id
         || reservation.generation != grant.endpoint_generation
     {
         let failed = close_received_reverse(system, &received, counts.handles);
         if failed {
-            return Err(InitError::Cleanup);
+            return Err(DispatchError::Fatal(InitError::Cleanup));
         }
         send_versioned_job_error(
             system,
+            jobs,
             session,
             reservation,
             version,
@@ -697,9 +739,16 @@ where
         Err(error) => {
             let failed = close_received_reverse(system, &received, counts.handles);
             if failed {
-                return Err(InitError::Cleanup);
+                return Err(DispatchError::Fatal(InitError::Cleanup));
             }
-            send_versioned_job_error(system, session, reservation, version, job_error_code(error))?;
+            send_versioned_job_error(
+                system,
+                jobs,
+                session,
+                reservation,
+                version,
+                job_error_code(error),
+            )?;
             return Ok(JobDispatchOutcome::Responded);
         }
     };
@@ -709,10 +758,11 @@ where
             Err(_) => {
                 let failed = close_received_reverse(system, &received, counts.handles);
                 if failed {
-                    return Err(InitError::Cleanup);
+                    return Err(DispatchError::Fatal(InitError::Cleanup));
                 }
                 send_shell_v1_error(
                     system,
+                    jobs,
                     session,
                     reservation,
                     LaunchErrorCode::MalformedRequest,
@@ -722,10 +772,11 @@ where
         };
         if !scope.admits_shell_v1() {
             if close_received_reverse(system, &received, counts.handles) {
-                return Err(InitError::Cleanup);
+                return Err(DispatchError::Fatal(InitError::Cleanup));
             }
             send_shell_v1_error(
                 system,
+                jobs,
                 session,
                 reservation,
                 LaunchErrorCode::PolicyRejected,
@@ -735,17 +786,29 @@ where
         for info in &received[..counts.handles] {
             if let Err(error) = validate_controller_channel(system, info.handle) {
                 if close_received_reverse(system, &received, counts.handles) {
-                    return Err(InitError::Cleanup);
+                    return Err(DispatchError::Fatal(InitError::Cleanup));
                 }
-                send_shell_v1_error(system, session, reservation, launch_error_code(&error))?;
+                send_shell_v1_error(
+                    system,
+                    jobs,
+                    session,
+                    reservation,
+                    launch_error_code(&error),
+                )?;
                 return Ok(JobDispatchOutcome::Responded);
             }
         }
         let (Some(policy), Some(shell)) = (policy, shell.as_deref_mut()) else {
             if close_received_reverse(system, &received, counts.handles) {
-                return Err(InitError::Cleanup);
+                return Err(DispatchError::Fatal(InitError::Cleanup));
             }
-            send_shell_v1_error(system, session, reservation, LaunchErrorCode::LoaderFailure)?;
+            send_shell_v1_error(
+                system,
+                jobs,
+                session,
+                reservation,
+                LaunchErrorCode::LoaderFailure,
+            )?;
             return Ok(JobDispatchOutcome::Responded);
         };
         let accepted = match accept_reserved_shell(
@@ -765,12 +828,13 @@ where
             Err(error) => {
                 let response = send_shell_v1_error(
                     system,
+                    jobs,
                     session,
                     reservation,
                     shell_launch_error_code(&error),
                 );
                 return if error == InitError::Cleanup {
-                    Err(error)
+                    Err(DispatchError::Fatal(error))
                 } else {
                     response?;
                     Ok(JobDispatchOutcome::Responded)
@@ -785,16 +849,29 @@ where
         let mut response = [0_u8; wyrmroot_launch_proto::SHELL_V1_REPLY_BYTES];
         let response_size = encode_shell_v1_accepted(reservation, loaded.job_id, &mut response)
             .map_err(|_| InitError::Accounting)?;
-        if let Err(error) = system.send_channel(session, &response[..response_size]) {
+        if let Err(refused) = send_session_reply(system, jobs, session, &response[..response_size])
+        {
+            // The console launcher would not take `LAUNCH_SHELL_V1`'s
+            // acceptance. The shell is unpublished and is rolled back. This
+            // reply is not held for a full queue: the shell's launch Channel
+            // is released only once the acceptance is sent, and the launcher
+            // sends one request at a time, so its queue is full only if it
+            // stopped reading.
             jobs.jobs.restore_launch_channel(release);
             shell.state.poison(shell.topology.generation());
-            return Err(
-                if cleanup_shell_before_publication(system, waits, jobs, loaded).is_err() {
-                    InitError::Cleanup
-                } else {
-                    InitError::Native(error)
-                },
-            );
+            if cleanup_shell_before_publication(system, waits, jobs, loaded).is_err() {
+                return Err(DispatchError::Fatal(InitError::Cleanup));
+            }
+            return Err(match refused {
+                ReplyError::Encode => DispatchError::Fatal(InitError::Accounting),
+                ReplyError::Native(error) => DispatchError::Fatal(InitError::Native(error)),
+                ReplyError::PeerClosed => DispatchError::Client(FaultCause::ReplyUndeliverable(
+                    deepwyrm_syscall::DW_STATUS_PEER_CLOSED,
+                )),
+                ReplyError::QueueFull => DispatchError::Client(FaultCause::ReplyUndeliverable(
+                    deepwyrm_syscall::DW_STATUS_WOULD_BLOCK,
+                )),
+            });
         }
         if system.close_handle(loaded.loaded.launch_channel).is_err() {
             jobs.jobs.restore_launch_channel(release);
@@ -803,7 +880,7 @@ where
                 .map_err(InitError::Jobs)?;
             shell.state.poison(shell.topology.generation());
             let _ = cleanup_shell_before_publication(system, waits, jobs, loaded);
-            return Err(InitError::Cleanup);
+            return Err(DispatchError::Fatal(InitError::Cleanup));
         }
         return Ok(JobDispatchOutcome::Launched(
             jobs.jobs
@@ -816,10 +893,11 @@ where
         Err(_) => {
             let failed = close_received_reverse(system, &received, counts.handles);
             if failed {
-                return Err(InitError::Cleanup);
+                return Err(DispatchError::Fatal(InitError::Cleanup));
             }
             send_job_error(
                 system,
+                jobs,
                 session,
                 reservation,
                 LaunchErrorCode::MalformedRequest,
@@ -831,10 +909,11 @@ where
         LaunchMessage::Launch(request) => {
             if !scope.admits_legacy_launch(request.path) {
                 if close_received_reverse(system, &received, counts.handles) {
-                    return Err(InitError::Cleanup);
+                    return Err(DispatchError::Fatal(InitError::Cleanup));
                 }
                 send_observed_job_error(
                     system,
+                    jobs,
                     session,
                     reservation,
                     LaunchErrorCode::PolicyRejected,
@@ -843,10 +922,11 @@ where
             }
             let Some(policy) = policy else {
                 if close_received_reverse(system, &received, counts.handles) {
-                    return Err(InitError::Cleanup);
+                    return Err(DispatchError::Fatal(InitError::Cleanup));
                 }
                 send_observed_job_error(
                     system,
+                    jobs,
                     session,
                     reservation,
                     LaunchErrorCode::PolicyRejected,
@@ -874,35 +954,36 @@ where
         LaunchMessage::LaunchImage(request) => {
             let Some(policy) = policy else {
                 if close_received_reverse(system, &received, counts.handles) {
-                    return Err(InitError::Cleanup);
+                    return Err(DispatchError::Fatal(InitError::Cleanup));
                 }
                 send_observed_job_error(
                     system,
+                    jobs,
                     session,
                     reservation,
                     LaunchErrorCode::PolicyRejected,
                 )?;
                 return Ok(JobDispatchOutcome::Responded);
             };
-            crate::image_launch::defer_image_launch(
+            // The policy is not consulted for a file image; requiring it
+            // keeps a build with no launch policy refusing every launch.
+            let _ = (policy, request);
+            crate::image_launch::begin_image_launch(
                 system,
-                loader,
-                waits,
                 authority,
-                policy,
                 jobs,
                 session,
                 grant,
                 scope,
                 reservation,
                 request_ticket,
-                request,
+                &bytes[..counts.bytes],
                 &received[..wyrmroot_launch_proto::LAUNCH_IMAGE_HANDLE_COUNT],
             )
         }
         message => {
             if close_received_reverse(system, &received, counts.handles) {
-                return Err(InitError::Cleanup);
+                return Err(DispatchError::Fatal(InitError::Cleanup));
             }
             dispatch_reserved_operation_observed(
                 system,
@@ -931,5 +1012,10 @@ mod tests;
 
 mod deferred_launch;
 mod job_poll;
+mod session_fault;
 pub(crate) use deferred_launch::*;
 pub(crate) use job_poll::*;
+pub(crate) use session_fault::*;
+
+#[cfg(test)]
+pub(crate) mod isolation_tests;
