@@ -290,6 +290,11 @@ impl BuildManifest {
         }
     }
 
+    /// The pinned Deepwyrm revision, `[deepwyrm] revision`.
+    pub(crate) fn deepwyrm_revision(&self) -> Result<&str, Failure> {
+        self.required("deepwyrm.revision")
+    }
+
     fn required(&self, key: &str) -> Result<&str, Failure> {
         self.values.get(key).map(String::as_str).ok_or_else(|| {
             Failure::task(format!(
@@ -304,7 +309,10 @@ fn read_file(path: &Path) -> Result<String, Failure> {
         .map_err(|error| Failure::task(format!("could not read {}: {error}", path.display())))
 }
 
-fn parse_scalar_toml(contents: &str, path: &Path) -> Result<BTreeMap<String, String>, Failure> {
+pub(crate) fn parse_scalar_toml(
+    contents: &str,
+    path: &Path,
+) -> Result<BTreeMap<String, String>, Failure> {
     if contains_toml_multiline_string(contents) {
         return Err(Failure::task(format!(
             "{} contains an unsupported TOML multiline string",

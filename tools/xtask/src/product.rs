@@ -211,6 +211,9 @@ pub(crate) fn build(
     }
 
     let manifest = crate::metadata::BuildManifest::load(&repository)?;
+    if let Some(sdk) = sdk {
+        crate::sdk_pairing::require(&repository, sdk, manifest.deepwyrm_revision()?)?;
+    }
     let profile = manifest.validate_loader_build_readiness(&repository)?;
     let toolchain = tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
     let cargo_home = tasks::project_cargo_home(&repository, &manifest)?;

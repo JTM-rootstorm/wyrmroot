@@ -9,6 +9,7 @@ mod gate;
 mod metadata;
 mod product;
 mod product_engine;
+mod sdk_pairing;
 mod secure_fs;
 mod sha256;
 mod tasks;
