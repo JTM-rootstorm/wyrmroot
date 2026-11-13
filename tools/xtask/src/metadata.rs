@@ -290,6 +290,11 @@ impl BuildManifest {
         }
     }
 
+    /// The pinned semantic ABI fingerprint, validated at load.
+    pub(crate) fn deepwyrm_abi_fingerprint(&self) -> Result<&str, Failure> {
+        self.required("deepwyrm.abi_fingerprint")
+    }
+
     /// The pinned Deepwyrm revision, `[deepwyrm] revision`.
     pub(crate) fn deepwyrm_revision(&self) -> Result<&str, Failure> {
         self.required("deepwyrm.revision")

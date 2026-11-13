@@ -2,12 +2,14 @@ schema_version = 1
 milestone = "WYR0"
 
 # The canonical Deepwyrm pin record. `revision` is the exact commit whose
-# generated deepwyrm-abi and deepwyrm-syscall crates Wyrmroot compiles against,
-# kept as provenance. `abi_fingerprint` is that commit's semantic ABI
-# fingerprint (abi/generated/abi_fingerprint.toml), and the revision-pairing
-# gates accept any kernel revision that carries it, so a documentation-only
+# generated deepwyrm-abi and deepwyrm-syscall crates Wyrmroot compiles against.
+# `abi_fingerprint` is that commit's semantic ABI fingerprint
+# (abi/generated/abi_fingerprint.toml). `xtask product` and `xtask dev-boot`
+# build the kernel from the Deepwyrm checkout's working tree and refuse it
+# unless its fingerprint is this one (tools/xtask/src/abi_pairing.rs), so any
+# kernel revision that carries the fingerprint pairs and a documentation-only
 # schema edit needs no repin. Cargo.toml and Cargo.lock must restate
-# `revision`; a host test checks them, and every other site derives the pin.
+# `revision`; a host test checks them.
 [deepwyrm]
 repository = "https://github.com/JTM-rootstorm/deepwyrm"
 revision = "94ad17eb6b7eaeb3049389d605eadc62c03b2103"
@@ -19,7 +21,7 @@ abi_dependency_state = "available"
 upstream_repository = "https://github.com/rust-lang/rust"
 upstream_stable_release = "1.97.1"
 upstream_stable_revision = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
-fork_repository = "git@github.com:JTM-rootstorm/rust.git"
+fork_repository = "https://github.com/JTM-rootstorm/rust.git"
 wyrmroot_revision = "d54c16b7f2160f9c5bd61456cf27eaf7f3c45aab"
 local_toolchain_name = "wyrmroot-1.97.1-d54c16b7"
 accepted_artifact_root = "artifacts/toolchains/accepted/RUST-TC2-WYRMROOT-PSABI-008"

@@ -211,6 +211,14 @@ pub(crate) fn build(
     }
 
     let manifest = crate::metadata::BuildManifest::load(&repository)?;
+    // Before anything is built: the kernel comes from this checkout's working
+    // tree, userspace from the pinned ABI, and they must be the same ABI.
+    let abi_fingerprint = crate::abi_pairing::require(
+        &deep_repository,
+        &deep_revision,
+        manifest.deepwyrm_abi_fingerprint()?,
+    )?;
+    eprintln!("xtask product: Deepwyrm kernel {deep_revision}, ABI fingerprint {abi_fingerprint}");
     if let Some(sdk) = sdk {
         crate::sdk_pairing::require(&repository, sdk, manifest.deepwyrm_revision()?)?;
     }
