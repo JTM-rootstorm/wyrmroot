@@ -73,13 +73,22 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
     let mode = (startup.argc() >= 2)
         .then(|| startup.arg(1).map(|argument| argument.as_str()))
         .flatten();
-    let mut probe = |region: DwHandle| on_demand::probe(region, mode == Some("on-demand-exhaust"));
+    let exhaust = mode == Some("on-demand-exhaust");
+    let mut last_touch = None;
+    let mut probe = |region: DwHandle| on_demand::probe(region, exhaust, &mut last_touch);
     let probe: Option<&mut dyn FnMut(DwHandle) -> &'static [u8]> = match mode {
         Some("on-demand" | "on-demand-exhaust") => Some(&mut probe),
         _ => None,
     };
-    run_stream_hello_with(&mut system, startup.bootstrap_channel().as_abi(), probe)
-        .map_or_else(|error| error.exit_code(), |_| 0)
+    let status = run_stream_hello_with(&mut system, startup.bootstrap_channel().as_abi(), probe)
+        .map_or_else(|error| error.exit_code(), |_| 0);
+    // The exhausting touch comes once the job is running, not during its
+    // launch, so it ends a job and init reports its termination.
+    if let Some(address) = last_touch {
+        on_demand::touch(address);
+        return 1;
+    }
+    status
 }
 
 /// `run bin/hello on-demand`: exercises an on-demand MemoryObject end to
@@ -88,9 +97,9 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
 /// across it (each a served page fault), reads untouched ones as zero, has
 /// a syscall write into a page never touched (the fill-in phase), and
 /// commits a page. With `on-demand-exhaust` it then spends the job's page
-/// quota and touches one more page, which ends the job with
-/// `DW_TERMINATION_RESOURCE_POLICY`. The line it returns names the first
-/// step that failed.
+/// quota, and the job touches one more page once it is running, which ends
+/// it with `DW_TERMINATION_RESOURCE_POLICY`. The line it returns names the
+/// first step that failed.
 #[allow(
     unsafe_code,
     reason = "reads and writes the probe's own fresh mapping through raw pointers"
@@ -119,7 +128,16 @@ mod on_demand {
         unsafe { core::ptr::write_volatile(address as *mut u64, value) }
     }
 
-    pub(super) fn probe(region: DwHandle, exhaust: bool) -> &'static [u8] {
+    /// Writes one word of the probe's mapping.
+    pub(super) fn touch(address: u64) {
+        write(address, MARK);
+    }
+
+    pub(super) fn probe(
+        region: DwHandle,
+        exhaust: bool,
+        last_touch: &mut Option<u64>,
+    ) -> &'static [u8] {
         let mut object = DwHandle(0);
         let rights =
             DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0);
@@ -193,10 +211,10 @@ mod on_demand {
             {
                 return b"on-demand failed: commit past the quota\n";
             }
-            // Untouched and past what the commit reached: this fault ends
-            // the job.
-            write(base + 50 * MIB, MARK);
-            return b"on-demand failed: survived an exhausted touch\n";
+            // Untouched and past what the commit reached: the caller's
+            // touch of it ends the job.
+            *last_touch = Some(base + 50 * MIB);
+            return b"on-demand quota spent\n";
         }
         if deepwyrm_syscall::address_region_unmap(region, at, DwSize(SIZE)) != DW_STATUS_SUCCESS
             || deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS
