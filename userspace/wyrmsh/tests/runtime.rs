@@ -13,7 +13,8 @@ use wyrmroot_console_proto::{
     ErrorCode as StatusErrorCode, Header as StatusHeader, LastFailure, Snapshot,
     State as StatusState, encode_error as encode_status_error, encode_snapshot,
 };
-use wyrmroot_fs_proto as _;
+use wyrmroot_fs_proto::node::{self as fs_node, Attr, Body as FsBody, Kind as FsKind};
+use wyrmroot_fs_proto::{Status as FsStatus, namespace};
 use wyrmroot_launch_proto::{
     ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchMessageType,
     Reservation, TerminationClassification, TerminationResult, encode_error as encode_launch_error,
@@ -121,6 +122,11 @@ struct Fixture {
     last_job_kind: Option<LaunchMessageType>,
     fail_close_once: Option<DwHandle>,
     close_attempts: Vec<DwHandle>,
+    /// A stand-in vfsd and filesystem: see [`Fixture::fake_vfs_send`].
+    fake_vfs: bool,
+    fake_nodes: Vec<DwHandle>,
+    /// Nodes whose server end closed after CLOSE.
+    fake_closed_nodes: Vec<DwHandle>,
 }
 
 impl Fixture {
@@ -186,6 +192,9 @@ impl Fixture {
             last_job_kind: None,
             fail_close_once: None,
             close_attempts: vec![],
+            fake_vfs: false,
+            fake_nodes: vec![],
+            fake_closed_nodes: vec![],
         }
     }
 
@@ -238,6 +247,97 @@ impl Fixture {
             handle_send_attempts: self.handle_send_attempts.clone(),
             child_receive_trace: self.child_receive_trace.clone(),
         }
+    }
+
+    /// The stand-in vfsd and filesystem. The registry connects any lookup,
+    /// an OPEN on the connection succeeds as a directory, SYNC succeeds,
+    /// and CLOSE drops the node and closes the server's end. Returns
+    /// whether it answered the send.
+    fn fake_vfs_send(
+        &mut self,
+        channel: DwHandle,
+        bytes: &[u8],
+        transfers: &[DwHandleTransferV1],
+    ) -> bool {
+        if !self.fake_vfs {
+            return false;
+        }
+        let mut reply = [0_u8; fs_node::MAX_BYTES];
+        if channel == REGISTRY && transfers.len() == 1 {
+            let parsed = parse_registry_message(bytes, 1).unwrap();
+            let used = wyrmroot_registry_proto::encode_empty(
+                RegistryHeader {
+                    message_type: RegistryMessageType::Connected,
+                    ..parsed.header
+                },
+                &mut reply,
+            )
+            .unwrap();
+            self.control_incoming.push_back(ControlDatagram {
+                channel,
+                bytes: reply[..used].to_vec(),
+                handles: vec![],
+            });
+            return true;
+        }
+        if transfers.len() == 1
+            && let Ok(message) = namespace::parse(bytes, 1)
+            && matches!(message.body, namespace::Body::Open { .. })
+        {
+            // `create_channel` hands out the shell's end just below the far end.
+            let node = DwHandle(transfers[0].handle.0 - 1);
+            self.fake_nodes.push(node);
+            let used = fs_node::encode(
+                &fs_node::Message {
+                    transaction_id: message.transaction_id,
+                    body: FsBody::OnOpen {
+                        status: FsStatus::Ok,
+                        attr: Some(Attr {
+                            kind: FsKind::Directory,
+                            access: fs_node::ACCESS_READ,
+                            size: 0,
+                            id: 1,
+                            filesystem: 1,
+                        }),
+                    },
+                },
+                &mut reply,
+            )
+            .unwrap();
+            self.control_incoming.push_back(ControlDatagram {
+                channel: node,
+                bytes: reply[..used].to_vec(),
+                handles: vec![],
+            });
+            return true;
+        }
+        if self.fake_nodes.contains(&channel) {
+            let message = fs_node::parse(bytes, 0).unwrap();
+            match message.body {
+                FsBody::Sync => {
+                    let used = fs_node::encode(
+                        &fs_node::Message {
+                            transaction_id: message.transaction_id,
+                            body: FsBody::Status {
+                                status: FsStatus::Ok,
+                                value: 0,
+                            },
+                        },
+                        &mut reply,
+                    )
+                    .unwrap();
+                    self.control_incoming.push_back(ControlDatagram {
+                        channel,
+                        bytes: reply[..used].to_vec(),
+                        handles: vec![],
+                    });
+                }
+                FsBody::Close => self.fake_closed_nodes.push(channel),
+                other => panic!("fake filesystem: unexpected {other:?}"),
+            }
+            return true;
+        }
+        false
     }
 
     fn queue_control(&mut self, channel: DwHandle, bytes: &[u8]) {
@@ -346,6 +446,10 @@ impl WyrmshSystem for Fixture {
             self.ready.extend_from_slice(bytes);
             return Ok(());
         }
+        if self.fake_vfs_send(channel, bytes, &[]) {
+            self.control_requests.push((channel, bytes.to_vec()));
+            return Ok(());
+        }
         let kind = (channel == SHELL_JOBS).then(|| request_kind(bytes, 0));
         self.last_job_kind = kind;
         if kind.is_some() && self.fail_job_send_kind == kind {
@@ -387,6 +491,10 @@ impl WyrmshSystem for Fixture {
             self.trace.push(Trace::JobSend(kind));
         }
         self.moved.push(transfers.to_vec());
+        if self.fake_vfs_send(channel, bytes, transfers) {
+            self.control_requests.push((channel, bytes.to_vec()));
+            return Ok(());
+        }
         if transfers.is_empty() {
             self.send_channel(channel, bytes)
         } else {
@@ -471,6 +579,12 @@ impl WyrmshSystem for Fixture {
             })
         {
             return Err(NativeError::Status(DW_STATUS_TIMED_OUT));
+        }
+        if let Some(index) = items.iter().position(|item| {
+            self.fake_closed_nodes.contains(&item.handle)
+                && item.signals.0 & DW_SIGNAL_PEER_CLOSED.0 != 0
+        }) {
+            return Ok(wait_result(index, DW_SIGNAL_PEER_CLOSED));
         }
         if let Some(message) = self.control_incoming.front()
             && let Some(index) = items.iter().position(|item| {
@@ -2774,5 +2888,41 @@ fn shell_jobs_peer_loss_with_active_job_is_generation_fatal() {
         !fixture
             .trace
             .contains(&Trace::JobSend(LaunchMessageType::CloseJob))
+    );
+}
+
+/// A file command ends its node with WRFS 1.3 CLOSE, and closes its own end
+/// only after the server has closed its end, so the job is no longer charged
+/// for either when the next command opens again.
+#[test]
+fn file_commands_end_their_node_with_close_before_closing_it() {
+    let mut fixture = Fixture::new(&[b"mkdir /d\nexit\n"]);
+    fixture.fake_vfs = true;
+    fixture.scripted_controls = true;
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
+    assert!(
+        fixture.output(STDERR).is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&fixture.output(STDERR))
+    );
+    let node = fixture.fake_nodes[0];
+    let bodies: Vec<_> = fixture
+        .control_requests
+        .iter()
+        .filter(|(channel, _)| *channel == node)
+        .map(|(_, bytes)| fs_node::parse(bytes, 0).unwrap().body)
+        .collect();
+    assert!(matches!(bodies.as_slice(), [FsBody::Sync, FsBody::Close]));
+    assert_eq!(fixture.fake_closed_nodes, [node]);
+    assert_eq!(
+        fixture
+            .closed
+            .iter()
+            .filter(|closed| **closed == node)
+            .count(),
+        1
     );
 }

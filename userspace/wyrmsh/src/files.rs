@@ -175,6 +175,41 @@ fn connect<System: WyrmshSystem>(
     }
 }
 
+/// How long [`close_node`] waits for the server to close its end.
+const CLOSE_WAIT_NS: u64 = 1_000_000_000;
+
+/// Ends an opened node with WRFS 1.3 CLOSE and closes its Channel.
+///
+/// The server drops the node, with its locks, and closes its end; waiting
+/// for that means the job's charge for both ends is gone when this returns,
+/// so a command that opens again straight after cannot run out of Channels.
+/// A server that has not closed its end by [`CLOSE_WAIT_NS`] still drops
+/// the node once it sees this end close. The POSIX layer's `node::close`
+/// does the same.
+fn close_node<System: WyrmshSystem>(system: &mut System, channel: DwHandle) {
+    let mut bytes = [0u8; node::MAX_BYTES];
+    let sent = node::encode(
+        &node::Message {
+            transaction_id: 1,
+            body: Body::Close,
+        },
+        &mut bytes,
+    )
+    .ok()
+    .is_some_and(|size| system.send_channel(channel, &bytes[..size]).is_ok());
+    if sent && let Ok(now) = system.monotonic_active_now() {
+        let item = DwWaitItemV1 {
+            handle: channel,
+            signals: DW_SIGNAL_PEER_CLOSED,
+        };
+        let _ = system.wait_many(
+            core::slice::from_ref(&item),
+            DwDeadline(now.saturating_add(CLOSE_WAIT_NS)),
+        );
+    }
+    let _ = system.close_handle(channel);
+}
+
 /// Waits for one message on `channel` and returns its length.
 fn receive<System: WyrmshSystem>(
     system: &mut System,
@@ -437,7 +472,7 @@ pub(crate) fn list<System: WyrmshSystem>(
         }
         Ok(())
     })();
-    let _ = system.close_handle(node);
+    close_node(system, node);
     result
 }
 
@@ -489,7 +524,7 @@ pub(crate) fn cat<System: WyrmshSystem>(
         }
         Ok(())
     })();
-    let _ = system.close_handle(node);
+    close_node(system, node);
     result
 }
 
@@ -525,7 +560,7 @@ pub(crate) fn open_for_run<System: WyrmshSystem>(
         || display.len() > wyrmroot_launch_proto::MAX_PATH_BYTES
         || !display.is_ascii()
     {
-        let _ = system.close_handle(node);
+        close_node(system, node);
         let _ = system.close_handle(vfs);
         console.fail(
             system,
@@ -626,7 +661,7 @@ pub(crate) fn write<System: WyrmshSystem>(
         }
         sync(system, &mut console, "write", node, 2, path)
     })();
-    let _ = system.close_handle(node);
+    close_node(system, node);
     result
 }
 
@@ -653,7 +688,7 @@ pub(crate) fn mkdir<System: WyrmshSystem>(
         return Ok(());
     };
     let result = sync(system, &mut console, "mkdir", node, 1, &canonical[..length]);
-    let _ = system.close_handle(node);
+    close_node(system, node);
     result
 }
 
@@ -713,6 +748,6 @@ pub(crate) fn remove<System: WyrmshSystem>(
         }
         sync(system, &mut console, "rm", node, 2, path)
     })();
-    let _ = system.close_handle(node);
+    close_node(system, node);
     result
 }
