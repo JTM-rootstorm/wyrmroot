@@ -203,6 +203,63 @@ pub enum ElfError {
     EntryPointOutsideExecutableSegment,
 }
 
+impl ElfError {
+    /// This variant's 1-based position, for bounded diagnostic exit codes
+    /// (`DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4). New variants go at
+    /// the end, so a code keeps its meaning.
+    #[must_use]
+    pub const fn diagnostic_ordinal(&self) -> u32 {
+        match self {
+            Self::ImageSize { .. } => 1,
+            Self::HeaderTruncated { .. } => 2,
+            Self::BadMagic { .. } => 3,
+            Self::UnsupportedClass { .. } => 4,
+            Self::UnsupportedDataEncoding { .. } => 5,
+            Self::UnsupportedIdentVersion { .. } => 6,
+            Self::UnsupportedOsAbi { .. } => 7,
+            Self::UnsupportedAbiVersion { .. } => 8,
+            Self::UnsupportedElfType { .. } => 9,
+            Self::UnsupportedMachine { .. } => 10,
+            Self::UnsupportedElfVersion { .. } => 11,
+            Self::UnsupportedElfFlags { .. } => 12,
+            Self::InvalidElfHeaderSize { .. } => 13,
+            Self::InvalidProgramHeaderSize { .. } => 14,
+            Self::MissingProgramHeaders { .. } => 15,
+            Self::TooManyProgramHeaders { .. } => 16,
+            Self::ProgramHeaderTableOverflow { .. } => 17,
+            Self::ProgramHeaderTableTruncated { .. } => 18,
+            Self::ProgramHeaderTableOverlapsElfHeader { .. } => 19,
+            Self::ProgramHeaderTableMisaligned { .. } => 20,
+            Self::UnsupportedProgramHeaderType { .. } => 21,
+            Self::DuplicateProgramHeaderType { .. } => 22,
+            Self::UnknownSegmentFlags { .. } => 23,
+            Self::InvalidStackHeader { .. } => 24,
+            Self::InvalidPhdrHeader { .. } => 25,
+            Self::InvalidTlsHeader { .. } => 26,
+            Self::TooManyLoadSegments { .. } => 27,
+            Self::OutputTooSmall { .. } => 28,
+            Self::EmptyLoadSegment { .. } => 29,
+            Self::FileSizeExceedsMemorySize { .. } => 30,
+            Self::SegmentFileRangeOverflow { .. } => 31,
+            Self::SegmentFileRangeTruncated { .. } => 32,
+            Self::SegmentVirtualRangeOverflow { .. } => 33,
+            Self::SegmentMappingRangeOverflow { .. } => 34,
+            Self::InvalidSegmentAlignment { .. } => 35,
+            Self::SegmentAlignmentBelowPolicy { .. } => 36,
+            Self::SegmentAddressAlignmentMismatch { .. } => 37,
+            Self::SegmentVirtualRangeOutsidePolicy { .. } => 38,
+            Self::SegmentOverlapsInitialStack { .. } => 39,
+            Self::WritableExecutableSegment { .. } => 40,
+            Self::UnsupportedSegmentProtection { .. } => 41,
+            Self::OverlappingVirtualSegments { .. } => 42,
+            Self::OverlappingVirtualMappingRanges { .. } => 43,
+            Self::MappedImageLimit { .. } => 44,
+            Self::ZeroEntryPoint { .. } => 45,
+            Self::EntryPointOutsideExecutableSegment { .. } => 46,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Header {
     entry: u64,

@@ -111,6 +111,28 @@ pub enum StartupBlockError {
     StringContainsNul,
 }
 
+impl StartupBlockError {
+    /// This variant's 1-based position, for bounded diagnostic exit codes
+    /// (`DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4). New variants go at
+    /// the end, so a code keeps its meaning.
+    #[must_use]
+    pub const fn diagnostic_ordinal(&self) -> u32 {
+        match self {
+            Self::PageSize { .. } => 1,
+            Self::EmptyDisplayPath { .. } => 2,
+            Self::DisplayPathContainsNul { .. } => 3,
+            Self::DisplayPathTooLong { .. } => 4,
+            Self::PointerOverflow { .. } => 5,
+            Self::TooManyArguments { .. } => 6,
+            Self::TooManyEnvironmentEntries { .. } => 7,
+            Self::StringBytesExceeded { .. } => 8,
+            Self::InvalidEnvironment { .. } => 9,
+            Self::DuplicateEnvironment { .. } => 10,
+            Self::StringContainsNul { .. } => 11,
+        }
+    }
+}
+
 /// Writes the exact WYR0-D0 `argc`/`argv`/`envp`/auxv startup block.
 ///
 /// The entire page is cleared so all unused bytes and terminators are deterministic.

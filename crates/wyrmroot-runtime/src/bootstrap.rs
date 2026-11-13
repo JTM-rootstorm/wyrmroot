@@ -102,6 +102,21 @@ pub enum CapabilityValidationError {
     InvalidFreshCapability,
 }
 
+impl CapabilityValidationError {
+    /// This variant's 1-based position, for bounded diagnostic exit codes
+    /// (`DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4). New variants go at
+    /// the end, so a code keeps its meaning.
+    #[must_use]
+    pub const fn diagnostic_ordinal(&self) -> u32 {
+        match self {
+            Self::InvalidBootstrapChannel { .. } => 1,
+            Self::WrongInitCapabilityCount { .. } => 2,
+            Self::InvalidReceivedCapability { .. } => 3,
+            Self::InvalidFreshCapability { .. } => 4,
+        }
+    }
+}
+
 /// Validates exact bootstrap Channel type and rights without hard-coding ABI constants.
 pub fn validate_bootstrap_channel<ObjectType: Eq, Rights: Eq>(
     actual: CapabilityInfo<ObjectType, Rights>,
@@ -224,6 +239,20 @@ pub enum MappingPlanError {
     ArchiveTooLarge,
     /// Page rounding overflowed.
     RoundingOverflow,
+}
+
+impl MappingPlanError {
+    /// This variant's 1-based position, for bounded diagnostic exit codes
+    /// (`DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4). New variants go at
+    /// the end, so a code keeps its meaning.
+    #[must_use]
+    pub const fn diagnostic_ordinal(&self) -> u32 {
+        match self {
+            Self::EmptyArchive { .. } => 1,
+            Self::ArchiveTooLarge { .. } => 2,
+            Self::RoundingOverflow { .. } => 3,
+        }
+    }
 }
 
 impl MappingPlan {

@@ -349,14 +349,16 @@ impl BootstrapError {
             Self::Native(NativeError::Output(output)) => {
                 PREFIX | 0x0002_0000 | native_output_code(*output)
             }
-            Self::BootstrapChannel(_) => PREFIX | 0x02,
-            Self::Protocol(_) => PREFIX | 0x03,
-            Self::ReceiveCounts(_) => PREFIX | 0x04,
+            // Each carries its cause (contract §3.4): the category, then
+            // the variant's ordinal or the bounded detail.
+            Self::BootstrapChannel(error) => carried(0x02, error.diagnostic_ordinal()),
+            Self::Protocol(error) => carried(0x03, error.diagnostic_ordinal()),
+            Self::ReceiveCounts(counts) => carried(0x04, receive_counts_detail(*counts)),
             Self::UnexpectedMessage => PREFIX | 0x05,
             Self::UnexpectedTransactionId => PREFIX | 0x06,
-            Self::Capability(_) => PREFIX | 0x07,
-            Self::Mapping(_) => PREFIX | 0x08,
-            Self::Bootfs(_) => PREFIX | 0x09,
+            Self::Capability(error) => carried(0x07, error.diagnostic_ordinal()),
+            Self::Mapping(error) => carried(0x08, error.diagnostic_ordinal()),
+            Self::Bootfs(error) => carried(0x09, bootfs_detail(error)),
             Self::MissingRequiredEntry => PREFIX | 0x0A,
             Self::RequiredEntryNotExecutable => PREFIX | 0x0B,
             Self::Loader(LoadError::Platform {
@@ -364,26 +366,33 @@ impl BootstrapError {
                 cause,
                 rollback_failed,
             }) => loader_platform_exit_code(*stage, *cause, *rollback_failed),
-            // `Loader(_) => PREFIX | 0x01FF` collapsed three distinct loader
-            // failures into one code: an ELF rejection, a startup-block
-            // rejection and a launch rejection arrived identical. Named per
-            // variant so the match is exhaustive over `LoadError`, per
-            // `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4.
-            //
-            // The inner `ElfError`, `StartupBlockError` and `LaunchError`
-            // ordinals are not yet surfaced. The boot path has no snapshot to
-            // fall back on, so contract §4 puts them here rather than in §4.2 --
-            // this encoder is the reader's only channel that early. Adding them
-            // is the next step, not a decision deferred to a wildcard.
-            Self::Loader(LoadError::Elf(_)) => PREFIX | 0x0101,
-            Self::Loader(LoadError::Startup(_)) => PREFIX | 0x0102,
-            Self::Loader(LoadError::Launch(_)) => PREFIX | 0x0103,
+            // Named per variant and carrying the inner ordinal: the boot path
+            // has no snapshot to fall back on, so this encoder is the
+            // reader's only channel that early (contract §4).
+            Self::Loader(LoadError::Elf(error)) => carried(0x11, error.diagnostic_ordinal()),
+            Self::Loader(LoadError::Startup(error)) => carried(0x12, error.diagnostic_ordinal()),
+            Self::Loader(LoadError::Launch(error)) => carried(0x13, error.diagnostic_ordinal()),
             Self::Supervision(error) => supervision_exit_code(error),
             Self::ObservedSupervision(error) => observed_supervision_exit_code(error),
             Self::Cleanup(error) => cleanup_exit_code(*error),
             Self::MissingLoadedProcess => PREFIX | 0x0301,
         }
     }
+}
+
+/// A bootstrap failure with its cause carried: `0xB5`, the category in bits
+/// 23..16 and a 16-bit detail (contract §3.4).
+const fn carried(category: u32, detail: u32) -> u32 {
+    const PREFIX: u32 = 0xB500_0000;
+    PREFIX | (category << 16) | (detail & 0xFFFF)
+}
+
+/// A bootfs parse failure: the variant's ordinal in bits 15..11 and the
+/// archive offset, saturated at 0x7FF, below it.
+const fn bootfs_detail(error: &ParseError) -> u32 {
+    let offset = error.offset();
+    let offset = if offset > 0x7FF { 0x7FF } else { offset as u32 };
+    (error.diagnostic_ordinal() << 11) | offset
 }
 
 /// Encodes a permanent supervisor's retained terminal record without widening

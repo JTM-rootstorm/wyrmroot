@@ -322,6 +322,31 @@ pub enum LaunchError {
     ProfileSpecificEncoderRequired,
 }
 
+impl LaunchError {
+    /// This variant's 1-based position, for bounded diagnostic exit codes
+    /// (`DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4). New variants go at
+    /// the end, so a code keeps its meaning.
+    #[must_use]
+    pub const fn diagnostic_ordinal(&self) -> u32 {
+        match self {
+            Self::BufferSize { .. } => 1,
+            Self::BadMagic { .. } => 2,
+            Self::BadVersion { .. } => 3,
+            Self::BadType { .. } => 4,
+            Self::NonzeroFlags { .. } => 5,
+            Self::BadTotalSize { .. } => 6,
+            Self::BadCapabilityCount { .. } => 7,
+            Self::ZeroTransaction { .. } => 8,
+            Self::TransactionMismatch { .. } => 9,
+            Self::NonzeroReserved { .. } => 10,
+            Self::BadCapabilityRole { .. } => 11,
+            Self::HandleCount { .. } => 12,
+            Self::HandleMetadata { .. } => 13,
+            Self::ProfileSpecificEncoderRequired { .. } => 14,
+        }
+    }
+}
+
 pub fn encode_init(
     profile: LaunchProfile,
     transaction_id: u64,

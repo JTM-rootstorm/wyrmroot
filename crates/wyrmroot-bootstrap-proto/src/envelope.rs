@@ -273,6 +273,30 @@ pub enum DecodeError {
     EncodeBufferTooSmall,
 }
 
+impl DecodeError {
+    /// This variant's 1-based position, for bounded diagnostic exit codes
+    /// (`DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4). New variants go at
+    /// the end, so a code keeps its meaning.
+    #[must_use]
+    pub const fn diagnostic_ordinal(&self) -> u32 {
+        match self {
+            Self::TruncatedHeader { .. } => 1,
+            Self::WrongMagic { .. } => 2,
+            Self::UnsupportedMajor { .. } => 3,
+            Self::UnsupportedMinor { .. } => 4,
+            Self::UnknownMessageType { .. } => 5,
+            Self::NonzeroFlags { .. } => 6,
+            Self::NonzeroReserved { .. } => 7,
+            Self::WrongTotalSize { .. } => 8,
+            Self::WrongCapabilityCount { .. } => 9,
+            Self::WrongHandleCount { .. } => 10,
+            Self::ZeroTransactionId { .. } => 11,
+            Self::WrongCapabilityRoles { .. } => 12,
+            Self::EncodeBufferTooSmall { .. } => 13,
+        }
+    }
+}
+
 impl InitMessage {
     /// The fixed primordial G0 INIT transaction.
     pub const fn primordial() -> Self {

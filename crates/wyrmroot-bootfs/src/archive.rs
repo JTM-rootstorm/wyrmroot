@@ -323,6 +323,66 @@ pub enum ParseError {
     TrailingBytes { offset: usize },
 }
 
+impl ParseError {
+    /// The archive offset the failure was found at.
+    #[must_use]
+    pub const fn offset(&self) -> usize {
+        match self {
+            Self::TruncatedHeader { offset }
+            | Self::InvalidMagic { offset }
+            | Self::InvalidNumeric { offset }
+            | Self::SizeOverflow { offset }
+            | Self::InvalidNameSize { offset }
+            | Self::TruncatedName { offset }
+            | Self::InvalidName { offset }
+            | Self::TruncatedData { offset }
+            | Self::TruncatedPadding { offset }
+            | Self::InvalidPadding { offset }
+            | Self::InvalidTrailer { offset }
+            | Self::DuplicateName { offset }
+            | Self::UnsortedName { offset }
+            | Self::InvalidMetadata { offset }
+            | Self::UnsupportedFileType { offset }
+            | Self::UnsupportedPermissions { offset }
+            | Self::InvalidPath { offset }
+            | Self::ArchiveTooLarge { offset }
+            | Self::TooManyRecords { offset }
+            | Self::NameTooLarge { offset }
+            | Self::TrailingBytes { offset } => *offset,
+        }
+    }
+
+    /// This variant's 1-based position, for bounded diagnostic exit codes
+    /// (`DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4). New variants go at
+    /// the end, so a code keeps its meaning.
+    #[must_use]
+    pub const fn diagnostic_ordinal(&self) -> u32 {
+        match self {
+            Self::TruncatedHeader { .. } => 1,
+            Self::InvalidMagic { .. } => 2,
+            Self::InvalidNumeric { .. } => 3,
+            Self::SizeOverflow { .. } => 4,
+            Self::InvalidNameSize { .. } => 5,
+            Self::TruncatedName { .. } => 6,
+            Self::InvalidName { .. } => 7,
+            Self::TruncatedData { .. } => 8,
+            Self::TruncatedPadding { .. } => 9,
+            Self::InvalidPadding { .. } => 10,
+            Self::InvalidTrailer { .. } => 11,
+            Self::DuplicateName { .. } => 12,
+            Self::UnsortedName { .. } => 13,
+            Self::InvalidMetadata { .. } => 14,
+            Self::UnsupportedFileType { .. } => 15,
+            Self::UnsupportedPermissions { .. } => 16,
+            Self::InvalidPath { .. } => 17,
+            Self::ArchiveTooLarge { .. } => 18,
+            Self::TooManyRecords { .. } => 19,
+            Self::NameTooLarge { .. } => 20,
+            Self::TrailingBytes { .. } => 21,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LookupError {
     InvalidPath(ArchivePathError),

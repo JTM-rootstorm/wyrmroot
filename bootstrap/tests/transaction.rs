@@ -121,6 +121,38 @@ fn live_exit_code_identifies_bootstrap_owned_failure() {
     );
 }
 
+/// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` B.3: every bootstrap failure that
+/// wraps a cause carries it, so two different causes never share a code.
+#[test]
+fn wrapped_causes_reach_the_exit_code() {
+    use wyrmroot_bootfs::archive::ParseError;
+    use wyrmroot_loader::elf::ElfError;
+    assert_eq!(
+        BootstrapError::Bootfs(ParseError::InvalidMagic { offset: 0x30 }).exit_code(),
+        0xB509_0000 | (2 << 11) | 0x30
+    );
+    assert_eq!(
+        BootstrapError::Bootfs(ParseError::TrailingBytes { offset: 1 << 20 }).exit_code(),
+        0xB509_0000 | (21 << 11) | 0x7FF
+    );
+    assert_eq!(
+        BootstrapError::Loader(LoadError::Elf(ElfError::BadMagic)).exit_code(),
+        0xB511_0003
+    );
+    assert_ne!(
+        BootstrapError::Mapping(wyrmroot_runtime::MappingPlanError::EmptyArchive).exit_code(),
+        BootstrapError::Mapping(wyrmroot_runtime::MappingPlanError::ArchiveTooLarge).exit_code()
+    );
+    assert_eq!(
+        BootstrapError::ReceiveCounts(wyrmroot_runtime::ReceiveCounts {
+            bytes: 3,
+            handles: 1
+        })
+        .exit_code(),
+        0xB504_0000 | (3 << 7) | 1
+    );
+}
+
 #[test]
 fn supervision_exit_codes_preserve_every_bounded_failure_category() {
     let cases = [
