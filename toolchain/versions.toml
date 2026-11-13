@@ -10,8 +10,8 @@ milestone = "WYR0"
 # `revision`; a host test checks them, and every other site derives the pin.
 [deepwyrm]
 repository = "https://github.com/JTM-rootstorm/deepwyrm"
-revision = "b9ceb030ef05191b15cf62e7a6b7377bc28d28b1"
-abi_fingerprint = "6ca0a3814032aa13d7cc568a0f36ff6a44d99a8400a26e856823709882967dd6"
+revision = "e8d577a957a573b291e15a65aa8e21a39b5049af"
+abi_fingerprint = "c461b78cfb5aa745a9bfdbc779a46d4293cbf4bf10dc707f8705d4b0b5058bc9"
 abi_version = 0
 abi_dependency_state = "available"
 

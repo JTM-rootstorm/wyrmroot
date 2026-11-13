@@ -2,7 +2,8 @@
 
 use deepwyrm_syscall::{
     DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
-    DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_CLOCK_MONOTONIC_ACTIVE, DW_MEMORY_OBJECT_INFO_V1_SIZE,
+    DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_CLOCK_MONOTONIC_ACTIVE,
+    DW_MEMORY_OBJECT_CREATE_FLAGS_SUPPORTED_MASK, DW_MEMORY_OBJECT_INFO_V1_SIZE,
     DW_MEMORY_PROTECTION_READ, DW_OBJECT_INFO_V1_SIZE, DW_SIGNALS_KNOWN_MASK, DW_STATUS_SUCCESS,
     DW_TASK_TERMINATION_INFO_V1_SIZE, DW_WAIT_MODE_ANY, DW_WAIT_RESULT_V1_SIZE,
     DwAddressRegionMapArgsV1, DwAddressRegionMapFlags, DwChannelReceiveResultV1, DwDeadline,
@@ -396,7 +397,9 @@ fn validate_memory_object_info(
     if required_size == u64::from(DW_MEMORY_OBJECT_INFO_V1_SIZE)
         && info.size == DW_MEMORY_OBJECT_INFO_V1_SIZE
         && info.version == 1
-        && info.reserved == [0; 2]
+        && info.flags.0 & !DW_MEMORY_OBJECT_CREATE_FLAGS_SUPPORTED_MASK.0 == 0
+        && info.reserved0 == 0
+        && info.reserved == 0
     {
         Ok(())
     } else {
@@ -563,12 +566,33 @@ mod tests {
             validate_memory_object_info(&memory, u64::from(DW_MEMORY_OBJECT_INFO_V1_SIZE)),
             Ok(())
         );
-        let mut malformed = memory;
-        malformed.reserved[0] = 1;
-        assert!(
-            validate_memory_object_info(&malformed, u64::from(DW_MEMORY_OBJECT_INFO_V1_SIZE))
-                .is_err()
+        let on_demand = DwMemoryObjectInfoV1 {
+            flags: deepwyrm_syscall::DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND,
+            ..memory
+        };
+        assert_eq!(
+            validate_memory_object_info(&on_demand, u64::from(DW_MEMORY_OBJECT_INFO_V1_SIZE)),
+            Ok(())
         );
+        for malformed in [
+            DwMemoryObjectInfoV1 {
+                reserved: 1,
+                ..memory
+            },
+            DwMemoryObjectInfoV1 {
+                reserved0: 1,
+                ..memory
+            },
+            DwMemoryObjectInfoV1 {
+                flags: deepwyrm_syscall::DwMemoryObjectCreateFlags(1 << 31),
+                ..memory
+            },
+        ] {
+            assert!(
+                validate_memory_object_info(&malformed, u64::from(DW_MEMORY_OBJECT_INFO_V1_SIZE))
+                    .is_err()
+            );
+        }
 
         let task = DwTaskTerminationInfoV1 {
             size: DW_TASK_TERMINATION_INFO_V1_SIZE,
