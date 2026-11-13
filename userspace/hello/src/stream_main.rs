@@ -110,8 +110,8 @@ mod on_demand {
         DW_CLOCK_MONOTONIC_ACTIVE, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND,
         DW_MEMORY_PROTECTION_READ, DW_MEMORY_PROTECTION_WRITE, DW_RIGHT_INSPECT, DW_RIGHT_MAP,
         DW_RIGHT_READ, DW_RIGHT_WRITE, DW_STATUS_NO_RESOURCES, DW_STATUS_SUCCESS,
-        DwAddressRegionMapArgsV1, DwHandle, DwMemoryObjectInfoV1, DwMemoryProtection, DwOffset,
-        DwRights, DwSize, DwUserAddress,
+        DwAddressRegionMapArgsV1, DwChannelReceiveResultV1, DwHandle, DwMemoryObjectInfoV1,
+        DwMemoryProtection, DwOffset, DwRights, DwSize, DwUserAddress,
     };
 
     const MIB: u64 = 1 << 20;
@@ -203,6 +203,34 @@ mod on_demand {
             || read(base + 30 * MIB) != 0
         {
             return b"on-demand failed: commit\n";
+        }
+        // A syscall reads from a page nothing has touched: the kernel fills
+        // it in for the read, and what it reads is zeros.
+        let input = base + 25 * MIB;
+        let (mut sender, mut receiver) = (DwHandle(0), DwHandle(0));
+        if deepwyrm_syscall::channel_create(
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0),
+            &mut sender,
+            &mut receiver,
+        ) != DW_STATUS_SUCCESS
+        {
+            return b"on-demand failed: channel\n";
+        }
+        // SAFETY: 64 bytes of the probe's own mapping, never written.
+        let untouched = unsafe { core::slice::from_raw_parts(input as *const u8, 64) };
+        let mut received = [0xff_u8; 64];
+        let mut result = DwChannelReceiveResultV1::default();
+        let sent = deepwyrm_syscall::channel_send(sender, untouched, &[], 0);
+        let got = deepwyrm_syscall::channel_receive(receiver, &mut received, &mut [], &mut result);
+        let closed = deepwyrm_syscall::handle_close(sender) == DW_STATUS_SUCCESS
+            && deepwyrm_syscall::handle_close(receiver) == DW_STATUS_SUCCESS;
+        if sent != DW_STATUS_SUCCESS
+            || got != DW_STATUS_SUCCESS
+            || !closed
+            || received.iter().any(|byte| *byte != 0)
+            || read(input) != 0
+        {
+            return b"on-demand failed: read fill-in\n";
         }
         if exhaust {
             // The whole object is four times the job's page budget.
