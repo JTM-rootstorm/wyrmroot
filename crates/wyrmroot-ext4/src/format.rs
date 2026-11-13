@@ -441,6 +441,9 @@ impl Volume {
             csum: Some(crc::update(!0, &sb[0x68..0x78])),
             writable: true,
             now: crate::get32(&sb, 0x30),
+            held: [0; crate::MAX_HELD],
+            held_len: 0,
+            orphans_pending: false,
         }
     }
 

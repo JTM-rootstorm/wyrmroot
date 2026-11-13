@@ -565,3 +565,568 @@ fn a_deleted_entry_with_a_stale_long_name_is_skipped() {
         .unwrap();
     assert!(volume.lookup(&mut disk, ROOT_INODE, b"after").is_ok());
 }
+
+// Unlinked while held: the orphan list (`orphan.rs`).
+
+fn free_inodes(volume: &Volume) -> u32 {
+    get32(&volume.sb, 0x10)
+}
+
+fn remounted(disk: &mut Memory) -> Volume {
+    Volume::mount(disk, SIZE as u64, true).unwrap()
+}
+
+/// Frees every orphan the mount found; returns how many.
+fn recover_orphans(volume: &mut Volume, disk: &mut Memory) -> u32 {
+    let mut freed = 0;
+    while volume.orphans_pending() {
+        volume.recover_orphan(disk, usize::MAX).unwrap();
+        freed += 1;
+    }
+    freed
+}
+
+#[test]
+fn a_file_unlinked_while_held_works_until_it_is_released() {
+    for block_size in [1024, 4096] {
+        let (mut disk, mut volume) = formatted(block_size);
+        let free = (volume.usage().free_blocks, free_inodes(&volume));
+        let file = volume
+            .create(&mut disk, ROOT_INODE, b"temp", Kind::File)
+            .unwrap();
+        volume
+            .write(&mut disk, file.inode, 0, &[7u8; 9000])
+            .unwrap();
+        assert!(volume.keeps_unlinked());
+        volume.unlink_held(&mut disk, ROOT_INODE, b"temp").unwrap();
+        assert_eq!(volume.held(), [file.inode]);
+
+        // The name is gone and free again; the node is not.
+        assert_eq!(
+            volume.lookup(&mut disk, ROOT_INODE, b"temp"),
+            Err(Error::NotFound)
+        );
+        assert_eq!(
+            names(&volume, &mut disk, ROOT_INODE),
+            [b"lost+found".to_vec()]
+        );
+        assert_eq!(volume.stat(&mut disk, file.inode).unwrap().size, 9000);
+        let mut out = vec![0u8; 9000];
+        assert_eq!(volume.read(&mut disk, file.inode, 0, &mut out), Ok(9000));
+        assert_eq!(out, [7u8; 9000]);
+        assert_eq!(
+            volume.write(&mut disk, file.inode, 9000, &[8u8; 20_000]),
+            Ok(20_000)
+        );
+        volume.truncate(&mut disk, file.inode, 12_000).unwrap();
+        let mut out = vec![0u8; 16_000];
+        assert_eq!(volume.read(&mut disk, file.inode, 0, &mut out), Ok(12_000));
+        assert_eq!(out[8999..9001], [7, 8]);
+        let again = volume
+            .create(&mut disk, ROOT_INODE, b"temp", Kind::File)
+            .unwrap();
+        assert_ne!(again.inode, file.inode);
+        // Nothing was freed with the name.
+        assert!(volume.usage().free_blocks < free.0);
+        assert_eq!(free_inodes(&volume), free.1 - 2);
+
+        volume.release(&mut disk, file.inode, usize::MAX).unwrap();
+        assert!(volume.held().is_empty());
+        assert_eq!(volume.stat(&mut disk, file.inode), Err(Error::NotFound));
+        assert_eq!(
+            volume.release(&mut disk, file.inode, usize::MAX),
+            Err(Error::NotFound)
+        );
+        volume.unlink(&mut disk, ROOT_INODE, b"temp").unwrap();
+        assert_eq!((volume.usage().free_blocks, free_inodes(&volume)), free);
+
+        // What is on the device says the same, with no orphan list.
+        let mut volume = remounted(&mut disk);
+        assert!(!volume.orphans_pending());
+        assert_eq!((volume.usage().free_blocks, free_inodes(&volume)), free);
+        assert_eq!(
+            volume
+                .create(&mut disk, ROOT_INODE, b"reuse", Kind::File)
+                .unwrap()
+                .inode,
+            file.inode.min(again.inode)
+        );
+    }
+}
+
+#[test]
+fn an_unlink_that_frees_at_once_leaves_nothing_to_hold() {
+    // The control for the test above: without a holder the node goes with
+    // its name.
+    let (mut disk, mut volume) = formatted(4096);
+    let free = (volume.usage().free_blocks, free_inodes(&volume));
+    let file = volume
+        .create(&mut disk, ROOT_INODE, b"temp", Kind::File)
+        .unwrap();
+    volume
+        .write(&mut disk, file.inode, 0, &[7u8; 9000])
+        .unwrap();
+    volume.unlink(&mut disk, ROOT_INODE, b"temp").unwrap();
+    assert!(volume.held().is_empty());
+    assert_eq!(volume.stat(&mut disk, file.inode), Err(Error::NotFound));
+    let mut out = [0u8; 16];
+    assert_eq!(
+        volume.read(&mut disk, file.inode, 0, &mut out),
+        Err(Error::NotFound)
+    );
+    assert_eq!((volume.usage().free_blocks, free_inodes(&volume)), free);
+}
+
+#[test]
+fn held_files_are_released_in_any_order() {
+    let (mut disk, mut volume) = formatted(4096);
+    let free = (volume.usage().free_blocks, free_inodes(&volume));
+    let mut inodes = Vec::new();
+    for name in [&b"a"[..], b"b", b"c", b"d"] {
+        let file = volume
+            .create(&mut disk, ROOT_INODE, name, Kind::File)
+            .unwrap();
+        volume
+            .write(&mut disk, file.inode, 0, &[name[0]; 5000])
+            .unwrap();
+        inodes.push(file.inode);
+    }
+    for name in [&b"a"[..], b"b", b"c", b"d"] {
+        volume.unlink_held(&mut disk, ROOT_INODE, name).unwrap();
+    }
+    // The middle, the last on the list, the first on it, then the only one.
+    for index in [1, 0, 3, 2] {
+        let mut out = [0u8; 4];
+        for &other in volume.held().to_vec().iter() {
+            assert_eq!(volume.read(&mut disk, other, 0, &mut out), Ok(4));
+        }
+        volume
+            .release(&mut disk, inodes[index], usize::MAX)
+            .unwrap();
+        // The list on the device is the list held: a mount of the device
+        // as it is now finds exactly the others.
+        let mut copy = Memory {
+            bytes: disk.bytes.clone(),
+            flushes: 0,
+        };
+        let mut crashed = remounted(&mut copy);
+        assert_eq!(
+            recover_orphans(&mut crashed, &mut copy) as usize,
+            volume.held().len()
+        );
+        assert_eq!((crashed.usage().free_blocks, free_inodes(&crashed)), free);
+    }
+    assert_eq!((volume.usage().free_blocks, free_inodes(&volume)), free);
+}
+
+#[test]
+fn a_mount_frees_what_a_crash_left_unlinked() {
+    for block_size in [1024, 4096] {
+        let (mut disk, mut volume) = formatted(block_size);
+        let free = (volume.usage().free_blocks, free_inodes(&volume));
+        let keep = volume
+            .create(&mut disk, ROOT_INODE, b"keep", Kind::File)
+            .unwrap();
+        volume.write(&mut disk, keep.inode, 0, b"kept").unwrap();
+        let kept = (volume.usage().free_blocks, free_inodes(&volume));
+        // One with a depth-one extent tree, one small, one empty.
+        let big = volume
+            .create(&mut disk, ROOT_INODE, b"big", Kind::File)
+            .unwrap();
+        let small = volume
+            .create(&mut disk, ROOT_INODE, b"small", Kind::File)
+            .unwrap();
+        let bs = block_size as usize;
+        for index in 0..12 {
+            for inode in [big.inode, small.inode] {
+                volume
+                    .write(&mut disk, inode, (index * bs) as u64, &[3u8; 100])
+                    .unwrap();
+            }
+        }
+        volume.truncate(&mut disk, small.inode, 10).unwrap();
+        volume
+            .create(&mut disk, ROOT_INODE, b"empty", Kind::File)
+            .unwrap();
+        for name in [&b"big"[..], b"small", b"empty"] {
+            volume.unlink_held(&mut disk, ROOT_INODE, name).unwrap();
+        }
+        // Written to while unlinked, then the holder is gone.
+        volume
+            .write(&mut disk, small.inode, 50_000, &[4u8; 3000])
+            .unwrap();
+        // The holder is gone here, without a release.
+
+        // A read-only mount leaves the list alone.
+        let before = disk.bytes.clone();
+        let mut read_only = Volume::mount(&mut disk, SIZE as u64, false).unwrap();
+        assert!(read_only.read_only() && !read_only.orphans_pending());
+        assert_eq!(read_only.recover_orphan(&mut disk, usize::MAX), Ok(false));
+        assert_eq!(disk.bytes, before);
+
+        let mut volume = remounted(&mut disk);
+        assert!(!volume.read_only() && volume.orphans_pending());
+        // Nothing changes before the list is empty.
+        assert_eq!(
+            volume.create(&mut disk, ROOT_INODE, b"early", Kind::File),
+            Err(Error::ReadOnly)
+        );
+        assert!(!volume.keeps_unlinked());
+        assert_eq!(recover_orphans(&mut volume, &mut disk), 3);
+        assert_eq!(volume.recover_orphan(&mut disk, usize::MAX), Ok(false));
+        assert_eq!((volume.usage().free_blocks, free_inodes(&volume)), kept);
+        assert_eq!(volume.stat(&mut disk, big.inode), Err(Error::NotFound));
+        let mut out = [0u8; 4];
+        assert_eq!(volume.read(&mut disk, keep.inode, 0, &mut out), Ok(4));
+        assert_eq!(&out, b"kept");
+        volume.unlink(&mut disk, ROOT_INODE, b"keep").unwrap();
+        assert_eq!((volume.usage().free_blocks, free_inodes(&volume)), free);
+        let volume = remounted(&mut disk);
+        assert!(!volume.orphans_pending());
+        assert_eq!((volume.usage().free_blocks, free_inodes(&volume)), free);
+    }
+}
+
+#[test]
+fn a_held_directory_and_a_full_table_are_busy_with_nothing_changed() {
+    let (mut disk, mut volume) = formatted(4096);
+    volume
+        .create(&mut disk, ROOT_INODE, b"dir", Kind::Directory)
+        .unwrap();
+    assert_eq!(
+        volume.unlink_held(&mut disk, ROOT_INODE, b"dir"),
+        Err(Error::Busy)
+    );
+    assert!(volume.lookup(&mut disk, ROOT_INODE, b"dir").is_ok());
+    assert_eq!(
+        volume.unlink_held(&mut disk, ROOT_INODE, b"absent"),
+        Err(Error::NotFound)
+    );
+    for index in 0..=MAX_HELD {
+        let name = std::format!("f{index}");
+        volume
+            .create(&mut disk, ROOT_INODE, name.as_bytes(), Kind::File)
+            .unwrap();
+        let unlinked = volume.unlink_held(&mut disk, ROOT_INODE, name.as_bytes());
+        if index < MAX_HELD {
+            assert_eq!(unlinked, Ok(()));
+        } else {
+            assert!(!volume.keeps_unlinked());
+            assert_eq!(unlinked, Err(Error::Busy));
+            assert!(
+                volume
+                    .lookup(&mut disk, ROOT_INODE, name.as_bytes())
+                    .is_ok()
+            );
+        }
+    }
+    assert_eq!(volume.held().len(), MAX_HELD);
+    let first = volume.held()[MAX_HELD - 1];
+    volume.release(&mut disk, first, usize::MAX).unwrap();
+    assert!(volume.keeps_unlinked());
+}
+
+/// Rewrites inode `number` through a volume that takes changes.
+fn patch_inode(disk: &mut Memory, number: u32, patch: impl FnOnce(&mut Inode)) {
+    let volume = Volume::mount(disk, SIZE as u64, false).unwrap();
+    let mut inode = volume.inode(disk, number).unwrap();
+    patch(&mut inode);
+    volume.write_inode(disk, &mut inode).unwrap();
+}
+
+#[test]
+fn an_orphan_list_that_cannot_be_trusted_leaves_the_volume_read_only() {
+    let (mut disk, mut volume) = formatted(4096);
+    let file = volume
+        .create(&mut disk, ROOT_INODE, b"file", Kind::File)
+        .unwrap();
+    volume
+        .write(&mut disk, file.inode, 0, &[9u8; 6000])
+        .unwrap();
+    let other = volume
+        .create(&mut disk, ROOT_INODE, b"other", Kind::File)
+        .unwrap();
+    let free = volume.usage().free_blocks;
+    let refused = |disk: &mut Memory, error: Error| {
+        let mut volume = remounted(disk);
+        assert!(volume.orphans_pending());
+        assert_eq!(volume.recover_orphan(disk, usize::MAX), Err(error));
+        assert!(volume.read_only());
+        assert_eq!(volume.usage().free_blocks, free);
+        assert_eq!(
+            volume.create(disk, ROOT_INODE, b"x", Kind::File),
+            Err(Error::ReadOnly)
+        );
+        // The named file is untouched.
+        let mut out = [0u8; 8];
+        assert_eq!(volume.read(disk, file.inode, 0, &mut out), Ok(8));
+        assert_eq!(out, [9u8; 8]);
+    };
+
+    // A listed inode that still has its name (Linux mid-truncate).
+    let mut case = Memory {
+        bytes: disk.bytes.clone(),
+        flushes: 0,
+    };
+    patch_superblock(&mut case, 0xE8, file.inode);
+    refused(&mut case, Error::Unsupported);
+    // A reserved inode, and one past the last.
+    for inode in [ROOT_INODE, 8, u32::MAX] {
+        let mut case = Memory {
+            bytes: disk.bytes.clone(),
+            flushes: 0,
+        };
+        patch_superblock(&mut case, 0xE8, inode);
+        refused(&mut case, Error::Corrupt);
+    }
+    // An orphan naming itself as the next.
+    let mut case = Memory {
+        bytes: disk.bytes.clone(),
+        flushes: 0,
+    };
+    patch_inode(&mut case, other.inode, |inode| {
+        inode.set_links(0);
+        put32(&mut inode.raw, 0x14, other.inode);
+    });
+    patch_superblock(&mut case, 0xE8, other.inode);
+    refused(&mut case, Error::Corrupt);
+    // A list that loops through two orphans ends at the inode already freed.
+    let mut case = Memory {
+        bytes: disk.bytes.clone(),
+        flushes: 0,
+    };
+    patch_inode(&mut case, other.inode, |inode| {
+        inode.set_links(0);
+        put32(&mut inode.raw, 0x14, file.inode);
+    });
+    patch_inode(&mut case, file.inode, |inode| {
+        inode.set_links(0);
+        put32(&mut inode.raw, 0x14, other.inode);
+    });
+    patch_superblock(&mut case, 0xE8, other.inode);
+    let mut volume = remounted(&mut case);
+    assert_eq!(volume.recover_orphan(&mut case, usize::MAX), Ok(true));
+    assert_eq!(volume.recover_orphan(&mut case, usize::MAX), Ok(true));
+    assert_eq!(
+        volume.recover_orphan(&mut case, usize::MAX),
+        Err(Error::Corrupt)
+    );
+    assert!(volume.read_only());
+
+    // Beside an orphan file the list is not touched, and none is started.
+    let compat = get32(&disk.bytes[1024..], 0x5C);
+    let mut case = Memory {
+        bytes: disk.bytes.clone(),
+        flushes: 0,
+    };
+    patch_superblock(&mut case, 0x5C, compat | 0x1000);
+    let mut volume = remounted(&mut case);
+    assert!(!volume.read_only() && !volume.keeps_unlinked());
+    assert_eq!(
+        volume.unlink_held(&mut case, ROOT_INODE, b"file"),
+        Err(Error::Busy)
+    );
+    assert!(volume.lookup(&mut case, ROOT_INODE, b"file").is_ok());
+    patch_superblock(&mut case, 0xE8, other.inode);
+    let volume = remounted(&mut case);
+    assert!(volume.read_only() && !volume.orphans_pending());
+}
+
+#[test]
+fn a_second_name_for_a_held_file_is_corruption_and_changes_nothing() {
+    // A hostile image: two names for an inode whose link count is one.
+    let (mut disk, mut volume) = formatted(4096);
+    let file = volume
+        .create(&mut disk, ROOT_INODE, b"first", Kind::File)
+        .unwrap();
+    volume
+        .write(&mut disk, file.inode, 0, &[5u8; 6000])
+        .unwrap();
+    let mut root = volume.inode(&mut disk, ROOT_INODE).unwrap();
+    volume
+        .add_entry(
+            &mut disk,
+            &mut root,
+            b"second",
+            file.inode,
+            crate::dir::TYPE_FILE,
+        )
+        .unwrap();
+    assert_eq!(
+        volume
+            .lookup(&mut disk, ROOT_INODE, b"second")
+            .unwrap()
+            .inode,
+        file.inode
+    );
+    volume.unlink_held(&mut disk, ROOT_INODE, b"first").unwrap();
+    let listed = disk.bytes.clone();
+
+    // The stale name reaches nothing and removes nothing.
+    assert_eq!(
+        volume.lookup(&mut disk, ROOT_INODE, b"second"),
+        Err(Error::Corrupt)
+    );
+    assert_eq!(
+        volume.resolve(&mut disk, ROOT_INODE, b"second"),
+        Err(Error::Corrupt)
+    );
+    assert_eq!(
+        volume.unlink_held(&mut disk, ROOT_INODE, b"second"),
+        Err(Error::Corrupt)
+    );
+    assert_eq!(
+        volume.unlink(&mut disk, ROOT_INODE, b"second"),
+        Err(Error::Corrupt)
+    );
+    assert_eq!(disk.bytes, listed);
+    assert_eq!(volume.held(), [file.inode]);
+    assert!(!volume.read_only());
+
+    // The holder goes on, and its close frees the file.
+    let mut out = [0u8; 4];
+    assert_eq!(volume.read(&mut disk, file.inode, 0, &mut out), Ok(4));
+    assert_eq!(volume.release(&mut disk, file.inode, usize::MAX), Ok(true));
+    assert!(volume.held().is_empty());
+    let volume = remounted(&mut disk);
+    assert!(!volume.read_only() && !volume.orphans_pending());
+}
+
+#[test]
+fn a_file_whose_blocks_cannot_be_freed_keeps_its_name() {
+    // Block-mapped, and an extent tree deeper than this module trims.
+    let patches: [fn(&mut Inode); 2] = [
+        |inode| inode.set_flags(inode.flags() & !EXT4_EXTENTS_FL),
+        |inode| put16(inode.root_mut(), 6, 2),
+    ];
+    for patch in patches {
+        let (mut disk, mut volume) = formatted(4096);
+        let file = volume
+            .create(&mut disk, ROOT_INODE, b"file", Kind::File)
+            .unwrap();
+        volume
+            .write(&mut disk, file.inode, 0, &[5u8; 6000])
+            .unwrap();
+        patch_inode(&mut disk, file.inode, patch);
+        let before = disk.bytes.clone();
+        // Closed or held, the answer is the same and nothing is written.
+        assert_eq!(
+            volume.unlink(&mut disk, ROOT_INODE, b"file"),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(
+            volume.unlink_held(&mut disk, ROOT_INODE, b"file"),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(disk.bytes, before);
+        assert_eq!(
+            volume.lookup(&mut disk, ROOT_INODE, b"file").unwrap().inode,
+            file.inode
+        );
+        assert!(!volume.read_only() && volume.held().is_empty());
+    }
+}
+
+#[test]
+fn an_unlink_frees_blocks_past_the_end_of_an_empty_file() {
+    let (mut disk, mut volume) = formatted(4096);
+    let free = (volume.usage().free_blocks, free_inodes(&volume));
+    let file = volume
+        .create(&mut disk, ROOT_INODE, b"file", Kind::File)
+        .unwrap();
+    volume
+        .write(&mut disk, file.inode, 0, &[5u8; 20_000])
+        .unwrap();
+    // Preallocated past a size of zero, as fallocate leaves a file.
+    patch_inode(&mut disk, file.inode, |inode| inode.set_size(0));
+    assert_eq!(volume.stat(&mut disk, file.inode).unwrap().size, 0);
+    assert!(volume.usage().free_blocks < free.0);
+    volume.unlink(&mut disk, ROOT_INODE, b"file").unwrap();
+    assert_eq!((volume.usage().free_blocks, free_inodes(&volume)), free);
+    let volume = remounted(&mut disk);
+    assert_eq!((volume.usage().free_blocks, free_inodes(&volume)), free);
+}
+
+#[test]
+fn freeing_in_steps_needs_room_for_one_block_group() {
+    let (mut disk, mut volume) = formatted(4096);
+    let file = volume
+        .create(&mut disk, ROOT_INODE, b"file", Kind::File)
+        .unwrap();
+    volume.unlink_held(&mut disk, ROOT_INODE, b"file").unwrap();
+    let before = disk.bytes.clone();
+    assert_eq!(
+        volume.release(&mut disk, file.inode, MIN_FREE_ROOM - 1),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(disk.bytes, before);
+    assert!(!volume.read_only());
+    assert_eq!(
+        volume.release(&mut disk, file.inode, MIN_FREE_ROOM),
+        Ok(true)
+    );
+}
+
+/// A device whose writes fail from the `left`-th on.
+struct Failing {
+    disk: Memory,
+    left: usize,
+}
+
+impl Device for Failing {
+    fn read(&mut self, offset: u64, out: &mut [u8]) -> Result<(), DeviceError> {
+        self.disk.read(offset, out)
+    }
+    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), DeviceError> {
+        if self.left == 0 {
+            return Err(DeviceError(77));
+        }
+        self.left -= 1;
+        self.disk.write(offset, data)
+    }
+    fn flush(&mut self) -> Result<(), DeviceError> {
+        self.disk.flush()
+    }
+}
+
+#[test]
+fn an_unlink_that_fails_after_its_first_write_stops_the_volume() {
+    // The name may be gone with the node neither freed nor listed, so the
+    // volume takes nothing more (a journaling caller drops the transaction).
+    for hold in [false, true] {
+        let mut failures = 0;
+        for writes in 0.. {
+            let (disk, mut volume) = formatted(4096);
+            let mut disk = Failing {
+                disk,
+                left: usize::MAX,
+            };
+            let file = volume
+                .create(&mut disk, ROOT_INODE, b"file", Kind::File)
+                .unwrap();
+            volume
+                .write(&mut disk, file.inode, 0, &[5u8; 6000])
+                .unwrap();
+            disk.left = writes;
+            let unlinked = if hold {
+                volume.unlink_held(&mut disk, ROOT_INODE, b"file")
+            } else {
+                volume.unlink(&mut disk, ROOT_INODE, b"file")
+            };
+            if unlinked.is_ok() {
+                assert!(!volume.read_only());
+                assert_eq!(volume.is_held(file.inode), hold);
+                break;
+            }
+            failures += 1;
+            assert_eq!(unlinked, Err(Error::Device(DeviceError(77))));
+            assert!(volume.read_only() && volume.held().is_empty());
+            disk.left = usize::MAX;
+            assert_eq!(
+                volume.create(&mut disk, ROOT_INODE, b"x", Kind::File),
+                Err(Error::ReadOnly)
+            );
+        }
+        assert!(failures >= 3, "only {failures} writes could fail");
+    }
+}
