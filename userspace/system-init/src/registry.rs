@@ -224,6 +224,14 @@ pub(crate) enum JobDispatcherPollOutcome {
         grant: EndpointGrant,
         scope: LaunchSessionScope,
     },
+    /// The session was retired for its client's own fault: a request that is
+    /// no request, or a reply the client would not take. It is gone exactly
+    /// as a closed one is; the tick is not.
+    SessionFaulted {
+        grant: EndpointGrant,
+        scope: LaunchSessionScope,
+        cause: FaultCause,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

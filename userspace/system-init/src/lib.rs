@@ -201,6 +201,65 @@ impl ResidentSystemInit {
         let observed = crate::control_tick(self, system, loader, waits, now_ns);
         attribute_failure(RecoveryOperation::ResidentTick, observed)
     }
+
+    /// Advances the file image being read for a shell, if one is, by one
+    /// step and without waiting (`image_launch`). The resident loop calls
+    /// this between ticks, with the scratch region once it has mapped one.
+    pub(crate) fn service_image_launch<S, L, W>(
+        &mut self,
+        system: &mut S,
+        loader: &mut L,
+        waits: &mut W,
+        now_ns: u64,
+        scratch: Option<&mut [u8]>,
+    ) -> Result<crate::image_launch::ImageService, InitError>
+    where
+        S: ResidentPlatform,
+        L: LoaderPlatform<Error = NativeError>,
+        W: SupervisionPlatform<Error = NativeError>,
+    {
+        let authority = self.authority;
+        let Some(jobs) = crate::console::session_jobs(self) else {
+            return Ok(crate::image_launch::ImageService::Idle);
+        };
+        let serviced = crate::image_launch::service_image_launch(
+            system, loader, waits, authority, jobs, now_ns, scratch,
+        );
+        attribute_failure(RecoveryOperation::DispatchShellJob, serviced)
+    }
+
+    /// Fails the file image launch whose scratch region could not be mapped,
+    /// back to its client.
+    pub(crate) fn refuse_image_scratch<S, W>(
+        &mut self,
+        system: &mut S,
+        waits: &mut W,
+        error: NativeError,
+    ) -> Result<(), InitError>
+    where
+        S: ResidentPlatform,
+        W: SupervisionPlatform<Error = NativeError>,
+    {
+        let Some(jobs) = crate::console::session_jobs(self) else {
+            return Ok(());
+        };
+        let refused = match system.now() {
+            Ok(now_ns) => crate::image_launch::fail_parked_image(
+                system,
+                waits,
+                jobs,
+                native_launch_error_code(error),
+                now_ns,
+            ),
+            Err(clock) => Err(InitError::Native(clock)),
+        };
+        attribute_failure(RecoveryOperation::DispatchShellJob, refused)
+    }
+
+    /// The address-space root an image's scratch region is mapped into.
+    pub(crate) const fn scratch_root(&self) -> DwHandle {
+        self.authority.parent_root
+    }
 }
 
 /// Native operations owned by permanent init in addition to the reusable

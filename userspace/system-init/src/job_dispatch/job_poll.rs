@@ -10,7 +10,7 @@ use super::*;
 /// (F4 WYR1-F4-M1). Each job's task group is ended here; the poll loop then
 /// observes the exit and reaps it, as for any other job, and the empty
 /// connection slot is reclaimed. Returns whether any termination failed.
-fn retire_excess_orphans<S: ResidentPlatform>(
+pub(crate) fn retire_excess_orphans<S: ResidentPlatform>(
     system: &mut S,
     jobs: &mut JobDispatcher,
 ) -> Result<bool, InitError> {
@@ -72,7 +72,7 @@ pub(crate) fn poll_job_dispatcher_with_shell<S, L, W>(
     jobs: &mut JobDispatcher,
     now_ns: u64,
     shell: &mut ShellLaunchContext<'_>,
-) -> Result<JobDispatcherPollOutcome, InitError>
+) -> Result<JobDispatcherPoll, InitError>
 where
     S: ResidentPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -90,13 +90,18 @@ pub(crate) fn poll_job_dispatcher_inner<S, L, W>(
     jobs: &mut JobDispatcher,
     now_ns: u64,
     mut shell: Option<&mut ShellLaunchContext<'_>>,
-) -> Result<JobDispatcherPollOutcome, InitError>
+) -> Result<JobDispatcherPoll, InitError>
 where
     S: ResidentPlatform,
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    let mut outcome = JobDispatcherPollOutcome::Stable;
+    let mut poll = JobDispatcherPoll::STABLE;
+    // A session the image read retired since the last poll is this poll's to
+    // report: its fault reaches the caller like any other.
+    if let Some(fault) = jobs.image_fault.take() {
+        poll.faulted(fault);
+    }
     // Reset cards R6B-2 and R6C. A launch parked by a previous tick is looked at
     // before any new request is read -- the child is already alive and its READY
     // deadline is already running, so it has the older claim -- but it is only
@@ -115,20 +120,73 @@ where
         jobs.launch_cursor = token.slot().wrapping_add(1);
         match parked_launch_disposition(system, jobs, token, now_ns)? {
             ParkedLaunch::Waiting => {}
-            disposition => finish_deferred_launch(
-                system,
-                waits,
-                jobs,
-                token,
-                shell.as_deref_mut(),
-                disposition,
-            )?,
+            disposition => {
+                // Finishing it sends its session a reply. A session whose
+                // queue is full keeps its launch parked until there is room,
+                // and is retired -- its launch rolled back with it -- only
+                // when its patience runs out.
+                let grant = jobs
+                    .launches
+                    .grant(token)
+                    .map_err(launch_transaction_error)?;
+                let gate = match jobs.session_scope(grant) {
+                    Ok(scope) => Some((scope, reply_gate(system, jobs, grant, now_ns)?)),
+                    // Its session went without it; it is finished unanswered.
+                    Err(_) => None,
+                };
+                let unanswerable = match gate {
+                    Some((_, ReplyGate::Blocked)) => None,
+                    Some((_, ReplyGate::Expired)) => {
+                        Some((grant, FaultCause::ReplyQueueNeverDrained))
+                    }
+                    Some((_, ReplyGate::Open)) | None => finish_deferred_launch(
+                        system,
+                        waits,
+                        jobs,
+                        token,
+                        shell.as_deref_mut(),
+                        disposition,
+                        now_ns,
+                    )?,
+                };
+                if let Some((grant, cause)) = unanswerable
+                    && let Ok(scope) = jobs.session_scope(grant)
+                {
+                    retire_session(system, waits, jobs, grant, scope)?;
+                    poll.faulted(SessionFault {
+                        grant,
+                        scope,
+                        cause,
+                    });
+                }
+            }
         }
     }
     if let Some((grant, session)) = jobs.next_session() {
+        // A reply held for this session goes first. Until it has gone, the
+        // session's requests are not read -- each would be owed a reply
+        // there is nowhere to put -- but its peer closing is still seen.
+        let reading = match flush_held_reply(system, jobs, grant, session, now_ns)? {
+            HeldFlush::Clear => true,
+            HeldFlush::StillHeld => false,
+            HeldFlush::Unanswerable(cause) => {
+                let scope = jobs.session_scope(grant).map_err(InitError::Jobs)?;
+                retire_session(system, waits, jobs, grant, scope)?;
+                poll.faulted(SessionFault {
+                    grant,
+                    scope,
+                    cause,
+                });
+                return finish_poll(system, waits, jobs, shell, now_ns, poll);
+            }
+        };
         let item = DwWaitItemV1 {
             handle: session,
-            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            signals: deepwyrm_syscall::DwSignals(if reading {
+                DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0
+            } else {
+                DW_SIGNAL_PEER_CLOSED.0
+            }),
         };
         match system.wait_many(core::slice::from_ref(&item), DwDeadline(now_ns)) {
             Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {}
@@ -136,150 +194,144 @@ where
             Ok(observed) if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 => {
                 // Read before the dispatch, which may disconnect the session.
                 let scope = jobs.session_scope(grant).map_err(InitError::Jobs)?;
-                let size = system
-                    .query_memory_object_size(authority.bootfs)
-                    .map_err(InitError::Native)?;
-                let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
-                let dispatched = system
-                    .with_bootfs_bytes(
-                        authority.parent_root,
-                        authority.bootfs,
-                        plan,
-                        |system, bootfs| {
-                            let archive = Archive::new(bootfs).map_err(InitError::Bootfs)?;
-                            let manifest = archive
-                                .lookup(MANIFEST_PATH.as_bytes())
-                                .map_err(map_lookup)?;
-                            let boot_generation: [u8; 32] = manifest
-                                .data()
-                                .get(48..80)
-                                .ok_or(InitError::Accounting)?
-                                .try_into()
-                                .map_err(|_| InitError::Accounting)?;
-                            let policy = PolicyView::from_bootfs(archive, boot_generation)
-                                .map_err(InitError::Jobs)?;
-                            if let Some(shell) = shell.as_deref_mut() {
-                                dispatch_one_job_request_with_shell(
-                                    system,
-                                    loader,
-                                    waits,
-                                    authority,
-                                    Some(&policy),
-                                    jobs,
-                                    session,
-                                    grant,
-                                    shell,
-                                )
-                            } else {
-                                dispatch_one_job_request(
-                                    system,
-                                    loader,
-                                    waits,
-                                    authority,
-                                    Some(&policy),
-                                    jobs,
-                                    session,
-                                    grant,
-                                )
-                            }
-                        },
-                    )
-                    .map_err(InitError::Native)?;
-                if let Err(dispatch_error) = dispatched {
-                    // R6C. Whatever this session had in flight goes with it.
-                    let cancel_failed = cancel_parked_launch(system, waits, jobs, grant).is_err();
-                    // Both arms ran the same emergency cleanup; only one said
-                    // which half of it failed. The other collapsed to a bare
-                    // `Cleanup`, losing the initiating error entirely -- the
-                    // collapse `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` 3.2 says
-                    // owes an instance. One arm now, and the reported kind is
-                    // unchanged: a failed cleanup still reports kind 04.
-                    let disconnected = jobs.disconnect_owned_session(grant);
-                    let emergency_cleanup = match disconnected {
-                        Ok(session) => {
-                            let channel_close_failed =
-                                system.close_handle(session.channel).is_err();
-                            let owner_cleanup_failed =
-                                cleanup_session_owner(system, waits, session.owner, true);
-                            EmergencyCleanup::Attempted {
-                                channel_close_failed,
-                                owner_cleanup_failed,
-                            }
+                let dispatched = with_launch_policy(system, authority, |system, policy| {
+                    if let Some(shell) = shell.as_deref_mut() {
+                        dispatch_one_job_request_with_shell(
+                            system,
+                            loader,
+                            waits,
+                            authority,
+                            Some(policy),
+                            jobs,
+                            session,
+                            grant,
+                            shell,
+                        )
+                    } else {
+                        dispatch_one_job_request(
+                            system,
+                            loader,
+                            waits,
+                            authority,
+                            Some(policy),
+                            jobs,
+                            session,
+                            grant,
+                        )
+                    }
+                });
+                // Init's own bootfs or launch policy failing to map or parse
+                // is init's failure, whichever session's turn it was.
+                let dispatched = match dispatched {
+                    Ok(dispatched) => dispatched,
+                    Err(error) => Err(DispatchError::Fatal(error)),
+                };
+                match dispatched {
+                    Ok(
+                        JobDispatchOutcome::Responded
+                        | JobDispatchOutcome::Launched(_)
+                        | JobDispatchOutcome::Constructed
+                        | JobDispatchOutcome::ImageParked,
+                    ) => {}
+                    // The client's fault, and the client's loss: the session
+                    // goes, by the same route as one whose peer closed, and
+                    // the tick carries on to the jobs and waits behind it.
+                    // Dispatched, and the reply found the queue full. It is
+                    // held; a client with a reply already held is past what
+                    // the queue allows.
+                    Err(DispatchError::ReplyHeld) => {
+                        if let Err(cause) = hold_reply(jobs, grant, now_ns) {
+                            retire_session(system, waits, jobs, grant, scope)?;
+                            poll.faulted(SessionFault {
+                                grant,
+                                scope,
+                                cause,
+                            });
                         }
-                        Err(_) => EmergencyCleanup::DisconnectFailed,
-                    };
-                    let emergency_cleanup = match emergency_cleanup {
-                        EmergencyCleanup::Attempted {
-                            channel_close_failed,
-                            owner_cleanup_failed,
-                        } => EmergencyCleanup::Attempted {
-                            channel_close_failed,
-                            owner_cleanup_failed: owner_cleanup_failed | cancel_failed,
-                        },
-                        other => other,
-                    };
-                    // F3A.7j. Named by the session's scope, so a failed
-                    // request says whose it was; `attribute_failure` keeps
-                    // an operation the error already carries.
-                    let operation = match scope {
-                        LaunchSessionScope::ConsoleLauncher => {
-                            RecoveryOperation::DispatchConsoleJob
-                        }
-                        LaunchSessionScope::ShellJobs => RecoveryOperation::DispatchShellJob,
-                    };
-                    let attributed =
-                        attribute_failure(operation, Err::<(), _>(dispatch_error)).unwrap_err();
-                    return Err(dispatch_failure(attributed, emergency_cleanup));
+                    }
+                    Err(DispatchError::Client(cause)) => {
+                        // F3A.7j. A retirement that cannot complete is named
+                        // by the session it was for.
+                        let operation = match scope {
+                            LaunchSessionScope::ConsoleLauncher => {
+                                RecoveryOperation::DispatchConsoleJob
+                            }
+                            LaunchSessionScope::ShellJobs => RecoveryOperation::DispatchShellJob,
+                        };
+                        attribute_failure(
+                            operation,
+                            retire_session(system, waits, jobs, grant, scope),
+                        )?;
+                        poll.faulted(SessionFault {
+                            grant,
+                            scope,
+                            cause,
+                        });
+                    }
+                    Err(DispatchError::Fatal(dispatch_error)) => {
+                        // R6C. Whatever this session had in flight goes with it.
+                        let cancel_failed = cancel_parked_launch(system, waits, jobs, grant)
+                            .is_err()
+                            | crate::image_launch::cancel_parked_image(system, jobs, Some(grant));
+                        // Both arms ran the same emergency cleanup; only one said
+                        // which half of it failed. The other collapsed to a bare
+                        // `Cleanup`, losing the initiating error entirely -- the
+                        // collapse `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` 3.2 says
+                        // owes an instance. One arm now, and the reported kind is
+                        // unchanged: a failed cleanup still reports kind 04.
+                        let disconnected = jobs.disconnect_owned_session(grant);
+                        let emergency_cleanup = match disconnected {
+                            Ok(session) => {
+                                let channel_close_failed =
+                                    system.close_handle(session.channel).is_err();
+                                let owner_cleanup_failed =
+                                    cleanup_session_owner(system, waits, session.owner, true);
+                                EmergencyCleanup::Attempted {
+                                    channel_close_failed,
+                                    owner_cleanup_failed: owner_cleanup_failed | cancel_failed,
+                                }
+                            }
+                            Err(_) => EmergencyCleanup::DisconnectFailed,
+                        };
+                        // F3A.7j. Named by the session's scope, so a failed
+                        // request says whose it was; `attribute_failure` keeps
+                        // an operation the error already carries.
+                        let operation = match scope {
+                            LaunchSessionScope::ConsoleLauncher => {
+                                RecoveryOperation::DispatchConsoleJob
+                            }
+                            LaunchSessionScope::ShellJobs => RecoveryOperation::DispatchShellJob,
+                        };
+                        let attributed =
+                            attribute_failure(operation, Err::<(), _>(dispatch_error)).unwrap_err();
+                        return Err(dispatch_failure(attributed, emergency_cleanup));
+                    }
                 }
             }
             Ok(observed) if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => {
                 let scope = jobs.session_scope(grant).map_err(InitError::Jobs)?;
-                let defer_console_retirement = false;
-                // When recovery owns this session and its process as one
-                // coordinated retirement, observe peer close without consuming
-                // either owner ahead of that join.
-                if !defer_console_retirement {
-                    // R6C's cancel. The peer that asked for this launch is gone
-                    // before it was told the child exists, so nothing owns the
-                    // child and nothing is owed a reply. Rolling it back here
-                    // rather than leaving it to its deadline means the session's
-                    // resources and its child's go in one step -- and means the
-                    // slot is not still holding a Channel this branch is about
-                    // to close.
-                    cancel_parked_launch(system, waits, jobs, grant)?;
-                    let outer = if scope == crate::job_sessions::LaunchSessionScope::ConsoleLauncher
-                    {
-                        jobs.jobs
-                            .loaded_job_for_owner(grant.endpoint_id, grant.endpoint_generation)
-                            .map_err(InitError::Jobs)?
-                    } else {
-                        None
-                    };
-                    let disconnected = jobs
-                        .disconnect_owned_session(grant)
-                        .map_err(InitError::Jobs)?;
-                    let mut failed = system.close_handle(disconnected.channel).is_err()
-                        | cleanup_session_owner(system, waits, disconnected.owner, true)
-                        | disconnected.outer_job.is_some_and(|job_id| {
-                            let loaded = jobs.jobs.loaded_job(job_id);
-                            loaded.map_or(true, |loaded| {
-                                force_cleanup_job(system, waits, jobs, loaded).is_err()
-                            })
-                        });
-                    if let Some(outer) = outer {
-                        failed |=
-                            cleanup_shell_before_publication(system, waits, jobs, outer).is_err();
-                    }
-                    failed |= retire_excess_orphans(system, jobs)?;
-                    if failed {
-                        return Err(InitError::Cleanup);
-                    }
-                    outcome = JobDispatcherPollOutcome::SessionClosed { grant, scope };
-                }
+                retire_session(system, waits, jobs, grant, scope)?;
+                poll.closed(grant, scope);
             }
             Ok(_) => return Err(InitError::Supervision),
         }
     }
+    finish_poll(system, waits, jobs, shell, now_ns, poll)
+}
+
+/// The half of the poll every path runs: reap one job, answer one WAIT.
+fn finish_poll<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    shell: Option<&mut ShellLaunchContext<'_>>,
+    now_ns: u64,
+    mut poll: JobDispatcherPoll,
+) -> Result<JobDispatcherPoll, InitError>
+where
+    S: ResidentPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
     if let Some(loaded) = jobs.next_cleanup_job() {
         let terminal_staged = jobs
             .jobs
@@ -323,12 +375,100 @@ where
             }
         }
     }
-    if let Some(shell) = shell {
-        service_pending_wait_inner(system, waits, jobs, Some(&mut *shell.state))?;
-    } else {
-        service_pending_wait(system, waits, jobs)?;
+    let unanswerable = service_pending_wait_inner(
+        system,
+        waits,
+        jobs,
+        shell.map(|shell| &mut *shell.state),
+        now_ns,
+    )?;
+    if let Some(fault) = unanswerable {
+        poll.faulted(fault);
     }
-    Ok(outcome)
+    Ok(poll)
+}
+
+/// What became of the reply held for a session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeldFlush {
+    /// Nothing is held, or it has just been delivered.
+    Clear,
+    /// The queue is still full, with patience left.
+    StillHeld,
+    /// The peer is gone, or the queue never drained.
+    Unanswerable(FaultCause),
+}
+
+fn flush_held_reply<S: ResidentPlatform>(
+    system: &mut S,
+    jobs: &mut JobDispatcher,
+    grant: EndpointGrant,
+    session: DwHandle,
+    now_ns: u64,
+) -> Result<HeldFlush, InitError> {
+    let Some(held) = jobs.session_mut(grant).map_err(InitError::Jobs)?.held_reply else {
+        return Ok(HeldFlush::Clear);
+    };
+    let sent = send_session_reply(system, jobs, session, held.bytes());
+    // It is held already; the copy a refused send staged is not needed.
+    jobs.staged_reply = None;
+    let state = jobs.session_mut(grant).map_err(InitError::Jobs)?;
+    match sent {
+        Ok(()) => {
+            state.held_reply = None;
+            state.blocked_since = None;
+            Ok(HeldFlush::Clear)
+        }
+        Err(ReplyError::QueueFull) => {
+            let since = *state.blocked_since.get_or_insert(now_ns);
+            Ok(if now_ns.saturating_sub(since) >= REPLY_PATIENCE_NS {
+                HeldFlush::Unanswerable(FaultCause::ReplyQueueNeverDrained)
+            } else {
+                HeldFlush::StillHeld
+            })
+        }
+        Err(ReplyError::PeerClosed) => Ok(HeldFlush::Unanswerable(FaultCause::ReplyUndeliverable(
+            deepwyrm_syscall::DW_STATUS_PEER_CLOSED,
+        ))),
+        Err(ReplyError::Encode) => Err(InitError::Accounting),
+        Err(ReplyError::Native(error)) => Err(InitError::Native(error)),
+    }
+}
+
+/// Runs `use_policy` over the launch policy of init's own retained bootfs.
+///
+/// Every failure here is init's: the archive is the one init booted from.
+pub(crate) fn with_launch_policy<S: ResidentPlatform, R>(
+    system: &mut S,
+    authority: LoadAuthority,
+    use_policy: impl for<'a> FnOnce(&mut S, &PolicyView<'a>) -> R,
+) -> Result<R, InitError> {
+    let size = system
+        .query_memory_object_size(authority.bootfs)
+        .map_err(InitError::Native)?;
+    let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
+    system
+        .with_bootfs_bytes(
+            authority.parent_root,
+            authority.bootfs,
+            plan,
+            |system, bootfs| {
+                let archive = Archive::new(bootfs).map_err(InitError::Bootfs)?;
+                let manifest = archive
+                    .lookup(MANIFEST_PATH.as_bytes())
+                    .map_err(map_lookup)?;
+                let boot_generation: [u8; 32] = manifest
+                    .data()
+                    .get(48..80)
+                    .ok_or(InitError::Accounting)?
+                    .try_into()
+                    .map_err(|_| InitError::Accounting)?;
+                let policy =
+                    PolicyView::from_bootfs(archive, boot_generation).map_err(InitError::Jobs)?;
+                Ok(use_policy(system, &policy))
+            },
+        )
+        .map_err(InitError::Native)?
 }
 
 /// Latches a console child's session shutdown, at either WAIT reply.
@@ -359,31 +499,25 @@ pub(crate) fn observe_session_shutdown_result(
     }
 }
 
-pub(crate) fn service_pending_wait<S, W>(
-    system: &mut S,
-    waits: &mut W,
-    jobs: &mut JobDispatcher,
-) -> Result<(), InitError>
-where
-    S: ResidentPlatform,
-    W: SupervisionPlatform<Error = NativeError>,
-{
-    service_pending_wait_inner(system, waits, jobs, None)
-}
-
+/// Answers one pending WAIT whose job has ended.
+///
+/// Returns the session it retired, if the session would not take the answer:
+/// a `JOB_RESULT` that cannot be delivered is the waiting client's fault, and
+/// costs it its session rather than costing init the tick.
 #[allow(unused_mut)]
 pub(crate) fn service_pending_wait_inner<S, W>(
     system: &mut S,
     waits: &mut W,
     jobs: &mut JobDispatcher,
     mut evidence: Option<&mut ShellControllerState>,
-) -> Result<(), InitError>
+    now_ns: u64,
+) -> Result<Option<SessionFault>, InitError>
 where
     S: ResidentPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
     let Some(pending) = jobs.next_pending_wait() else {
-        return Ok(());
+        return Ok(None);
     };
     let scope = jobs.session_scope(pending.grant).map_err(InitError::Jobs)?;
     let result = match jobs.jobs.result_for_owner(
@@ -392,31 +526,41 @@ where
         pending.job_id,
     ) {
         Ok(result) => result,
-        Err(JobError::UnknownJob) => return Ok(()),
+        Err(JobError::UnknownJob) => return Ok(None),
         Err(error) => return Err(InitError::Jobs(error)),
     };
     let session = jobs
         .session_handle(pending.grant)
         .map_err(InitError::Jobs)?;
+    // The result is ready; whether it can be sent is the session's queue.
+    // With no room the WAIT simply stays pending.
+    let fault = |cause| SessionFault {
+        grant: pending.grant,
+        scope,
+        cause,
+    };
+    match reply_gate(system, jobs, pending.grant, now_ns)? {
+        ReplyGate::Open => {}
+        ReplyGate::Blocked => return Ok(None),
+        ReplyGate::Expired => {
+            retire_session(system, waits, jobs, pending.grant, scope)?;
+            return Ok(Some(fault(FaultCause::ReplyQueueNeverDrained)));
+        }
+    }
     let terminal = controller_result_to_wire(result)?;
     observe_session_shutdown_result(scope, evidence, terminal);
     let mut response = [0_u8; 88];
     let size = encode_job_result(pending.reservation, pending.job_id, terminal, &mut response)
         .map_err(|_| InitError::Accounting)?;
-    if let Err(error) = system.send_channel(session, &response[..size]) {
-        jobs.finish_pending_wait(pending).map_err(InitError::Jobs)?;
-        let disconnected = jobs
-            .disconnect_owned_session(pending.grant)
-            .map_err(InitError::Jobs)?;
-        let failed = system.close_handle(disconnected.channel).is_err()
-            | cleanup_session_owner(system, waits, disconnected.owner, true);
-        return Err(if failed {
-            InitError::Cleanup
-        } else {
-            InitError::Native(error)
-        });
+    let sent = send_session_reply(system, jobs, session, &response[..size]);
+    jobs.finish_pending_wait(pending).map_err(InitError::Jobs)?;
+    match settle_reply(jobs, pending.grant, sent, now_ns)? {
+        None => Ok(None),
+        Some(cause) => {
+            retire_session(system, waits, jobs, pending.grant, scope)?;
+            Ok(Some(fault(cause)))
+        }
     }
-    jobs.finish_pending_wait(pending).map_err(InitError::Jobs)
 }
 
 pub(crate) fn cleanup_session_owner<S, W>(
@@ -539,8 +683,9 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     let mut sessions = [None; crate::job_sessions::MAX_SESSIONS];
+    // An image still being read is owed to a session that is going.
+    let mut failed = crate::image_launch::cancel_parked_image(system, jobs, None);
     let session_count = jobs.drain_sessions(&mut sessions);
-    let mut failed = false;
     for session in sessions[..session_count].iter().rev().flatten().copied() {
         failed |= system.close_handle(session.channel).is_err()
             | cleanup_session_owner(system, waits, session.owner, true);

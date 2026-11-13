@@ -190,7 +190,8 @@ pub(crate) fn finish_deferred_launch<S, W>(
     token: LaunchToken,
     mut shell: Option<&mut ShellLaunchContext<'_>>,
     disposition: ParkedLaunch,
-) -> Result<(), InitError>
+    now_ns: u64,
+) -> Result<Option<(EndpointGrant, FaultCause)>, InitError>
 where
     S: ResidentPlatform,
     W: SupervisionPlatform<Error = NativeError>,
@@ -270,30 +271,45 @@ where
             },
         ),
     };
+    // The session, if it would not take the reply this launch owed it.
+    let mut unanswerable = None;
+    let mut reply_failure = None;
     let published = match outcome {
         Ok(_) => Ok(()),
         Err(error) => {
-            // Best-effort, and deliberately not `?`. The reply is owed to a
-            // session that may already be gone -- peer close, or an emergency
-            // disconnect elsewhere in the tick, closes the Channel this slot
-            // recorded, and sending on a closed handle fails. What is *not*
-            // best-effort is emptying the slot below: a transaction left open
-            // here would be handed back by `awaiting_ready_from` on every
-            // subsequent tick, for ever, holding a child nothing else can name.
-            let reply =
-                send_deferred_launch_error(system, session, reservation, launch_error_code(&error));
-            Err(match reply {
-                Ok(()) => error,
-                // A failed reply does not relabel the launch's own failure, for
-                // the same reason `LaunchTransactions::fail` keeps the first
-                // disposition: the caller asked why the launch failed, not what
-                // went wrong telling it.
-                Err(InitError::Cleanup) => InitError::Cleanup,
-                Err(_) => error,
-            })
+            // Deliberately not `?`. What must happen whatever the reply does
+            // is emptying the slot below: a transaction left open here would
+            // be handed back by `awaiting_ready_from` on every subsequent
+            // tick, for ever, holding a child nothing else can name.
+            //
+            // The reply is owed to a session that may already be gone -- a
+            // shell reaped elsewhere in the tick closes the Channel this
+            // slot recorded -- and then it is owed to no one.
+            if jobs.session_handle(grant) == Ok(session) {
+                let reply = send_deferred_launch_error(
+                    system,
+                    jobs,
+                    session,
+                    reservation,
+                    launch_error_code(&error),
+                );
+                // A reply that fails does not relabel the launch's own
+                // failure, for the same reason `LaunchTransactions::fail`
+                // keeps the first disposition. A full queue holds it; a
+                // client that cannot be told is the caller's to retire.
+                match settle_reply(jobs, grant, reply, now_ns) {
+                    Ok(None) => {}
+                    Ok(Some(cause)) => unanswerable = Some((grant, cause)),
+                    Err(failure) => reply_failure = Some(failure),
+                }
+            }
+            Err(error)
         }
     };
     close_deferred_launch(jobs, token, published.is_ok())?;
+    if let Some(failure) = reply_failure {
+        return Err(failure);
+    }
     // One launch failing is not the tick failing. The one-frame path answered a
     // failed launch with an `ERROR` reply and returned `Responded`, and only a
     // failed *cleanup* escalated -- because a cleanup that did not happen means
@@ -302,9 +318,13 @@ where
     // that never answers must not take down the supervisor, which is most of
     // what R6D has to prove.
     match published {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(None),
         Err(InitError::Cleanup) => Err(InitError::Cleanup),
-        Err(_) => Ok(()),
+        // `LAUNCH_ACCEPTED` refused for a reason no peer can cause.
+        Err(InitError::Native(error)) if peer_cause(ChannelOperation::Send, error).is_none() => {
+            Err(InitError::Native(error))
+        }
+        Err(_) => Ok(unanswerable),
     }
 }
 
@@ -338,15 +358,10 @@ pub(crate) fn close_deferred_launch(
 /// Sends the error reply a deferred launch owes its session, and records it.
 pub(crate) fn send_deferred_launch_error<S: ResidentPlatform>(
     system: &mut S,
+    jobs: &mut JobDispatcher,
     session: DwHandle,
     reservation: LaunchReservation,
     code: LaunchErrorCode,
-) -> Result<(), InitError> {
-    let mut response = [0_u8; 88];
-    let size =
-        encode_launch_error(reservation, code, &mut response).map_err(|_| InitError::Accounting)?;
-    system
-        .send_channel(session, &response[..size])
-        .map_err(InitError::Native)?;
-    Ok(())
+) -> Result<(), ReplyError> {
+    send_job_error(system, jobs, session, reservation, code)
 }

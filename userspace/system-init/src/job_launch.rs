@@ -697,16 +697,15 @@ pub(crate) const fn shell_launch_error_code(error: &InitError) -> LaunchErrorCod
 
 pub(crate) fn send_job_error<S: InitPlatform>(
     system: &mut S,
+    jobs: &mut JobDispatcher,
     session: DwHandle,
     reservation: LaunchReservation,
     code: LaunchErrorCode,
-) -> Result<(), InitError> {
+) -> Result<(), ReplyError> {
     let mut response = [0_u8; 88];
     let size =
-        encode_launch_error(reservation, code, &mut response).map_err(|_| InitError::Accounting)?;
-    system
-        .send_channel(session, &response[..size])
-        .map_err(InitError::Native)
+        encode_launch_error(reservation, code, &mut response).map_err(|_| ReplyError::Encode)?;
+    send_session_reply(system, jobs, session, &response[..size])
 }
 
 /// Constructs the child, parks the transaction, and returns to the event loop.
@@ -742,7 +741,7 @@ pub(crate) fn defer_reserved_launch<S, L, W>(
     moved: &[DwReceivedHandleInfoV1],
     handle_count: usize,
     file_image: Option<&[u8]>,
-) -> Result<JobDispatchOutcome, InitError>
+) -> Result<JobDispatchOutcome, DispatchError>
 where
     S: ResidentPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -765,23 +764,54 @@ where
     ) {
         Ok(constructed) => constructed,
         Err(error) => {
-            send_observed_job_error(system, session, reservation, launch_error_code(&error))?;
-            return if error == InitError::Cleanup {
-                Err(error)
-            } else {
-                Ok(JobDispatchOutcome::Responded)
-            };
+            let reply = send_observed_job_error(
+                system,
+                jobs,
+                session,
+                reservation,
+                launch_error_code(&error),
+            );
+            // A cleanup that failed outranks a reply that could not be sent:
+            // the first is init's, the second only the client's.
+            if error == InitError::Cleanup {
+                return Err(DispatchError::Fatal(error));
+            }
+            reply?;
+            return Ok(JobDispatchOutcome::Responded);
         }
     };
-    if let Err(error) = park_constructed_launch(jobs, grant, scope, constructed) {
+    if let Err(refusal) = park_constructed_launch(jobs, grant, scope, constructed) {
         let cleanup_failed =
             rollback_prepared_job(system, waits, jobs, constructed.prepared).is_err();
-        send_observed_job_error(system, session, reservation, launch_error_code(&error))?;
-        return Err(if cleanup_failed {
-            InitError::Cleanup
-        } else {
-            error
-        });
+        let error = launch_transaction_error(refusal);
+        let reply = send_observed_job_error(
+            system,
+            jobs,
+            session,
+            reservation,
+            launch_error_code(&error),
+        );
+        if cleanup_failed {
+            return Err(DispatchError::Fatal(InitError::Cleanup));
+        }
+        return match refusal {
+            // The client's doing, and answered as such: a session that sends
+            // a second launch while its first is still awaiting READY
+            // (`ERROR` code 5, invalid state), or more launches in flight
+            // than the arena holds (`ERROR` code 6, capacity; 9.5). The
+            // child is rolled back; the session stays.
+            LaunchTransactionError::Capacity | LaunchTransactionError::SessionBusy => {
+                reply?;
+                Ok(JobDispatchOutcome::Responded)
+            }
+            // The arena refusing a sequence the dispatcher itself produced.
+            LaunchTransactionError::Stale
+            | LaunchTransactionError::StageTransition
+            | LaunchTransactionError::ResourcesHeld
+            | LaunchTransactionError::ResourceIdentity
+            | LaunchTransactionError::Incomplete
+            | LaunchTransactionError::GenerationExhausted => Err(DispatchError::Fatal(error)),
+        };
     }
     Ok(JobDispatchOutcome::Constructed)
 }
@@ -795,11 +825,10 @@ pub(crate) fn park_constructed_launch(
     grant: EndpointGrant,
     scope: LaunchSessionScope,
     constructed: ConstructedLaunch,
-) -> Result<(), InitError> {
+) -> Result<(), LaunchTransactionError> {
     let token = jobs
         .launches
-        .open(grant, constructed.session, scope, constructed.reservation)
-        .map_err(launch_transaction_error)?;
+        .open(grant, constructed.session, scope, constructed.reservation)?;
     let record = || -> Result<(), LaunchTransactionError> {
         jobs.launches
             .attach_job(token, constructed.prepared.job_id())?;
@@ -826,7 +855,7 @@ pub(crate) fn park_constructed_launch(
         let _ = jobs.launches.advance(token, LaunchStage::Cleanup);
         let _ = jobs.launches.advance(token, LaunchStage::Complete);
         let _ = jobs.launches.close(token);
-        return Err(launch_transaction_error(error));
+        return Err(error);
     }
     Ok(())
 }
@@ -838,38 +867,37 @@ pub(crate) fn launch_transaction_error(error: LaunchTransactionError) -> InitErr
     match error {
         LaunchTransactionError::Capacity => InitError::Jobs(JobError::Capacity),
         LaunchTransactionError::SessionBusy => InitError::Jobs(JobError::WrongState),
-        _ => InitError::Accounting,
+        LaunchTransactionError::Stale
+        | LaunchTransactionError::StageTransition
+        | LaunchTransactionError::ResourcesHeld
+        | LaunchTransactionError::ResourceIdentity
+        | LaunchTransactionError::Incomplete
+        | LaunchTransactionError::GenerationExhausted => InitError::Accounting,
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn send_observed_job_error<S: ResidentPlatform>(
     system: &mut S,
+    jobs: &mut JobDispatcher,
     session: DwHandle,
     reservation: LaunchReservation,
     code: LaunchErrorCode,
-) -> Result<(), InitError> {
-    let mut response = [0_u8; 88];
-    let size =
-        encode_launch_error(reservation, code, &mut response).map_err(|_| InitError::Accounting)?;
-    system
-        .send_channel(session, &response[..size])
-        .map_err(InitError::Native)?;
-    Ok(())
+) -> Result<(), ReplyError> {
+    send_job_error(system, jobs, session, reservation, code)
 }
 
 pub(crate) fn send_shell_v1_error<S: InitPlatform>(
     system: &mut S,
+    jobs: &mut JobDispatcher,
     session: DwHandle,
     reservation: LaunchReservation,
     code: LaunchErrorCode,
-) -> Result<(), InitError> {
+) -> Result<(), ReplyError> {
     let mut response = [0_u8; wyrmroot_launch_proto::SHELL_V1_REPLY_BYTES];
     let size = encode_shell_v1_error_reply(reservation, code, &mut response)
-        .map_err(|_| InitError::Accounting)?;
-    system
-        .send_channel(session, &response[..size])
-        .map_err(InitError::Native)
+        .map_err(|_| ReplyError::Encode)?;
+    send_session_reply(system, jobs, session, &response[..size])
 }
 
 pub(crate) fn controller_result_to_wire(

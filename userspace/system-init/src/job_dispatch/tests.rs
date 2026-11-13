@@ -160,18 +160,23 @@ impl MockPlatform {
     }
 }
 
-struct InitSendLoader {
+pub(crate) struct InitSendLoader {
     next: u64,
     closed: [DwHandle; 32],
     close_count: usize,
     transferred_service: Option<DwHandle>,
-    sent_init: Vec<u8>,
+    pub(crate) sent_init: Vec<u8>,
     sent_transfers: Vec<DwHandleTransferV1>,
-    fail_init: bool,
+    pub(crate) fail_init: bool,
+    /// Every file-backed segment the loader was given to map, in order.
+    pub(crate) materialized: Vec<Vec<u8>>,
+    /// Where each created Process's TaskGroup is recorded, for a test whose
+    /// kernel and waits must agree on which children have been ended.
+    pub(crate) children: Option<super::isolation_tests::SharedChildren>,
 }
 
 impl InitSendLoader {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             next: 0x1000,
             closed: [DwHandle(0); 32],
@@ -180,6 +185,8 @@ impl InitSendLoader {
             sent_init: Vec::new(),
             sent_transfers: Vec::new(),
             fail_init: true,
+            materialized: Vec::new(),
+            children: None,
         }
     }
 
@@ -209,10 +216,17 @@ impl LoaderPlatform for InitSendLoader {
 
     fn process_create(
         &mut self,
-        _request: ProcessCreateRequest,
+        request: ProcessCreateRequest,
     ) -> Result<ProcessCreateResult, Self::Error> {
+        let process = self.handle();
+        if let Some(children) = &self.children {
+            children
+                .borrow_mut()
+                .group_of
+                .insert(process.0, request.task_group.0);
+        }
         Ok(ProcessCreateResult {
-            process: self.handle(),
+            process,
             root: self.handle(),
             child_bootstrap: self.handle(),
         })
@@ -228,8 +242,9 @@ impl LoaderPlatform for InitSendLoader {
         memory: DwHandle,
         object_size: u64,
         _destination_offset: u64,
-        _source: &[u8],
+        source: &[u8],
     ) -> Result<ParentMapping, Self::Error> {
+        self.materialized.push(source.to_vec());
         Ok(ParentMapping {
             address: 0x6000_0000 + memory.0 * 0x10_0000,
             bytes: object_size,
@@ -324,7 +339,7 @@ impl LoaderPlatform for InitSendLoader {
     }
 }
 
-fn executable() -> Vec<u8> {
+pub(crate) fn executable() -> Vec<u8> {
     let mut bytes = vec![0_u8; 0x2000];
     bytes[..4].copy_from_slice(b"\x7fELF");
     bytes[4] = 2;
@@ -445,7 +460,7 @@ impl InitPlatform for MockPlatform {
     }
 }
 
-struct TerminalWaits;
+pub(crate) struct TerminalWaits;
 
 impl SupervisionPlatform for TerminalWaits {
     type Error = NativeError;
@@ -832,7 +847,7 @@ fn shell_v1_receive_failure_retains_uncommitted_sender_handles() {
             DwHandle(90),
             owner,
         ),
-        Err(InitError::Native(FAILURE))
+        Err(DispatchError::Fatal(InitError::Native(FAILURE)))
     );
     assert_eq!(platform.inbound_handle_count, excess);
     assert_eq!(platform.close_count, 0);

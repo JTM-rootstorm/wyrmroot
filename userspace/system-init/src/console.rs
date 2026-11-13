@@ -91,12 +91,28 @@ pub(crate) fn reconcile_job_dispatcher_outcome(
     state: &mut ConsoleState,
     outcome: JobDispatcherPollOutcome,
 ) -> Result<Option<PollOutcome>, InitError> {
-    let JobDispatcherPollOutcome::SessionClosed {
-        grant,
-        scope: LaunchSessionScope::ConsoleLauncher,
-    } = outcome
-    else {
-        return Ok(None);
+    // The console launcher's session ended, by its peer closing or by its
+    // own fault; the dispatcher has released the console either way. A
+    // shell's job session ending changes nothing the console state tracks.
+    let grant = match outcome {
+        JobDispatcherPollOutcome::SessionClosed {
+            grant,
+            scope: LaunchSessionScope::ConsoleLauncher,
+        }
+        | JobDispatcherPollOutcome::SessionFaulted {
+            grant,
+            scope: LaunchSessionScope::ConsoleLauncher,
+            cause: _,
+        } => grant,
+        JobDispatcherPollOutcome::Stable
+        | JobDispatcherPollOutcome::SessionClosed {
+            scope: LaunchSessionScope::ShellJobs,
+            ..
+        }
+        | JobDispatcherPollOutcome::SessionFaulted {
+            scope: LaunchSessionScope::ShellJobs,
+            ..
+        } => return Ok(None),
     };
     let peer = state.console.ok_or(InitError::AbsentState(0x80))?;
     if peer.grant != grant {
@@ -265,6 +281,15 @@ where
         registry.control_channel,
         &mut state.topology,
     )
+}
+
+/// The job dispatcher of the session this supervisor serves, if it has one.
+pub(super) fn session_jobs(resident: &mut ResidentSystemInit) -> Option<&mut JobDispatcher> {
+    resident
+        .product
+        .as_mut()
+        .and_then(|state| state.session.as_mut())
+        .map(|session| &mut session.jobs)
 }
 
 pub(super) fn registry_recovery_required(resident: &ResidentSystemInit) -> bool {
@@ -884,7 +909,24 @@ where
                 };
             }
         };
-        if let Some(outcome) = reconcile_job_dispatcher_outcome(session, dispatcher_outcome)? {
+        // Whether any session was retired for its client's fault, whichever
+        // retirement the outcome names.
+        let faulted = dispatcher_outcome.fault.is_some();
+        let reconciled = reconcile_job_dispatcher_outcome(session, dispatcher_outcome.outcome)?;
+        // A session retired for its client's fault used to reach here as an
+        // error, and with the registry poisoned an error is a recovery. The
+        // session is gone either way; the poisoned registry still is not.
+        if faulted
+            && matches!(
+                session.shell.health(),
+                crate::ShellRegistryHealth::Poisoned { .. }
+            )
+        {
+            return Ok(PollOutcome::RecoverRegistry(
+                crate::abandoned::phase::DISPATCHER_POISONED,
+            ));
+        }
+        if let Some(outcome) = reconciled {
             return Ok(outcome);
         }
     }
