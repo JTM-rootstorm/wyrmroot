@@ -444,6 +444,7 @@ impl Volume {
             held: [0; crate::MAX_HELD],
             held_len: 0,
             orphans_pending: false,
+            free_room: usize::MAX,
         }
     }
 

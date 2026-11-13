@@ -1454,3 +1454,67 @@ fn a_file_this_role_cannot_free_is_not_supported_open_or_closed() {
     // The volume still takes changes.
     assert_eq!(fs.open(root, CREATE, b"new").1, Status::Ok);
 }
+
+/// Shortens the journal of `image` (4 KiB blocks, v3 checksums) to
+/// `blocks`, found by its superblock's magic and block type.
+fn shorten_journal(image: &mut [u8], blocks: u32) {
+    use wyrmroot_ext4::crc;
+    let at = (0..image.len())
+        .step_by(4096)
+        .find(|&at| image[at..at + 8] == [0xC0, 0x3B, 0x39, 0x98, 0, 0, 0, 4])
+        .expect("a journal superblock");
+    let sb = &mut image[at..at + 1024];
+    sb[0x10..0x14].copy_from_slice(&blocks.to_be_bytes());
+    let sum = crc::update(!0, &sb[..0xFC]);
+    let sum = crc::update_zeros(sum, 4);
+    let sum = crc::update(sum, &sb[0x100..]);
+    sb[0xFC..0x100].copy_from_slice(&sum.to_be_bytes());
+}
+
+#[test]
+fn a_journal_too_small_to_free_an_orphan_keeps_names_and_leaves_orphans() {
+    // A transaction of this journal holds fewer blocks than one freeing
+    // step may write, so no unlinked file could ever be freed.
+    let mut image = image_with_journal(1024);
+    shorten_journal(&mut image, 16);
+    let mut fs = journaled_fs(image);
+    let root = fs.root;
+    let (etc, _, _) = fs.open(root, OPEN_READ | OPEN_WRITE, b"etc");
+    let (motd, status, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    assert_eq!(status, Status::Ok);
+    assert_eq!(
+        fs.status(etc, Body::Unlink { name: b"motd" }).0,
+        Status::Busy
+    );
+    assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+    assert_eq!(fs.on_disk(b"etc/motd").unwrap(), b"welcome\n");
+    assert_eq!(fs.counts().first_orphan, 0);
+    // Closed, it goes as any file does, and the volume still takes changes.
+    fs.send_close(motd);
+    assert_eq!(fs.status(etc, Body::Unlink { name: b"motd" }).0, Status::Ok);
+    assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+    assert_eq!(fs.on_disk(b"etc/motd"), None);
+
+    // An orphan list on such a volume: the role starts, the volume is
+    // read-only, and the list is as it was found.
+    let mut image = image_with_journal(1024);
+    let orphan = {
+        let mut device = Image(&mut image);
+        let mut volume = Volume::mount(&mut device, IMAGE_BYTES as u64, true).unwrap();
+        let stat = volume
+            .resolve(&mut device, ROOT_INODE, b"etc/motd")
+            .unwrap();
+        let etc = volume.resolve(&mut device, ROOT_INODE, b"etc").unwrap();
+        volume.unlink_held(&mut device, etc.inode, b"motd").unwrap();
+        stat.inode
+    };
+    shorten_journal(&mut image, 16);
+    let before = counts_of(&image);
+    assert_eq!(before.first_orphan, orphan);
+    let mut fs = journaled_fs(image);
+    let root = fs.root;
+    assert_eq!(fs.open(root, CREATE, b"new").1, Status::ReadOnly);
+    assert_eq!(fs.list(root).len(), 2);
+    fs.server.retire(&mut fs.world);
+    assert_eq!(fs.counts(), before);
+}

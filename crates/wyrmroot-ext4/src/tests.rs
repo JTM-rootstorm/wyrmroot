@@ -1130,3 +1130,25 @@ fn an_unlink_that_fails_after_its_first_write_stops_the_volume() {
         assert!(failures >= 3, "only {failures} writes could fail");
     }
 }
+
+#[test]
+fn a_volume_without_room_to_free_an_orphan_keeps_none() {
+    let (mut disk, mut volume) = formatted(4096);
+    volume
+        .create(&mut disk, ROOT_INODE, b"file", Kind::File)
+        .unwrap();
+    volume.set_free_room(MIN_FREE_ROOM - 1);
+    assert!(!volume.frees_orphans() && !volume.keeps_unlinked());
+    let before = disk.bytes.clone();
+    assert_eq!(
+        volume.unlink_held(&mut disk, ROOT_INODE, b"file"),
+        Err(Error::Busy)
+    );
+    assert_eq!(disk.bytes, before);
+    assert!(!volume.read_only());
+    // With room for one step it is kept; with none asked for, it is freed.
+    volume.set_free_room(MIN_FREE_ROOM);
+    assert!(volume.keeps_unlinked());
+    volume.set_free_room(0);
+    volume.unlink(&mut disk, ROOT_INODE, b"file").unwrap();
+}

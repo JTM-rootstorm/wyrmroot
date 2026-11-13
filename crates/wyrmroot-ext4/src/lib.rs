@@ -347,6 +347,9 @@ pub struct Volume {
     /// The mount found an orphan list; nothing changes until
     /// [`Volume::recover_orphan`] has emptied it.
     pub(crate) orphans_pending: bool,
+    /// The metadata blocks one freeing step may write
+    /// ([`Volume::set_free_room`]).
+    pub(crate) free_room: usize,
 }
 
 impl Volume {
@@ -499,6 +502,7 @@ impl Volume {
             held: [0; MAX_HELD],
             held_len: 0,
             orphans_pending: writable && orphans,
+            free_room: usize::MAX,
         };
         let root = volume.inode(device, ROOT_INODE)?;
         if root.kind() != Some(Kind::Directory) {

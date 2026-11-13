@@ -72,11 +72,27 @@ impl Volume {
         self.held().contains(&inode)
     }
 
+    /// Tells the volume how many metadata blocks one change may write: a
+    /// journaling caller's transaction limit. Unlimited by default, as it
+    /// is without a journal, where every write goes straight to the device.
+    /// Below [`MIN_FREE_ROOM`] no orphan could ever be freed, so
+    /// [`Volume::unlink_held`] keeps none ([`Error::Busy`]).
+    pub fn set_free_room(&mut self, room: usize) {
+        self.free_room = room;
+    }
+
+    /// Whether an orphan can be freed in the room the volume was given
+    /// ([`Volume::set_free_room`]).
+    pub fn frees_orphans(&self) -> bool {
+        self.free_room >= MIN_FREE_ROOM
+    }
+
     /// Whether [`Volume::unlink_held`] can keep one more node: the volume
-    /// takes changes, has no orphan file, and holds fewer than
-    /// [`MAX_HELD`].
+    /// takes changes, has no orphan file, has room to free an orphan, and
+    /// holds fewer than [`MAX_HELD`].
     pub fn keeps_unlinked(&self) -> bool {
         self.require_writable().is_ok()
+            && self.frees_orphans()
             && get32(&self.sb, 0x5C) & COMPAT_ORPHAN_FILE == 0
             && self.held_len < MAX_HELD
     }

@@ -34,8 +34,10 @@
 //! removes the name, so if this role dies first the next start frees it
 //! before it serves anything. UNLINK still answers BUSY for a directory that
 //! is open (the root always is), and for an open file's last name on a
-//! volume with an orphan file (`orphan_file`), which this role gives no
-//! orphans. An unlinked file is freed in steps that each fit one
+//! volume with an orphan file (`orphan_file`) or a journal too small to
+//! free one in (a transaction under `wyrmroot_ext4::MIN_FREE_ROOM` blocks),
+//! which this role gives no orphans; an orphan list found on the latter is
+//! left untouched and the volume read-only. An unlinked file is freed in steps that each fit one
 //! transaction, the file staying on the orphan list until the last, so a
 //! large one cannot overflow the journal. A failure while freeing one, at
 //! its last close or at start, or an UNLINK that fails after its first
@@ -520,6 +522,13 @@ impl<V: View> Server<V> {
             None => None,
         };
         let filesystem = filesystem_identity(volume.uuid());
+        // What one freeing step may write: a transaction, or without a
+        // journal anything, each write going straight to the device. In
+        // less than one step's room no unlinked file could be freed, so
+        // none is kept (UNLINK of an open file's last name is BUSY).
+        if let Some((_, transaction)) = &journal {
+            volume.set_free_room(transaction.limit());
+        }
         let mut server = Self {
             launch,
             root,
@@ -544,6 +553,12 @@ impl<V: View> Server<V> {
     /// cannot be processed leaves the volume read-only, as it was found.
     fn recover_orphans<P: Ext4Platform>(&mut self, platform: &mut P) {
         if !self.volume.orphans_pending() {
+            return;
+        }
+        // A journal too small for one freeing step: the list is left as it
+        // was found, for Linux or e2fsck, and nothing changes.
+        if !self.volume.frees_orphans() {
+            self.volume.set_read_only();
             return;
         }
         while self.volume.orphans_pending() {
