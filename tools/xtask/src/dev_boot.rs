@@ -15,7 +15,9 @@
 //! `lost+found`) is mounted there; lists `/boot/EFI/WYRMROOT` and `cat`s its
 //! README through vfsd, fat32d and blockmgr; spawns two `bin/cpu-hog` jobs,
 //! which hold their own FP registers and FS base while they preempt each
-//! other; runs `bin/hello` (a shell job under its TaskGroup limits) and the
+//! other; runs `bin/hello` with its on-demand MemoryObject probe, which must
+//! pass and then end in `resource-policy` once its page quota is spent
+//! (Deepwyrm DW2 M6); runs `bin/hello` (a shell job under its TaskGroup limits) and the
 //! same ELF from the ESP to their output and the next prompt (with `--sdk`,
 //! also the SDK's programs); terminates the hogs and requires each to have
 //! been still running; then writes a
@@ -315,6 +317,14 @@ fn first_boot(shell: &mut Shell<'_>, token: &str, sdk: bool) -> Result<(), Failu
         spawn_job(shell, "bin/cpu-hog")?,
     ];
     shell.expect("run bin/hello", JOB_OUTPUT)?;
+    // An on-demand MemoryObject end to end (Deepwyrm DW2 M6): served page
+    // faults, a syscall filling a page in, a commit; then a touch with the
+    // job's page quota spent, which must end the job, not the system.
+    run_sdk(shell, &[("run bin/hello on-demand", b"on-demand ok")])?;
+    shell.expect(
+        "run bin/hello on-demand-exhaust",
+        b"classification=resource-policy",
+    )?;
     // The same `hello` from the ESP: init reads the ELF through vfsd and
     // fat32d instead of bootfs.
     shell.expect("run /boot/EFI/WYRMROOT/HELLO.ELF", JOB_OUTPUT)?;
@@ -537,13 +547,12 @@ fn record_cpu_state(socket: &Path, output: &Path) {
             state.extend_from_slice(&buffer[..read]);
         }
     };
-    let send = |monitor: &mut std::os::unix::net::UnixStream,
-                    state: &mut Vec<u8>,
-                    command: &str| {
-        let sent = monitor.write_all(format!("{command}\n").as_bytes()).is_ok();
-        read_all(monitor, state);
-        sent
-    };
+    let send =
+        |monitor: &mut std::os::unix::net::UnixStream, state: &mut Vec<u8>, command: &str| {
+            let sent = monitor.write_all(format!("{command}\n").as_bytes()).is_ok();
+            read_all(monitor, state);
+            sent
+        };
     read_all(&mut monitor, &mut state);
     for command in [
         "stop",

@@ -165,6 +165,17 @@ pub fn run_stream_hello<System: StreamHelloSystem>(
     system: &mut System,
     bootstrap_channel: DwHandle,
 ) -> Result<(), HelloError> {
+    run_stream_hello_with(system, bootstrap_channel, None)
+}
+
+/// [`run_stream_hello`], and when `probe` is given, runs it with the job's
+/// own AddressRegion before letting that go and writes the line it returns
+/// after the greeting (`run bin/hello on-demand`, Deepwyrm DW2 M6).
+pub fn run_stream_hello_with<System: StreamHelloSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+    mut probe: Option<&mut dyn FnMut(DwHandle) -> &'static [u8]>,
+) -> Result<(), HelloError> {
     let channel = system
         .query_capability_info(bootstrap_channel)
         .map_err(|cause| HelloError::Native {
@@ -189,7 +200,8 @@ pub fn run_stream_hello<System: StreamHelloSystem>(
     let streams = extract_job_v2_streams(&init[..counts.bytes], &handles[..counts.handles])
         .map_err(HelloError::StreamLaunch)?;
     // Hello maps nothing and opens no paths, so its self root and any
-    // namespace go at once.
+    // namespace go at once, after the probe if there is one.
+    let probed = probe.as_mut().map(|probe| probe(streams.self_root));
     for handle in core::iter::once(streams.self_root).chain(streams.namespace) {
         system
             .close_handle(handle)
@@ -203,6 +215,11 @@ pub fn run_stream_hello<System: StreamHelloSystem>(
         .write(system, b"hello from native stdout\n")
         .map_err(HelloError::Stream)?
         != 25
+    {
+        return Err(HelloError::Stream(StreamError::Protocol));
+    }
+    if let Some(line) = probed
+        && stdout.write(system, line).map_err(HelloError::Stream)? != line.len()
     {
         return Err(HelloError::Stream(StreamError::Protocol));
     }

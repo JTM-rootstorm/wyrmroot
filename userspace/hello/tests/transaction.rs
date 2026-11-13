@@ -5,7 +5,7 @@ use deepwyrm_syscall::{
 };
 use wyrmroot_hello::{
     HelloError, HelloNativeOperation, HelloSystem, JobHelloSystem, run_hello, run_job_hello,
-    run_stream_hello,
+    run_stream_hello, run_stream_hello_with,
 };
 use wyrmroot_loader::launch::{LaunchProfile, encode_init, parse_ready, parse_ready_for_profile};
 use wyrmroot_runtime::{
@@ -353,6 +353,43 @@ fn stream_hello_uses_only_a_validated_native_stdout_record() {
             "close-bootstrap",
         ]
     );
+}
+
+/// `run bin/hello on-demand` (Deepwyrm DW2 M6): the probe runs with the
+/// job's own self root before hello lets it go, and its line follows the
+/// greeting on stdout.
+#[test]
+fn stream_hello_runs_its_probe_with_the_self_root_then_writes_its_line() {
+    let mut fixture = StreamFixture::new();
+    let mut seen = None;
+    let mut probe = |region: DwHandle| {
+        seen = Some(region);
+        b"on-demand ok\n".as_slice()
+    };
+    assert_eq!(
+        run_stream_hello_with(&mut fixture, CHANNEL, Some(&mut probe)),
+        Ok(())
+    );
+    assert_eq!(seen, Some(ROOT));
+    let payloads: Vec<_> = fixture
+        .sent
+        .iter()
+        .take(2)
+        .map(|record| {
+            wyrmroot_stream_proto::decode_data(record)
+                .unwrap()
+                .payload()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(
+        payloads,
+        [
+            b"hello from native stdout\n".to_vec(),
+            b"on-demand ok\n".to_vec()
+        ]
+    );
+    assert_eq!(fixture.closed[0], ROOT);
 }
 
 #[test]

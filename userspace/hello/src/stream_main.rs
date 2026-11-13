@@ -4,7 +4,7 @@
 
 use core::panic::PanicInfo;
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
-use wyrmroot_hello::{HelloSystem, JobHelloSystem, run_stream_hello};
+use wyrmroot_hello::{HelloSystem, JobHelloSystem, run_stream_hello_with};
 use wyrmroot_loader as _;
 use wyrmroot_runtime::{
     CapabilityInfo, NativeError, ReceiveCounts, StartupBlock, StreamSystem, close_handle,
@@ -70,8 +70,141 @@ impl StreamSystem for NativeSystem {
 }
 fn hello_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
-    run_stream_hello(&mut system, startup.bootstrap_channel().as_abi())
+    let mode = (startup.argc() >= 2)
+        .then(|| startup.arg(1).map(|argument| argument.as_str()))
+        .flatten();
+    let mut probe = |region: DwHandle| on_demand::probe(region, mode == Some("on-demand-exhaust"));
+    let probe: Option<&mut dyn FnMut(DwHandle) -> &'static [u8]> = match mode {
+        Some("on-demand" | "on-demand-exhaust") => Some(&mut probe),
+        _ => None,
+    };
+    run_stream_hello_with(&mut system, startup.bootstrap_channel().as_abi(), probe)
         .map_or_else(|error| error.exit_code(), |_| 0)
+}
+
+/// `run bin/hello on-demand`: exercises an on-demand MemoryObject end to
+/// end in a real job (Deepwyrm DW2 M6 §8.7 step 5). It creates and maps a
+/// 64 MiB object, larger than the job's whole page budget, touches pages
+/// across it (each a served page fault), reads untouched ones as zero, has
+/// a syscall write into a page never touched (the fill-in phase), and
+/// commits a page. With `on-demand-exhaust` it then spends the job's page
+/// quota and touches one more page, which ends the job with
+/// `DW_TERMINATION_RESOURCE_POLICY`. The line it returns names the first
+/// step that failed.
+#[allow(
+    unsafe_code,
+    reason = "reads and writes the probe's own fresh mapping through raw pointers"
+)]
+mod on_demand {
+    use deepwyrm_syscall::{
+        DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
+        DW_CLOCK_MONOTONIC_ACTIVE, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND,
+        DW_MEMORY_PROTECTION_READ, DW_MEMORY_PROTECTION_WRITE, DW_RIGHT_INSPECT, DW_RIGHT_MAP,
+        DW_RIGHT_READ, DW_RIGHT_WRITE, DW_STATUS_NO_RESOURCES, DW_STATUS_SUCCESS,
+        DwAddressRegionMapArgsV1, DwHandle, DwMemoryObjectInfoV1, DwMemoryProtection, DwOffset,
+        DwRights, DwSize, DwUserAddress,
+    };
+
+    const MIB: u64 = 1 << 20;
+    const SIZE: u64 = 64 * MIB;
+    const MARK: u64 = 0x4f4e_2d44_454d_414e;
+
+    fn read(address: u64) -> u64 {
+        // SAFETY: `address` is an aligned word of the probe's own mapping.
+        unsafe { core::ptr::read_volatile(address as *const u64) }
+    }
+
+    fn write(address: u64, value: u64) {
+        // SAFETY: as for `read`; the mapping is read-write.
+        unsafe { core::ptr::write_volatile(address as *mut u64, value) }
+    }
+
+    pub(super) fn probe(region: DwHandle, exhaust: bool) -> &'static [u8] {
+        let mut object = DwHandle(0);
+        let rights =
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0);
+        if deepwyrm_syscall::memory_object_create(
+            DwSize(SIZE),
+            DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND,
+            rights,
+            &mut object,
+        ) != DW_STATUS_SUCCESS
+        {
+            return b"on-demand failed: create\n";
+        }
+        let mut info = DwMemoryObjectInfoV1::default();
+        let mut required = 0;
+        if deepwyrm_syscall::object_get_memory_object_info_v1(object, &mut info, &mut required)
+            != DW_STATUS_SUCCESS
+            || info.flags != DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND
+            || info.byte_size != SIZE
+        {
+            return b"on-demand failed: info\n";
+        }
+        let args = DwAddressRegionMapArgsV1 {
+            size: DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE,
+            version: DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
+            memory_object_offset: DwOffset(0),
+            byte_len: DwSize(SIZE),
+            protections: DwMemoryProtection(
+                DW_MEMORY_PROTECTION_READ.0 | DW_MEMORY_PROTECTION_WRITE.0,
+            ),
+            ..DwAddressRegionMapArgsV1::default()
+        };
+        let mut at = DwUserAddress(0);
+        if deepwyrm_syscall::address_region_map(region, object, &args, &mut at) != DW_STATUS_SUCCESS
+        {
+            return b"on-demand failed: map\n";
+        }
+        let base = at.0;
+        // A read fault, then writes past the first 16 MiB and at the end.
+        if read(base) != 0 {
+            return b"on-demand failed: first read\n";
+        }
+        write(base + 40 * MIB + 8, MARK);
+        write(base + SIZE - 8, !MARK);
+        if read(base + 40 * MIB + 8) != MARK
+            || read(base + SIZE - 8) != !MARK
+            || read(base + 40 * MIB + 4096) != 0
+            || read(base + 8) != 0
+        {
+            return b"on-demand failed: touch\n";
+        }
+        // A syscall writes into a page nothing has touched.
+        let out = base + 20 * MIB;
+        // SAFETY: an aligned word of the probe's own read-write mapping.
+        let nanoseconds = unsafe { &mut *(out as *mut u64) };
+        if deepwyrm_syscall::clock_get(DW_CLOCK_MONOTONIC_ACTIVE.0, nanoseconds)
+            != DW_STATUS_SUCCESS
+            || read(out) == 0
+        {
+            return b"on-demand failed: fill-in\n";
+        }
+        if deepwyrm_syscall::memory_object_commit(object, DwOffset(30 * MIB), DwSize(4096))
+            != DW_STATUS_SUCCESS
+            || read(base + 30 * MIB) != 0
+        {
+            return b"on-demand failed: commit\n";
+        }
+        if exhaust {
+            // The whole object is four times the job's page budget.
+            if deepwyrm_syscall::memory_object_commit(object, DwOffset(0), DwSize(SIZE))
+                != DW_STATUS_NO_RESOURCES
+            {
+                return b"on-demand failed: commit past the quota\n";
+            }
+            // Untouched and past what the commit reached: this fault ends
+            // the job.
+            write(base + 50 * MIB, MARK);
+            return b"on-demand failed: survived an exhausted touch\n";
+        }
+        if deepwyrm_syscall::address_region_unmap(region, at, DwSize(SIZE)) != DW_STATUS_SUCCESS
+            || deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS
+        {
+            return b"on-demand failed: teardown\n";
+        }
+        b"on-demand ok\n"
+    }
 }
 wyrmroot_runtime::native_entry!(crate::hello_main);
 #[panic_handler]
