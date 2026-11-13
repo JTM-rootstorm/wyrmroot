@@ -407,13 +407,9 @@ fn directories_are_made_listed_and_removed() {
         },
     );
     assert_eq!(fs.list(dir), [(Kind::File, String::from("a.txt"))]);
-    // Both are open, so both stay.
+    // An open directory stays, empty or not.
     assert_eq!(
         fs.status(root, Body::Unlink { name: b"home" }).0,
-        Status::Busy
-    );
-    assert_eq!(
-        fs.status(dir, Body::Unlink { name: b"a.txt" }).0,
         Status::Busy
     );
     fs.world.close_handle(inner).unwrap();
@@ -423,6 +419,10 @@ fn directories_are_made_listed_and_removed() {
         Status::Ok
     );
     assert_eq!(fs.on_disk(b"home/a.txt"), None);
+    assert_eq!(
+        fs.status(root, Body::Unlink { name: b"home" }).0,
+        Status::Busy
+    );
     fs.world.close_handle(dir).unwrap();
     fs.step();
     assert_eq!(
@@ -893,14 +893,18 @@ fn a_request_after_a_close_sees_the_close() {
         .0,
         Status::Ok
     );
-    // A node that is still open is still BUSY.
-    let (open, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
-    let (etc, _, _) = fs.open(root, OPEN_READ | OPEN_WRITE, b"etc");
+    // A directory that is still open is still BUSY.
+    let (home, status, _) = fs.open(
+        root,
+        OPEN_READ | OPEN_WRITE | OPEN_DIRECTORY | OPEN_CREATE,
+        b"home",
+    );
+    assert_eq!(status, Status::Ok);
     assert_eq!(
-        fs.status(etc, Body::Unlink { name: b"motd" }).0,
+        fs.status(root, Body::Unlink { name: b"home" }).0,
         Status::Busy
     );
-    let _ = open;
+    let _ = home;
 }
 
 impl Fs {
@@ -1057,4 +1061,460 @@ fn close_ends_a_node_whose_lock_is_waiting() {
     // The holder's unlock grants nothing to the closed waiter.
     let unlock = fs.lock_send(holder, lock(0, 0, LockMode::Unlock), 0);
     assert_eq!(fs.answer(holder, unlock).0, Status::Ok);
+}
+
+// Open nodes outlive their names (platform conventions 5.3).
+
+fn journaled_fs(image: Vec<u8>) -> Fs {
+    let (world, disk, launched, root, server) = start(image);
+    Fs {
+        world,
+        disk,
+        launched,
+        server: server.unwrap_or_else(|step| panic!("ext4d did not start: {step}")),
+        root,
+        transaction: 1,
+    }
+}
+
+/// What a volume's superblock says is free, and the first inode on its
+/// orphan list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Counts {
+    free_blocks: u64,
+    free_inodes: u32,
+    first_orphan: u32,
+}
+
+/// `image` as a crash now would leave it (the journal replayed on a copy).
+fn counts_of(image: &[u8]) -> Counts {
+    let mut bytes = image.to_vec();
+    let mut image = Image(&mut bytes);
+    wyrmroot_ext4::recover(&mut image, IMAGE_BYTES as u64).unwrap();
+    let volume = Volume::mount(&mut image, IMAGE_BYTES as u64, false).unwrap();
+    let word = |at: usize| u32::from_le_bytes(bytes[1024 + at..1024 + at + 4].try_into().unwrap());
+    Counts {
+        free_blocks: volume.usage().free_blocks,
+        free_inodes: word(0x10),
+        first_orphan: word(0xE8),
+    }
+}
+
+impl Fs {
+    fn counts(&self) -> Counts {
+        counts_of(&self.disk.borrow().image)
+    }
+
+    fn free_bytes(&mut self) -> u64 {
+        let root = self.root;
+        let reply = self.request(root, Body::QueryFilesystem);
+        let Body::FsInfo(info) = node::parse(&reply, 0).unwrap().body else {
+            panic!("expected FS_INFO")
+        };
+        info.free_bytes
+    }
+
+    fn attr(&mut self, channel: DwHandle) -> Attr {
+        let reply = self.request(channel, Body::GetAttr);
+        match node::parse(&reply, 0).unwrap().body {
+            Body::Attr(attr) => attr,
+            other => panic!("expected ATTR, got {other:?}"),
+        }
+    }
+
+    fn write_all(&mut self, file: DwHandle, offset: u64, data: &[u8]) {
+        for (index, chunk) in data.chunks(MAX_IO_BYTES).enumerate() {
+            assert_eq!(
+                self.status(
+                    file,
+                    Body::Write {
+                        offset: offset + (index * MAX_IO_BYTES) as u64,
+                        data: chunk,
+                    },
+                ),
+                (Status::Ok, chunk.len() as u64)
+            );
+        }
+    }
+}
+
+const CREATE: u32 = OPEN_READ | OPEN_WRITE | OPEN_FILE | OPEN_CREATE;
+
+#[test]
+fn a_file_unlinked_while_open_lives_until_its_last_close() {
+    for journal_blocks in [0, 1024] {
+        let mut fs = journaled_fs(image_with_journal(journal_blocks));
+        let root = fs.root;
+        assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+        let before = fs.counts();
+        let free = fs.free_bytes();
+
+        let (writer, status, attr) = fs.open(root, CREATE, b"temp");
+        assert_eq!(status, Status::Ok);
+        let id = attr.unwrap().id;
+        let data = pattern(20_000);
+        fs.write_all(writer, 0, &data);
+        let (reader, status, _) = fs.open(root, OPEN_READ, b"temp");
+        assert_eq!(status, Status::Ok);
+
+        // The name goes at once, and durably with the next commit.
+        assert_eq!(
+            fs.status(root, Body::Unlink { name: b"temp" }).0,
+            Status::Ok
+        );
+        assert!(!fs.list(root).iter().any(|(_, name)| name == "temp"));
+        assert_eq!(fs.open(root, OPEN_READ, b"temp").1, Status::NotFound);
+        assert_eq!(
+            fs.status(root, Body::Unlink { name: b"temp" }).0,
+            Status::NotFound
+        );
+        assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+        assert_eq!(fs.on_disk(b"temp"), None);
+        let held = fs.counts();
+        assert_eq!(u64::from(held.first_orphan), id);
+        assert_eq!(held.free_inodes, before.free_inodes - 1);
+        assert!(fs.free_bytes() < free);
+
+        // Both handles go on as before.
+        let attr = fs.attr(writer);
+        assert_eq!((attr.id, attr.size, attr.kind), (id, 20_000, Kind::File));
+        assert_eq!(fs.read_all(reader), data);
+        fs.write_all(writer, 20_000, &data);
+        assert_eq!(fs.attr(reader).size, 40_000);
+        assert_eq!(
+            fs.status(writer, Body::Truncate { size: 30_000 }).0,
+            Status::Ok
+        );
+        let mut expected = data.clone();
+        expected.extend_from_slice(&data[..10_000]);
+        assert_eq!(fs.read_all(reader), expected);
+        // The file opened again through its own handle is the same file.
+        let (again, status, attr) = fs.open(reader, OPEN_READ, b"");
+        assert_eq!((status, attr.unwrap().id), (Status::Ok, id));
+
+        // The name is free for another file.
+        let (other, status, attr) = fs.open(root, CREATE | OPEN_EXCLUSIVE, b"temp");
+        assert_eq!(status, Status::Ok);
+        assert_ne!(attr.unwrap().id, id);
+        fs.write_all(other, 0, b"another");
+        assert_eq!(fs.read_all(reader), expected);
+
+        // Not the first close, nor the second: the last.
+        fs.send_close(writer);
+        assert_eq!(fs.read_all(reader), expected);
+        fs.world.close_handle(reader).unwrap();
+        fs.step();
+        assert_eq!(fs.read_all(again), expected);
+        assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+        assert_eq!(u64::from(fs.counts().first_orphan), id);
+        fs.send_close(again);
+        assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+        let closed = fs.counts();
+        assert_eq!(
+            (closed.first_orphan, closed.free_inodes),
+            (0, before.free_inodes - 1)
+        );
+        assert_eq!(fs.on_disk(b"temp").as_deref(), Some(&b"another"[..]));
+
+        // The second file goes the same way, and everything is free again.
+        assert_eq!(
+            fs.status(root, Body::Unlink { name: b"temp" }).0,
+            Status::Ok
+        );
+        assert_eq!(fs.read_all(other), b"another");
+        fs.send_close(other);
+        assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+        assert_eq!(fs.counts(), before);
+        assert_eq!(fs.free_bytes(), free);
+    }
+}
+
+#[test]
+fn a_file_whose_handles_are_closed_is_freed_with_its_name() {
+    // The control for the test above: with no handle left nothing is kept.
+    let mut fs = journaled_fs(image_with_journal(1024));
+    let root = fs.root;
+    assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+    let before = fs.counts();
+    let (file, status, _) = fs.open(root, CREATE, b"temp");
+    assert_eq!(status, Status::Ok);
+    fs.write_all(file, 0, &pattern(20_000));
+    fs.send_close(file);
+    assert_eq!(
+        fs.status(root, Body::Unlink { name: b"temp" }).0,
+        Status::Ok
+    );
+    assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+    assert_eq!(fs.counts(), before);
+}
+
+#[test]
+fn a_start_frees_the_files_a_dead_server_left_unlinked() {
+    let mut fs = journaled_fs(image_with_journal(1024));
+    let root = fs.root;
+    assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+    let before = fs.counts();
+    let free = fs.free_bytes();
+    let mut open = Vec::new();
+    for name in [&b"one"[..], b"two", b"three"] {
+        let (file, status, _) = fs.open(root, CREATE, name);
+        assert_eq!(status, Status::Ok);
+        fs.write_all(file, 0, &pattern(30_000));
+        assert_eq!(fs.status(root, Body::Unlink { name }).0, Status::Ok);
+        fs.write_all(file, 30_000, &pattern(5000));
+        open.push(file);
+    }
+    assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+    // The server dies here with all three open: what the disk holds now is
+    // what the next one finds.
+    let crashed = fs.disk.borrow().image.clone();
+    let left = counts_of(&crashed);
+    assert_ne!(left.first_orphan, 0);
+    assert_eq!(left.free_inodes, before.free_inodes - 3);
+    assert!(left.free_blocks < before.free_blocks);
+
+    let mut next = journaled_fs(crashed.clone());
+    let root = next.root;
+    assert_eq!(next.free_bytes(), free);
+    assert_eq!(next.counts(), before);
+    assert_eq!(next.list(root).len(), 2);
+    // It takes changes, and holds unlinked files again.
+    let (file, status, _) = next.open(root, CREATE, b"one");
+    assert_eq!(status, Status::Ok);
+    next.write_all(file, 0, b"new");
+    assert_eq!(
+        next.status(root, Body::Unlink { name: b"one" }).0,
+        Status::Ok
+    );
+    assert_eq!(next.read_all(file), b"new");
+    // Init retires the role with the file still open: nothing is left.
+    next.server.retire(&mut next.world);
+    let mut bytes = next.disk.borrow().image.clone();
+    assert_eq!(
+        wyrmroot_ext4::recover(&mut Image(&mut bytes), IMAGE_BYTES as u64),
+        Ok(false)
+    );
+    assert_eq!(counts_of(&bytes), before);
+
+    // A crash before the unlinks commit leaves the files named.
+    let mut fs = journaled_fs(image_with_journal(1024));
+    let root = fs.root;
+    let (file, status, _) = fs.open(root, CREATE, b"named");
+    assert_eq!(status, Status::Ok);
+    fs.write_all(file, 0, &pattern(9000));
+    assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+    assert_eq!(
+        fs.status(root, Body::Unlink { name: b"named" }).0,
+        Status::Ok
+    );
+    let crashed = fs.disk.borrow().image.clone();
+    let mut next = journaled_fs(crashed);
+    let root = next.root;
+    let (named, status, _) = next.open(root, OPEN_READ, b"named");
+    assert_eq!(status, Status::Ok);
+    assert_eq!(next.read_all(named), pattern(9000));
+}
+
+/// Sets superblock word `at` of `image`, with the superblock's checksum.
+fn patch_superblock(image: &mut [u8], at: usize, value: u32) {
+    let sb = &mut image[1024..2048];
+    sb[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    let sum = wyrmroot_ext4::crc::update(!0, &sb[..0x3FC]);
+    sb[0x3FC..].copy_from_slice(&sum.to_le_bytes());
+}
+
+#[test]
+fn a_volume_with_an_orphan_file_keeps_an_open_file_s_name() {
+    let mut image = ext4_image();
+    let compat = u32::from_le_bytes(image[1024 + 0x5C..1024 + 0x60].try_into().unwrap());
+    patch_superblock(&mut image, 0x5C, compat | 0x1000);
+    let mut fs = journaled_fs(image);
+    let root = fs.root;
+    let (etc, _, _) = fs.open(root, OPEN_READ | OPEN_WRITE, b"etc");
+    let (motd, status, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    assert_eq!(status, Status::Ok);
+    assert_eq!(
+        fs.status(etc, Body::Unlink { name: b"motd" }).0,
+        Status::Busy
+    );
+    assert_eq!(fs.on_disk(b"etc/motd").unwrap(), b"welcome\n");
+    assert_eq!(fs.counts().first_orphan, 0);
+    fs.send_close(motd);
+    assert_eq!(fs.status(etc, Body::Unlink { name: b"motd" }).0, Status::Ok);
+    assert_eq!(fs.on_disk(b"etc/motd"), None);
+}
+
+#[test]
+fn an_orphan_list_that_cannot_be_processed_leaves_the_volume_read_only() {
+    for journal_blocks in [0, 1024] {
+        let mut image = image_with_journal(journal_blocks);
+        let motd = {
+            let mut device = Image(&mut image);
+            let volume = Volume::mount(&mut device, IMAGE_BYTES as u64, false).unwrap();
+            volume
+                .resolve(&mut device, ROOT_INODE, b"etc/motd")
+                .unwrap()
+                .inode
+        };
+        // A listed inode that still has its name: not this role's to free.
+        patch_superblock(&mut image, 0xE8, motd);
+        let before = counts_of(&image);
+        let mut fs = journaled_fs(image);
+        let root = fs.root;
+        assert_eq!(fs.open(root, CREATE, b"new").1, Status::ReadOnly);
+        let (file, status, _) = fs.open(root, OPEN_READ, b"etc/motd");
+        assert_eq!(status, Status::Ok);
+        assert_eq!(fs.read_all(file), b"welcome\n");
+        fs.server.retire(&mut fs.world);
+        assert_eq!(fs.counts(), before);
+    }
+}
+
+#[test]
+fn freeing_an_unlinked_file_starts_with_what_is_pending_committed() {
+    // Its blocks are freed in a transaction of their own, so the changes
+    // of earlier requests cannot overflow with them (and be lost).
+    let mut fs = journaled_fs(image_with_journal(1024));
+    let root = fs.root;
+    let (temp, status, attr) = fs.open(root, CREATE, b"temp");
+    assert_eq!(status, Status::Ok);
+    let id = attr.unwrap().id;
+    fs.write_all(temp, 0, &pattern(20_000));
+    assert_eq!(
+        fs.status(root, Body::Unlink { name: b"temp" }).0,
+        Status::Ok
+    );
+    assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+    let (later, status, _) = fs.open(root, CREATE, b"later");
+    assert_eq!(status, Status::Ok);
+    fs.write_all(later, 0, b"pending");
+    assert_eq!(fs.on_disk(b"later"), None);
+
+    fs.send_close(temp);
+    // What was pending is on the disk; the free itself is the next commit.
+    assert_eq!(fs.on_disk(b"later").as_deref(), Some(&b"pending"[..]));
+    assert_eq!(u64::from(fs.counts().first_orphan), id);
+    assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+    assert_eq!(fs.counts().first_orphan, 0);
+}
+
+/// Rewrites the flags of inode `number` in `image` (4 KiB blocks, one
+/// group, 256-byte inodes, `metadata_csum`), with the inode's checksum.
+fn patch_inode_flags(image: &mut [u8], number: u32, patch: impl FnOnce(u32) -> u32) {
+    use wyrmroot_ext4::crc;
+    let word = |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let seed = crc::update(!0, &image[1024 + 0x68..1024 + 0x78]);
+    let table = word(image, 4096 + 0x8) as usize;
+    let at = table * 4096 + (number as usize - 1) * 256;
+    let raw = &mut image[at..at + 256];
+    let flags = patch(word(raw, 0x20));
+    raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+    let sum = crc::update(seed, &number.to_le_bytes());
+    let sum = crc::update(sum, &raw[0x64..0x68]);
+    let sum = crc::update(sum, &raw[..0x7C]);
+    let sum = crc::update_zeros(sum, 2);
+    let sum = crc::update(sum, &raw[0x7E..0x82]);
+    let sum = crc::update_zeros(sum, 2);
+    let sum = crc::update(sum, &raw[0x84..]);
+    raw[0x7C..0x7E].copy_from_slice(&(sum as u16).to_le_bytes());
+    raw[0x82..0x84].copy_from_slice(&((sum >> 16) as u16).to_le_bytes());
+}
+
+#[test]
+fn a_file_this_role_cannot_free_is_not_supported_open_or_closed() {
+    // A block-mapped file: UNLINK cannot free its blocks, so its name
+    // stays, whether or not a handle is open (not BUSY: closing the handle
+    // would not change the answer).
+    let mut image = ext4_image();
+    let motd = {
+        let mut device = Image(&mut image);
+        let volume = Volume::mount(&mut device, IMAGE_BYTES as u64, false).unwrap();
+        volume
+            .resolve(&mut device, ROOT_INODE, b"etc/motd")
+            .unwrap()
+            .inode
+    };
+    patch_inode_flags(&mut image, motd, |flags| flags & !0x80000);
+    let mut fs = journaled_fs(image);
+    let root = fs.root;
+    let (etc, _, _) = fs.open(root, OPEN_READ | OPEN_WRITE, b"etc");
+    let (file, status, attr) = fs.open(root, OPEN_READ, b"etc/motd");
+    assert_eq!((status, attr.unwrap().size), (Status::Ok, 8));
+    assert_eq!(
+        fs.status(etc, Body::Unlink { name: b"motd" }).0,
+        Status::NotSupported
+    );
+    fs.send_close(file);
+    assert_eq!(
+        fs.status(etc, Body::Unlink { name: b"motd" }).0,
+        Status::NotSupported
+    );
+    assert_eq!(fs.list(etc), [(Kind::File, String::from("motd"))]);
+    assert_eq!(fs.counts().first_orphan, 0);
+    // The volume still takes changes.
+    assert_eq!(fs.open(root, CREATE, b"new").1, Status::Ok);
+}
+
+/// Shortens the journal of `image` (4 KiB blocks, v3 checksums) to
+/// `blocks`, found by its superblock's magic and block type.
+fn shorten_journal(image: &mut [u8], blocks: u32) {
+    use wyrmroot_ext4::crc;
+    let at = (0..image.len())
+        .step_by(4096)
+        .find(|&at| image[at..at + 8] == [0xC0, 0x3B, 0x39, 0x98, 0, 0, 0, 4])
+        .expect("a journal superblock");
+    let sb = &mut image[at..at + 1024];
+    sb[0x10..0x14].copy_from_slice(&blocks.to_be_bytes());
+    let sum = crc::update(!0, &sb[..0xFC]);
+    let sum = crc::update_zeros(sum, 4);
+    let sum = crc::update(sum, &sb[0x100..]);
+    sb[0xFC..0x100].copy_from_slice(&sum.to_be_bytes());
+}
+
+#[test]
+fn a_journal_too_small_to_free_an_orphan_keeps_names_and_leaves_orphans() {
+    // A transaction of this journal holds fewer blocks than one freeing
+    // step may write, so no unlinked file could ever be freed.
+    let mut image = image_with_journal(1024);
+    shorten_journal(&mut image, 16);
+    let mut fs = journaled_fs(image);
+    let root = fs.root;
+    let (etc, _, _) = fs.open(root, OPEN_READ | OPEN_WRITE, b"etc");
+    let (motd, status, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    assert_eq!(status, Status::Ok);
+    assert_eq!(
+        fs.status(etc, Body::Unlink { name: b"motd" }).0,
+        Status::Busy
+    );
+    assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+    assert_eq!(fs.on_disk(b"etc/motd").unwrap(), b"welcome\n");
+    assert_eq!(fs.counts().first_orphan, 0);
+    // Closed, it goes as any file does, and the volume still takes changes.
+    fs.send_close(motd);
+    assert_eq!(fs.status(etc, Body::Unlink { name: b"motd" }).0, Status::Ok);
+    assert_eq!(fs.status(root, Body::Sync).0, Status::Ok);
+    assert_eq!(fs.on_disk(b"etc/motd"), None);
+
+    // An orphan list on such a volume: the role starts, the volume is
+    // read-only, and the list is as it was found.
+    let mut image = image_with_journal(1024);
+    let orphan = {
+        let mut device = Image(&mut image);
+        let mut volume = Volume::mount(&mut device, IMAGE_BYTES as u64, true).unwrap();
+        let stat = volume
+            .resolve(&mut device, ROOT_INODE, b"etc/motd")
+            .unwrap();
+        let etc = volume.resolve(&mut device, ROOT_INODE, b"etc").unwrap();
+        volume.unlink_held(&mut device, etc.inode, b"motd").unwrap();
+        stat.inode
+    };
+    shorten_journal(&mut image, 16);
+    let before = counts_of(&image);
+    assert_eq!(before.first_orphan, orphan);
+    let mut fs = journaled_fs(image);
+    let root = fs.root;
+    assert_eq!(fs.open(root, CREATE, b"new").1, Status::ReadOnly);
+    assert_eq!(fs.list(root).len(), 2);
+    fs.server.retire(&mut fs.world);
+    assert_eq!(fs.counts(), before);
 }

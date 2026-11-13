@@ -894,3 +894,566 @@ fn a_journal_without_checksums_or_64bit_takes_commits_that_e2fsck_replays() {
     fsck_clean(&path);
     assert_eq!(debugfs(&path, "cat /plain.txt"), pattern(9_000, 13));
 }
+
+// Files unlinked while held: the orphan list (`src/orphan.rs`).
+
+/// The superblock's free block and inode counts, as `dumpe2fs` prints them.
+fn free_counts(path: &Path) -> (u64, u64) {
+    let header = dumpe2fs(path);
+    let field = |name: &str| {
+        let line = header
+            .lines()
+            .find(|line| line.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} in {header}"));
+        first_number(line.as_bytes())
+    };
+    (field("Free blocks:"), field("Free inodes:"))
+}
+
+/// Mounts `path` and frees the orphans a crash left; returns how many.
+fn mount_recovering(path: &Path) -> u32 {
+    let bytes = fs::metadata(path).unwrap().len();
+    let mut disk = open_image(path);
+    recover(&mut disk, bytes).unwrap();
+    let mut volume = Volume::mount(&mut disk, bytes, true).unwrap();
+    let mut freed = 0;
+    while volume.orphans_pending() {
+        volume.recover_orphan(&mut disk, usize::MAX).unwrap();
+        freed += 1;
+    }
+    volume.sync(&mut disk).unwrap();
+    freed
+}
+
+#[test]
+fn held_unlinked_files_leave_a_volume_e2fsck_accepts() {
+    for (block_size, bytes) in [(4096u32, 32u64 << 20), (1024, 16 << 20)] {
+        let path = scratch(&format!("held-{block_size}.img"));
+        let mut disk = image(&path, bytes);
+        format(
+            &mut disk,
+            bytes,
+            &FormatParams {
+                block_size,
+                ..PARAMS
+            },
+        )
+        .unwrap();
+        let mut volume = Volume::mount(&mut disk, bytes, true).unwrap();
+        let keep = volume
+            .create(&mut disk, ROOT_INODE, b"keep", Kind::File)
+            .unwrap();
+        volume
+            .write(&mut disk, keep.inode, 0, &pattern(5000, 1))
+            .unwrap();
+        volume.sync(&mut disk).unwrap();
+        let free = free_counts(&path);
+
+        // Two files written in turn, so each has a depth-one extent tree.
+        let bs = block_size as usize;
+        let one = volume
+            .create(&mut disk, ROOT_INODE, b"one", Kind::File)
+            .unwrap();
+        let two = volume
+            .create(&mut disk, ROOT_INODE, b"two", Kind::File)
+            .unwrap();
+        for index in 0..40 {
+            for (inode, seed) in [(one.inode, 0), (two.inode, 100)] {
+                volume
+                    .write(
+                        &mut disk,
+                        inode,
+                        (index * bs) as u64,
+                        &pattern(bs, seed + index as u32),
+                    )
+                    .unwrap();
+            }
+        }
+        volume.unlink_held(&mut disk, ROOT_INODE, b"one").unwrap();
+        volume.unlink_held(&mut disk, ROOT_INODE, b"two").unwrap();
+        volume
+            .write(&mut disk, two.inode, (60 * bs) as u64, &pattern(bs, 7))
+            .unwrap();
+        volume.sync(&mut disk).unwrap();
+        let listing = String::from_utf8(debugfs(&path, "ls /")).unwrap();
+        assert!(
+            !listing.contains("one") && !listing.contains("two"),
+            "{listing}"
+        );
+
+        // The holders gone without a close: e2fsck frees what is on the
+        // list, and so does the next mount, to the same counts.
+        let crashed = scratch(&format!("held-{block_size}-crashed.img"));
+        fs::copy(&path, &crashed).unwrap();
+        let by_e2fsck = e2fsck_replayed(&crashed, &format!("held-{block_size}-e2fsck.img"));
+        assert_eq!(free_counts(&by_e2fsck), free);
+        assert_eq!(mount_recovering(&crashed), 2);
+        fsck_clean(&crashed);
+        assert_eq!(free_counts(&crashed), free);
+        assert_eq!(debugfs(&crashed, "cat /keep"), pattern(5000, 1));
+
+        // The last close of each: the same again.
+        volume.release(&mut disk, one.inode, usize::MAX).unwrap();
+        volume.sync(&mut disk).unwrap();
+        // One still held is one orphan to e2fsck, not damage.
+        e2fsck_replayed(&path, &format!("held-{block_size}-one.img"));
+        volume.release(&mut disk, two.inode, usize::MAX).unwrap();
+        volume.sync(&mut disk).unwrap();
+        drop(disk);
+        fsck_clean(&path);
+        assert_eq!(free_counts(&path), free);
+    }
+}
+
+#[test]
+fn a_hard_linked_file_is_held_only_with_its_last_name() {
+    let source = scratch("links-source");
+    let _ = fs::remove_dir_all(&source);
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("first"), pattern(40_000, 9)).unwrap();
+    fs::hard_link(source.join("first"), source.join("second")).unwrap();
+    let path = scratch("links.img");
+    let output = tool("mke2fs")
+        .args(["-q", "-F", "-t", "ext4", "-O", "^orphan_file", "-d"])
+        .arg(&source)
+        .arg(&path)
+        .arg("32M")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let free = free_counts(&path);
+    let bytes = fs::metadata(&path).unwrap().len();
+    let mut disk = open_image(&path);
+    let mut volume = Volume::mount(&mut disk, bytes, true).unwrap();
+    let file = volume.lookup(&mut disk, ROOT_INODE, b"first").unwrap();
+    assert_eq!(
+        volume.lookup(&mut disk, ROOT_INODE, b"second").unwrap(),
+        file
+    );
+    // One name of two: nothing to hold.
+    volume.unlink_held(&mut disk, ROOT_INODE, b"first").unwrap();
+    assert!(volume.held().is_empty());
+    volume.sync(&mut disk).unwrap();
+    fsck_clean(&path);
+    assert_eq!(free_counts(&path), free);
+    assert_eq!(debugfs(&path, "cat /second"), pattern(40_000, 9));
+    // The last name.
+    volume
+        .unlink_held(&mut disk, ROOT_INODE, b"second")
+        .unwrap();
+    assert_eq!(volume.held(), [file.inode]);
+    let mut out = vec![0u8; 40_000];
+    let mut done = 0;
+    while done < out.len() {
+        done += volume
+            .read(&mut disk, file.inode, done as u64, &mut out[done..])
+            .unwrap();
+    }
+    assert_eq!(out, pattern(40_000, 9));
+    volume.release(&mut disk, file.inode, usize::MAX).unwrap();
+    volume.sync(&mut disk).unwrap();
+    drop(disk);
+    fsck_clean(&path);
+    let after = free_counts(&path);
+    assert!(
+        after.0 > free.0 && after.1 == free.1 + 1,
+        "{free:?} {after:?}"
+    );
+}
+
+#[test]
+fn a_volume_with_an_orphan_file_is_given_no_orphans() {
+    let path = mke2fs_image("orphan-file", &["-O", "orphan_file"]);
+    assert!(dumpe2fs(&path).contains("orphan_file"));
+    let bytes = fs::metadata(&path).unwrap().len();
+    let mut disk = open_image(&path);
+    let mut volume = Volume::mount(&mut disk, bytes, true).unwrap();
+    assert!(!volume.read_only() && !volume.keeps_unlinked());
+    let docs = volume.resolve(&mut disk, ROOT_INODE, b"docs").unwrap();
+    assert_eq!(
+        volume.unlink_held(&mut disk, docs.inode, b"readme.txt"),
+        Err(wyrmroot_ext4::Error::Busy)
+    );
+    assert!(volume.held().is_empty());
+    // Without a holder the name and the node go together, as before.
+    volume.unlink(&mut disk, docs.inode, b"readme.txt").unwrap();
+    volume.sync(&mut disk).unwrap();
+    drop(disk);
+    fsck_clean(&path);
+    assert_eq!(debugfs(&path, "cat /docs/deep/blob"), pattern(123_457, 4));
+
+    // The control: the same volume without the feature takes the orphan.
+    let path = mke2fs_image("no-orphan-file", &["-O", "^orphan_file"]);
+    assert!(!dumpe2fs(&path).contains("orphan_file"));
+    let mut disk = open_image(&path);
+    let mut volume = Volume::mount(&mut disk, bytes, true).unwrap();
+    let docs = volume.resolve(&mut disk, ROOT_INODE, b"docs").unwrap();
+    let readme = volume.lookup(&mut disk, docs.inode, b"readme.txt").unwrap();
+    assert_eq!(
+        volume.unlink_held(&mut disk, docs.inode, b"readme.txt"),
+        Ok(())
+    );
+    assert_eq!(volume.held(), [readme.inode]);
+    volume.release(&mut disk, readme.inode, usize::MAX).unwrap();
+    volume.sync(&mut disk).unwrap();
+    drop(disk);
+    fsck_clean(&path);
+}
+
+/// A journaled volume holding `/temp` (unlinked while held, in a
+/// transaction whose commit loses power after `flushes` flushes) and
+/// `/keep`. Returns the free counts before `/temp` existed.
+fn crashed_holding(path: &Path, flushes: usize) -> (u64, u64) {
+    let (mut disk, mut volume, mut journal, mut transaction) = journaled(path, None);
+    let mut view = Journaled {
+        device: &mut disk,
+        transaction: &mut transaction,
+    };
+    let keep = volume
+        .create(&mut view, ROOT_INODE, b"keep", Kind::File)
+        .unwrap();
+    volume
+        .write(&mut view, keep.inode, 0, &pattern(5000, 1))
+        .unwrap();
+    journal
+        .commit(&volume, &mut disk, &mut transaction)
+        .unwrap();
+    let free = free_counts(path);
+    let mut view = Journaled {
+        device: &mut disk,
+        transaction: &mut transaction,
+    };
+    let temp = volume
+        .create(&mut view, ROOT_INODE, b"temp", Kind::File)
+        .unwrap();
+    volume
+        .write(&mut view, temp.inode, 0, &pattern(30_000, 2))
+        .unwrap();
+    journal
+        .commit(&volume, &mut disk, &mut transaction)
+        .unwrap();
+    assert_eq!(debugfs(path, "cat /temp"), pattern(30_000, 2));
+
+    disk.flushes = Some(flushes);
+    let mut view = Journaled {
+        device: &mut disk,
+        transaction: &mut transaction,
+    };
+    volume.unlink_held(&mut view, ROOT_INODE, b"temp").unwrap();
+    // Held: it still reads, and takes a write after its name is gone.
+    assert_eq!(
+        volume.write(&mut view, temp.inode, 30_000, &pattern(9000, 3)),
+        Ok(9000)
+    );
+    assert_eq!(volume.stat(&mut view, temp.inode).unwrap().size, 39_000);
+    assert!(
+        journal
+            .commit(&volume, &mut disk, &mut transaction)
+            .is_err()
+    );
+    free
+}
+
+#[test]
+fn a_crash_while_a_file_is_held_leaves_it_named_or_on_the_orphan_list() {
+    // Power lost before the commit block: the unlink never happened.
+    let path = journaled_format("held-uncommitted.img", 4096, 32 << 20);
+    let free = crashed_holding(&path, 2);
+    let by_e2fsck = e2fsck_replayed(&path, "held-uncommitted-e2fsck.img");
+    assert_eq!(
+        debugfs(&by_e2fsck, "cat /temp")[..30_000],
+        pattern(30_000, 2)
+    );
+    assert_eq!(mount_recovering(&path), 0);
+    fsck_clean(&path);
+    assert_eq!(debugfs(&path, "cat /temp")[..30_000], pattern(30_000, 2));
+    assert!(free_counts(&path).1 == free.1 - 1);
+
+    // Power lost after it: the name is gone and the file is an orphan,
+    // which e2fsck and the next mount free alike.
+    let path = journaled_format("held-committed.img", 4096, 32 << 20);
+    let free = crashed_holding(&path, 3);
+    let by_e2fsck = e2fsck_replayed(&path, "held-committed-e2fsck.img");
+    assert_eq!(free_counts(&by_e2fsck), free);
+    let listing = String::from_utf8(debugfs(&by_e2fsck, "ls /")).unwrap();
+    assert!(!listing.contains("temp"), "{listing}");
+    assert_eq!(mount_recovering(&path), 1);
+    fsck_clean(&path);
+    assert_eq!(free_counts(&path), free);
+    let listing = String::from_utf8(debugfs(&path, "ls /")).unwrap();
+    assert!(!listing.contains("temp"), "{listing}");
+    assert_eq!(debugfs(&path, "cat /keep"), pattern(5000, 1));
+}
+
+#[test]
+fn a_crash_while_a_held_file_is_released_frees_it_at_the_next_mount() {
+    for flushes in [2, 3] {
+        let path = journaled_format(&format!("release-crash-{flushes}.img"), 4096, 32 << 20);
+        let (mut disk, mut volume, mut journal, mut transaction) = journaled(&path, None);
+        let free = free_counts(&path);
+        let mut view = Journaled {
+            device: &mut disk,
+            transaction: &mut transaction,
+        };
+        let temp = volume
+            .create(&mut view, ROOT_INODE, b"temp", Kind::File)
+            .unwrap();
+        volume
+            .write(&mut view, temp.inode, 0, &pattern(30_000, 2))
+            .unwrap();
+        volume.unlink_held(&mut view, ROOT_INODE, b"temp").unwrap();
+        journal
+            .commit(&volume, &mut disk, &mut transaction)
+            .unwrap();
+        disk.flushes = Some(flushes);
+        let mut view = Journaled {
+            device: &mut disk,
+            transaction: &mut transaction,
+        };
+        volume.release(&mut view, temp.inode, usize::MAX).unwrap();
+        assert!(
+            journal
+                .commit(&volume, &mut disk, &mut transaction)
+                .is_err()
+        );
+        drop(disk);
+        let by_e2fsck = e2fsck_replayed(&path, &format!("release-crash-{flushes}-e2fsck.img"));
+        assert_eq!(free_counts(&by_e2fsck), free);
+        // Before the commit block the orphan is still listed; after it the
+        // replay has already freed it.
+        assert_eq!(mount_recovering(&path), if flushes == 2 { 1 } else { 0 });
+        fsck_clean(&path);
+        assert_eq!(free_counts(&path), free);
+    }
+}
+
+// Freeing an orphan in steps that each fit one transaction.
+
+/// A transaction this small holds the changes of three block groups.
+const FEW: usize = 24;
+type Small = Transaction<VecStore, FEW>;
+
+/// A journaled volume of many small block groups (512 blocks of 1 KiB),
+/// mounted with a transaction of [`FEW`] blocks.
+fn many_groups(name: &str) -> PathBuf {
+    let path = scratch(name);
+    let output = tool("mke2fs")
+        .args(["-q", "-F", "-t", "ext4", "-b", "1024", "-g", "512"])
+        .args([
+            "-O",
+            "^orphan_file,^resize_inode,^metadata_csum,^uninit_bg",
+            "-J",
+            "size=1",
+        ])
+        .arg(&path)
+        .arg("16M")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "mke2fs: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    path
+}
+
+fn open_small(path: &Path) -> (Image, Volume, Journal, Small) {
+    let bytes = fs::metadata(path).unwrap().len();
+    let mut disk = open_image(path);
+    recover(&mut disk, bytes).unwrap();
+    let mut volume = Volume::mount(&mut disk, bytes, true).unwrap();
+    let journal = Journal::open(&mut volume, &mut disk).unwrap().unwrap();
+    let store = VecStore(vec![0; FEW * volume.block_size() as usize]);
+    let transaction = Transaction::new(store, &journal);
+    assert_eq!(transaction.limit(), FEW);
+    (disk, volume, journal, transaction)
+}
+
+/// One freeing step as a server takes it: what is pending commits first.
+/// `inode` is a held inode, or `None` for the first orphan a mount found.
+/// Returns whether that inode is freed, or no orphan is left.
+fn free_step(
+    disk: &mut Image,
+    volume: &mut Volume,
+    journal: &mut Journal,
+    transaction: &mut Small,
+    inode: Option<u32>,
+) -> bool {
+    journal.commit(volume, disk, transaction).unwrap();
+    let room = transaction.limit();
+    let mut view = Journaled {
+        device: disk,
+        transaction,
+    };
+    match inode {
+        Some(inode) => volume.release(&mut view, inode, room).unwrap(),
+        None => !volume.recover_orphan(&mut view, room).unwrap(),
+    }
+}
+
+#[test]
+fn orphans_larger_than_a_transaction_are_freed_in_steps() {
+    let path = many_groups("steps.img");
+    // Two files of 5 MiB written in turn: each lies in most block groups
+    // and has a depth-one extent tree.
+    let free = {
+        let (mut disk, mut volume, mut journal, mut transaction) = journaled(&path, None);
+        let free = free_counts(&path);
+        for chunk in 0..320u32 {
+            for (index, name) in [&b"one"[..], b"two"].into_iter().enumerate() {
+                let mut view = Journaled {
+                    device: &mut disk,
+                    transaction: &mut transaction,
+                };
+                let inode = match volume.lookup(&mut view, ROOT_INODE, name) {
+                    Ok(stat) => stat.inode,
+                    Err(_) => {
+                        volume
+                            .create(&mut view, ROOT_INODE, name, Kind::File)
+                            .unwrap()
+                            .inode
+                    }
+                };
+                let data = pattern(16 << 10, chunk * 2 + index as u32);
+                assert_eq!(
+                    volume.write(&mut view, inode, u64::from(chunk) << 14, &data),
+                    Ok(data.len())
+                );
+                journal
+                    .commit(&volume, &mut disk, &mut transaction)
+                    .unwrap();
+            }
+        }
+        journal
+            .close(&mut volume, &mut disk, &mut transaction)
+            .unwrap();
+        free
+    };
+    fsck_clean(&path);
+    let (mut disk, mut volume, mut journal, mut transaction) = open_small(&path);
+    let files =
+        [&b"one"[..], b"two"].map(|name| volume.lookup(&mut disk, ROOT_INODE, name).unwrap().inode);
+    for name in [&b"one"[..], b"two"] {
+        let mut view = Journaled {
+            device: &mut disk,
+            transaction: &mut transaction,
+        };
+        volume.unlink_held(&mut view, ROOT_INODE, name).unwrap();
+    }
+    journal
+        .commit(&volume, &mut disk, &mut transaction)
+        .unwrap();
+    let held = scratch("steps-held.img");
+    fs::copy(&path, &held).unwrap();
+
+    // The control: all of one file at once does not fit the transaction.
+    {
+        let (mut disk, mut volume, _journal, mut transaction) = open_small(&held);
+        let inode = {
+            // Nothing holds them after a mount; recovery is the same free.
+            let mut view = Journaled {
+                device: &mut disk,
+                transaction: &mut transaction,
+            };
+            volume.recover_orphan(&mut view, usize::MAX)
+        };
+        assert_eq!(inode, Err(wyrmroot_ext4::Error::Device(TRANSACTION_FULL)));
+        assert!(volume.read_only());
+    }
+    fs::copy(&path, &held).unwrap();
+
+    // In steps it does, and a step leaves the file listed until the last.
+    let mut steps = 0;
+    while !free_step(
+        &mut disk,
+        &mut volume,
+        &mut journal,
+        &mut transaction,
+        Some(files[0]),
+    ) {
+        steps += 1;
+        assert!(volume.is_held(files[0]));
+        if steps == 2 {
+            // Power is lost here, between two steps of one file.
+            journal
+                .commit(&volume, &mut disk, &mut transaction)
+                .unwrap();
+            let crashed = scratch("steps-crashed.img");
+            fs::copy(&path, &crashed).unwrap();
+            // e2fsck finishes both orphans, to the counts before them.
+            let by_e2fsck = e2fsck_replayed(&crashed, "steps-crashed-e2fsck.img");
+            assert_eq!(free_counts(&by_e2fsck), free);
+            // So does the next mount: the half-freed one and the whole one,
+            // which together exceed a transaction many times over.
+            let (mut disk, mut volume, mut journal, mut transaction) = open_small(&crashed);
+            assert!(volume.orphans_pending());
+            let mut calls = 0;
+            while !free_step(&mut disk, &mut volume, &mut journal, &mut transaction, None) {
+                calls += 1;
+            }
+            assert!(calls > 4, "{calls} calls freed two files");
+            assert!(!volume.read_only() && !volume.orphans_pending());
+            journal
+                .close(&mut volume, &mut disk, &mut transaction)
+                .unwrap();
+            drop(disk);
+            fsck_clean(&crashed);
+            assert_eq!(free_counts(&crashed), free);
+        }
+    }
+    assert!(steps > 2, "one file was freed in {steps} steps");
+    assert_eq!(volume.held(), [files[1]]);
+    // The other still reads, and goes the same way.
+    let mut out = vec![0u8; 16 << 10];
+    let mut view = Journaled {
+        device: &mut disk,
+        transaction: &mut transaction,
+    };
+    assert_eq!(
+        volume.read(&mut view, files[1], 5 << 14, &mut out),
+        Ok(out.len())
+    );
+    assert_eq!(out, pattern(16 << 10, 11));
+    while !free_step(
+        &mut disk,
+        &mut volume,
+        &mut journal,
+        &mut transaction,
+        Some(files[1]),
+    ) {}
+    journal
+        .close(&mut volume, &mut disk, &mut transaction)
+        .unwrap();
+    drop(disk);
+    fsck_clean(&path);
+    assert_eq!(free_counts(&path), free);
+}
+
+#[test]
+fn an_unlink_frees_blocks_preallocated_past_an_empty_file() {
+    let path = scratch("past-end.img");
+    let bytes = 32 << 20;
+    let mut disk = image(&path, bytes);
+    format(&mut disk, bytes, &PARAMS).unwrap();
+    let mut volume = Volume::mount(&mut disk, bytes, true).unwrap();
+    volume.sync(&mut disk).unwrap();
+    let free = free_counts(&path);
+    let file = volume
+        .create(&mut disk, ROOT_INODE, b"file", Kind::File)
+        .unwrap();
+    volume.sync(&mut disk).unwrap();
+    drop(disk);
+    // As fallocate leaves a file: unwritten blocks, and a size of zero.
+    debugfs_write(&path, "fallocate /file 0 19");
+    fsck_clean(&path);
+    assert!(free_counts(&path).0 < free.0);
+
+    let mut disk = open_image(&path);
+    let mut volume = Volume::mount(&mut disk, bytes, true).unwrap();
+    assert_eq!(volume.stat(&mut disk, file.inode).unwrap().size, 0);
+    volume.unlink(&mut disk, ROOT_INODE, b"file").unwrap();
+    volume.sync(&mut disk).unwrap();
+    drop(disk);
+    fsck_clean(&path);
+    assert_eq!(free_counts(&path), free);
+}

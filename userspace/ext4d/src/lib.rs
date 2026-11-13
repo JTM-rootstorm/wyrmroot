@@ -23,8 +23,26 @@
 //! the volume read-only with the last commit on disk. Without a journal
 //! every write reaches the device before its request is answered, and SYNC
 //! flushes the device. A handle's access is what it was opened with; writing,
-//! creating, truncating and unlinking need WRITE. A node that is open
-//! somewhere cannot be unlinked (BUSY), so no inode is freed under a handle.
+//! creating, truncating and unlinking need WRITE.
+//!
+//! An open node outlives its names (platform conventions 5.3). UNLINK of a
+//! file that is open removes the name at once, and the file reads, writes,
+//! truncates and answers GET_ATTR as before on every Channel that has it
+//! open; its inode and blocks are freed when the last of them closes. Until
+//! then the inode is on the volume's orphan list
+//! (`wyrmroot_ext4::Volume::unlink_held`), put there in the transaction that
+//! removes the name, so if this role dies first the next start frees it
+//! before it serves anything. UNLINK still answers BUSY for a directory that
+//! is open (the root always is), and for an open file's last name on a
+//! volume with an orphan file (`orphan_file`) or a journal too small to
+//! free one in (a transaction under `wyrmroot_ext4::MIN_FREE_ROOM` blocks),
+//! which this role gives no orphans; an orphan list found on the latter is
+//! left untouched and the volume read-only. An unlinked file is freed in steps that each fit one
+//! transaction, the file staying on the orphan list until the last, so a
+//! large one cannot overflow the journal. A failure while freeing one, at
+//! its last close or at start, or an UNLINK that fails after its first
+//! write, leaves the volume read-only on its last commit.
+//!
 //! A filesystem inconsistency or device error answers the one request with
 //! IO_ERROR; a peer that breaks WRFS loses its own node.
 
@@ -410,6 +428,7 @@ fn status_of(error: Ext4Error) -> Status {
         Ext4Error::NotEmpty => Status::NotEmpty,
         Ext4Error::NoSpace | Ext4Error::TooLarge => Status::NoSpace,
         Ext4Error::ReadOnly => Status::ReadOnly,
+        Ext4Error::Busy => Status::Busy,
         Ext4Error::InvalidName => Status::InvalidPath,
         Ext4Error::Unsupported | Ext4Error::NotFileOrDirectory => Status::NotSupported,
         Ext4Error::Corrupt | Ext4Error::Device(_) | Ext4Error::NotExt4 => Status::IoError,
@@ -503,7 +522,14 @@ impl<V: View> Server<V> {
             None => None,
         };
         let filesystem = filesystem_identity(volume.uuid());
-        Ok(Self {
+        // What one freeing step may write: a transaction, or without a
+        // journal anything, each write going straight to the device. In
+        // less than one step's room no unlinked file could be freed, so
+        // none is kept (UNLINK of an open file's last name is BUSY).
+        if let Some((_, transaction)) = &journal {
+            volume.set_free_room(transaction.limit());
+        }
+        let mut server = Self {
             launch,
             root,
             volume,
@@ -517,7 +543,96 @@ impl<V: View> Server<V> {
             failed: false,
             locks: LockServer::with_owner_limit(LOCKS_PER_NODE),
             filesystem,
-        })
+        };
+        server.recover_orphans(platform);
+        Ok(server)
+    }
+
+    /// Frees what a crash left on the orphan list: files unlinked while
+    /// open whose last close this role did not live to see. A list that
+    /// cannot be processed leaves the volume read-only, as it was found.
+    fn recover_orphans<P: Ext4Platform>(&mut self, platform: &mut P) {
+        if !self.volume.orphans_pending() {
+            return;
+        }
+        // A journal too small for one freeing step: the list is left as it
+        // was found, for Linux or e2fsck, and nothing changes.
+        if !self.volume.frees_orphans() {
+            self.volume.set_read_only();
+            return;
+        }
+        while self.volume.orphans_pending() {
+            if !self.free_step(platform, None) {
+                return;
+            }
+        }
+        let _ = self.commit(platform);
+    }
+
+    /// One step of freeing an unlinked file: the held `inode`, or the first
+    /// on the orphan list the mount found. A step frees from as many block
+    /// groups as fit one transaction and leaves the file on the orphan list
+    /// until nothing of it is left, so it starts with the transaction empty
+    /// (what earlier requests left is committed first) and no file is too
+    /// large to free; a crash between steps leaves an orphan the next start
+    /// finishes. `false` when the volume takes no more changes.
+    fn free_step<P: Ext4Platform>(&mut self, platform: &mut P, inode: Option<u32>) -> bool {
+        let pending = matches!(&self.journal, Some((_, transaction)) if !transaction.is_empty());
+        if pending && self.commit(platform).is_err() {
+            return false;
+        }
+        let room = match &self.journal {
+            Some((_, transaction)) => transaction.limit(),
+            None => usize::MAX,
+        };
+        let mut device = Self::device(
+            platform,
+            &mut self.client,
+            &mut self.view,
+            &mut self.cache,
+            &mut self.journal,
+            &mut self.full,
+        );
+        let step = match inode {
+            Some(inode) => self.volume.release(&mut device, inode, room),
+            None => self.volume.recover_orphan(&mut device, room),
+        };
+        if step.is_err() {
+            self.abandon();
+        }
+        step.is_ok()
+    }
+
+    /// After a change failed part-way: the running transaction is dropped
+    /// and the volume stays read-only on its last commit.
+    fn abandon(&mut self) {
+        if let Some((_, transaction)) = self.journal.as_mut() {
+            transaction.discard();
+        }
+        self.full = false;
+        self.commit_due = None;
+        self.volume.set_read_only();
+    }
+
+    /// Frees the unlinked files nothing has open any more, or with
+    /// `every` (the role is ending) all of them.
+    fn release_unlinked<P: Ext4Platform>(&mut self, platform: &mut P, every: bool) {
+        let mut index = 0;
+        let mut released = false;
+        while let Some(&inode) = self.volume.held().get(index) {
+            if (!every && is_open(&self.nodes, inode)) || self.volume.read_only() {
+                index += 1;
+                continue;
+            }
+            // A freed inode leaves the list, and the next is at this index.
+            if !self.free_step(platform, Some(inode)) {
+                return;
+            }
+            released = true;
+        }
+        if released {
+            self.settle(platform);
+        }
     }
 
     /// Waits once and handles what woke it; `Ok(false)` once init asks the
@@ -608,8 +723,10 @@ impl<V: View> Server<V> {
                 }
             }
         }
-        // Whatever was served or closed may have released a lock.
+        // Whatever was served or closed may have released a lock, or been
+        // the last handle of an unlinked file.
         self.grant_waiters(platform);
+        self.release_unlinked(platform, false);
         Ok(true)
     }
 
@@ -728,6 +845,8 @@ impl<V: View> Server<V> {
 
     /// Commits what is left and marks the volume clean.
     pub fn retire<P: Ext4Platform>(&mut self, platform: &mut P) {
+        // No node outlives the role.
+        self.release_unlinked(platform, true);
         let mut device = VolumeDevice {
             platform,
             client: &mut self.client,
@@ -964,12 +1083,27 @@ impl<V: View> Server<V> {
                     );
                     found = self.volume.lookup(&mut device, here.inode, name);
                 }
-                status(match found {
-                    Ok(stat) if is_open(&self.nodes, stat.inode) => Status::Busy,
-                    Ok(_) => match self.volume.unlink(&mut device, here.inode, name) {
-                        Ok(()) => Status::Ok,
-                        Err(error) => status_of(error),
-                    },
+                // An open file's last name goes and the file stays until its
+                // last close; BUSY when the volume cannot keep it. A file
+                // whose blocks this role cannot free (block-mapped, or an
+                // extent tree deeper than one level) is NOT_SUPPORTED open
+                // or closed: closing it would not change the answer.
+                let taking = !self.volume.read_only();
+                let unlinked = found.and_then(|stat| {
+                    if is_open(&self.nodes, stat.inode) {
+                        self.volume.unlink_held(&mut device, here.inode, name)
+                    } else {
+                        self.volume.unlink(&mut device, here.inode, name)
+                    }
+                });
+                // It failed after its first write: the name may be gone
+                // with the node neither freed nor on the orphan list, so
+                // nothing of the transaction is kept.
+                if taking && self.volume.read_only() {
+                    self.abandon();
+                }
+                status(match unlinked {
+                    Ok(()) => Status::Ok,
                     Err(error) => status_of(error),
                 })
             }

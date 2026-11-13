@@ -3,7 +3,9 @@
 //! Written from the kernel.org ext4 disk-layout documentation as shipped in
 //! Linux 7.2.14 (`Documentation/filesystems/ext4/`: `super.rst`,
 //! `group_descr.rst`, `inodes.rst`, `ifork.rst`, `directory.rst`,
-//! `checksums.rst`, `bitmaps.rst`, `blockgroup.rst`, `special_inodes.rst`).
+//! `checksums.rst`, `bitmaps.rst`, `blockgroup.rst`, `special_inodes.rst`,
+//! and for the orphan list `orphan.rst` with `inodes.rst` "Inode Timestamps"
+//! and `super.rst` `s_last_orphan`).
 //! No implementation source was copied. `ext4-view` (MIT/Apache-2.0) is
 //! read-only and needs `alloc`; `lwext4` is C with per-file BSD/GPL-2.0
 //! licensing and its own I/O model. Neither was adopted.
@@ -15,13 +17,21 @@
 //!   incompatible features, and every checksum `metadata_csum` defines for
 //!   the structures it touches. An unknown incompatible feature, a journal
 //!   that still needs recovery ([`recover`] replays it first), `meta_bg`,
-//!   `bigalloc` or a non-Linux creator is refused; an unknown read-only-compatible feature, an orphan list or
-//!   recorded errors mount read-only.
+//!   `bigalloc` or a non-Linux creator is refused; an unknown
+//!   read-only-compatible feature, recorded errors, or an orphan list on a
+//!   volume with an orphan file mount read-only.
 //! - Reads directories linearly (htree index blocks look empty to a linear
 //!   reader) and files through extent trees of any legal depth.
 //! - Writes files, creates files and directories, truncates and unlinks,
 //!   allocating from initialised groups only. Directories with an htree
 //!   index and extent trees deeper than one level are not modified.
+//! - Keeps a file whose last name is removed while a caller holds it open
+//!   ([`Volume::unlink_held`]) on the orphan list (`s_last_orphan`, linked
+//!   through `i_dtime`, link count 0) until [`Volume::release`] frees it, and
+//!   frees the inodes a crash left on that list ([`Volume::recover_orphan`])
+//!   before a mount takes its first change. Freeing an orphan is done in
+//!   bounded steps, each fitting one journal transaction. Volumes with an
+//!   orphan file (`orphan_file`) are never given orphans.
 //! - Formats a volume ([`format`]) with a fixed modern feature set and,
 //!   optionally, a journal.
 //! - Journals metadata in `data=ordered` mode ([`journal`]): through a
@@ -43,10 +53,12 @@ mod dir;
 mod extent;
 mod format;
 pub mod journal;
+mod orphan;
 mod write;
 
 pub use format::{FormatParams, MIN_JOURNAL_BLOCKS, format};
 pub use journal::{Journal, Journaled, Store, Transaction, recover};
+pub use orphan::MIN_FREE_ROOM;
 
 /// A failed device transfer, carrying a source-defined code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +105,9 @@ pub enum Error {
     InvalidName,
     /// Past the largest file this volume stores.
     TooLarge,
+    /// The node is held open and its last name cannot go: it is a
+    /// directory, or the volume cannot record another orphan.
+    Busy,
 }
 
 impl From<DeviceError> for Error {
@@ -107,6 +122,8 @@ pub const MAX_BLOCK_BYTES: usize = 4096;
 pub const MAX_NAME_BYTES: usize = 255;
 /// The root directory's inode.
 pub const ROOT_INODE: u32 = 2;
+/// The most unlinked nodes a volume keeps for their holders at once.
+pub const MAX_HELD: usize = 32;
 
 const SUPERBLOCK_OFFSET: u64 = 1024;
 const SUPERBLOCK_BYTES: usize = 1024;
@@ -144,6 +161,8 @@ const RO_COMPAT_WRITABLE: u32 = RO_COMPAT_SPARSE_SUPER
     | RO_COMPAT_EXTRA_ISIZE
     | RO_COMPAT_METADATA_CSUM;
 const INCOMPAT_META_BG: u32 = 0x10;
+/// `s_feature_compat`: orphans are tracked in an orphan file (`orphan.rst`).
+const COMPAT_ORPHAN_FILE: u32 = 0x1000;
 const STATE_ERRORS: u16 = 0x2;
 
 // Group descriptor flags (`group_descr.rst`).
@@ -321,6 +340,16 @@ pub struct Volume {
     pub(crate) csum: Option<u32>,
     pub(crate) writable: bool,
     pub(crate) now: u32,
+    /// The inodes on the orphan list for their holders, first on the list
+    /// first ([`Volume::unlink_held`]).
+    pub(crate) held: [u32; MAX_HELD],
+    pub(crate) held_len: usize,
+    /// The mount found an orphan list; nothing changes until
+    /// [`Volume::recover_orphan`] has emptied it.
+    pub(crate) orphans_pending: bool,
+    /// The metadata blocks one freeing step may write
+    /// ([`Volume::set_free_room`]).
+    pub(crate) free_room: usize,
 }
 
 impl Volume {
@@ -440,12 +469,16 @@ impl Volume {
             return Err(Error::Corrupt);
         }
         let state = get16(&sb, 0x3A);
+        // An orphan list is emptied before the first change, except beside
+        // an orphan file, whose volumes are left to Linux and e2fsck.
+        let orphans = get32(&sb, 0xE8) != 0;
+        let orphan_file = get32(&sb, 0x5C) & COMPAT_ORPHAN_FILE != 0;
         let writable = writable
             && !recovering
             && ro_compat & !RO_COMPAT_WRITABLE == 0
             && !gdt_csum_only
             && state & STATE_ERRORS == 0
-            && get32(&sb, 0xE8) == 0
+            && !(orphans && orphan_file)
             && incompat & INCOMPAT_EXTENTS != 0;
         let now = get32(&sb, 0x30)
             .max(get32(&sb, 0x2C))
@@ -466,6 +499,10 @@ impl Volume {
             csum,
             writable,
             now,
+            held: [0; MAX_HELD],
+            held_len: 0,
+            orphans_pending: writable && orphans,
+            free_room: usize::MAX,
         };
         let root = volume.inode(device, ROOT_INODE)?;
         if root.kind() != Some(Kind::Directory) {
@@ -474,7 +511,8 @@ impl Volume {
         Ok(volume)
     }
 
-    /// Whether mutations are refused.
+    /// Whether mutations are refused. A volume mounted with an orphan list
+    /// also refuses them until [`Volume::recover_orphan`] has emptied it.
     pub fn read_only(&self) -> bool {
         !self.writable
     }
@@ -816,10 +854,15 @@ impl Volume {
         Ok(())
     }
 
-    /// The live node `inode` must be a file or directory in use.
-    fn live<D: Device>(&self, device: &mut D, number: u32) -> Result<(Inode, Kind), Error> {
+    /// The live node `inode` must be a file or directory in use: one with
+    /// a name, or one kept for its holders.
+    pub(crate) fn live<D: Device>(
+        &self,
+        device: &mut D,
+        number: u32,
+    ) -> Result<(Inode, Kind), Error> {
         let inode = self.inode(device, number)?;
-        if inode.links() == 0 {
+        if inode.links() == 0 && !self.is_held(number) {
             return Err(Error::NotFound);
         }
         let kind = inode.kind().ok_or(Error::NotFileOrDirectory)?;
@@ -882,6 +925,11 @@ impl Volume {
         let found = self
             .find_entry(device, &raw, name)?
             .ok_or(Error::NotFound)?;
+        // A held node lost its last name: another name for it is one its
+        // link count never covered.
+        if self.is_held(found.inode) {
+            return Err(Error::Corrupt);
+        }
         self.stat(device, found.inode)
     }
 

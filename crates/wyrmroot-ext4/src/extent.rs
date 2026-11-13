@@ -454,6 +454,22 @@ impl Volume {
         Ok(())
     }
 
+    /// Whether [`Volume::map_truncate`] can free every block of `inode`;
+    /// [`Error::Unsupported`] when it cannot.
+    pub(crate) fn check_freeable(&self, inode: &Inode) -> Result<(), Error> {
+        if inode.flags() & EXT4_EXTENTS_FL == 0 {
+            return if inode.root().iter().all(|&byte| byte == 0) {
+                Ok(())
+            } else {
+                Err(Error::Unsupported)
+            };
+        }
+        if inode.flags() & EXT4_HUGE_FILE_FL != 0 || header(inode.root())?.depth > 1 {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
+    }
+
     /// Frees every block of `inode` at or past logical block `keep`,
     /// including leaf blocks left empty. The caller writes the inode.
     pub(crate) fn map_truncate<D: Device>(
@@ -518,6 +534,90 @@ impl Volume {
         }
     }
 
+    /// Frees `inode`'s blocks from the end of its tree, entry by entry as
+    /// stored, until `budget` admits no more block groups. Returns whether
+    /// nothing is left; the caller writes the inode either way. Besides the
+    /// admitted groups' bitmaps and descriptors it writes at most the four
+    /// leaf blocks of a depth-one tree and frees at most those four.
+    pub(crate) fn trim_tail<D: Device>(
+        &mut self,
+        device: &mut D,
+        inode: &mut Inode,
+        budget: &mut GroupBudget,
+    ) -> Result<bool, Error> {
+        self.check_freeable(inode)?;
+        if inode.flags() & EXT4_EXTENTS_FL == 0 {
+            return Ok(true);
+        }
+        let root = header(inode.root())?;
+        if root.depth == 0 {
+            let mut node = [0u8; 60];
+            node.copy_from_slice(inode.root());
+            let emptied = self.trim_leaf_tail(device, inode, &mut node, budget)?;
+            inode.root_mut().copy_from_slice(&node);
+            return Ok(emptied);
+        }
+        let mut index = usize::from(root.entries);
+        while index > 0 {
+            index -= 1;
+            let (_, block) = index_entry(inode.root(), index);
+            let mut leaf = [0u8; MAX_BLOCK_BYTES];
+            let leaf = &mut leaf[..self.bs()];
+            self.read_node(device, inode, block, 0, leaf)?;
+            if !self.trim_leaf_tail(device, inode, leaf, budget)? {
+                self.write_node(device, inode, block, leaf)?;
+                return Ok(false);
+            }
+            self.free_blocks_range(device, block, 1)?;
+            self.charge(inode, 1, false);
+            let entries = usize::from(get16(inode.root(), 2));
+            close_slot(inode.root_mut(), index, entries);
+            put16(inode.root_mut(), 2, (entries - 1) as u16);
+        }
+        empty_root(inode.root_mut());
+        Ok(true)
+    }
+
+    /// [`Volume::trim_tail`] for one leaf `node`; whether it is now empty.
+    fn trim_leaf_tail<D: Device>(
+        &mut self,
+        device: &mut D,
+        inode: &mut Inode,
+        node: &mut [u8],
+        budget: &mut GroupBudget,
+    ) -> Result<bool, Error> {
+        let mut entries = usize::from(header(node)?.entries);
+        while entries > 0 {
+            let mut found = extent(node, entries - 1)?;
+            self.check_extent(found)?;
+            // The lowest block of the extent whose group, and every group
+            // above it, is admitted.
+            let end = found.physical + u64::from(found.len);
+            let mut from = end;
+            while from > found.physical {
+                let group = ((from - 1 - u64::from(self.first_data_block))
+                    / u64::from(self.blocks_per_group)) as u32;
+                if !budget.admit(group) {
+                    break;
+                }
+                from = self.group_first_block(group).max(found.physical);
+            }
+            let freed = (end - from) as u32;
+            if freed != 0 {
+                self.free_blocks_range(device, from, freed)?;
+                self.charge(inode, freed, false);
+            }
+            if from != found.physical {
+                found.len -= freed;
+                set_extent(node, entries - 1, found);
+                return Ok(false);
+            }
+            entries -= 1;
+            put16(node, 2, entries as u16);
+        }
+        Ok(true)
+    }
+
     /// Trims one leaf `node` to logical blocks below `keep`, freeing the rest.
     fn trim_leaf<D: Device>(
         &mut self,
@@ -559,6 +659,39 @@ impl Volume {
         } else {
             now.saturating_sub(sectors)
         });
+    }
+}
+
+/// The most block groups one [`Volume::trim_tail`] step frees from.
+pub(crate) const MAX_STEP_GROUPS: usize = 64;
+
+/// The block groups one step may free from: the first `limit` it meets.
+pub(crate) struct GroupBudget {
+    groups: [u32; MAX_STEP_GROUPS],
+    len: usize,
+    limit: usize,
+}
+
+impl GroupBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            groups: [0; MAX_STEP_GROUPS],
+            len: 0,
+            limit: limit.min(MAX_STEP_GROUPS),
+        }
+    }
+
+    /// Whether `group` is, or may become, one of the step's groups.
+    fn admit(&mut self, group: u32) -> bool {
+        if self.groups[..self.len].contains(&group) {
+            return true;
+        }
+        if self.len == self.limit {
+            return false;
+        }
+        self.groups[self.len] = group;
+        self.len += 1;
+        true
     }
 }
 

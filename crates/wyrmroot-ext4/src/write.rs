@@ -28,8 +28,8 @@ fn set_bit(bitmap: &mut [u8], index: u32, value: bool) {
 }
 
 impl Volume {
-    fn require_writable(&self) -> Result<(), Error> {
-        if self.writable {
+    pub(crate) fn require_writable(&self) -> Result<(), Error> {
+        if self.writable && !self.orphans_pending {
             Ok(())
         } else {
             Err(Error::ReadOnly)
@@ -221,7 +221,7 @@ impl Volume {
         Err(Error::NoSpace)
     }
 
-    fn free_inode<D: Device>(
+    pub(crate) fn free_inode<D: Device>(
         &mut self,
         device: &mut D,
         number: u32,
@@ -382,7 +382,7 @@ impl Volume {
         self.write_superblock(device)
     }
 
-    fn truncate_node<D: Device>(
+    pub(crate) fn truncate_node<D: Device>(
         &mut self,
         device: &mut D,
         node: &mut Inode,
@@ -500,12 +500,29 @@ impl Volume {
     }
 
     /// Removes `name` from directory `dir`; a directory must be empty. The
-    /// node's blocks and inode are freed with its last name.
+    /// node's blocks and inode are freed with its last name, so the caller
+    /// must know that nothing holds the node ([`Volume::unlink_held`]
+    /// otherwise).
     pub fn unlink<D: Device>(
         &mut self,
         device: &mut D,
         dir: u32,
         name: &[u8],
+    ) -> Result<(), Error> {
+        self.unlink_node(device, dir, name, false)
+    }
+
+    /// [`Volume::unlink`], or with `hold` [`Volume::unlink_held`]. Every
+    /// refusal comes before the first write. A failure after it leaves the
+    /// volume read-only, because the name may be gone with its node neither
+    /// freed nor listed: what was written is unknown (through a journal, the
+    /// caller drops the transaction).
+    pub(crate) fn unlink_node<D: Device>(
+        &mut self,
+        device: &mut D,
+        dir: u32,
+        name: &[u8],
+        hold: bool,
     ) -> Result<(), Error> {
         let mut parent = self.writable_node(device, dir, Kind::Directory)?;
         if !valid_name(name) {
@@ -514,33 +531,71 @@ impl Volume {
         let found = self
             .find_entry(device, &parent, name)?
             .ok_or(Error::NotFound)?;
+        // A held node has no name left: this one was never counted.
+        if self.is_held(found.inode) {
+            return Err(Error::Corrupt);
+        }
         let (mut node, kind) = self.live(device, found.inode)?;
         let directory = kind == Kind::Directory;
+        if directory && hold {
+            return Err(Error::Busy);
+        }
         if directory && !self.dir_is_empty(device, &node)? {
             return Err(Error::NotEmpty);
         }
-        self.remove_entry(device, &parent, found)?;
-        if directory {
-            let links = parent.links();
-            if links > 2 {
-                parent.set_links(links - 1);
+        let last = directory || node.links() <= 1;
+        if last {
+            // Nothing changes for a node whose blocks could not be freed
+            // (a block-mapped file, an extent tree deeper than one level):
+            // `Unsupported`, held or not, since no close would change it.
+            self.check_freeable(&node)?;
+            if hold {
+                if !self.keeps_unlinked() {
+                    return Err(Error::Busy);
+                }
+                self.check_held_first()?;
             }
-            node.set_links(0);
-        } else {
-            node.set_links(node.links().saturating_sub(1));
         }
-        parent.set_times(self.now, true, true);
-        self.write_inode(device, &mut parent)?;
-        if node.links() == 0 {
-            self.truncate_node(device, &mut node, 0)?;
-            put32(&mut node.raw, 0x14, self.now.max(1));
-            node.set_times(self.now, true, false);
-            self.write_inode(device, &mut node)?;
-            self.free_inode(device, node.number, directory)?;
-        } else {
-            node.set_times(self.now, true, false);
-            self.write_inode(device, &mut node)?;
+        // An indexed directory is never modified.
+        if parent.flags() & crate::EXT4_INDEX_FL != 0 {
+            return Err(Error::Unsupported);
         }
-        self.write_superblock(device)
+        let before = self.sb;
+        let changed = (|| {
+            self.remove_entry(device, &parent, found)?;
+            if directory {
+                let links = parent.links();
+                if links > 2 {
+                    parent.set_links(links - 1);
+                }
+            }
+            parent.set_times(self.now, true, true);
+            self.write_inode(device, &mut parent)?;
+            node.set_times(self.now, true, false);
+            if !last {
+                node.set_links(node.links() - 1);
+                self.write_inode(device, &mut node)?;
+            } else if hold {
+                self.hold(device, &mut node)?;
+            } else {
+                node.set_links(0);
+                // Every block, whatever the size says.
+                self.map_truncate(device, &mut node, 0)?;
+                node.set_size(0);
+                put32(&mut node.raw, 0x14, self.now.max(1));
+                self.write_inode(device, &mut node)?;
+                self.free_inode(device, node.number, directory)?;
+            }
+            self.write_superblock(device)
+        })();
+        if changed.is_err() {
+            self.sb = before;
+            self.writable = false;
+            if hold && self.held().first() == Some(&node.number) {
+                self.held.copy_within(1..self.held_len, 0);
+                self.held_len -= 1;
+            }
+        }
+        changed
     }
 }
