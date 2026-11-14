@@ -66,19 +66,36 @@ pub struct JobMemoryPlan {
 
 impl JobMemoryPlan {
     /// The 16 MiB plan, keeping whatever was learned before `cause`.
+    ///
+    /// The jobs limit is what `MAX_SHELL_JOBS` jobs of 16 MiB could reach
+    /// together, but when free is known never more than free − reserve, so
+    /// jobs never spend the residents' reserve; a zero limit means no job
+    /// launches (Mike, 2026-11-14; DW2 §10.11). A job's budget is at most
+    /// the limit.
     const fn fallback(
         free_pages: u64,
         reserve_pages: u64,
         cap_pages: u64,
         cause: FallbackCause,
     ) -> Self {
+        let fixed = FALLBACK_JOB_MEMORY_PAGES * MAX_SHELL_JOBS as u32;
+        let jobs_limit_pages = if free_pages == 0 {
+            fixed
+        } else {
+            let available = saturate(free_pages.saturating_sub(reserve_pages));
+            if available < fixed { available } else { fixed }
+        };
+        let job_budget_pages = if jobs_limit_pages < FALLBACK_JOB_MEMORY_PAGES {
+            jobs_limit_pages
+        } else {
+            FALLBACK_JOB_MEMORY_PAGES
+        };
         Self {
             free_pages,
             reserve_pages,
             cap_pages,
-            // What `MAX_SHELL_JOBS` jobs of 16 MiB could reach together.
-            jobs_limit_pages: FALLBACK_JOB_MEMORY_PAGES * MAX_SHELL_JOBS as u32,
-            job_budget_pages: FALLBACK_JOB_MEMORY_PAGES,
+            jobs_limit_pages,
+            job_budget_pages,
             source: JobMemorySource::Fallback,
             cause,
         }

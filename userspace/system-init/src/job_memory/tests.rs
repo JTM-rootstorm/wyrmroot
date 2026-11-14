@@ -111,12 +111,42 @@ fn every_failure_falls_back_to_16_mib_never_to_no_cap() {
         let plan = plan_job_memory(free, config);
         assert_eq!(plan.cause, cause);
         assert_eq!(plan.source, JobMemorySource::Fallback);
-        assert_eq!(plan.job_budget_pages, FALLBACK_JOB_MEMORY_PAGES);
-        assert_eq!(plan.jobs_limit_pages, fallback_jobs);
+        // Free known: never past free - reserve.
+        let limit = match free {
+            Ok(free) if free != 0 => {
+                fallback_jobs.min(u32::try_from(free.saturating_sub(plan.reserve_pages)).unwrap())
+            }
+            _ => fallback_jobs,
+        };
+        assert_eq!(plan.jobs_limit_pages, limit);
+        assert_eq!(plan.job_budget_pages, FALLBACK_JOB_MEMORY_PAGES.min(limit));
     }
     // Two pages above the reserve is the least that budgets a page a job.
     let least = plan_job_memory(Ok(256 * MIB + 2), Ok(config(0, 0)));
     assert_eq!((least.job_budget_pages, least.jobs_limit_pages), (1, 2));
+}
+
+#[test]
+fn a_fallback_never_lets_jobs_spend_the_reserve() {
+    let fallback_jobs = FALLBACK_JOB_MEMORY_PAGES * MAX_SHELL_JOBS as u32;
+    // Free at the reserve: no job may launch.
+    let none = plan_job_memory(Ok(256 * MIB), Ok(config(0, 0)));
+    assert_eq!((none.jobs_limit_pages, none.job_budget_pages), (0, 0));
+    // One page above it: one page for all jobs.
+    let one = plan_job_memory(Ok(256 * MIB + 1), Ok(config(0, 0)));
+    assert_eq!((one.jobs_limit_pages, one.job_budget_pages), (1, 1));
+    // Room for 40 MiB of jobs: the limit, and each job's 16 MiB.
+    let some = plan_job_memory(Ok(296 * MIB), Err(FallbackCause::ConfigMissing));
+    assert_eq!(
+        (some.jobs_limit_pages, some.job_budget_pages),
+        (u32::try_from(40 * MIB).unwrap(), FALLBACK_JOB_MEMORY_PAGES)
+    );
+    // Plenty: the fixed 64 MiB.
+    let plenty = plan_job_memory(Ok(2 * GIB), Err(FallbackCause::ConfigMissing));
+    assert_eq!(plenty.jobs_limit_pages, fallback_jobs);
+    // Free unknown: the fixed limit, as before.
+    let unknown = plan_job_memory(Err(FallbackCause::TopicUnreadable), Ok(config(0, 0)));
+    assert_eq!(unknown.jobs_limit_pages, fallback_jobs);
 }
 
 fn bootfs(entries: &[(&str, &[u8], FileMode)]) -> Vec<u8> {

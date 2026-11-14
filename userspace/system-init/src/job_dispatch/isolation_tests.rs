@@ -1345,6 +1345,34 @@ fn a_job_is_launched_under_the_jobs_group_with_the_planned_budget() {
     assert_eq!(&init[init.len() - 8..], &(131_072_u64 * 4096).to_le_bytes());
 }
 
+/// A fallback plan with no room above the residents' reserve launches no
+/// job: the launch is refused as `Capacity` and nothing is made for it.
+#[test]
+fn a_plan_with_no_room_for_jobs_refuses_every_launch() {
+    use crate::job_memory::{FallbackCause, JobMemory, JobMemoryPlan, JobMemorySource};
+    let mut jobs = one_session();
+    jobs.memory = JobMemory {
+        plan: JobMemoryPlan {
+            free_pages: 65_536,
+            reserve_pages: 65_536,
+            cap_pages: 0,
+            jobs_limit_pages: 0,
+            job_budget_pages: 0,
+            source: JobMemorySource::Fallback,
+            cause: FallbackCause::FreeNotAboveReserve,
+        },
+        jobs_group: Some(DwHandle(0x7700)),
+        init_group: AUTHORITY.task_group,
+    };
+    let mut rig = Rig::new(jobs);
+    rig.kernel.deliver(channel(1), &launch_hello(1, 1), &[]);
+    assert_eq!(rig.tick(), JobDispatcherPoll::STABLE);
+    assert_eq!(rig.replies(1), [Reply::Error(LaunchErrorCode::Capacity)]);
+    assert!(rig.kernel.groups_created.is_empty());
+    assert_eq!(rig.jobs.jobs.live_jobs(), 0);
+    assert_eq!(rig.jobs.launches.open_count(), 0);
+}
+
 /// QUERY_MEMORY is answered with the plan and live reads of the jobs group
 /// and of init's own group; a read that fails reports zero (WRLJ 3).
 #[test]

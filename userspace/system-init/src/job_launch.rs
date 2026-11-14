@@ -217,6 +217,16 @@ where
             return Err(if failed { InitError::Cleanup } else { error });
         }
     }
+    // A plan that leaves jobs no memory launches none (Mike, 2026-11-14;
+    // DW2 §10.11): the reply is `Capacity`, as for any exhaustion.
+    if jobs.memory.plan.job_budget_pages == 0 {
+        let failed = close_received_reverse(system, received, handle_count);
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Native(NativeError::Status(DW_STATUS_NO_MEMORY))
+        });
+    }
     let ticket = match jobs.jobs.begin_reserved_launch(request_ticket, true) {
         Ok(ticket) => ticket,
         Err(error) => {
