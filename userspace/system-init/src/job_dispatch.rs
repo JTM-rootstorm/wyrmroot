@@ -8,7 +8,7 @@ use deepwyrm_syscall::{DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_TASK_STATE_
 use wyrmroot_launch_proto::{
     ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchMessageType,
     Reservation as LaunchReservation, TerminationResult, encode_job_list, encode_job_message,
-    encode_job_result, encode_job_state, encode_shell_v1_accepted,
+    encode_job_result, encode_job_state, encode_shell_v1_accepted, encode_version,
     parse_message as parse_launch_message, parse_reservation_prefix, parse_shell_v1_request,
     parse_shell_v1_reservation_prefix,
 };
@@ -160,6 +160,14 @@ where
             .map(Some)
             .map_err(|_| JobError::WrongState)
         }
+        // The controller's own version (X1); WRLJ defines no feature bits.
+        LaunchMessage::QueryVersion => encode_version(
+            reservation,
+            wyrmroot_launch_proto::Version::current(0),
+            &mut response,
+        )
+        .map(Some)
+        .map_err(|_| JobError::WrongState),
         _ => Err(JobError::WrongState),
     };
     match result {

@@ -485,3 +485,277 @@ fn argv0_is_independent_of_the_path() {
         Err(Error::InvalidArgumentCount)
     );
 }
+
+// ------------------------------------------------------------ versions (X1)
+
+/// `bytes` in `minor`, with `extra` trailing bytes a later minor might
+/// append. A LAUNCH's own size field follows the datagram.
+fn in_minor(bytes: &[u8], minor: u16, extra: &[u8]) -> Vec<u8> {
+    let mut patched = bytes.to_vec();
+    patched.extend_from_slice(extra);
+    patched[6..8].copy_from_slice(&minor.to_le_bytes());
+    if matches!(patched[40], 1 | 17) {
+        let size = patched.len() as u32;
+        patched[48..52].copy_from_slice(&size.to_le_bytes());
+    }
+    patched
+}
+
+fn minor_of(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[6], bytes[7]])
+}
+
+/// One of every job-protocol message, encoded by this crate, with the
+/// handles it carries.
+fn every_job_message() -> Vec<(Vec<u8>, usize)> {
+    let mut all = Vec::new();
+    let mut push = |encode: &dyn Fn(&mut [u8]) -> Result<usize, Error>, handles| {
+        let mut bytes = [0u8; 1024];
+        let size = encode(&mut bytes).unwrap();
+        all.push((bytes[..size].to_vec(), handles));
+    };
+    push(
+        &|out| encode_launch(R, "bin/hello", &["bin/hello", "x"], &["A=1"], true, out),
+        STREAM_COUNT,
+    );
+    push(
+        &|out| encode_launch_image(R, "bin/a", &["a"], &[], out),
+        LAUNCH_IMAGE_HANDLE_COUNT,
+    );
+    for kind in [
+        MessageType::LaunchAccepted,
+        MessageType::Query,
+        MessageType::Wait,
+        MessageType::Terminate,
+        MessageType::TerminationAccepted,
+        MessageType::Cancel,
+        MessageType::Cancelled,
+        MessageType::CloseJob,
+        MessageType::Closed,
+    ] {
+        push(&|out| encode_job_message(R, kind, 17, out), 0);
+    }
+    push(&|out| encode_list_jobs(R, out), 0);
+    push(&|out| encode_job_state(R, 17, JobPhase::Exited, out), 0);
+    push(
+        &|out| {
+            let result = TerminationResult {
+                classification: TerminationClassification::NormalExit,
+                application_code: 3,
+                exception_class: 0,
+                exception_detail: 0,
+                exception_address: 0,
+                cleanup_result: 1,
+            };
+            encode_job_result(R, 17, result, out)
+        },
+        0,
+    );
+    push(&|out| encode_job_list(R, &[17, 19], out), 0);
+    push(&|out| encode_error(R, ErrorCode::Capacity, out), 0);
+    push(&|out| encode_query_version(R, out), 0);
+    push(
+        &|out| {
+            encode_version(
+                R,
+                Version {
+                    minor: u16::MAX,
+                    ..Version::current(u64::MAX)
+                },
+                out,
+            )
+        },
+        0,
+    );
+    all
+}
+
+#[test]
+fn every_message_is_sent_in_the_oldest_minor_with_its_layout() {
+    for (bytes, _) in every_job_message() {
+        let since = MessageType::parse(read_u32(&bytes, 40).unwrap())
+            .unwrap()
+            .since();
+        assert_eq!(minor_of(&bytes), since);
+    }
+    // A pre-X1 peer, whose decoder wants exactly 0, reads every 1.0 answer.
+    let mut bytes = [0u8; 64];
+    let size = encode_job_state(R, 17, JobPhase::Running, &mut bytes).unwrap();
+    assert_eq!(minor_of(&bytes[..size]), 0);
+    let size = encode_query_version(R, &mut bytes).unwrap();
+    assert_eq!(minor_of(&bytes[..size]), VERSION_QUERY_MINOR);
+    assert_eq!(MINOR, VERSION_QUERY_MINOR);
+}
+
+#[test]
+fn every_job_message_of_a_later_minor_with_trailing_bytes_is_read_as_known() {
+    for (bytes, handles) in every_job_message() {
+        let known = parse_message(&bytes, handles).unwrap();
+        for (minor, extra) in [
+            (MINOR, &[][..]),
+            (MINOR + 1, &[0xa5; 24][..]),
+            (u16::MAX, &[1][..]),
+        ] {
+            let later = in_minor(&bytes, minor, extra);
+            let parsed = parse_message(&later, handles);
+            assert_eq!(parsed, Ok(known), "{:?} {minor}", known.message);
+            assert_eq!(parse_reservation_prefix(&later), Ok(R));
+            // Handle counts stay exact.
+            assert_eq!(
+                parse_message(&later, handles + 1),
+                Err(Error::WrongHandleCount)
+            );
+        }
+        // Minor 1 is the shell-V1 envelope, never a job message.
+        let shell = in_minor(&bytes, SHELL_V1_MINOR, &[]);
+        assert_eq!(
+            parse_message(&shell, handles),
+            Err(Error::UnsupportedVersion)
+        );
+        assert_eq!(
+            parse_reservation_prefix(&shell),
+            Err(Error::UnsupportedVersion)
+        );
+    }
+}
+
+#[test]
+fn trailing_bytes_never_join_the_strings_or_job_ids() {
+    let mut bytes = [0u8; 512];
+    let size = encode_launch(R, "bin/hello", &["bin/hello"], &["A=1"], false, &mut bytes).unwrap();
+    let later = in_minor(&bytes[..size], MINOR + 1, b"B=2");
+    let Message::Launch(request) = parse_message(&later, 0).unwrap().message else {
+        panic!()
+    };
+    assert_eq!(request.environment_count(), 1);
+    assert_eq!(request.environment(0), Some("A=1"));
+    // The size field still equals the datagram.
+    let mut wrong = later.clone();
+    wrong[48] ^= 1;
+    assert_eq!(parse_message(&wrong, 0), Err(Error::WrongSize));
+    // Counts that reach past the message are refused.
+    let mut long = later.clone();
+    long[64..68].copy_from_slice(&64u32.to_le_bytes());
+    assert!(parse_message(&long, 0).is_err());
+
+    let size = encode_job_list(R, &[5], &mut bytes).unwrap();
+    let later = in_minor(&bytes[..size], MINOR + 1, &[0xff; 8]);
+    let Message::JobList(ids) = parse_message(&later, 0).unwrap().message else {
+        panic!()
+    };
+    assert_eq!((ids.len(), ids.get(0)), (1, Some(5)));
+    let mut long = later.clone();
+    long[48] = 3;
+    assert_eq!(parse_message(&long, 0), Err(Error::WrongSize));
+
+    // Reserved fields and flags in the known body stay zero; unknown types
+    // are still refused.
+    let size = encode_error(R, ErrorCode::Capacity, &mut bytes).unwrap();
+    let mut later = in_minor(&bytes[..size], MINOR + 1, &[0; 8]);
+    later[52] = 1;
+    assert_eq!(parse_message(&later, 0), Err(Error::NonzeroReserved));
+    later[52] = 0;
+    later[44] = 1;
+    assert_eq!(parse_message(&later, 0), Err(Error::NonzeroFlags));
+    later[44] = 0;
+    later[40] = 99;
+    assert_eq!(parse_message(&later, 0), Err(Error::UnknownMessageType));
+}
+
+#[test]
+fn shell_v1_keeps_its_exact_minor_and_ignores_trailing_bytes() {
+    let request = ShellV1Request {
+        console_generation: 13,
+        status_generation: 15,
+        requested_child_generation: 17,
+    };
+    let mut bytes = [0u8; SHELL_V1_REQUEST_BYTES];
+    encode_shell_v1_request(R, request, &mut bytes).unwrap();
+    let mut longer = bytes.to_vec();
+    longer.extend_from_slice(&[0xa5; 16]);
+    assert_eq!(
+        parse_shell_v1_request(&longer, SHELL_V1_HANDLE_COUNT).map(|parsed| parsed.request),
+        Ok(request)
+    );
+    // The frozen path padding is still zero.
+    longer[127] = 1;
+    assert_eq!(
+        parse_shell_v1_request(&longer, SHELL_V1_HANDLE_COUNT),
+        Err(Error::NonzeroReserved)
+    );
+    for minor in [0, MINOR] {
+        let other = in_minor(&bytes, minor, &[]);
+        assert_eq!(
+            parse_shell_v1_request(&other, SHELL_V1_HANDLE_COUNT),
+            Err(Error::UnsupportedVersion)
+        );
+        assert_eq!(
+            parse_shell_v1_reservation_prefix(&other),
+            Err(Error::UnsupportedVersion)
+        );
+    }
+    let mut reply = [0u8; SHELL_V1_REPLY_BYTES];
+    encode_shell_v1_accepted(R, 19, &mut reply).unwrap();
+    let mut longer = reply.to_vec();
+    longer.extend_from_slice(&[0xa5; 8]);
+    assert_eq!(
+        parse_shell_v1_reply(&longer, 0).map(|parsed| parsed.reply),
+        Ok(ShellV1Reply::LaunchAccepted { job_id: 19 })
+    );
+}
+
+#[test]
+fn the_version_query_round_trips_and_exists_only_from_minor_two() {
+    let mut bytes = [0u8; 128];
+    let size = encode_query_version(R, &mut bytes).unwrap();
+    assert_eq!(size, HEADER_BYTES);
+    assert_eq!(
+        parse_message(&bytes[..size], 0).unwrap().message,
+        Message::QueryVersion
+    );
+    let old = in_minor(&bytes[..size], 0, &[]);
+    assert_eq!(parse_message(&old, 0), Err(Error::UnknownMessageType));
+
+    let version = Version {
+        features: 1 << 63,
+        ..Version::current(0)
+    };
+    let size = encode_version(R, version, &mut bytes).unwrap();
+    assert_eq!(size, HEADER_BYTES + 16);
+    let good = bytes[..size].to_vec();
+    assert_eq!(
+        parse_message(&good, 0).unwrap().message,
+        Message::Version(version)
+    );
+    assert_eq!(
+        parse_message(&in_minor(&good, 0, &[]), 0),
+        Err(Error::UnknownMessageType)
+    );
+    let patched = |offset: usize, value: &[u8]| {
+        let mut bytes = good.clone();
+        bytes[offset..offset + value.len()].copy_from_slice(value);
+        parse_message(&bytes, 0).map(|_| ())
+    };
+    assert_eq!(patched(48, &[2, 0]), Err(Error::UnsupportedVersion));
+    assert_eq!(patched(50, &[1, 0]), Err(Error::UnsupportedVersion));
+    assert_eq!(patched(52, &[1]), Err(Error::NonzeroReserved));
+    assert_eq!(
+        parse_message(&in_minor(&good, MINOR + 1, &[]), 0),
+        Err(Error::UnsupportedVersion)
+    );
+    assert_eq!(
+        encode_version(
+            R,
+            Version {
+                minor: 0,
+                ..version
+            },
+            &mut bytes
+        ),
+        Err(Error::UnsupportedVersion)
+    );
+    assert_eq!(
+        encode_version(R, version, &mut bytes[..size - 1]),
+        Err(Error::WrongSize)
+    );
+}
