@@ -78,10 +78,7 @@ fn node_samples<'a>(listing: &'a [u8], data: &'a [u8]) -> Vec<Body<'a>> {
             offset: 1 << 40,
             length: MAX_IO_BYTES as u32,
         },
-        Body::Write {
-            offset: 5,
-            data,
-        },
+        Body::Write { offset: 5, data },
         Body::Truncate { size: 12 },
         Body::Unlink { name: b"old" },
         Body::Sync,
