@@ -162,7 +162,33 @@ where
             }
         }
     }
-    if let Some((grant, session)) = jobs.next_session() {
+    // After a job init ended, no new request is read until its memory has
+    // settled (DW2 §10.10 item 7); a peer closing is still seen. In the
+    // tick a pause ends, every session takes a turn, so a request queued
+    // during it does not wait a further tick for each session ahead of it
+    // (Mike, 2026-11-14; step-5 review W R1).
+    let paused = jobs.settle.is_some();
+    let settling = match jobs.settle {
+        Some(settle) => {
+            let memory = jobs.memory;
+            jobs.settle = settle.poll(now_ns, || {
+                memory.jobs_usage(&mut crate::job_memory::InitJobGroups(system))
+            });
+            jobs.settle.is_some()
+        }
+        None => false,
+    };
+    let turns = if paused && !settling {
+        jobs.session_count()
+    } else {
+        1
+    };
+    for _ in 0..turns {
+        // A request served in an earlier turn may have begun a new pause.
+        let settling = settling || jobs.settle.is_some();
+        let Some((grant, session)) = jobs.next_session() else {
+            break;
+        };
         // A reply held for this session goes first. Until it has gone, the
         // session's requests are not read -- each would be owed a reply
         // there is nowhere to put -- but its peer closing is still seen.
@@ -179,18 +205,6 @@ where
                 });
                 return finish_poll(system, waits, jobs, shell, now_ns, poll);
             }
-        };
-        // After a job init ended, no new request is read until its memory
-        // has settled (DW2 §10.10 item 7); a peer closing is still seen.
-        let settling = match jobs.settle {
-            Some(settle) => {
-                let memory = jobs.memory;
-                jobs.settle = settle.poll(now_ns, || {
-                    memory.jobs_usage(&mut crate::job_memory::InitJobGroups(system))
-                });
-                jobs.settle.is_some()
-            }
-            None => false,
         };
         let reading = reading && !settling;
         let item = DwWaitItemV1 {

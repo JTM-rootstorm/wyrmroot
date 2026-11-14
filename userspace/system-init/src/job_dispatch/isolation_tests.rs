@@ -1489,12 +1489,12 @@ fn requests_wait_while_an_ended_job_s_memory_is_still_falling() {
     assert_eq!(rig.replies(1).len(), 1);
 }
 
-/// Step-5 review W R1, measured (DW2 §10.11, M5 step 6): with every
-/// session waiting through a whole settle pause, the last is answered when
-/// the poll's turn reaches it after the pause ends, one session per tick:
-/// at most the pause's limit plus a tick per session.
+/// Step-5 review W R1 (DW2 §10.11, M5 step 6): with every session waiting
+/// through a whole settle pause, each is answered in the tick the pause
+/// ends, every session taking a turn then (Mike, 2026-11-14). Before, one
+/// session per tick made the last wait 875 ms against wyrmsh's 1 s.
 #[test]
-fn the_slowest_reply_after_a_settle_pause_is_the_pause_plus_a_turn_per_session() {
+fn every_session_waiting_through_a_settle_pause_is_answered_when_it_ends() {
     use crate::job_memory::{
         FallbackCause, JobMemory, JobMemoryPlan, JobMemorySource, SETTLE_LIMIT_NS, Settle,
     };
@@ -1557,7 +1557,6 @@ fn the_slowest_reply_after_a_settle_pause_is_the_pause_plus_a_turn_per_session()
     let first = *answered.values().min().unwrap();
     // Nothing is read during the pause.
     assert!(first >= SETTLE_LIMIT_NS);
-    assert!(slowest <= SETTLE_LIMIT_NS + MAX_SESSIONS as u64 * RESIDENT_TICK_NS);
-    // 500 ms of pause and 15 more turns: 875 ms, against wyrmsh's 1 s.
-    assert_eq!(slowest, 875_000_000);
+    assert_eq!(slowest, first, "all in one tick");
+    assert!(slowest < SETTLE_LIMIT_NS + RESIDENT_TICK_NS);
 }

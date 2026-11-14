@@ -283,6 +283,11 @@ impl JobDispatcher {
         })
     }
 
+    /// Sessions installed now.
+    pub(crate) fn session_count(&self) -> usize {
+        self.sessions.iter().flatten().count()
+    }
+
     pub(crate) fn next_session(&mut self) -> Option<(EndpointGrant, DwHandle)> {
         for offset in 0..MAX_SESSIONS {
             let index = (self.poll_cursor + offset) % MAX_SESSIONS;
