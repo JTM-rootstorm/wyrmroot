@@ -18,7 +18,7 @@
 //! cannot be made, the plan records why and every job gets the old 16 MiB,
 //! with the jobs group (when it exists) held to what the old jobs could
 //! reach together. Init has no log stream; the plan, its cause included,
-//! is what the shell's `status` reports (WRLJ MEMORY).
+//! is what the shell's `memory` command reports (WRLJ MEMORY).
 
 use deepwyrm_syscall::{
     DW_TASK_GROUP_LIMIT_MEMORY_PAGES, DW_TASK_GROUP_LIMIT_UNLIMITED, DwHandle,
@@ -47,7 +47,7 @@ const MAX_FINITE_LIMIT: u32 = DW_TASK_GROUP_LIMIT_UNLIMITED - 1;
 /// reports them.
 pub use wyrmroot_launch_proto::{MemoryFallback as FallbackCause, MemorySource as JobMemorySource};
 
-/// What init computed, kept for the boot and reported by `status`.
+/// What init computed, kept for the boot and reported by `memory`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobMemoryPlan {
     /// Free frames when init read the topic; zero if it could not.
@@ -180,7 +180,7 @@ pub(crate) struct JobMemory {
     /// Absent only when it could not be made ([`FallbackCause::JobsGroup`]);
     /// jobs then go under init's own group at 16 MiB each.
     pub(crate) jobs_group: Option<DwHandle>,
-    /// Init's own group, the root, whose free count `status` reads again.
+    /// Init's own group, the root, whose free count `memory` reads again.
     pub(crate) init_group: DwHandle,
 }
 
