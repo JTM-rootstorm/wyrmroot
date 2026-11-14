@@ -33,7 +33,7 @@ use wyrmroot_fs_proto::node::{
     MAX_IO_BYTES,
 };
 use wyrmroot_fs_proto::{
-    MAX_HANDLES, MAX_NAME_BYTES, OPEN_DIRECTORY, OPEN_FILE, OPEN_MUTATING, Status,
+    MAX_HANDLES, MAX_NAME_BYTES, OPEN_DIRECTORY, OPEN_FILE, OPEN_MUTATING, ReplyTo, Status, Version,
 };
 use wyrmroot_runtime::{MemoryPlatform, WYR0_I_SUPERVISION_POLICY};
 use wyrmroot_service::block::BlockClient;
@@ -374,7 +374,11 @@ impl<V: View> Server<V> {
             }
             return false;
         };
-        let transaction_id = message.transaction_id;
+        // Answered in the request's minor (X1).
+        let to = ReplyTo::new(
+            &bytes[..counts.bytes.min(bytes.len())],
+            message.transaction_id,
+        );
         let here = cursor.node();
         let status = |status| Body::Status { status, value: 0 };
         let mut listing = [0u8; MAX_DIRENT_BYTES];
@@ -390,7 +394,7 @@ impl<V: View> Server<V> {
                     let _ = platform.close_handle(server.handle);
                     return false;
                 }
-                self.open(platform, transaction_id, here, flags, path, server.handle);
+                self.open(platform, to, here, flags, path, server.handle);
                 return true;
             }
             Body::GetAttr => Body::Attr(Self::attr(here)),
@@ -432,12 +436,14 @@ impl<V: View> Server<V> {
                 total_bytes: self.volume.total_bytes(),
                 free_bytes: 0,
             }),
+            // No locks (above), so no feature bits.
+            Body::QueryVersion => Body::Version(Version::current(0)),
             // CLOSE (WRFS 1.3): drop the node with no reply; closing this end
             // completes the client's close.
             Body::Close => return false,
             _ => return false,
         };
-        send(platform, channel, transaction_id, reply)
+        send(platform, channel, to, reply)
     }
 
     /// One page of directory `dir` from `cookie`: (next cookie, bytes).
@@ -479,7 +485,7 @@ impl<V: View> Server<V> {
     fn open<P: Fat32Platform>(
         &mut self,
         platform: &mut P,
-        transaction_id: u64,
+        to: ReplyTo,
         dir: Node,
         flags: u32,
         path: &[u8],
@@ -511,12 +517,8 @@ impl<V: View> Server<V> {
             (Ok(_), None) => (Status::NoResources, None),
             (Err(status), _) => (status, None),
         };
-        let sent = send(
-            platform,
-            server,
-            transaction_id,
-            Body::OnOpen { status, attr },
-        );
+        // ON_OPEN goes in the OPEN's minor.
+        let sent = send(platform, server, to, Body::OnOpen { status, attr });
         match (found, slot) {
             (Ok(node), Some(slot)) if sent => {
                 self.nodes[slot] = Some(OpenNode {
@@ -534,18 +536,12 @@ impl<V: View> Server<V> {
 fn send<P: Fat32Platform>(
     platform: &mut P,
     channel: DwHandle,
-    transaction_id: u64,
+    to: ReplyTo,
     body: Body<'_>,
 ) -> bool {
     let mut bytes = [0u8; node::MAX_BYTES];
-    node::encode(
-        &node::Message {
-            transaction_id,
-            body,
-        },
-        &mut bytes,
-    )
-    .is_ok_and(|size| platform.send_channel(channel, &bytes[..size], &[]).is_ok())
+    node::encode_reply(to, body, &mut bytes)
+        .is_ok_and(|size| platform.send_channel(channel, &bytes[..size], &[]).is_ok())
 }
 
 #[cfg(test)]

@@ -11,7 +11,8 @@ use wyrmroot_fs_proto::node::{
     MAX_DIRENT_BYTES,
 };
 use wyrmroot_fs_proto::{
-    MAX_HANDLES, MAX_NAME_BYTES, OPEN_CREATE, OPEN_EXCLUSIVE, OPEN_FILE, OPEN_MUTATING, Status,
+    MAX_HANDLES, MAX_NAME_BYTES, OPEN_CREATE, OPEN_EXCLUSIVE, OPEN_FILE, OPEN_MUTATING, ReplyTo,
+    Status, Version,
 };
 use wyrmroot_runtime::{ChannelPlatform, HandlePlatform, NativeError, WaitPlatform};
 
@@ -252,21 +253,27 @@ impl Vfs {
             close_all(platform, received);
             return false;
         };
+        // Answered, and passed on, in the request's minor (X1).
+        let to = ReplyTo::new(
+            &bytes[..counts.bytes.min(bytes.len())],
+            message.transaction_id,
+        );
         let status = match message.body {
             namespace::Body::Open { flags, path } => {
                 if !admitted(received[0], OPEN_CHANNEL_RIGHTS) {
                     close_all(platform, received);
                     return false;
                 }
-                self.open(
-                    platform,
-                    owner,
-                    message.transaction_id,
-                    flags,
-                    path,
-                    received[0].handle,
-                );
+                self.open(platform, owner, to, flags, path, received[0].handle);
                 return true;
+            }
+            namespace::Body::QueryVersion => {
+                return send_namespace(
+                    platform,
+                    channel,
+                    to,
+                    namespace::Body::Version(Version::current(NAMESPACE_FEATURES)),
+                );
             }
             namespace::Body::Mount { flags, path } => {
                 let root = received[0];
@@ -301,19 +308,9 @@ impl Vfs {
                     Status::NotFound
                 }
             }
-            namespace::Body::Status(_) => return false,
+            namespace::Body::Status(_) | namespace::Body::Version(_) => return false,
         };
-        let mut reply = [0u8; namespace::MAX_BYTES];
-        let Ok(size) = namespace::encode(
-            &namespace::Message {
-                transaction_id: message.transaction_id,
-                body: namespace::Body::Status(status),
-            },
-            &mut reply,
-        ) else {
-            return false;
-        };
-        platform.send_channel(channel, &reply[..size], &[]).is_ok()
+        send_namespace(platform, channel, to, namespace::Body::Status(status))
     }
 
     /// Opens a checked absolute `path` onto the node Channel `server`, which
@@ -323,21 +320,14 @@ impl Vfs {
         &mut self,
         platform: &mut P,
         owner: u64,
-        transaction_id: u64,
+        to: ReplyTo,
         flags: u32,
         path: &[u8],
         server: DwHandle,
     ) {
         let status = match self.mounts.resolve(path) {
             Resolution::Mount { index, rest } => {
-                match self.forward(
-                    platform,
-                    (owner, transaction_id),
-                    flags,
-                    index,
-                    rest,
-                    server,
-                ) {
+                match self.forward(platform, (owner, to), flags, index, rest, server) {
                     Ok(()) => return,
                     Err(status) => status,
                 }
@@ -350,7 +340,7 @@ impl Vfs {
                 } else if flags & OPEN_MUTATING != 0 {
                     Status::ReadOnly
                 } else {
-                    match self.add_node(platform, owner, transaction_id, path, server) {
+                    match self.add_node(platform, owner, to, path, server) {
                         Ok(()) => return,
                         Err(status) => status,
                     }
@@ -358,16 +348,17 @@ impl Vfs {
             }
             Resolution::NotFound => Status::NotFound,
         };
-        fail_open(platform, transaction_id, server, status);
+        fail_open(platform, to, server, status);
     }
 
     /// Passes an open on to mount `index`, naming the client connection
-    /// `owner` it came through (WRFS 1.2); on `Err` the caller still owns
-    /// `server`.
+    /// `owner` it came through (WRFS 1.2), in the minor it arrived in so the
+    /// filesystem's ON_OPEN reaches the client in it (X1); on `Err` the
+    /// caller still owns `server`.
     fn forward<P: VfsPlatform>(
         &mut self,
         platform: &mut P,
-        (owner, transaction_id): (u64, u64),
+        (owner, to): (u64, ReplyTo),
         mut flags: u32,
         index: usize,
         rest: &[u8],
@@ -386,14 +377,12 @@ impl Vfs {
             flags &= !OPEN_CREATE;
         }
         let mut bytes = [0u8; node::MAX_BYTES];
-        let size = node::encode(
-            &node::Message {
-                transaction_id,
-                body: NodeBody::Open {
-                    flags,
-                    path: rest,
-                    client: owner,
-                },
+        let size = node::encode_reply(
+            to,
+            NodeBody::Open {
+                flags,
+                path: rest,
+                client: owner,
             },
             &mut bytes,
         )
@@ -425,7 +414,7 @@ impl Vfs {
         &mut self,
         platform: &mut P,
         owner: u64,
-        transaction_id: u64,
+        to: ReplyTo,
         path: &[u8],
         server: DwHandle,
     ) -> Result<(), Status> {
@@ -447,7 +436,7 @@ impl Vfs {
         let sent = send_node(
             platform,
             server,
-            transaction_id,
+            to,
             NodeBody::OnOpen {
                 status: Status::Ok,
                 attr: Some(SYNTHETIC_ATTR),
@@ -492,7 +481,10 @@ impl Vfs {
             close_all(platform, received);
             return false;
         };
-        let transaction_id = message.transaction_id;
+        let to = ReplyTo::new(
+            &bytes[..counts.bytes.min(bytes.len())],
+            message.transaction_id,
+        );
         let status = |status| NodeBody::Status { status, value: 0 };
         let mut listing = [0u8; MAX_DIRENT_BYTES];
         let reply = match message.body {
@@ -508,29 +500,17 @@ impl Vfs {
                 }
                 // Only vfsd names a client connection (WRFS 1.2).
                 if client != 0 {
-                    fail_open(platform, transaction_id, server.handle, Status::Invalid);
+                    fail_open(platform, to, server.handle, Status::Invalid);
                     return true;
                 }
                 // A synthetic directory is only listed, so nothing opened
                 // through it may be written (access never grows).
                 if flags & OPEN_MUTATING != 0 {
-                    fail_open(
-                        platform,
-                        transaction_id,
-                        server.handle,
-                        Status::AccessDenied,
-                    );
+                    fail_open(platform, to, server.handle, Status::AccessDenied);
                 } else if let Some(full) = PathBuf::join(base.as_bytes(), path) {
-                    self.open(
-                        platform,
-                        owner,
-                        transaction_id,
-                        flags,
-                        full.as_bytes(),
-                        server.handle,
-                    );
+                    self.open(platform, owner, to, flags, full.as_bytes(), server.handle);
                 } else {
-                    fail_open(platform, transaction_id, server.handle, Status::InvalidPath);
+                    fail_open(platform, to, server.handle, Status::InvalidPath);
                 }
                 return true;
             }
@@ -561,12 +541,14 @@ impl Vfs {
                 total_bytes: 0,
                 free_bytes: 0,
             }),
+            // Synthetic directories hold no locks.
+            NodeBody::QueryVersion => NodeBody::Version(Version::current(SYNTHETIC_FEATURES)),
             // CLOSE (WRFS 1.3): drop the node with no reply; closing this end
             // completes the client's close.
             NodeBody::Close => return false,
             _ => return false,
         };
-        send_node(platform, channel, transaction_id, reply)
+        send_node(platform, channel, to, reply)
     }
 
     /// Writes the page of synthetic directory `dir` that starts at `cookie`
@@ -587,6 +569,11 @@ impl Vfs {
         Some((if next < count { next as u64 } else { 0 }, used))
     }
 }
+
+/// WRNS feature bits vfsd offers: none are defined yet.
+const NAMESPACE_FEATURES: u64 = 0;
+/// WRFS feature bits of a synthetic directory: no locks.
+const SYNTHETIC_FEATURES: u64 = 0;
 
 /// Every synthetic directory looks the same: listable, never writable, with
 /// no identity of its own.
@@ -612,35 +599,37 @@ fn close_all<P: VfsPlatform>(platform: &mut P, received: &[DwReceivedHandleInfoV
     }
 }
 
-/// Sends one WRFS message; `false` if it could not be encoded or sent.
+/// Sends one WRFS reply; `false` if it could not be encoded or sent.
 fn send_node<P: VfsPlatform>(
     platform: &mut P,
     channel: DwHandle,
-    transaction_id: u64,
+    to: ReplyTo,
     body: NodeBody<'_>,
 ) -> bool {
     let mut bytes = [0u8; node::MAX_BYTES];
-    node::encode(
-        &node::Message {
-            transaction_id,
-            body,
-        },
-        &mut bytes,
-    )
-    .is_ok_and(|size| platform.send_channel(channel, &bytes[..size], &[]).is_ok())
+    node::encode_reply(to, body, &mut bytes)
+        .is_ok_and(|size| platform.send_channel(channel, &bytes[..size], &[]).is_ok())
 }
 
-/// Answers a failed open on its node Channel and closes it.
-fn fail_open<P: VfsPlatform>(
+/// Sends one WRNS reply; `false` if it could not be encoded or sent.
+fn send_namespace<P: VfsPlatform>(
     platform: &mut P,
-    transaction_id: u64,
-    server: DwHandle,
-    status: Status,
-) {
+    channel: DwHandle,
+    to: ReplyTo,
+    body: namespace::Body<'_>,
+) -> bool {
+    let mut bytes = [0u8; namespace::MAX_BYTES];
+    namespace::encode_reply(to, body, &mut bytes)
+        .is_ok_and(|size| platform.send_channel(channel, &bytes[..size], &[]).is_ok())
+}
+
+/// Answers a failed open on its node Channel, in the OPEN's minor, and
+/// closes it.
+fn fail_open<P: VfsPlatform>(platform: &mut P, to: ReplyTo, server: DwHandle, status: Status) {
     let _ = send_node(
         platform,
         server,
-        transaction_id,
+        to,
         NodeBody::OnOpen { status, attr: None },
     );
     let _ = platform.close_handle(server);

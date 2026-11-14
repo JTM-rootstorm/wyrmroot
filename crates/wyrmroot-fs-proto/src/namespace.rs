@@ -1,10 +1,15 @@
-//! WRNS 1.3: the namespace protocol, spoken to `vfsd`.
+//! WRNS 1.4: the namespace protocol, spoken to `vfsd`.
 //!
 //! ```text
 //! client -> vfsd  OPEN (+ new node Channel)        (one-way; WRFS ON_OPEN on that Channel)
 //! admin  -> vfsd  MOUNT (+ filesystem root Channel) -> STATUS
 //! admin  -> vfsd  UNMOUNT                          -> STATUS
+//! client -> vfsd  QUERY_VERSION                    -> VERSION (1.4)
 //! ```
+//!
+//! Versions follow the crate's rule (higher minors and trailing data
+//! accepted, answers in the request's minor). WRNS defines no feature bits
+//! yet; a later minor may.
 //!
 //! OPEN takes a canonical absolute path. `vfsd` picks the mount whose path
 //! is the longest component-wise prefix of it and passes the open on to
@@ -14,18 +19,22 @@
 //! are answered ACCESS_DENIED.
 
 use crate::{
-    Error, HEADER_BYTES, MAX_PATH_BYTES, Status, check_absolute, check_open_flags, get32, put32,
-    read_header, tail, write_header,
+    EXTENSION_BYTES, Error, HEADER_BYTES, MAX_PATH_BYTES, MIN_MINOR, MINOR, ReplyTo, Status,
+    VERSION_BODY_BYTES, VERSION_QUERY_MINOR, Version, check_absolute, check_encode_minor,
+    check_open_flags, check_version, fixed, get_version, get32, put_version, put32, read_header,
+    tail, write_header,
 };
 
 pub const MAGIC: [u8; 4] = *b"WRNS";
-/// The largest WRNS message, for receive buffers.
-pub const MAX_BYTES: usize = HEADER_BYTES + 8 + MAX_PATH_BYTES;
+/// The largest WRNS message of any 1.x minor, for receive buffers.
+pub const MAX_BYTES: usize = HEADER_BYTES + 8 + MAX_PATH_BYTES + EXTENSION_BYTES;
 
 const TYPE_OPEN: u32 = 1;
 const TYPE_MOUNT: u32 = 2;
 const TYPE_UNMOUNT: u32 = 3;
 const TYPE_STATUS: u32 = 4;
+const TYPE_QUERY_VERSION: u32 = 5;
+const TYPE_VERSION: u32 = 6;
 
 /// MOUNT flag: `vfsd` refuses every write, create or truncate under the
 /// mount with READ_ONLY, whatever the filesystem would allow.
@@ -49,23 +58,36 @@ pub enum Body<'a> {
         path: &'a [u8],
     },
     Status(Status),
+    /// Asks `vfsd` for its version (1.4), on any connection.
+    QueryVersion,
+    /// QUERY_VERSION's answer (1.4).
+    Version(Version),
 }
 
 impl Body<'_> {
     /// Whether a client sends this message (as opposed to `vfsd`).
     pub const fn is_request(&self) -> bool {
-        !matches!(self, Self::Status(_))
+        !matches!(self, Self::Status(_) | Self::Version(_))
     }
 
     pub const fn wire_size(&self) -> usize {
         HEADER_BYTES
-            + 8
             + match self {
                 Self::Open { path, .. } | Self::Mount { path, .. } | Self::Unmount { path } => {
-                    path.len()
+                    8 + path.len()
                 }
-                Self::Status(_) => 0,
+                Self::Status(_) => 8,
+                Self::QueryVersion => 0,
+                Self::Version(_) => VERSION_BODY_BYTES,
             }
+    }
+
+    /// The minor that introduced this message.
+    pub const fn since(&self) -> u16 {
+        match self {
+            Self::QueryVersion | Self::Version(_) => VERSION_QUERY_MINOR,
+            _ => MIN_MINOR,
+        }
     }
 
     pub const fn handle_count(&self) -> usize {
@@ -81,6 +103,8 @@ impl Body<'_> {
             Self::Mount { .. } => TYPE_MOUNT,
             Self::Unmount { .. } => TYPE_UNMOUNT,
             Self::Status(_) => TYPE_STATUS,
+            Self::QueryVersion => TYPE_QUERY_VERSION,
+            Self::Version(_) => TYPE_VERSION,
         }
     }
 }
@@ -92,9 +116,30 @@ pub struct Message<'a> {
     pub body: Body<'a>,
 }
 
-/// Encodes `message` into exactly `output[..wire_size]`, returning that size.
+/// Encodes `message` in [`MINOR`] into exactly `output[..wire_size]`,
+/// returning that size.
 pub fn encode(message: &Message<'_>, output: &mut [u8]) -> Result<usize, Error> {
+    encode_at(message, MINOR, output)
+}
+
+/// Encodes the reply `body` to `to` in its minor.
+pub fn encode_reply(to: ReplyTo, body: Body<'_>, output: &mut [u8]) -> Result<usize, Error> {
+    encode_at(
+        &Message {
+            transaction_id: to.transaction_id,
+            body,
+        },
+        to.minor,
+        output,
+    )
+}
+
+/// Encodes `message` in `minor`'s layout, which must be one this crate
+/// speaks and have the message: how a reply answers in the request's minor
+/// ([`crate::reply_minor`]).
+pub fn encode_at(message: &Message<'_>, minor: u16, output: &mut [u8]) -> Result<usize, Error> {
     let body = &message.body;
+    check_encode_minor(minor, body.since())?;
     let size = body.wire_size();
     let output = output.get_mut(..size).ok_or(Error::WrongSize)?;
     if message.transaction_id == 0 {
@@ -104,6 +149,7 @@ pub fn encode(message: &Message<'_>, output: &mut [u8]) -> Result<usize, Error> 
     write_header(
         output,
         MAGIC,
+        minor,
         body.message_type(),
         body.handle_count(),
         message.transaction_id,
@@ -119,6 +165,8 @@ pub fn encode(message: &Message<'_>, output: &mut [u8]) -> Result<usize, Error> 
             output[40..].copy_from_slice(path);
         }
         Body::Status(status) => put32(output, 32, status as u32),
+        Body::QueryVersion => {}
+        Body::Version(version) => put_version(output, 32, version),
     }
     Ok(size)
 }
@@ -143,13 +191,19 @@ pub fn parse(bytes: &[u8], handle_count: usize) -> Result<Message<'_>, Error> {
             Body::Unmount { path }
         }
         TYPE_STATUS => {
-            if bytes.len() != HEADER_BYTES + 8 {
-                return Err(Error::WrongSize);
-            }
+            fixed(bytes, 8)?;
             if get32(bytes, 36) != 0 {
                 return Err(Error::NonzeroReserved);
             }
             Body::Status(Status::parse(get32(bytes, 32))?)
+        }
+        TYPE_QUERY_VERSION if header.minor >= VERSION_QUERY_MINOR => {
+            fixed(bytes, 0)?;
+            Body::QueryVersion
+        }
+        TYPE_VERSION if header.minor >= VERSION_QUERY_MINOR => {
+            fixed(bytes, VERSION_BODY_BYTES)?;
+            Body::Version(get_version(bytes, 32, header.minor)?)
         }
         _ => return Err(Error::UnknownMessage),
     };
@@ -178,7 +232,8 @@ fn validate(body: &Body<'_>) -> Result<(), Error> {
             }
         }
         Body::Unmount { path } => check_absolute(path),
-        Body::Status(_) => Ok(()),
+        Body::Version(version) => check_version(version),
+        Body::Status(_) | Body::QueryVersion => Ok(()),
     }
 }
 

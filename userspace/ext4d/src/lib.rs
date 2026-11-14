@@ -66,12 +66,12 @@ use wyrmroot_ext4::{
 };
 use wyrmroot_fs_lock::{LockServer, Outcome};
 use wyrmroot_fs_proto::node::{
-    self, ACCESS_READ, ACCESS_WRITE, Attr, Body, EntryWriter, FS_DURABLE_SYNC, FS_HARD_LINKS,
-    FS_READ_ONLY, FsInfo, Kind, MAX_DIRENT_BYTES, MAX_IO_BYTES,
+    self, ACCESS_READ, ACCESS_WRITE, Attr, Body, EntryWriter, FEATURE_LOCKS, FS_DURABLE_SYNC,
+    FS_HARD_LINKS, FS_READ_ONLY, FsInfo, Kind, MAX_DIRENT_BYTES, MAX_IO_BYTES,
 };
 use wyrmroot_fs_proto::{
-    MAX_HANDLES, MAX_NAME_BYTES, OPEN_CREATE, OPEN_DIRECTORY, OPEN_EXCLUSIVE, OPEN_FILE,
-    OPEN_MUTATING, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE, Status,
+    MAX_HANDLES, MAX_NAME_BYTES, MINOR, OPEN_CREATE, OPEN_DIRECTORY, OPEN_EXCLUSIVE, OPEN_FILE,
+    OPEN_MUTATING, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE, ReplyTo, Status, Version,
 };
 use wyrmroot_runtime::{MemoryPlatform, NativeError, WYR0_I_SUPERVISION_POLICY};
 use wyrmroot_service::block::BlockClient;
@@ -348,6 +348,8 @@ struct OpenNode {
     access: u32,
     /// The `vfsd` client connection it was opened through, or 0 (WRFS 1.2).
     client: u64,
+    /// The minor of the LOCK it waits in, to answer it in once granted (X1).
+    wait_minor: u16,
 }
 
 impl OpenNode {
@@ -380,6 +382,8 @@ pub struct Server<V> {
     locks: LockServer<MAX_LOCKS, { MAX_NODES + 1 }>,
     /// The filesystem identity every Attr carries, from the volume's UUID.
     filesystem: u64,
+    /// The root Channel's `OpenNode::wait_minor`.
+    root_wait_minor: u16,
 }
 
 /// A nonzero filesystem identity folded from a volume UUID.
@@ -541,6 +545,7 @@ impl<V: View> Server<V> {
             commit_due: None,
             full: false,
             failed: false,
+            root_wait_minor: MINOR,
             locks: LockServer::with_owner_limit(LOCKS_PER_NODE),
             filesystem,
         };
@@ -699,6 +704,7 @@ impl<V: View> Server<V> {
                     inode: ROOT_INODE,
                     access: self.root_access(),
                     client: 0,
+                    wait_minor: self.root_wait_minor,
                 };
                 if !readable || !self.serve(platform, here) {
                     // Unmounted, or vfsd broke WRFS: no new path opens, but
@@ -734,7 +740,12 @@ impl<V: View> Server<V> {
     fn grant_waiters<P: Ext4Platform>(&mut self, platform: &mut P) {
         while let Some((owner, transaction_id, outcome)) = self.locks.take_granted() {
             let channel = DwHandle(owner);
-            if send(platform, channel, transaction_id, lock_reply(outcome)) {
+            // In the minor the LOCK waited in (X1).
+            let to = ReplyTo {
+                transaction_id,
+                minor: self.wait_minor(channel),
+            };
+            if send(platform, channel, to, lock_reply(outcome)) {
                 continue;
             }
             // A Channel that cannot be answered is dropped, as a failed
@@ -751,6 +762,32 @@ impl<V: View> Server<V> {
                 self.nodes[slot] = None;
                 let _ = platform.close_handle(channel);
             }
+        }
+    }
+
+    /// The minor `channel`'s waiting LOCK came in.
+    fn wait_minor(&self, channel: DwHandle) -> u16 {
+        if channel == self.root {
+            return self.root_wait_minor;
+        }
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|node| node.channel == channel)
+            .map_or(MINOR, |node| node.wait_minor)
+    }
+
+    /// Records the minor of `channel`'s LOCK, which now waits.
+    fn set_wait_minor(&mut self, channel: DwHandle, minor: u16) {
+        if channel == self.root {
+            self.root_wait_minor = minor;
+        } else if let Some(node) = self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.channel == channel)
+        {
+            node.wait_minor = minor;
         }
     }
 
@@ -924,7 +961,11 @@ impl<V: View> Server<V> {
         if message.body == Body::Close {
             return false;
         }
-        let transaction_id = message.transaction_id;
+        // Answered in the request's minor (X1).
+        let to = ReplyTo::new(
+            &bytes[..counts.bytes.min(bytes.len())],
+            message.transaction_id,
+        );
         let status = |status| Body::Status { status, value: 0 };
         let writable = here.access & ACCESS_WRITE != 0;
         let readable = here.access & ACCESS_READ != 0;
@@ -943,12 +984,7 @@ impl<V: View> Server<V> {
             for info in received {
                 let _ = platform.close_handle(info.handle);
             }
-            return send(
-                platform,
-                here.channel,
-                transaction_id,
-                status(Status::Invalid),
-            );
+            return send(platform, here.channel, to, status(Status::Invalid));
         }
         let reply = match message.body {
             Body::Open {
@@ -975,7 +1011,7 @@ impl<V: View> Server<V> {
                     let _ = send(
                         platform,
                         server.handle,
-                        transaction_id,
+                        to,
                         Body::OnOpen {
                             status: Status::Invalid,
                             attr: None,
@@ -987,7 +1023,7 @@ impl<V: View> Server<V> {
                 };
                 // The node opened through `here` belongs to `client`.
                 let dir = OpenNode { client, ..here };
-                self.open(platform, transaction_id, dir, flags, path, server.handle);
+                self.open(platform, to, dir, flags, path, server.handle);
                 self.settle(platform);
                 return true;
             }
@@ -1121,16 +1157,17 @@ impl<V: View> Server<V> {
                 let owner = here.channel.0;
                 let mut outcome =
                     self.locks
-                        .request(owner, group, node, lock, flags, transaction_id);
+                        .request(owner, group, node, lock, flags, to.transaction_id);
                 if matches!(outcome, Outcome::Busy | Outcome::Deadlock | Outcome::NoRoom) {
                     self.reap_closed(platform, here.channel);
-                    outcome = self
-                        .locks
-                        .request(owner, group, node, lock, flags, transaction_id);
+                    outcome =
+                        self.locks
+                            .request(owner, group, node, lock, flags, to.transaction_id);
                 }
                 match outcome {
                     // Answered when it is granted (`grant_waiters`).
                     Outcome::Waiting => {
+                        self.set_wait_minor(here.channel, to.minor);
                         self.grant_waiters(platform);
                         return true;
                     }
@@ -1150,6 +1187,7 @@ impl<V: View> Server<V> {
                 Ok(()) => Status::Ok,
                 Err(error) => status_of(error),
             }),
+            Body::QueryVersion => Body::Version(Version::current(FEATURE_LOCKS)),
             Body::QueryFilesystem => {
                 let usage = self.volume.usage();
                 let mut flags = FS_DURABLE_SYNC | FS_HARD_LINKS;
@@ -1167,7 +1205,7 @@ impl<V: View> Server<V> {
             _ => return false,
         };
         self.settle(platform);
-        send(platform, here.channel, transaction_id, reply)
+        send(platform, here.channel, to, reply)
     }
 
     /// Resolves, and with OPEN_CREATE creates, `path` below `dir`.
@@ -1249,7 +1287,7 @@ impl<V: View> Server<V> {
     fn open<P: Ext4Platform>(
         &mut self,
         platform: &mut P,
-        transaction_id: u64,
+        to: ReplyTo,
         dir: OpenNode,
         flags: u32,
         path: &[u8],
@@ -1278,12 +1316,8 @@ impl<V: View> Server<V> {
             Ok(stat) => (Status::Ok, Some(Self::attr(stat, access, self.filesystem))),
             Err(status) => (status, None),
         };
-        let sent = send(
-            platform,
-            server,
-            transaction_id,
-            Body::OnOpen { status, attr },
-        );
+        // ON_OPEN goes in the OPEN's minor.
+        let sent = send(platform, server, to, Body::OnOpen { status, attr });
         match (found, slot) {
             (Ok(stat), Some(slot)) if sent => {
                 self.nodes[slot] = Some(OpenNode {
@@ -1291,6 +1325,7 @@ impl<V: View> Server<V> {
                     inode: stat.inode,
                     access,
                     client: dir.client,
+                    wait_minor: MINOR,
                 });
             }
             _ => {
@@ -1324,21 +1359,10 @@ fn is_open(nodes: &[Option<OpenNode>], inode: u32) -> bool {
     inode == ROOT_INODE || nodes.iter().flatten().any(|node| node.inode == inode)
 }
 
-fn send<P: Ext4Platform>(
-    platform: &mut P,
-    channel: DwHandle,
-    transaction_id: u64,
-    body: Body<'_>,
-) -> bool {
+fn send<P: Ext4Platform>(platform: &mut P, channel: DwHandle, to: ReplyTo, body: Body<'_>) -> bool {
     let mut bytes = [0u8; node::MAX_BYTES];
-    node::encode(
-        &node::Message {
-            transaction_id,
-            body,
-        },
-        &mut bytes,
-    )
-    .is_ok_and(|size| platform.send_channel(channel, &bytes[..size], &[]).is_ok())
+    node::encode_reply(to, body, &mut bytes)
+        .is_ok_and(|size| platform.send_channel(channel, &bytes[..size], &[]).is_ok())
 }
 
 #[cfg(test)]
