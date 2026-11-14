@@ -270,7 +270,7 @@ pub(crate) fn build(
         }
 
         // Every image the product loads carries this build's ABI note: the
-        // loader's own parser refuses it otherwise, and init, which the
+        // loader's own parser refuses it otherwise, and bootstrap, which the
         // kernel loads, would fail its self-check at boot instead.
         require_abi_note("bootstrap", &bootstrap)?;
         for (label, bytes) in &natives {
