@@ -38,7 +38,7 @@ Every protocol is a little-endian datagram with a four-byte magic and a major.mi
 | Magic | Version | Between |
 |---|---|---|
 | WRBP | 1.0 | bootstrap ↔ init |
-| WRLP | 1.x, a minor per startup profile (1.2–1.13) | loader → every child, at startup |
+| WRLP | 1.x, a minor per startup profile (1.2–1.13); INIT carries the child's execution mode, `X86_64` only | loader → every child, at startup |
 | WRRG | 1.0 | `registryd` and its clients (32 services) |
 | WRLJ | 1.0, shell envelope 1.1 | init's job and launch service; `wyrmsh` and `consoled` are clients |
 | WRDC, WRSC, WRCS, WRDP, WRPG, WRDM | 1.0–1.2 | `devmgr`, drivers, the serial connector, the device manifest |
@@ -53,7 +53,7 @@ The storage chain: `virtio-blkd` per disk → `blockmgr` per volume (the ESP's F
 
 ## 4. Loading and limits
 
-- `wyrmroot-loader` accepts static ET_EXEC x86-64 only: at most 16 MiB, 16 program headers, 8 PT_LOADs (2 for job images), 32 MiB mapped, never W+X, and exactly one PT_NOTE carrying this build's ABI fingerprint (V1; `crates/wyrmroot-loader/src/elf.rs`). The product build runs every image it ships through the same parser.
+- `wyrmroot-loader` accepts static ET_EXEC x86-64 only: at most 16 MiB, 16 program headers, 8 PT_LOADs (2 for job images), 32 MiB mapped, never W+X, and exactly one PT_NOTE carrying this build's ABI fingerprint (V1; `crates/wyrmroot-loader/src/elf.rs`). `identify` reports any image's class and machine before that policy (E2), for a future personality loader to dispatch on. The product build runs every image it ships through the same parser.
 - A child gets a 128 KiB stack with a guard page, a startup block and an auxiliary vector (PHDR, PHENT, PHNUM, PAGESZ, ENTRY) (`image.rs`); construction is failure-atomic (`process.rs`).
 - Job limits (`userspace/system-init/src/jobs.rs`):
   - per-job TaskGroup limits of 10 Channel endpoints, 4 MemoryObjects, 4 waits, 16 MiB, and no Events, Timers, Threads, Processes or TaskGroups;
