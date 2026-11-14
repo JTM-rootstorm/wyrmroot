@@ -142,11 +142,20 @@ struct Seen {
     statuses: Vec<Status>,
     block: Option<Vec<u8>>,
     done: bool,
+    /// The header minor of every reply.
+    minors: Vec<u16>,
+    version: Option<wrbd::Version>,
 }
 
 /// A client that connects to the system's volume, reads `lba` and one block
 /// past the volume's end, then has init retire blockmgr.
 fn client(system: &mut System, lba: u64, extra: Vec<Body>) -> Rc<RefCell<Seen>> {
+    client_in(system, lba, extra, wrbd::MINOR)
+}
+
+/// [`client`] sending every request in `minor`, with trailing bytes when
+/// that is newer than this crate's (X1).
+fn client_in(system: &mut System, lba: u64, extra: Vec<Body>, minor: u16) -> Rc<RefCell<Seen>> {
     let seen = Rc::new(RefCell::new(Seen::default()));
     let volume = system.volume;
     let (endpoint, _) = system.registry.client(&mut system.world);
@@ -169,13 +178,21 @@ fn client(system: &mut System, lba: u64, extra: Vec<Body>) -> Rc<RefCell<Seen>> 
                 &mut out,
             )
             .unwrap();
+            let mut bytes = out[..size].to_vec();
+            if minor > wrbd::MINOR {
+                bytes.extend_from_slice(&[0xa5; 8]);
+            }
+            bytes[6..8].copy_from_slice(&minor.to_le_bytes());
+            let total = bytes.len() as u32;
+            bytes[12..16].copy_from_slice(&total.to_le_bytes());
             let handles: Vec<_> = handle.map(|h| (h, LEND_RIGHTS)).into_iter().collect();
-            world.send_with(direct, &out[..size], &handles);
+            world.send_with(direct, &bytes, &handles);
         };
-        let reply = |world: &mut World, direct| {
+        let reply = |world: &mut World, direct, seen: &mut Seen| {
             let (bytes, handles) = world.receive(direct);
             let message = wrbd::parse(&bytes, handles.len()).unwrap();
             assert_eq!(message.transaction_id, 5);
+            seen.minors.push(u16::from_le_bytes([bytes[6], bytes[7]]));
             message.body
         };
         match step {
@@ -206,7 +223,7 @@ fn client(system: &mut System, lba: u64, extra: Vec<Body>) -> Rc<RefCell<Seen>> 
                 request(world, direct, Body::GetInfo, None);
             }
             2 if world.readable(direct) => {
-                let Body::Info(info) = reply(world, direct) else {
+                let Body::Info(info) = reply(world, direct, &mut seen) else {
                     panic!("expected INFO")
                 };
                 seen.info = Some(info);
@@ -215,7 +232,7 @@ fn client(system: &mut System, lba: u64, extra: Vec<Body>) -> Rc<RefCell<Seen>> 
                 request(world, direct, Body::Attach { byte_len: 4096 }, Some(memory));
             }
             3 if world.readable(direct) => {
-                let Body::Complete(status) = reply(world, direct) else {
+                let Body::Complete(status) = reply(world, direct, &mut seen) else {
                     panic!()
                 };
                 seen.statuses.push(status);
@@ -231,7 +248,7 @@ fn client(system: &mut System, lba: u64, extra: Vec<Body>) -> Rc<RefCell<Seen>> 
                 );
             }
             4 if world.readable(direct) => {
-                let Body::Complete(status) = reply(world, direct) else {
+                let Body::Complete(status) = reply(world, direct, &mut seen) else {
                     panic!()
                 };
                 seen.statuses.push(status);
@@ -249,10 +266,11 @@ fn client(system: &mut System, lba: u64, extra: Vec<Body>) -> Rc<RefCell<Seen>> 
                 );
             }
             5.. if world.readable(direct) => {
-                let Body::Complete(status) = reply(world, direct) else {
-                    panic!()
-                };
-                seen.statuses.push(status);
+                match reply(world, direct, &mut seen) {
+                    Body::Complete(status) => seen.statuses.push(status),
+                    Body::Version(version) => seen.version = Some(version),
+                    other => panic!("{other:?}"),
+                }
                 match queue.pop() {
                     Some(body) => {
                         request(world, direct, body, None);
@@ -419,4 +437,45 @@ fn a_role_that_is_neither_duty_exits_before_staging() {
         system.launched.bootstrap,
     );
     assert_eq!(code, FAILURE_BASE | 6);
+}
+
+#[test]
+fn requests_reach_the_driver_and_come_back_in_the_client_minor() {
+    for minor in [0, wrbd::MINOR + 1] {
+        let mut system = system(superfloppy(2048));
+        // QUERY_VERSION exists only from 1.1.
+        let extra = if minor == 0 {
+            vec![]
+        } else {
+            vec![Body::QueryVersion]
+        };
+        let seen = client_in(&mut system, 1000, extra, minor);
+        let code = blockmgr_main(
+            &mut system.world,
+            &mut ModelMapper,
+            system.launched.bootstrap,
+        );
+        assert_eq!(code, 0);
+        let seen = seen.borrow();
+        assert!(seen.done);
+        // Every answer in the client's minor, or blockmgr's if that is
+        // older; a 1.0 client never sees a minor it does not know.
+        let answered = minor.min(wrbd::MINOR);
+        assert!(seen.minors.iter().all(|&seen| seen == answered), "{minor}");
+        assert_eq!(seen.statuses, [Status::Ok, Status::Ok, Status::OutOfRange]);
+        // The driver saw the client's requests in the same minor; blockmgr's
+        // own discovery reads are its own.
+        let disk = system.disk.borrow();
+        assert!(
+            disk.minors.ends_with(&[answered, answered]),
+            "{:?}",
+            disk.minors
+        );
+        // blockmgr answers QUERY_VERSION itself.
+        if minor == 0 {
+            assert_eq!(seen.version, None);
+        } else {
+            assert_eq!(seen.version, Some(wrbd::Version::current(0)));
+        }
+    }
 }
