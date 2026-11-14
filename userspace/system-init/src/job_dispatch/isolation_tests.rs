@@ -1488,3 +1488,76 @@ fn requests_wait_while_an_ended_job_s_memory_is_still_falling() {
     assert_eq!(rig.jobs.settle, None);
     assert_eq!(rig.replies(1).len(), 1);
 }
+
+/// Step-5 review W R1, measured (DW2 §10.11, M5 step 6): with every
+/// session waiting through a whole settle pause, the last is answered when
+/// the poll's turn reaches it after the pause ends, one session per tick:
+/// at most the pause's limit plus a tick per session.
+#[test]
+fn the_slowest_reply_after_a_settle_pause_is_the_pause_plus_a_turn_per_session() {
+    use crate::job_memory::{
+        FallbackCause, JobMemory, JobMemoryPlan, JobMemorySource, SETTLE_LIMIT_NS, Settle,
+    };
+    use crate::job_sessions::MAX_SESSIONS;
+    use crate::resident_loop::RESIDENT_TICK_NS;
+    let jobs_group = DwHandle(0x7700);
+    let mut jobs = JobDispatcher::new();
+    let ids: Vec<u64> = (1..=MAX_SESSIONS as u64).collect();
+    for &id in &ids {
+        jobs.install_scoped_session(session(id), channel(id), LaunchSessionScope::ShellJobs)
+            .unwrap();
+    }
+    jobs.memory = JobMemory {
+        plan: JobMemoryPlan {
+            free_pages: 500_000,
+            reserve_pages: 65_536,
+            cap_pages: 131_072,
+            jobs_limit_pages: 434_464,
+            job_budget_pages: 131_072,
+            source: JobMemorySource::Capped,
+            cause: FallbackCause::None,
+        },
+        jobs_group: Some(jobs_group),
+        init_group: AUTHORITY.task_group,
+    };
+    let mut rig = Rig::new(jobs);
+    // The pause begins with every request already queued, and usage keeps
+    // falling, so it runs to its limit.
+    let began = rig.kernel.now;
+    let mut usage = 1_000_000_u64;
+    rig.jobs.settle = Settle::begin(None, Some(usage), began);
+    for &id in &ids {
+        let mut bytes = vec![0; wyrmroot_launch_proto::HEADER_BYTES];
+        wyrmroot_launch_proto::encode_query_memory(reservation(id, 1), &mut bytes).unwrap();
+        rig.kernel.deliver(channel(id), &bytes, &[]);
+    }
+    let mut answered = std::collections::BTreeMap::new();
+    while answered.len() < ids.len() {
+        usage -= 1_000;
+        rig.kernel.group_memory.insert(
+            jobs_group.0,
+            DwTaskGroupMemoryInfoV1 {
+                usage,
+                ..DwTaskGroupMemoryInfoV1::default()
+            },
+        );
+        let now = rig.kernel.now;
+        assert_eq!(rig.tick(), JobDispatcherPoll::STABLE);
+        for &id in &ids {
+            if !rig.replies(id).is_empty() {
+                answered.entry(id).or_insert(now - began);
+            }
+        }
+        assert!(
+            now - began < 10 * SETTLE_LIMIT_NS,
+            "every session is answered"
+        );
+    }
+    let slowest = *answered.values().max().unwrap();
+    let first = *answered.values().min().unwrap();
+    // Nothing is read during the pause.
+    assert!(first >= SETTLE_LIMIT_NS);
+    assert!(slowest <= SETTLE_LIMIT_NS + MAX_SESSIONS as u64 * RESIDENT_TICK_NS);
+    // 500 ms of pause and 15 more turns: 875 ms, against wyrmsh's 1 s.
+    assert_eq!(slowest, 875_000_000);
+}
