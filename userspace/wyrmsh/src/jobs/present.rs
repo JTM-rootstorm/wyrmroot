@@ -5,8 +5,8 @@ use super::*;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn close_job<System: WyrmshSystem>(
     system: &mut System,
-    stdout: &NativeOutput,
-    stderr: &mut NativeOutput,
+    stdout: &mut NativeOutput,
+    stderr: &NativeOutput,
     identity: ShellIdentity,
     controls: Controls,
     transactions: &mut TransactionIds,
@@ -176,8 +176,8 @@ pub(crate) fn write_decimal<System: WyrmshSystem>(
 
 pub(crate) fn launch_error<System: WyrmshSystem>(
     system: &mut System,
-    stderr: &mut NativeOutput,
-    stdout: &NativeOutput,
+    stderr: &NativeOutput,
+    stdout: &mut NativeOutput,
     controls: Controls,
     command: &[u8],
     code: ErrorCode,
@@ -190,8 +190,8 @@ pub(crate) fn launch_error<System: WyrmshSystem>(
 
 pub(crate) fn expected_operation_error<System: WyrmshSystem>(
     system: &mut System,
-    stderr: &mut NativeOutput,
-    stdout: &NativeOutput,
+    stderr: &NativeOutput,
+    stdout: &mut NativeOutput,
     controls: Controls,
     command: &[u8],
     code: ErrorCode,
@@ -221,86 +221,61 @@ pub(crate) fn error_name(code: ErrorCode) -> &'static [u8] {
 
 pub(crate) fn expected_text<System: WyrmshSystem>(
     system: &mut System,
-    stderr: &mut NativeOutput,
-    stdout: &NativeOutput,
+    stderr: &NativeOutput,
+    stdout: &mut NativeOutput,
     controls: Controls,
     command: &[u8],
     status: &[u8],
 ) -> Result<(), ShellError> {
-    write_stderr(
+    write_stdout(
         system,
-        stderr,
-        stdout.endpoint().handle(),
+        stdout,
+        stderr.endpoint().handle(),
         controls,
         command,
     )?;
-    write_stderr(
+    write_stdout(
         system,
-        stderr,
-        stdout.endpoint().handle(),
+        stdout,
+        stderr.endpoint().handle(),
         controls,
         b" status=",
     )?;
-    write_stderr(system, stderr, stdout.endpoint().handle(), controls, status)?;
-    write_stderr(system, stderr, stdout.endpoint().handle(), controls, b"\n")
+    write_stdout(system, stdout, stderr.endpoint().handle(), controls, status)?;
+    write_stdout(system, stdout, stderr.endpoint().handle(), controls, b"\n")
 }
 
 pub(crate) fn expected_job_text<System: WyrmshSystem>(
     system: &mut System,
-    stderr: &mut NativeOutput,
-    stdout: &NativeOutput,
+    stderr: &NativeOutput,
+    stdout: &mut NativeOutput,
     controls: Controls,
     command: &[u8],
     job_id: u64,
     status: &[u8],
 ) -> Result<(), ShellError> {
-    write_stderr(
+    write_stdout(
         system,
-        stderr,
-        stdout.endpoint().handle(),
+        stdout,
+        stderr.endpoint().handle(),
         controls,
         command,
     )?;
-    write_stderr(
+    write_stdout(
         system,
-        stderr,
-        stdout.endpoint().handle(),
+        stdout,
+        stderr.endpoint().handle(),
         controls,
         b" job=",
     )?;
-    write_decimal_stderr(system, stderr, stdout, controls, job_id)?;
-    write_stderr(
+    write_decimal(system, stdout, stderr, controls, job_id)?;
+    write_stdout(
         system,
-        stderr,
-        stdout.endpoint().handle(),
+        stdout,
+        stderr.endpoint().handle(),
         controls,
         b" status=",
     )?;
-    write_stderr(system, stderr, stdout.endpoint().handle(), controls, status)?;
-    write_stderr(system, stderr, stdout.endpoint().handle(), controls, b"\n")
-}
-
-pub(crate) fn write_decimal_stderr<System: WyrmshSystem>(
-    system: &mut System,
-    stderr: &mut NativeOutput,
-    stdout: &NativeOutput,
-    controls: Controls,
-    mut value: u64,
-) -> Result<(), ShellError> {
-    let mut bytes = [0_u8; 20];
-    let mut cursor = bytes.len();
-    loop {
-        cursor -= 1;
-        bytes[cursor] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            return write_stderr(
-                system,
-                stderr,
-                stdout.endpoint().handle(),
-                controls,
-                &bytes[cursor..],
-            );
-        }
-    }
+    write_stdout(system, stdout, stderr.endpoint().handle(), controls, status)?;
+    write_stdout(system, stdout, stderr.endpoint().handle(), controls, b"\n")
 }

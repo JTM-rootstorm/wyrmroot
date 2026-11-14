@@ -18,7 +18,7 @@ use crate::inspection::{STATUS_TIMEOUT_NS, TransactionIds};
 use crate::{
     Controls, EndpointRole, NativeOperation, ReceiveBudget, ShellError, ShellIdentity,
     WyrmshSystem, classify_health, control_deadline, ensure_before_control_deadline, health_items,
-    native, poll_health, receive_control, send_control, wait_item, write_stderr, write_stdout,
+    native, poll_health, receive_control, send_control, wait_item, write_stdout,
 };
 
 /// The controller exposes up to 32 live jobs and a separate 32-result ring.
@@ -456,21 +456,21 @@ pub(crate) fn run<System: WyrmshSystem>(
             // "run stream=failed\n" now names the cause instead of a bare
             // class, following the "<command> status=<name>\n" shape
             // `expected_text` already uses below.
-            write_stderr(
+            write_stdout(
                 system,
-                stderr,
-                stdout.endpoint().handle(),
+                stdout,
+                stderr.endpoint().handle(),
                 controls,
                 b"run stream=",
             )?;
-            write_stderr(
+            write_stdout(
                 system,
-                stderr,
-                stdout.endpoint().handle(),
+                stdout,
+                stderr.endpoint().handle(),
                 controls,
                 foreground_stream_cause_name(&cause),
             )?;
-            write_stderr(system, stderr, stdout.endpoint().handle(), controls, b"\n")
+            write_stdout(system, stdout, stderr.endpoint().handle(), controls, b"\n")
         }
         Err(ForegroundError::Fatal(error)) => Err(error),
     }

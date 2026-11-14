@@ -597,29 +597,29 @@ pub(crate) fn inspect_memory<System: WyrmshSystem>(
 
 pub(crate) fn inspection_failure<System: WyrmshSystem>(
     system: &mut System,
-    stderr: &mut NativeOutput,
-    stdout: &NativeOutput,
+    stderr: &NativeOutput,
+    stdout: &mut NativeOutput,
     controls: Controls,
     command: &str,
     error: InspectionError,
 ) -> Result<(), ShellError> {
     match error {
         InspectionError::Registry(_) | InspectionError::Launch(_) | InspectionError::Console(_) => {
-            write_stderr(
+            write_stdout(
                 system,
-                stderr,
-                stdout.endpoint().handle(),
+                stdout,
+                stderr.endpoint().handle(),
                 controls,
                 b"unavailable: ",
             )?;
-            write_stderr(
+            write_stdout(
                 system,
-                stderr,
-                stdout.endpoint().handle(),
+                stdout,
+                stderr.endpoint().handle(),
                 controls,
                 command.as_bytes(),
             )?;
-            write_stderr(system, stderr, stdout.endpoint().handle(), controls, b"\n")?;
+            write_stdout(system, stdout, stderr.endpoint().handle(), controls, b"\n")?;
             Err(ShellError::InspectionProtocol)
         }
         InspectionError::CounterOverflow => Err(ShellError::TransactionExhausted),
@@ -632,8 +632,8 @@ pub(crate) fn inspection_failure<System: WyrmshSystem>(
 
 pub(crate) fn control_transport_failure<System: WyrmshSystem>(
     system: &mut System,
-    stderr: &mut NativeOutput,
-    stdout: &NativeOutput,
+    stderr: &NativeOutput,
+    stdout: &mut NativeOutput,
     controls: Controls,
     command: &str,
     error: ShellError,
@@ -641,20 +641,20 @@ pub(crate) fn control_transport_failure<System: WyrmshSystem>(
     if !matches!(error, ShellError::InspectionTimeout) {
         return Err(error);
     }
-    write_stderr(
+    write_stdout(
         system,
-        stderr,
-        stdout.endpoint().handle(),
+        stdout,
+        stderr.endpoint().handle(),
         controls,
         b"unavailable: ",
     )?;
-    write_stderr(
+    write_stdout(
         system,
-        stderr,
-        stdout.endpoint().handle(),
+        stdout,
+        stderr.endpoint().handle(),
         controls,
         command.as_bytes(),
     )?;
-    write_stderr(system, stderr, stdout.endpoint().handle(), controls, b"\n")?;
+    write_stdout(system, stdout, stderr.endpoint().handle(), controls, b"\n")?;
     Err(ShellError::InspectionTimeout)
 }

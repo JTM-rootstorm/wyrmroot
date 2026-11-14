@@ -514,8 +514,8 @@ impl Shell {
             EditOutcome::Rejected(error) => {
                 present_edit_error(
                     system,
-                    &mut self.stderr,
-                    self.stdout.endpoint().handle(),
+                    &mut self.stdout,
+                    self.stderr.endpoint().handle(),
                     self.controls,
                     error,
                 )?;
@@ -566,8 +566,8 @@ impl Shell {
             Err(error) => {
                 present_command_error(
                     system,
-                    &mut self.stderr,
-                    self.stdout.endpoint().handle(),
+                    &mut self.stdout,
+                    self.stderr.endpoint().handle(),
                     self.controls,
                     error,
                 )?;

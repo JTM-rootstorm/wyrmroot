@@ -456,6 +456,13 @@ explicit stream failure before prompt. Editing Ctrl-C never kills a child;
 keys are not forwarded during synchronous run. ShellJobs peer loss retires
 administration and exits; no fallback to ambient process enumeration.
 
+The shell writes everything of its own (command results, `status=` and
+`unavailable:` lines, edit, parse and file errors) on stdout, the stream that
+carries its prompt; its stderr carries only a foreground child's stderr.
+consoled gives stdout and stderr no total order (WYR1_D §7), so a line of the
+shell's own on stderr could reach the console after the prompt that follows
+it. Found under load in Deepwyrm DW2 M5 step 4; Mike's decision, 2026-11-14.
+
 ## 8. E0 gate and downstream nonclaims
 
 The test-only host model lives at

@@ -1275,7 +1275,7 @@ fn editing_parser_and_usage_errors_redraw_without_control_requests() {
         run_v2(&mut fixture, "system/wyrmsh", &[]),
         Ok(Termination::Shell)
     );
-    let stderr = fixture.output(STDERR);
+    let stdout = fixture.output(STDOUT);
     for message in [
         &b"\nerror: invalid input\n"[..],
         &b"error: parse\n"[..],
@@ -1283,7 +1283,7 @@ fn editing_parser_and_usage_errors_redraw_without_control_requests() {
         &b"error: unknown command\n"[..],
     ] {
         assert!(
-            stderr
+            stdout
                 .windows(message.len())
                 .any(|window| window == message)
         );
@@ -1560,15 +1560,15 @@ fn ls_and_cat_report_an_absent_vfs_or_a_relative_path_and_carry_on() {
         run_v2(&mut fixture, "system/wyrmsh", &[]),
         Ok(Termination::Shell)
     );
-    let stderr = fixture.output(STDERR);
+    let stdout = fixture.output(STDOUT);
     for line in [
         b"ls: /boot: system.vfs is not available\n".as_slice(),
         b"cat: boot/x: not an absolute path\n".as_slice(),
     ] {
         assert!(
-            stderr.windows(line.len()).any(|window| window == line),
+            stdout.windows(line.len()).any(|window| window == line),
             "{:?}",
-            String::from_utf8_lossy(&stderr)
+            String::from_utf8_lossy(&stdout)
         );
     }
     // The one registry request was a lookup of system.vfs carrying the new
@@ -1606,7 +1606,7 @@ fn write_mkdir_and_rm_report_an_absent_vfs_or_a_bad_path_and_carry_on() {
         run_v2(&mut fixture, "system/wyrmsh", &[]),
         Ok(Termination::Shell)
     );
-    let stderr = fixture.output(STDERR);
+    let stdout = fixture.output(STDOUT);
     for line in [
         b"write: /etc/motd: system.vfs is not available\n".as_slice(),
         b"mkdir: home: not an absolute path\n".as_slice(),
@@ -1614,9 +1614,9 @@ fn write_mkdir_and_rm_report_an_absent_vfs_or_a_bad_path_and_carry_on() {
         b"rm: x: not an absolute path\n".as_slice(),
     ] {
         assert!(
-            stderr.windows(line.len()).any(|window| window == line),
+            stdout.windows(line.len()).any(|window| window == line),
             "{:?}",
-            String::from_utf8_lossy(&stderr)
+            String::from_utf8_lossy(&stdout)
         );
     }
     let lookups = fixture
@@ -1652,7 +1652,7 @@ fn typed_control_errors_are_reported_and_fail_closed() {
         );
         assert!(
             fixture
-                .output(STDERR)
+                .output(STDOUT)
                 .windows(diagnostic.len())
                 .any(|window| window == diagnostic)
         );
@@ -1672,7 +1672,7 @@ fn typed_control_errors_are_reported_and_fail_closed() {
         );
         assert!(
             fixture
-                .output(STDERR)
+                .output(STDOUT)
                 .windows(b"unavailable: status\n".len())
                 .any(|window| window == b"unavailable: status\n")
         );
@@ -1712,7 +1712,7 @@ fn control_backpressure_timeout_peer_loss_and_unexpected_handles_are_bounded() {
     assert_eq!(timeout.control_requests.len(), 1);
     assert!(
         timeout
-            .output(STDERR)
+            .output(STDOUT)
             .windows(b"unavailable: status\n".len())
             .any(|window| window == b"unavailable: status\n")
     );
@@ -1861,7 +1861,7 @@ fn every_inspection_timeout_uses_one_committed_request_and_the_same_absolute_dea
         assert_eq!(fixture.control_requests.len(), 1);
         assert!(
             fixture
-                .output(STDERR)
+                .output(STDOUT)
                 .windows(diagnostic.len())
                 .any(|window| window == diagnostic)
         );
@@ -1975,7 +1975,7 @@ fn response_validation_must_complete_before_the_absolute_deadline() {
         );
         assert!(
             fixture
-                .output(STDERR)
+                .output(STDOUT)
                 .windows(diagnostic.len())
                 .any(|window| window == diagnostic)
         );
@@ -2364,12 +2364,23 @@ fn committed_policy_rejection_closes_only_retained_stream_sides() {
     for moved in [MOVED_STDIN, MOVED_STDOUT, MOVED_STDERR] {
         assert!(!fixture.closed.contains(&moved));
     }
+    // The status line and the prompt after it share stdout, in that order:
+    // consoled gives stdout and stderr no total order (WYR1_D §7), so a line
+    // on stderr could reach the console after the prompt (DW2 M5 step 4).
+    let stdout = fixture.output(STDOUT);
+    let line = b"run status=policy-rejected\n";
+    let at = stdout
+        .windows(line.len())
+        .position(|bytes| bytes == line)
+        .expect("the status line is on stdout");
     assert!(
-        fixture
-            .output(STDERR)
-            .windows(b"run status=policy-rejected\n".len())
-            .any(|bytes| bytes == b"run status=policy-rejected\n")
+        stdout[at + line.len()..]
+            .windows(b"wyrmsh> ".len())
+            .any(|bytes| bytes == b"wyrmsh> "),
+        "{:?}",
+        String::from_utf8_lossy(&stdout)
     );
+    assert!(fixture.output(STDERR).is_empty());
 }
 
 #[test]
@@ -2474,12 +2485,12 @@ fn stream_failure_closes_endpoints_before_cancel_and_cancelled_closes_visibility
     let diagnostic = fixture
         .trace
         .iter()
-        .rposition(|event| *event == Trace::StreamSend(STDERR))
+        .rposition(|event| *event == Trace::StreamSend(STDOUT))
         .unwrap();
     assert!(close_job < diagnostic);
     assert!(
         fixture
-            .output(STDERR)
+            .output(STDOUT)
             // F3A.6n: `run stream=failed` named no cause. This fixture
             // injects a protocol violation, so the line must now say so --
             // a stricter assertion than the old literal, not a looser one.
@@ -2711,7 +2722,7 @@ fn authoritative_foreign_wait_removes_only_that_local_id() {
             LaunchMessageType::Launch,
         ]
     );
-    let error = fixture.output(STDERR);
+    let error = fixture.output(STDOUT);
     assert!(
         error
             .windows(b"wait job=91 status=foreign\n".len())
@@ -2999,5 +3010,5 @@ jobs-used-kib=36000 free-kib=1920000 plan-free-kib=2000000 reserve-kib=262144 ca
         &stdout,
         b"memory source=fallback fallback=config-missing job-budget-kib=16384 jobs-limit-kib=65536"
     ));
-    assert!(has(&fixture.output(STDERR), b"unavailable: "));
+    assert!(has(&fixture.output(STDOUT), b"unavailable: "));
 }

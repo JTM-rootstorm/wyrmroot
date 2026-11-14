@@ -38,7 +38,7 @@ fn duplicate_and_zero_publish_cannot_corrupt_reservation() {
 // these causes reached the reader as the same literal
 // "run stream=failed\n". These tests assert the instance now survives to
 // `foreground_stream_cause_name`/`stream_error_name` distinctly, which is
-// what `write_stderr`s the `run stream=<name>\n` line in `run`'s match on
+// what writes the `run stream=<name>\n` line in `run`'s match on
 // `ForegroundError`.
 
 #[test]

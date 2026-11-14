@@ -83,9 +83,8 @@ impl Console<'_> {
         path: &[u8],
         reason: Failure,
     ) -> Result<(), ShellError> {
-        let stdout = self.stdout.endpoint().handle();
         for part in [command.as_bytes(), b": ", path, b": ", reason, b"\n"] {
-            write_stderr(system, self.stderr, stdout, self.controls, part)?;
+            self.out(system, part)?;
         }
         Ok(())
     }

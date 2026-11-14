@@ -4,8 +4,8 @@ use super::*;
 
 pub(crate) fn present_edit_error<System: WyrmshSystem>(
     system: &mut System,
-    stderr: &mut NativeOutput,
-    stdout_handle: DwHandle,
+    stdout: &mut NativeOutput,
+    stderr_handle: DwHandle,
     controls: Controls,
     error: EditError,
 ) -> Result<(), ShellError> {
@@ -14,13 +14,13 @@ pub(crate) fn present_edit_error<System: WyrmshSystem>(
         EditError::LineTooLong => b"\nerror: line too long\n".as_slice(),
         EditError::UnsupportedCharacter => b"\nerror: unsupported character\n".as_slice(),
     };
-    write_stderr(system, stderr, stdout_handle, controls, message)
+    write_stdout(system, stdout, stderr_handle, controls, message)
 }
 
 pub(crate) fn present_command_error<System: WyrmshSystem>(
     system: &mut System,
-    stderr: &mut NativeOutput,
-    stdout_handle: DwHandle,
+    stdout: &mut NativeOutput,
+    stderr_handle: DwHandle,
     controls: Controls,
     error: CommandError,
 ) -> Result<(), ShellError> {
@@ -29,7 +29,7 @@ pub(crate) fn present_command_error<System: WyrmshSystem>(
         CommandError::Usage(UsageError::UnknownCommand) => b"error: unknown command\n".as_slice(),
         CommandError::Usage(_) => b"error: usage\n".as_slice(),
     };
-    write_stderr(system, stderr, stdout_handle, controls, message)
+    write_stdout(system, stdout, stderr_handle, controls, message)
 }
 
 pub(crate) fn write_stdout<System: WyrmshSystem>(
@@ -44,25 +44,6 @@ pub(crate) fn write_stdout<System: WyrmshSystem>(
         system,
         output,
         EndpointRole::Stdout,
-        stdout_handle,
-        stderr_handle,
-        controls,
-        bytes,
-    )
-}
-
-pub(crate) fn write_stderr<System: WyrmshSystem>(
-    system: &mut System,
-    output: &mut NativeOutput,
-    stdout_handle: DwHandle,
-    controls: Controls,
-    bytes: &[u8],
-) -> Result<(), ShellError> {
-    let stderr_handle = output.endpoint().handle();
-    write_all(
-        system,
-        output,
-        EndpointRole::Stderr,
         stdout_handle,
         stderr_handle,
         controls,
