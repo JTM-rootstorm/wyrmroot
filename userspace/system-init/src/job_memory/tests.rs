@@ -177,6 +177,7 @@ struct Groups {
     create_fails: bool,
     limit_fails: bool,
     close_fails: bool,
+    live_limit: u32,
     queried: Vec<DwHandle>,
     created_under: Vec<DwHandle>,
     limits: Vec<(DwHandle, u32, u32)>,
@@ -192,6 +193,7 @@ impl JobGroupPlatform for Groups {
         self.free_pages
             .map(|free_pages| DwTaskGroupMemoryInfoV1 {
                 free_pages,
+                limit: self.live_limit,
                 ..DwTaskGroupMemoryInfoV1::default()
             })
             .ok_or(FAILURE)
@@ -316,7 +318,7 @@ fn a_jobs_group_that_cannot_be_made_or_limited_leaves_jobs_at_16_mib() {
 
 #[test]
 fn settling_lasts_while_usage_falls_and_no_longer_than_the_limit() {
-    let start = Settle::begin(Some(1000), 0).unwrap();
+    let start = Settle::begin(None, Some(1000), 0).unwrap();
     // Not yet due: no read.
     assert_eq!(
         start.poll(SETTLE_SAMPLE_NS - 1, || panic!("read early")),
@@ -333,5 +335,43 @@ fn settling_lasts_while_usage_falls_and_no_longer_than_the_limit() {
     // Still falling at the limit: over all the same.
     assert_eq!(falling.poll(SETTLE_LIMIT_NS, || Some(1)), None);
     // No usage to start from: no pause.
-    assert_eq!(Settle::begin(None, 0), None);
+    assert_eq!(Settle::begin(None, None, 0), None);
+}
+
+#[test]
+fn a_second_reap_does_not_lengthen_the_pause() {
+    let first = Settle::begin(None, Some(1000), 0).unwrap();
+    // Another job is reaped late in the pause: usage is read afresh, but
+    // the pause still ends where the first one would.
+    let later = SETTLE_LIMIT_NS - SETTLE_SAMPLE_NS;
+    let second = Settle::begin(Some(first), Some(5000), later).unwrap();
+    assert_eq!(
+        second.poll(later + 1, || panic!("read early")),
+        Some(second)
+    );
+    assert_eq!(second.poll(SETTLE_LIMIT_NS, || Some(1)), None);
+    // Once a poll has ended the pause, the next reap starts a full one.
+    let fresh = Settle::begin(None, Some(5000), SETTLE_LIMIT_NS).unwrap();
+    assert!(fresh.poll(2 * SETTLE_LIMIT_NS - 1, || Some(1)).is_some());
+}
+
+#[test]
+fn the_report_carries_the_limit_the_kernel_holds() {
+    let mut groups = Groups {
+        free_pages: Some(500_000),
+        live_limit: 1234,
+        ..Groups::default()
+    };
+    let memory = establish(&mut groups, INIT_GROUP, b"not an archive").unwrap();
+    assert_ne!(memory.plan.jobs_limit_pages, 1234);
+    assert_eq!(memory.report(&mut groups).jobs_limit_pages, 1234);
+    // Without a jobs group nothing holds a limit: the plan's is reported.
+    let none = JobMemory {
+        jobs_group: None,
+        ..memory
+    };
+    assert_eq!(
+        none.report(&mut groups).jobs_limit_pages,
+        u64::from(memory.plan.jobs_limit_pages)
+    );
 }

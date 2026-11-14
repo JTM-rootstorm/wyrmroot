@@ -208,18 +208,25 @@ impl JobMemory {
     }
 
     /// The plan with what the jobs group and the machine hold now. A read
-    /// that fails reports zero rather than failing the query.
+    /// that fails reports zero rather than failing the query. The jobs limit
+    /// is the one the kernel holds on the jobs group, read now, so a limit
+    /// applied differently from the plan shows (step-5 review D3); without a
+    /// jobs group it is the plan's.
     pub(crate) fn report<P: JobGroupPlatform>(&self, system: &mut P) -> MemoryReport {
-        let jobs_usage_pages = self
+        let jobs = self
             .jobs_group
-            .and_then(|group| system.query_task_group_memory(group).ok())
-            .map_or(0, |info| info.usage);
+            .map(|group| system.query_task_group_memory(group).ok());
+        let jobs_usage_pages = jobs.flatten().map_or(0, |info| info.usage);
+        let jobs_limit_pages = match jobs {
+            Some(read) => read.map_or(0, |info| u64::from(info.limit)),
+            None => u64::from(self.plan.jobs_limit_pages),
+        };
         let free_pages_now = system
             .query_task_group_memory(self.init_group)
             .map_or(0, |info| info.free_pages);
         MemoryReport {
             job_budget_pages: u64::from(self.plan.job_budget_pages),
-            jobs_limit_pages: u64::from(self.plan.jobs_limit_pages),
+            jobs_limit_pages,
             jobs_usage_pages,
             free_pages_at_plan: self.plan.free_pages,
             free_pages_now,
@@ -254,12 +261,18 @@ pub(crate) struct Settle {
 
 impl Settle {
     /// A pause begun at `now_ns` with the usage just read; none if it could
-    /// not be read (a failed read never holds launches back).
-    pub(crate) fn begin(usage: Option<u64>, now_ns: u64) -> Option<Self> {
+    /// not be read (a failed read never holds launches back). `running` is
+    /// the pause already under way, if any: the new one keeps its end, so
+    /// jobs reaped one after another cannot hold requests back for longer
+    /// than one [`SETTLE_LIMIT_NS`] without a poll that reads them
+    /// (step-5 review R1).
+    pub(crate) fn begin(running: Option<Self>, usage: Option<u64>, now_ns: u64) -> Option<Self> {
         Some(Self {
             usage: usage?,
             sampled_ns: now_ns,
-            until_ns: now_ns.saturating_add(SETTLE_LIMIT_NS),
+            until_ns: running.map_or(now_ns.saturating_add(SETTLE_LIMIT_NS), |running| {
+                running.until_ns
+            }),
         })
     }
 

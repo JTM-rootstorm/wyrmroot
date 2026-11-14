@@ -3,7 +3,8 @@
 //! everything, and read init's plan and the jobs group's live usage through
 //! the shell's `memory` command:
 //! - 12: init's plan is the rule's arithmetic on its own read of the free
-//!   count, a second read agrees with it, and a job's INIT carries the
+//!   count, a second read agrees with it, the jobs limit it reports is the
+//!   one the kernel holds on the jobs group, and a job's INIT carries the
 //!   planned budget;
 //! - 13 and 14: eager objects up to 256 MiB are created, mapped, touched,
 //!   protected and unmapped in steps and timed; an on-demand mapping with no
@@ -14,8 +15,9 @@
 //!   were, and the shell answers throughout.
 //!
 //! The kernel's step report at power-off (`[steps]` on COM1) must then show
-//! that a Stop or an ended parked call landed inside each of a map, a create
-//! and a commit.
+//! that a Stop or an ended parked call landed inside a map in steps. Those
+//! inside a create or a commit are reported but not required, since a kill
+//! lands in them only by chance (see [`steps_report`]).
 
 use std::{thread, time::Duration};
 

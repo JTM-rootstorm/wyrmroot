@@ -298,7 +298,8 @@ impl MemoryFallback {
 pub struct MemoryReport {
     /// Each job's MEMORY_PAGES limit.
     pub job_budget_pages: u64,
-    /// The jobs group's MEMORY_PAGES limit.
+    /// The jobs group's MEMORY_PAGES limit, as the kernel holds it now (the
+    /// plan's without a jobs group; zero if it could not be read).
     pub jobs_limit_pages: u64,
     /// Pages charged to the jobs group now; zero without a jobs group.
     pub jobs_usage_pages: u64,

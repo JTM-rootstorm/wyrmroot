@@ -605,7 +605,7 @@ where
         let usage = jobs
             .memory
             .jobs_usage(&mut crate::job_memory::InitJobGroups(system));
-        jobs.settle = crate::job_memory::Settle::begin(usage, now);
+        jobs.settle = crate::job_memory::Settle::begin(jobs.settle, usage, now);
     }
     Ok(result)
 }

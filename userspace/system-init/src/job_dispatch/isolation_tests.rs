@@ -1372,7 +1372,14 @@ fn the_memory_query_reports_the_plan_and_live_usage() {
         free_pages,
         ..DwTaskGroupMemoryInfoV1::default()
     };
-    rig.kernel.group_memory.insert(jobs_group.0, info(9_000, 0));
+    // The limit the kernel holds, not the plan's, is what is reported.
+    rig.kernel.group_memory.insert(
+        jobs_group.0,
+        DwTaskGroupMemoryInfoV1 {
+            limit: 434_000,
+            ..info(9_000, 0)
+        },
+    );
     rig.kernel
         .group_memory
         .insert(AUTHORITY.task_group.0, info(70_000, 480_000));
@@ -1386,7 +1393,7 @@ fn the_memory_query_reports_the_plan_and_live_usage() {
     assert_eq!(rig.tick(), JobDispatcherPoll::STABLE);
     let expected = MemoryReport {
         job_budget_pages: 131_072,
-        jobs_limit_pages: 434_464,
+        jobs_limit_pages: 434_000,
         jobs_usage_pages: 9_000,
         free_pages_at_plan: 500_000,
         free_pages_now: 480_000,
@@ -1404,6 +1411,7 @@ fn the_memory_query_reports_the_plan_and_live_usage() {
     assert_eq!(
         rig.replies(1).last(),
         Some(&Reply::Memory(MemoryReport {
+            jobs_limit_pages: 0,
             jobs_usage_pages: 0,
             free_pages_now: 0,
             ..expected
@@ -1437,7 +1445,7 @@ fn requests_wait_while_an_ended_job_s_memory_is_still_falling() {
         usage,
         ..DwTaskGroupMemoryInfoV1::default()
     };
-    rig.jobs.settle = Settle::begin(Some(10_000), rig.kernel.now);
+    rig.jobs.settle = Settle::begin(None, Some(10_000), rig.kernel.now);
     rig.kernel.group_memory.insert(jobs_group.0, usage(9_000));
     let mut bytes = vec![0; wyrmroot_launch_proto::HEADER_BYTES];
     wyrmroot_launch_proto::encode_query_memory(reservation(1, 1), &mut bytes).unwrap();
