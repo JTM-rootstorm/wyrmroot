@@ -9,14 +9,14 @@ const R: Reservation = Reservation {
 };
 
 #[test]
-fn legacy_envelope_remains_exact() {
+fn the_envelope_round_trips_and_refuses_damage() {
     let mut bytes = [0xaa; ENVELOPE_BYTES];
     assert_eq!(encode(R, &mut bytes), Ok(ENVELOPE_BYTES));
-    assert_eq!(parse(&bytes), Ok(R));
+    assert_eq!(parse_reservation_prefix(&bytes), Ok(R));
     for offset in [0, 4, 6, 32] {
         let mut malformed = bytes;
         malformed[offset] ^= 1;
-        assert!(parse(&malformed).is_err());
+        assert!(parse_reservation_prefix(&malformed).is_err());
     }
     let mut complete = [0_u8; HEADER_BYTES];
     complete[..ENVELOPE_BYTES].copy_from_slice(&bytes);

@@ -468,14 +468,6 @@ pub fn encode(value: Reservation, output: &mut [u8]) -> Result<usize, Error> {
     Ok(ENVELOPE_BYTES)
 }
 
-/// Compatibility envelope parser retained for WYR1-A callers.
-pub fn parse(bytes: &[u8]) -> Result<Reservation, Error> {
-    if bytes.len() != ENVELOPE_BYTES {
-        return Err(Error::WrongSize);
-    }
-    parse_envelope(bytes)
-}
-
 /// Parses only the fixed correlatable envelope from a complete or partial
 /// message. Dispatchers use this before semantic body validation so a fresh
 /// transaction is replay-protected even when the body is rejected.
