@@ -180,6 +180,19 @@ where
                 return finish_poll(system, waits, jobs, shell, now_ns, poll);
             }
         };
+        // After a job init ended, no new request is read until its memory
+        // has settled (DW2 §10.10 item 7); a peer closing is still seen.
+        let settling = match jobs.settle {
+            Some(settle) => {
+                let memory = jobs.memory;
+                jobs.settle = settle.poll(now_ns, || {
+                    memory.jobs_usage(&mut crate::job_memory::InitJobGroups(system))
+                });
+                jobs.settle.is_some()
+            }
+            None => false,
+        };
+        let reading = reading && !settling;
         let item = DwWaitItemV1 {
             handle: session,
             signals: deepwyrm_syscall::DwSignals(if reading {

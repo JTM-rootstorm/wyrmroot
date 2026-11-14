@@ -593,7 +593,21 @@ where
         return Err(InitError::Cleanup);
     };
     jobs.jobs.reclaim_closed_sessions();
-    controller_result_to_wire(completed)
+    let result = controller_result_to_wire(completed)?;
+    // A job init ended leaves memory the kernel is still tearing down:
+    // hold the next launch back until that settles (DW2 §10.10 item 7).
+    if matches!(
+        result.classification,
+        wyrmroot_launch_proto::TerminationClassification::Authorized
+            | wyrmroot_launch_proto::TerminationClassification::TaskGroupTeardown
+    ) && let Ok(now) = system.now()
+    {
+        let usage = jobs
+            .memory
+            .jobs_usage(&mut crate::job_memory::InitJobGroups(system));
+        jobs.settle = crate::job_memory::Settle::begin(usage, now);
+    }
+    Ok(result)
 }
 
 pub(crate) const fn job_error_code(error: JobError) -> LaunchErrorCode {

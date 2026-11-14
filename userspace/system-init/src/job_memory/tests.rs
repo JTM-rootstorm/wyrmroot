@@ -313,3 +313,25 @@ fn a_jobs_group_that_cannot_be_made_or_limited_leaves_jobs_at_16_mib() {
         Err(InitError::Cleanup)
     );
 }
+
+#[test]
+fn settling_lasts_while_usage_falls_and_no_longer_than_the_limit() {
+    let start = Settle::begin(Some(1000), 0).unwrap();
+    // Not yet due: no read.
+    assert_eq!(
+        start.poll(SETTLE_SAMPLE_NS - 1, || panic!("read early")),
+        Some(start)
+    );
+    // Falling: the pause goes on from the new usage.
+    let falling = start.poll(SETTLE_SAMPLE_NS, || Some(900)).unwrap();
+    // Level: over.
+    assert_eq!(falling.poll(2 * SETTLE_SAMPLE_NS, || Some(900)), None);
+    // Rising (a new job started elsewhere): over.
+    assert_eq!(falling.poll(2 * SETTLE_SAMPLE_NS, || Some(950)), None);
+    // Unreadable: over.
+    assert_eq!(falling.poll(2 * SETTLE_SAMPLE_NS, || None), None);
+    // Still falling at the limit: over all the same.
+    assert_eq!(falling.poll(SETTLE_LIMIT_NS, || Some(1)), None);
+    // No usage to start from: no pause.
+    assert_eq!(Settle::begin(None, 0), None);
+}

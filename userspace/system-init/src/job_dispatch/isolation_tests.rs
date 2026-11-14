@@ -1410,3 +1410,45 @@ fn the_memory_query_reports_the_plan_and_live_usage() {
         }))
     );
 }
+
+/// After a job init ended, no new request is read while the jobs group's
+/// usage is still falling; once it stops, the waiting request is answered
+/// (DW2 §10.10 item 7).
+#[test]
+fn requests_wait_while_an_ended_job_s_memory_is_still_falling() {
+    use crate::job_memory::{FallbackCause, JobMemory, JobMemoryPlan, JobMemorySource, Settle};
+    let jobs_group = DwHandle(0x7700);
+    let mut jobs = one_session();
+    jobs.memory = JobMemory {
+        plan: JobMemoryPlan {
+            free_pages: 500_000,
+            reserve_pages: 65_536,
+            cap_pages: 131_072,
+            jobs_limit_pages: 434_464,
+            job_budget_pages: 131_072,
+            source: JobMemorySource::Capped,
+            cause: FallbackCause::None,
+        },
+        jobs_group: Some(jobs_group),
+        init_group: AUTHORITY.task_group,
+    };
+    let mut rig = Rig::new(jobs);
+    let usage = |usage| DwTaskGroupMemoryInfoV1 {
+        usage,
+        ..DwTaskGroupMemoryInfoV1::default()
+    };
+    rig.jobs.settle = Settle::begin(Some(10_000), rig.kernel.now);
+    rig.kernel.group_memory.insert(jobs_group.0, usage(9_000));
+    let mut bytes = vec![0; wyrmroot_launch_proto::HEADER_BYTES];
+    wyrmroot_launch_proto::encode_query_memory(reservation(1, 1), &mut bytes).unwrap();
+    rig.kernel.deliver(channel(1), &bytes, &[]);
+    // No sample due yet, then a fall: the request waits.
+    assert_eq!(rig.tick(), JobDispatcherPoll::STABLE);
+    assert_eq!(rig.tick(), JobDispatcherPoll::STABLE);
+    assert!(rig.replies(1).is_empty());
+    assert!(rig.jobs.settle.is_some());
+    // Level: the pause ends and the request is read.
+    assert_eq!(rig.tick(), JobDispatcherPoll::STABLE);
+    assert_eq!(rig.jobs.settle, None);
+    assert_eq!(rig.replies(1).len(), 1);
+}

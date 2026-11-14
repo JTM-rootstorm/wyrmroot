@@ -103,6 +103,9 @@ pub(crate) struct JobDispatcher {
     /// Each job's budget and the jobs group, planned once per boot before
     /// the first job (DW2 §10.3 item 7).
     pub(crate) memory: crate::job_memory::JobMemory,
+    /// The pause after a job init ended, while its memory is torn down
+    /// (DW2 §10.10 item 7).
+    pub(crate) settle: Option<crate::job_memory::Settle>,
 }
 
 impl JobDispatcher {
@@ -120,6 +123,7 @@ impl JobDispatcher {
             image_fault: None,
             staged_reply: None,
             memory: crate::job_memory::JobMemory::UNPLANNED,
+            settle: None,
         }
     }
 

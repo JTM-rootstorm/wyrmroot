@@ -198,6 +198,15 @@ impl JobMemory {
         self.jobs_group.unwrap_or(init_group)
     }
 
+    /// The jobs group's usage in pages now, if it can be read.
+    pub(crate) fn jobs_usage<P: JobGroupPlatform>(&self, system: &mut P) -> Option<u64> {
+        let group = self.jobs_group?;
+        system
+            .query_task_group_memory(group)
+            .ok()
+            .map(|info| info.usage)
+    }
+
     /// The plan with what the jobs group and the machine hold now. A read
     /// that fails reports zero rather than failing the query.
     pub(crate) fn report<P: JobGroupPlatform>(&self, system: &mut P) -> MemoryReport {
@@ -219,6 +228,56 @@ impl JobMemory {
             source: self.plan.source,
             fallback: self.plan.cause,
         }
+    }
+}
+
+/// The longest init holds launches back after ending a job: half the
+/// shell's one-second wait for a launch reply (DW2 §10.10 item 7).
+pub(crate) const SETTLE_LIMIT_NS: u64 = 500_000_000;
+/// The least time between two reads of the jobs group's usage while
+/// settling, so two reads a moment apart do not look like a stop.
+pub(crate) const SETTLE_SAMPLE_NS: u64 = 20_000_000;
+
+/// The pause after a job init ended has exited (DW2 §10.10 item 7; Mike's
+/// bounded park, 2026-11-14). The kernel tears an exited job's address
+/// space down in steps, so the jobs group's usage falls for a while after
+/// the exit. Until it stops falling, or [`SETTLE_LIMIT_NS`] has passed,
+/// init reads no new request from any session, so the next job does not
+/// start against memory still owed teardown. Everything else goes on:
+/// peer closes, reaping, parked launches and WAIT replies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Settle {
+    usage: u64,
+    sampled_ns: u64,
+    until_ns: u64,
+}
+
+impl Settle {
+    /// A pause begun at `now_ns` with the usage just read; none if it could
+    /// not be read (a failed read never holds launches back).
+    pub(crate) fn begin(usage: Option<u64>, now_ns: u64) -> Option<Self> {
+        Some(Self {
+            usage: usage?,
+            sampled_ns: now_ns,
+            until_ns: now_ns.saturating_add(SETTLE_LIMIT_NS),
+        })
+    }
+
+    /// The pause at `now_ns`, or none once it is over. `read` reads the
+    /// usage; it is called only when a sample is due.
+    pub(crate) fn poll(self, now_ns: u64, read: impl FnOnce() -> Option<u64>) -> Option<Self> {
+        if now_ns >= self.until_ns {
+            return None;
+        }
+        if now_ns < self.sampled_ns.saturating_add(SETTLE_SAMPLE_NS) {
+            return Some(self);
+        }
+        let usage = read()?;
+        (usage < self.usage).then_some(Self {
+            usage,
+            sampled_ns: now_ns,
+            ..self
+        })
     }
 }
 
