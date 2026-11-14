@@ -3,21 +3,51 @@
 **Status:** Canonical source-of-truth index  
 **Repository:** `JTM-rootstorm/wyrmroot`
 
-This file defines the minimum architecture reading set for Wyrmroot implementation work. Codex coordinators and human contributors should read the applicable documents before changing kernel/userspace contracts.
+This file defines the minimum architecture reading set for Wyrmroot implementation work. Read the applicable documents before changing kernel/userspace contracts.
 
-## Current governing documents
+Four kinds of document live here, and this index keeps them apart:
 
-WYR0 and WYR1 are closed. Current work is governed by these documents in the OS-Project coordination root, above this repository:
+- **As built:** what the code does now. Start here.
+- **Governing:** conventions and contracts that bind changes to what they cover. Several predate the code they govern in places (selector-era vocabulary, older protocol versions); where one disagrees with the code, the as-built document states the fact and the disagreement is reported, not resolved locally.
+- **Active plans:** work in progress, all in the OS-Project root.
+- **Archive:** records of closed phases. History, not authority (root `CLAUDE.md` §5).
+
+## As built
+
+- [`AS_BUILT_ARCHITECTURE.md`](AS_BUILT_ARCHITECTURE.md) describes Wyrmroot as it is: the boot chain, the roles and how init supervises them, every protocol with its version and parties, loading, jobs and the shell, and the product image. Update it in the change that alters what it describes.
+
+## Active plans (OS-Project root)
+
+- [`OS_STACK_ARCHITECTURE_PLAN.md`](../../OS_STACK_ARCHITECTURE_PLAN.md) - the stack-wide plan: capacity, IPC, supervisor and launcher, storage recovery, service description, protocols, authority, console, ABI lifetime, root of trust, mitigations, the i386 seam, parsers, documentation.
+- [`TOOLCHAIN_PLAN.md`](../../TOOLCHAIN_PLAN.md) - the SDK, libc, the LLVM fork and self-hosting; [`TOOLCHAIN_POSIX_LAYER_DESIGN.md`](../../TOOLCHAIN_POSIX_LAYER_DESIGN.md) designs its POSIX layer.
+- [`HARDWARE_BRINGUP_PLAN.md`](../../HARDWARE_BRINGUP_PLAN.md) - draft plan for a live USB boot on one named machine; nothing in it is built.
+- [`I386_EXECUTION_MODE_CONTRACT.md`](../../I386_EXECUTION_MODE_CONTRACT.md) - draft i386 execution-mode contract (OS stack plan E1), awaiting Mike's decisions.
+- [`CARRIED_OPEN_ITEMS.md`](../../CARRIED_OPEN_ITEMS.md) - the owned ledger of open items: each fixed, scheduled or awaiting a decision.
+
+## Governing documents
+
+In the OS-Project root:
 
 - [`BOOTSTRAP_AND_RECOVERY_ARCHITECTURE.md`](../../BOOTSTRAP_AND_RECOVERY_ARCHITECTURE.md) - canonical cross-repository architecture for bootstrap, storage/root recovery and recovery-scope policy.
-- [`STORAGE_PLAN.md`](../../STORAGE_PLAN.md) - the storage spine plan, block device to persistent ext4 root; closed 2026-11-11. [`STORAGE_W7_MILESTONE_RECORD.md`](../../STORAGE_W7_MILESTONE_RECORD.md) is its milestone record.
-- [`TOOLCHAIN_PLAN.md`](../../TOOLCHAIN_PLAN.md) - active plan for the SDK, libc, the LLVM fork and self-hosting.
-- [`TOOLCHAIN_POSIX_LAYER_DESIGN.md`](../../TOOLCHAIN_POSIX_LAYER_DESIGN.md) - design of the libc-neutral Wyrmroot POSIX layer for the toolchain plan's step 2 (file descriptors, paths, memory, time, spawn).
-- [`HARDWARE_BRINGUP_PLAN.md`](../../HARDWARE_BRINGUP_PLAN.md) - draft plan for a live USB boot on one named machine; nothing in it is built.
-- [`CARRIED_OPEN_ITEMS.md`](../../CARRIED_OPEN_ITEMS.md) - active ledger of the items closed records left open, each fixed, scheduled or awaiting a decision.
 - [`DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md`](../../DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md) - canonical contract for carrying failure causes across error, exit-code and evidence boundaries.
 
-## Mandatory reading order
+In this repository:
+
+- [`Plans/WYR1_BOOTSTRAP_SUPERVISOR_CONTRACT.md`](WYR1_BOOTSTRAP_SUPERVISOR_CONTRACT.md) defines the reached WYR1-A permanent `/system/init` handoff, immutable bootfs/RRC-A manifest, fixed bootstrap graph, generation-exact READY/restart/reap behavior, capability distribution, and finite degraded-recovery transition. Read it before implementing or changing WYR1 supervision and recovery-residency behavior.
+- [`Plans/WYR1_B_REGISTRY_LAUNCH_CONTRACT.md`](WYR1_B_REGISTRY_LAUNCH_CONTRACT.md) defines the bounded separate bootstrap registry, controller-installed publication/client authority, direct endpoint routing, startup ABI v2 and WRLP 1.3 profiles, supervisor-owned scoped launch/job protocol, orphan/reap policy, immutable launch policy, and WYR1-B host/live gates.
+- [`Plans/WYR1_C_DEVICE_COORDINATOR_CONTRACT.md`](WYR1_C_DEVICE_COORDINATOR_CONTRACT.md) defines the reached hardware-independent device-coordinator boundary: exact static q35 COM2 policy, allocation-free manifest and state model, distinct generation identities, READY-before-publication, direct driver-control framing, cleanup-before-replacement, and the truthful pre-DW1-D waiting state. Read it before changing real `devmgr`, device-role product policy, driver matching/lifecycle, or later device-resource delegation.
+- [`Plans/WYR1_C_DEVICE_HANDOFF_CONTRACT.md`](WYR1_C_DEVICE_HANDOFF_CONTRACT.md) defines the paired DW1-D0/WYR1-C resource-domain startup custody, exact q35 COM2 grant correlation, reduced devmgr claim authority, fixed two-handle resource bundle, generation identity, MOVE ownership, and cleanup-before-replacement seam. Read it before implementing WYR1-C4 resource claim, driver delegation, or post-resource readiness.
+- [`Plans/WYR1_D_SERIAL_STREAM_CONSOLE_CONTRACT.md`](WYR1_D_SERIAL_STREAM_CONSOLE_CONTRACT.md) freezes WYR1-D's WRST v1 byte grammar, connector 1.1 and staged production UART handoff, fixed pressure bounds, q35 UART baseline, CR/LF translation, generation replacement/restart policy, selector-32 identity, structured WRD1 joins, and D0 host-model gate while preserving selector-29/WRDC-1.0 behavior.
+- [`Plans/WYR1_E6_PRODUCT_INTEGRATION_CONTRACT.md`](WYR1_E6_PRODUCT_INTEGRATION_CONTRACT.md) freezes production CONNECT lifetime, exact publication readiness, and driver/registry recovery joins without new IPC wire values.
+- [`Plans/WYR1_E2_EDITOR_CONTRACT.md`](WYR1_E2_EDITOR_CONTRACT.md) fixes incremental input resynchronization, printable-scalar policy, editor/history submission state and bounded viewport redraw.
+- [`Plans/WYR1_E_WYRMSH_CONTRACT.md`](WYR1_E_WYRMSH_CONTRACT.md) defines the frozen E0B shell scopes, ShellV1 WRLJ 1.1, six-role WRLP 1.11, WRCN status protocol, transactional registry/session ownership, immutable product reservations and parser/editor/job semantics. Reached codec/scope/loader and controller/status implementation is recorded in the E3A/B and E3C/D validations; E4A/B startup/local runtime is recorded separately; inspection/job adapters and selected-product work remain later cards.
+- [`Plans/WYR0_BOOTFS_FORMAT_CONTRACT.md`](WYR0_BOOTFS_FORMAT_CONTRACT.md) defines the canonical deterministic archive subset implemented by WYR0-C. Read it before changing bootfs builder, parser, lookup, content-manifest, or archive-intake behavior.
+- [`Plans/WYR0_D0_PRIMORDIAL_STARTUP_CONTRACT.md`](WYR0_D0_PRIMORDIAL_STARTUP_CONTRACT.md) defines the paired native startup stack/register, bootstrap Channel wire/role, capability-validation, bootfs mapping/lifetime, and READY/exit contract. Read it before WYR0-D implementation.
+- [`Plans/WYR0_E0_USERSPACE_PROCESS_LOADING_CONTRACT.md`](WYR0_E0_USERSPACE_PROCESS_LOADING_CONTRACT.md) defines the paired static ELF subset, userspace child-construction transaction, capability delegation, rollback, readiness, and exit-observation contract. Read it before WYR0-E/F/G implementation.
+- [`Plans/WYR0_I_NATIVE_CAPABILITY_CONTRACT.md`](WYR0_I_NATIVE_CAPABILITY_CONTRACT.md) defines the generic WYR0-I native capability, bounded supervision/restart, readiness accounting/enforcement classification, peer/generation, and evidence contract. Read it before WYR0-I B/C/D/E/F implementation or any later consumer relies on the DW0-H/WYR0-I capability certificate.
+- [`Plans/WYRMROOT_STORAGE_FILESYSTEM_DIRECTION.md`](WYRMROOT_STORAGE_FILESYSTEM_DIRECTION.md) pins the reached storage/filesystem roles: FAT32 for guest-side EFI System Partition management, ext4 as the initial persistent root required for full userspace onlining, and a later XFS-led/ext4-tempered/NTFS-informed native-filesystem track. Read it before post-WYR0 block/VFS/filesystem/root work or native-filesystem planning.
+
+## Mandatory reading order for platform or contract changes
 
 The WYR0-era foundation documents below still define the platform conventions.
 
@@ -32,19 +62,16 @@ The WYR0-era foundation documents below still define the platform conventions.
 8. Deepwyrm's corresponding `Plans/DEEPWYRM_PRE_PHASE0_INVARIANTS.md`, DW0 plan, and addenda for any cross-repository ABI/handoff work.
 9. When work touches compatibility personalities, personality hosting, or uses Linux/Windows/DOS/POSIX requirements to justify a native service or kernel change, the OS-Project coordination doctrine `../personality-plan/CROSS_PERSONALITY_KERNEL_MECHANISM_DOCTRINE.md` and the affected family plan are mandatory reading.
 
-## Reached subsystem contracts
+## Archive
 
-- [`Plans/WYR1_BOOTSTRAP_SUPERVISOR_CONTRACT.md`](WYR1_BOOTSTRAP_SUPERVISOR_CONTRACT.md) defines the reached WYR1-A permanent `/system/init` handoff, immutable bootfs/RRC-A manifest, fixed bootstrap graph, generation-exact READY/restart/reap behavior, capability distribution, and finite degraded-recovery transition. Read it before implementing or changing WYR1 supervision and recovery-residency behavior.
+Records of closed phases. The storage spine's plan is closed: [`STORAGE_PLAN.md`](../../STORAGE_PLAN.md) (2026-11-11) with its milestone record [`STORAGE_W7_MILESTONE_RECORD.md`](../../STORAGE_W7_MILESTONE_RECORD.md).
+
 - [`Plans/WYR1_A_VALIDATION.md`](WYR1_A_VALIDATION.md) records the accepted WYR1-A product tuple, artifact identities, host gates, paired default/SMP live boot matrix, remediation, and explicit VM-hardware/nonclaim boundary.
-- [`Plans/WYR1_B_REGISTRY_LAUNCH_CONTRACT.md`](WYR1_B_REGISTRY_LAUNCH_CONTRACT.md) defines the bounded separate bootstrap registry, controller-installed publication/client authority, direct endpoint routing, startup ABI v2 and WRLP 1.3 profiles, supervisor-owned scoped launch/job protocol, orphan/reap policy, immutable launch policy, and WYR1-B host/live gates.
 - [`Plans/WYR1_B_VALIDATION.md`](WYR1_B_VALIDATION.md) records the accepted WYR1-B product tuple, capacity remediation, frozen identities, host/product gates, selector-27 live result, exact-current selector-25 default/SMP regression matrix, and nonclaims.
-- [`Plans/WYR1_C_DEVICE_COORDINATOR_CONTRACT.md`](WYR1_C_DEVICE_COORDINATOR_CONTRACT.md) defines the reached hardware-independent device-coordinator boundary: exact static q35 COM2 policy, allocation-free manifest and state model, distinct generation identities, READY-before-publication, direct driver-control framing, cleanup-before-replacement, and the truthful pre-DW1-D waiting state. Read it before changing real `devmgr`, device-role product policy, driver matching/lifecycle, or later device-resource delegation.
 - [`Plans/WYR1_C1_VALIDATION.md`](WYR1_C1_VALIDATION.md) records the reached WYR1-C1 real-devmgr host/native product tuple, accepted Rust-fork toolchain, inspected artifact and manifest identities, recovery/product gates, and the explicit no-selector/no-live-acceptance boundary.
 - [`Plans/WYR1_C2_VALIDATION.md`](WYR1_C2_VALIDATION.md) records the reached WYR1-C2 deterministic unselected product tuple, reviewed source-to-WRDM compilation, production loader/kernel/bootstrap and ESP identities, retained publication-hardening gate, and the explicit no-selector/no-VM/no-live-acceptance boundary.
 - [`Plans/WYR1_C3_VALIDATION.md`](WYR1_C3_VALIDATION.md) records the reached WYR1-C3 hardware-free supervisor construction seam, direct per-attempt driver-control Channel, bounded construction/readiness handshake, exact actor/profile correlation, process reap and replacement behavior, accepted native-toolchain builds, and the explicit DW1-D block before hardware authority.
-- [`Plans/WYR1_C_DEVICE_HANDOFF_CONTRACT.md`](WYR1_C_DEVICE_HANDOFF_CONTRACT.md) defines the paired DW1-D0/WYR1-C resource-domain startup custody, exact q35 COM2 grant correlation, reduced devmgr claim authority, fixed two-handle resource bundle, generation identity, MOVE ownership, and cleanup-before-replacement seam. Read it before implementing WYR1-C4 resource claim, driver delegation, or post-resource readiness.
 - [`Plans/WYR1_C_VALIDATION.md`](WYR1_C_VALIDATION.md) records the accepted WYR1-C selector-29 product tuple, exact two-handle COM2 delegation, U1/P1 to U2/P2 driver restart, D1-to-D2 custody recovery, stale and malformed live negatives, non-escaping authority/no-I/O evidence, default/SMP acceptance, selector-25/27/28 regressions, and explicit physical-I/O boundary.
-- [`Plans/WYR1_D_SERIAL_STREAM_CONSOLE_CONTRACT.md`](WYR1_D_SERIAL_STREAM_CONSOLE_CONTRACT.md) freezes WYR1-D's WRST v1 byte grammar, connector 1.1 and staged production UART handoff, fixed pressure bounds, q35 UART baseline, CR/LF translation, generation replacement/restart policy, selector-32 identity, structured WRD1 joins, and D0 host-model gate while preserving selector-29/WRDC-1.0 behavior.
 - [`Plans/WYR1_D1_IMPLEMENTATION_STATUS.md`](WYR1_D1_IMPLEMENTATION_STATUS.md) records the reached WYR1-D1 production WRST codec, bounded native stream wrappers, JobV2 role validation, and native-stdout hello seam.
 - [`Plans/WYR1_D2_IMPLEMENTATION_STATUS.md`](WYR1_D2_IMPLEMENTATION_STATUS.md) records the reached WYR1-D2 no-std, fake-register 16550 core: silent staged initialization, bounded interrupt draining, fixed rings, diagnostics, and the released D3 adapter seam without live I/O claims.
 - [`Plans/WYR1_D3A_D3C_IMPLEMENTATION_STATUS.md`](WYR1_D3A_D3C_IMPLEMENTATION_STATUS.md) records the reached D3A split DeviceResource/quiescence gate and D3C minor-1 direct-connector host/model gate, including separate WRDC 1.1/WRSC codecs, explicit endpoint-MOVE ownership, one-client reconnect, and preservation of selector-29 WRDC 1.0.
@@ -52,43 +79,21 @@ The WYR0-era foundation documents below still define the platform conventions.
 - [`Plans/WYR1_D4_IMPLEMENTATION_STATUS.md`](WYR1_D4_IMPLEMENTATION_STATUS.md) records the reached production `consoled` startup profile, generation-exact serial/child supervision model, bounded and fair native WRST/JobV2 brokerage, cleanup-before-replacement joins, accepted native-target build, and explicit selector-32/live nonclaims.
 - [`Plans/WYR1_D5_IMPLEMENTATION_STATUS.md`](WYR1_D5_IMPLEMENTATION_STATUS.md) preserves the historical D5 selector-32 UP/SMP checkpoint, replacement joins, GDB-guided broad regression repairs and exact A5 evidence.
 - [`Plans/WYR1_D_VALIDATION.md`](WYR1_D_VALIDATION.md) records accepted WYR1-D6 and WYR1-D closure: exact selector31/32 UP/SMP products, selector30/29/28/27 regressions, independently recomputed certificates and actual COM2 sends, scoped review, cleanup and the released WYR1-E seam. It does not claim shell, physical-hardware, final security or DW1-wide closure.
-
-## Closed and historical implementation records
-
 - [`Plans/WYR1_E4AB_VALIDATION.md`](WYR1_E4AB_VALIDATION.md) records the separate production wyrmsh startup/READY/release/editor runtime, local help/echo/clear/exit, shared startup-version accessor, stateful WRST harness, partial-output correction and accepted native compilation at the E4A/B checkpoint.
 - [`Plans/WYR1_E4C_VALIDATION.md`](WYR1_E4C_VALIDATION.md) closes E4 with scoped services/tasks/status, canonical LIST_JOBS encoding, finite inspection deadlines and their reviewed correction, 73 shell/core plus 250 protocol/server tests, and accepted native compilation.
 - [`Plans/WYR1_E5_VALIDATION.md`](WYR1_E5_VALIDATION.md) closes E5A/B/C with the shared ShellJobs adapter, foreground stream bridge, spawn/wait/terminate, controller eviction/orphan regressions, reviewed custody/fairness/deadline corrections, 98 shell/core tests, 445 broader regressions and accepted native compilation. Reached E6 product/stack integration is recorded below; guest acceptance remains later.
 - [`Plans/WYR1_E_VALIDATION.md`](WYR1_E_VALIDATION.md) accepts WYR1-E and releases `F0A.1`: five E8 UP/SMP pairs at 33/69 records and `DWTEST1 33 0`, the six E8D.4 regression rows, independently recomputed evidence, frozen E6 ancestry, and five resolved defects — three of them one class, code no routinely-run gate compiled, now closed by aggregate selector gates in both repositories. It does not claim physical hardware, a flake rate, final security review, or a selector34 run.
 - [`Plans/WYR1_COMPLETION_REPORT.md`](WYR1_COMPLETION_REPORT.md) closes WYR1 (2026-11-10) on Wyrmroot `45a45e0` / Deepwyrm `831e2ad`: the delivered services and shell, job bounds, evidence, F4 security disposition and the next storage spine. Read it before planning post-WYR1 work.
-- [`Plans/WYR1_E6_PRODUCT_INTEGRATION_CONTRACT.md`](WYR1_E6_PRODUCT_INTEGRATION_CONTRACT.md) freezes production CONNECT lifetime, exact publication readiness, and driver/registry recovery joins without new IPC wire values.
 - [`Plans/WYR1_E6_VALIDATION.md`](WYR1_E6_VALIDATION.md) closes E6A/B with two identical normal native bootfs freezes, standalone inspection, exact selected-shell stack proof, all ten native variants, scoped review, and historical selector32 isolation. Selector33 media and guest acceptance remain E7.
-
 - [`Plans/WYR1_E3AB_LAUNCH_VALIDATION.md`](WYR1_E3AB_LAUNCH_VALIDATION.md) records additive ShellV1 wire/session scopes and the six-role Wyrmsh loader boundary at the E3A/B checkpoint.
 - [`Plans/WYR1_E3CD_VALIDATION.md`](WYR1_E3CD_VALIDATION.md) records transactional shell construction, bounded registry preflight, WRCN/consoled status, fresh replacement identities, scoped review and host/native checks; production resident-loop selection remains E6 and guest acceptance remains E7/E8.
-- [`Plans/WYR1_E2_EDITOR_CONTRACT.md`](WYR1_E2_EDITOR_CONTRACT.md) fixes incremental input resynchronization, printable-scalar policy, editor/history submission state and bounded viewport redraw.
 - [`Plans/WYR1_E2_EDITOR_VALIDATION.md`](WYR1_E2_EDITOR_VALIDATION.md) records E2A/E2B host tests, scoped review, source provenance and measured fixed-state/stack-frame evidence; native integration remains later work.
 - [`Plans/WYR1_E1_PARSER_VALIDATION.md`](WYR1_E1_PARSER_VALIDATION.md) records the E1A/E1B pure parser and typed command model, exact grammar/path/arity decisions, bounded property corpus and validation limits. Runtime/product integration remains later work.
-- [`Plans/WYR1_E_WYRMSH_CONTRACT.md`](WYR1_E_WYRMSH_CONTRACT.md) defines the frozen E0B shell scopes, ShellV1 WRLJ 1.1, six-role WRLP 1.11, WRCN status protocol, transactional registry/session ownership, immutable product reservations and parser/editor/job semantics. Reached codec/scope/loader and controller/status implementation is recorded in the E3A/B and E3C/D validations; E4A/B startup/local runtime is recorded separately; inspection/job adapters and selected-product work remain later cards.
 - [`Plans/WYR1_E0_TRANSITION_INVENTORY.md`](WYR1_E0_TRANSITION_INVENTORY.md) records E0A's source-bound transition inventory, measured toolchain/revision preflight, required-source dispositions, current gaps and the accepted E0B host-model validation and scoped review receipt.
-
 - [`Plans/WYR1_C4_IMPLEMENTATION_STATUS.md`](WYR1_C4_IMPLEMENTATION_STATUS.md) records completed WYR1-C4 production/native intake: exact WRBP V3 and WRLP 1.7/1.9 custody, devmgr-generation resource-domain parenting, generated ABI feature and COM2 claim validation, restart ownership, accepted-product-compiler checks, and explicit C5/C6 nonclaims.
 - [`Plans/WYR1_C5_IMPLEMENTATION_STATUS.md`](WYR1_C5_IMPLEMENTATION_STATUS.md) records completed WYR1-C5 direct resource delegation: exact reduced DeviceResource plus fresh Interrupt MOVE, typed actor validation, generation-bound DRIVER_READY before registry publication, explicit retire/cleanup behavior, accepted-product-compiler checks, and the selector-29/live-I/O/restart boundary retained for C6.
-- [`Plans/WYR0_BOOTFS_FORMAT_CONTRACT.md`](WYR0_BOOTFS_FORMAT_CONTRACT.md) defines the canonical
-  deterministic archive subset implemented by WYR0-C. Read it before changing bootfs builder,
-  parser, lookup, content-manifest, or archive-intake behavior.
-- [`Plans/WYR0_D0_PRIMORDIAL_STARTUP_CONTRACT.md`](WYR0_D0_PRIMORDIAL_STARTUP_CONTRACT.md) defines the paired native startup stack/register, bootstrap Channel wire/role, capability-validation, bootfs mapping/lifetime, and READY/exit contract. Read it before WYR0-D implementation.
-- [`Plans/WYR0_E0_USERSPACE_PROCESS_LOADING_CONTRACT.md`](WYR0_E0_USERSPACE_PROCESS_LOADING_CONTRACT.md) defines the paired static ELF subset, userspace child-construction transaction, capability delegation, rollback, readiness, and exit-observation contract. Read it before WYR0-E/F/G implementation.
-- [`Plans/WYR0_I_NATIVE_CAPABILITY_CONTRACT.md`](WYR0_I_NATIVE_CAPABILITY_CONTRACT.md) defines the generic WYR0-I native capability, bounded supervision/restart, readiness accounting/enforcement classification, peer/generation, and evidence contract. Read it before WYR0-I B/C/D/E/F implementation or any later consumer relies on the DW0-H/WYR0-I capability certificate.
-- [`Plans/WYR0_I_VALIDATION.md`](WYR0_I_VALIDATION.md),
-  [`Plans/WYR0_COMPLETION_REPORT.md`](WYR0_COMPLETION_REPORT.md), and
-  [`security/WYR0_SECURITY_REVIEW.md`](../security/WYR0_SECURITY_REVIEW.md)
-  are the accepted WYR0-I validation, WYR0 completion, and exact-candidate
-  security records. Later consumers require their exact certified tuple and
-  evidence; the generic contract alone is not an acceptance certificate.
-
-## Forward subsystem architecture
-
-- [`Plans/WYRMROOT_STORAGE_FILESYSTEM_DIRECTION.md`](WYRMROOT_STORAGE_FILESYSTEM_DIRECTION.md) pins the reached storage/filesystem roles: FAT32 for guest-side EFI System Partition management, ext4 as the initial persistent root required for full userspace onlining, and a later XFS-led/ext4-tempered/NTFS-informed native-filesystem track. Read it before post-WYR0 block/VFS/filesystem/root work or native-filesystem planning.
+- [`Plans/WYR0_I_VALIDATION.md`](WYR0_I_VALIDATION.md), [`Plans/WYR0_COMPLETION_REPORT.md`](WYR0_COMPLETION_REPORT.md), and [`security/WYR0_SECURITY_REVIEW.md`](../security/WYR0_SECURITY_REVIEW.md) are the accepted WYR0-I validation, WYR0 completion, and exact-candidate security records. Later consumers require their exact certified tuple and evidence; the generic contract alone is not an acceptance certificate.
+- Also archived, without entries of their own: [`DW1_B_SELECTOR26_PRODUCT_CONTRACT.md`](DW1_B_SELECTOR26_PRODUCT_CONTRACT.md), [`DW1_E3A_IMPLEMENTATION_STATUS.md`](DW1_E3A_IMPLEMENTATION_STATUS.md), [`DW1_E3B_WYR1D_PRODUCT_LIFECYCLE_STATUS.md`](DW1_E3B_WYR1D_PRODUCT_LIFECYCLE_STATUS.md), [`SIGNED_HISTORY_MAP_2026-08-24.md`](SIGNED_HISTORY_MAP_2026-08-24.md), [`SIGNED_HISTORY_MAP_2026-08-30.md`](SIGNED_HISTORY_MAP_2026-08-30.md), [`SIGNED_HISTORY_MAP_2026-09-27.md`](SIGNED_HISTORY_MAP_2026-09-27.md), [`WYR0_D2_VALIDATION.md`](WYR0_D2_VALIDATION.md), [`WYR0_G3_VALIDATION.md`](WYR0_G3_VALIDATION.md), [`WYR0_H_VALIDATION.md`](WYR0_H_VALIDATION.md), [`WYR0_I2_STRESS_PAYLOAD.md`](WYR0_I2_STRESS_PAYLOAD.md), [`WYR0_I_B_VALIDATION.md`](WYR0_I_B_VALIDATION.md), [`WYR0_I_C_VALIDATION.md`](WYR0_I_C_VALIDATION.md), [`WYR0_I_D_VALIDATION.md`](WYR0_I_D_VALIDATION.md), [`WYR0_I_E_F_VALIDATION.md`](WYR0_I_E_F_VALIDATION.md), [`WYR0_I_G1_VALIDATION.md`](WYR0_I_G1_VALIDATION.md), [`WYR1_C_D5_CUSTODY_SEAM.md`](WYR1_C_D5_CUSTODY_SEAM.md), [`WYR1_D5_DRAIN_FENCE.md`](WYR1_D5_DRAIN_FENCE.md), [`WYR1_D5_PUBLICATION_HANDOFF.md`](WYR1_D5_PUBLICATION_HANDOFF.md).
 
 ## Authority rules
 

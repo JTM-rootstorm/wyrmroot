@@ -42,7 +42,7 @@ Wyrmroot consumes generated Deepwyrm ABI definitions from an exact pinned Deepwy
 
 - [Architecture and plan index](Plans/ARCHITECTURE_INDEX.md)
 - [Platform conventions](Plans/WYRMROOT_PLATFORM_CONVENTIONS.md)
-- [WYR0 implementation plan](Plans/WYR0_IMPLEMENTATION_PLAN.md)
+- [Wyrmroot as built](Plans/AS_BUILT_ARCHITECTURE.md)
 - [Licensing policy and component map](LICENSING.md)
 - [Validation records](validation/)
 - [Security reviews](security/)

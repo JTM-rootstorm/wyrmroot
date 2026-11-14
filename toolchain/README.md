@@ -1,8 +1,12 @@
-# WYR0 toolchain and provenance bootstrap
+# Toolchain pins and provenance
 
-This directory records the immutable source revisions and canonical tool
-families selected for WYR0. It does not build a toolchain or add a Rust target;
-the root dependency graph and build gate control Deepwyrm ABI consumption.
+This directory records the exact source revisions and tool families Wyrmroot
+builds with: the Deepwyrm pin and its ABI fingerprint, the Wyrmroot Rust fork
+and its `x86_64-unknown-wyrmroot` target, the LLVM tools, the native user link
+script (`native-user.ld`), and the scoped local transport that resolves the
+pinned Deepwyrm commit (`cargo-with-local-deepwyrm.sh`). The toolchain itself
+is built from the forks under the OS-Project root (root `TOOLCHAIN_PLAN.md`).
+Parts of the text below date from WYR0 and describe its gates.
 
 ## Version authority
 
