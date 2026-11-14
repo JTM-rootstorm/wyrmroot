@@ -157,12 +157,14 @@ fn validate(product: &Product<'_>) -> Result<(), BuildError> {
         entry(CPU_HOG_PATH)?,
         entry(POLICY_WYRMSH_PATH)?,
     );
-    // The hog is the one admitted payload with the opposite stream shape:
-    // `spawn` launches it with zero startup stream roles, so admitting it on
-    // three streams would grant a background job the foreground contract.
+    // `spawn` launches with zero startup stream roles and `run` with three.
+    // The hog is admitted only on zero: admitting it on three would grant a
+    // background job the foreground contract. Hello is admitted on both, so
+    // its memory probes can run in the background (DW2 M5); the shell only
+    // on three.
     if hello.startup_abi != 2
         || hello.profile_id != JOB_V2_PROFILE_ID
-        || hello.allow_no_streams
+        || !hello.allow_no_streams
         || !hello.allow_three_streams
         || cpu_hog.startup_abi != 2
         || cpu_hog.profile_id != JOB_V2_PROFILE_ID
@@ -212,6 +214,10 @@ mod tests {
     }
 
     fn policy(hog_three_streams: bool, include_hog: bool) -> Vec<u8> {
+        policy_with(hog_three_streams, include_hog, true)
+    }
+
+    fn policy_with(hog_three_streams: bool, include_hog: bool, hello_spawnable: bool) -> Vec<u8> {
         let hog = LaunchPolicyEntry {
             path: CPU_HOG_PATH,
             content_sha256: HOG,
@@ -225,7 +231,7 @@ mod tests {
             content_sha256: HELLO,
             startup_abi: 2,
             profile_id: JOB_V2_PROFILE_ID,
-            allow_no_streams: false,
+            allow_no_streams: hello_spawnable,
             allow_three_streams: true,
         };
         let shell = LaunchPolicyEntry {
@@ -413,7 +419,12 @@ mod tests {
     #[test]
     fn refuses_a_hog_on_three_streams_or_a_policy_without_it() {
         let manifest = wrdm(UART);
-        for bad in [policy(true, true), policy(false, false)] {
+        // A hello that cannot be spawned is not this product either.
+        for bad in [
+            policy(true, true),
+            policy(false, false),
+            policy_with(false, true, false),
+        ] {
             assert_eq!(
                 build(product(&manifest, &bad)),
                 Err(BuildError::InvalidLaunchPolicy)

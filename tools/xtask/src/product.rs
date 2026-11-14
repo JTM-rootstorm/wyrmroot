@@ -180,13 +180,14 @@ const fn native(
 /// Builds the product into `output`, which must not exist yet.
 /// The SDK's test files dev-boot runs from `/EFI/WYRMROOT`: each file in
 /// `<sdk>/programs` and its 8.3 name on the ESP.
-pub(crate) const SDK_FILES: [(&str, [u8; 11]); 6] = [
+pub(crate) const SDK_FILES: [(&str, [u8; 11]); 7] = [
     ("hello.elf", *b"SDKHELLOELF"),
     ("zlib-example.elf", *b"ZEXAMPLEELF"),
     ("lua.elf", *b"LUA     ELF"),
     ("test.lua", *b"TEST    LUA"),
     ("sqlite3.elf", *b"SQLITE3 ELF"),
     ("sqlite-test.elf", *b"SQLTEST ELF"),
+    ("memory-test.elf", *b"MEMTEST ELF"),
 ];
 /// The largest SDK file the ESP takes; init reads at most 8 MiB.
 const MAX_SDK_PROGRAM_BYTES: u64 = 8 << 20;
@@ -582,12 +583,14 @@ fn assemble(
                 allow_no_streams: true,
                 allow_three_streams: false,
             },
+            // `run` gives hello its streams; `spawn` gives none, which only
+            // its memory probes accept (DW2 M5), plain hello refusing it.
             LaunchPolicyEntry {
                 path: "bin/hello",
                 content_sha256: hello,
                 startup_abi: 2,
                 profile_id: JOB_V2_PROFILE_ID,
-                allow_no_streams: false,
+                allow_no_streams: true,
                 allow_three_streams: true,
             },
             // The storage service roles (root `STORAGE_PLAN.md` W6, W7), in

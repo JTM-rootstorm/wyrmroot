@@ -17,7 +17,9 @@
 //! which hold their own FP registers and FS base while they preempt each
 //! other; runs `bin/hello` with its on-demand MemoryObject probe, which must
 //! pass and then end in `resource-policy` once its page quota is spent
-//! (Deepwyrm DW2 M6); runs `bin/hello` (a shell job under its TaskGroup limits) and the
+//! (Deepwyrm DW2 M6); runs DW2 M5's memory probes (`memory.rs`), whose
+//! kernel step report the first boot's COM1 log must then carry; runs
+//! `bin/hello` (a shell job under its TaskGroup limits) and the
 //! same ELF from the ESP to their output and the next prompt (with `--sdk`,
 //! also the SDK's programs); terminates the hogs and requires each to have
 //! been still running; then writes a
@@ -46,6 +48,8 @@ use std::{
 };
 
 use crate::{error::Failure, product, tasks};
+
+mod memory;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DevBoot {
@@ -86,7 +90,7 @@ const JOB_OUTPUT: &[u8] = b"hello from native stdout";
 /// disk request crosses ext4d, blockmgr and virtio-blkd under load: without
 /// Deepwyrm's D8 (a Thread that blocks keeps its unused quantum) every hop
 /// waits out a time slice and SQLite's test does not finish in time.
-const SDK_RUNS: [(&str, &[u8]); 5] = [
+const SDK_RUNS: [(&str, &[u8]); 7] = [
     (
         "run /boot/EFI/WYRMROOT/SDKHELLO.ELF",
         b"hello from musl: 1 argument, 6*7=42, pi=3.14159, pages=2048",
@@ -107,6 +111,17 @@ const SDK_RUNS: [(&str, &[u8]); 5] = [
     (
         "run /boot/EFI/WYRMROOT/SQLTEST.ELF",
         b"sqlite tests passed: ",
+    ),
+    // DW2 M5 probe 16: one 256 MiB malloc and more than 16 MiB of small
+    // ones, past the old ceiling; then every mapping slot spent, which
+    // `mmap` and a split `munmap` report as ENOMEM.
+    (
+        "run /boot/EFI/WYRMROOT/MEMTEST.ELF",
+        b"memory tests passed: large=256MiB",
+    ),
+    (
+        "run /boot/EFI/WYRMROOT/MEMTEST.ELF slots",
+        b"mmap=ENOMEM split=ENOMEM",
     ),
 ];
 /// Files the SDK programs leave on the root filesystem.
@@ -282,6 +297,17 @@ fn check(
         first_boot(shell, &token, sdk)
     });
     first?;
+    // The kernel's step report from the first boot, which ran the probes.
+    let log = fs::read(boots[0].1).map_err(|error| Failure::task(format!("COM1 log: {error}")))?;
+    let steps = memory::steps_report(&log).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
+    for line in steps {
+        eprintln!("dev-boot: kernel steps {line}");
+    }
     let second = boot_once(
         boots[1].0,
         boots[1].1,
@@ -332,6 +358,8 @@ fn first_boot(shell: &mut Shell<'_>, token: &str, sdk: bool) -> Result<(), Failu
         "run bin/hello on-demand-exhaust",
         b"classification=resource-policy",
     )?;
+    // DW2 M5's memory probes (§10.5 probes 12-15), with the hogs running.
+    memory::probes(shell)?;
     // The same `hello` from the ESP: init reads the ELF through vfsd and
     // fat32d instead of bootfs.
     shell.expect("run /boot/EFI/WYRMROOT/HELLO.ELF", JOB_OUTPUT)?;
@@ -339,6 +367,11 @@ fn first_boot(shell: &mut Shell<'_>, token: &str, sdk: bool) -> Result<(), Failu
         // Static C programs built against the SDK: musl over the POSIX
         // layer, started from the ESP like the hello above.
         run_sdk(shell, &SDK_RUNS)?;
+        // Touching past the job's budget ends it on the touch (DW2 §10.1).
+        shell.expect(
+            "run /boot/EFI/WYRMROOT/MEMTEST.ELF over",
+            b"classification=resource-policy",
+        )?;
         for path in SDK_LEFTOVERS {
             shell.quiet(&format!("rm {path}"))?;
         }

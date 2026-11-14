@@ -13,7 +13,7 @@ use deepwyrm_syscall::{
     DwRights, DwSignals,
 };
 use wyrmroot_loader::launch::{
-    HEADER_BYTES, LaunchError, LaunchProfile, encode_ready_for_profile, parse_init,
+    HEADER_BYTES, LaunchError, LaunchProfile, encode_ready_for_profile, parse_init, parse_job_init,
 };
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, NativeError,
@@ -165,18 +165,25 @@ pub fn run_stream_hello<System: StreamHelloSystem>(
     system: &mut System,
     bootstrap_channel: DwHandle,
 ) -> Result<(), HelloError> {
-    run_stream_hello_with(system, bootstrap_channel, None)
+    run_stream_hello_with(system, bootstrap_channel, None).map(|_| ())
 }
 
-/// [`run_stream_hello`], and when `probe` is given, runs it with the job's
-/// own AddressRegion and its memory budget in bytes (from its INIT) before
-/// letting the region go, and writes the line it returns after the greeting
-/// (`run bin/hello on-demand`, Deepwyrm DW2 M6).
+/// A probe mode's work (`run bin/hello <mode>`, Deepwyrm DW2 M6 and M5):
+/// given the job's own AddressRegion, its memory budget in bytes (from its
+/// INIT) and a writer for stdout lines (which returns whether the whole line
+/// was written), it returns the job's exit status.
+pub type Probe<'a> = &'a mut dyn FnMut(DwHandle, u64, &mut dyn FnMut(&[u8]) -> bool) -> u32;
+
+/// [`run_stream_hello`], and when `probe` is given, runs it once the job is
+/// running: after the greeting, READY and the controller's release, with
+/// the self root and stdout still held, so a probe may take as long as it
+/// needs and report as it goes. Returns the probe's exit status (zero
+/// without one).
 pub fn run_stream_hello_with<System: StreamHelloSystem>(
     system: &mut System,
     bootstrap_channel: DwHandle,
-    mut probe: Option<&mut dyn FnMut(DwHandle, u64) -> &'static [u8]>,
-) -> Result<(), HelloError> {
+    probe: Option<Probe<'_>>,
+) -> Result<u32, HelloError> {
     let channel = system
         .query_capability_info(bootstrap_channel)
         .map_err(|cause| HelloError::Native {
@@ -195,23 +202,46 @@ pub fn run_stream_hello_with<System: StreamHelloSystem>(
             operation: HelloNativeOperation::ReceiveInit,
             cause,
         })?;
-    if counts.bytes > init.len() || !(4..=handles.len()).contains(&counts.handles) {
+    if counts.bytes > init.len() || !(1..=handles.len()).contains(&counts.handles) {
+        return Err(HelloError::ReceiveCounts(counts));
+    }
+    if counts.handles == 1 {
+        // `spawn` starts a job with no streams (JobV2): only a probe runs
+        // so, writing nothing.
+        let Some(probe) = probe else {
+            return Err(HelloError::ReceiveCounts(counts));
+        };
+        let job = parse_job_init(LaunchProfile::JobV2, &init[..counts.bytes], &handles[..1])
+            .map_err(HelloError::StreamLaunch)?;
+        let root = handles[0].handle;
+        send_ready(system, bootstrap_channel, job.profile, job.transaction_id)?;
+        wait_for_release(system, bootstrap_channel)?;
+        close_bootstrap(system, bootstrap_channel)?;
+        let status = probe(root, job.memory_budget_bytes, &mut |_| false);
+        close(system, root)?;
+        return Ok(status);
+    }
+    if counts.handles < 4 {
         return Err(HelloError::ReceiveCounts(counts));
     }
     let streams = extract_job_v2_streams(&init[..counts.bytes], &handles[..counts.handles])
         .map_err(HelloError::StreamLaunch)?;
-    // Hello maps nothing and opens no paths, so its self root and any
-    // namespace go at once, after the probe if there is one.
-    let probed = probe
-        .as_mut()
-        .map(|probe| probe(streams.self_root, streams.memory_budget_bytes));
-    for handle in core::iter::once(streams.self_root).chain(streams.namespace) {
-        system
-            .close_handle(handle)
-            .map_err(|cause| HelloError::Native {
-                operation: HelloNativeOperation::CloseBootstrapChannel,
-                cause,
-            })?;
+    let transaction = parse_init(
+        streams.profile,
+        &init[..counts.bytes],
+        &handles[..counts.handles],
+    )
+    .map_err(HelloError::Launch)?
+    .transaction_id;
+    // Hello opens no paths, so any namespace goes at once; the self root
+    // goes too unless a probe will map with it.
+    let keep_root = probe.is_some();
+    for handle in (!keep_root)
+        .then_some(streams.self_root)
+        .into_iter()
+        .chain(streams.namespace)
+    {
+        close(system, handle)?;
     }
     let mut stdout = NativeOutput::new(streams.stdout);
     if stdout
@@ -221,46 +251,57 @@ pub fn run_stream_hello_with<System: StreamHelloSystem>(
     {
         return Err(HelloError::Stream(StreamError::Protocol));
     }
-    if let Some(line) = probed
-        && stdout.write(system, line).map_err(HelloError::Stream)? != line.len()
-    {
-        return Err(HelloError::Stream(StreamError::Protocol));
+    let Some(probe) = probe else {
+        for handle in [streams.stdin, streams.stdout, streams.stderr] {
+            close(system, handle.handle())?;
+        }
+        send_ready(system, bootstrap_channel, streams.profile, transaction)?;
+        wait_for_release(system, bootstrap_channel)?;
+        close_bootstrap(system, bootstrap_channel)?;
+        return Ok(0);
+    };
+    send_ready(system, bootstrap_channel, streams.profile, transaction)?;
+    wait_for_release(system, bootstrap_channel)?;
+    close_bootstrap(system, bootstrap_channel)?;
+    let status = {
+        let mut write = |line: &[u8]| stdout.write(system, line).is_ok_and(|n| n == line.len());
+        probe(streams.self_root, streams.memory_budget_bytes, &mut write)
+    };
+    for handle in [
+        streams.self_root,
+        streams.stdin.handle(),
+        streams.stdout.handle(),
+        streams.stderr.handle(),
+    ] {
+        close(system, handle)?;
     }
+    Ok(status)
+}
+
+fn close<System: HelloSystem>(system: &mut System, handle: DwHandle) -> Result<(), HelloError> {
     system
-        .close_handle(streams.stdin.handle())
+        .close_handle(handle)
         .map_err(|cause| HelloError::Native {
             operation: HelloNativeOperation::CloseBootstrapChannel,
             cause,
-        })?;
-    system
-        .close_handle(streams.stdout.handle())
-        .map_err(|cause| HelloError::Native {
-            operation: HelloNativeOperation::CloseBootstrapChannel,
-            cause,
-        })?;
-    system
-        .close_handle(streams.stderr.handle())
-        .map_err(|cause| HelloError::Native {
-            operation: HelloNativeOperation::CloseBootstrapChannel,
-            cause,
-        })?;
+        })
+}
+
+fn send_ready<System: HelloSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+    profile: LaunchProfile,
+    transaction: u64,
+) -> Result<(), HelloError> {
     let mut ready = [0_u8; HEADER_BYTES];
-    let parsed = wyrmroot_loader::launch::parse_init(
-        streams.profile,
-        &init[..counts.bytes],
-        &handles[..counts.handles],
-    )
-    .map_err(HelloError::Launch)?;
-    let size = encode_ready_for_profile(streams.profile, parsed.transaction_id, &mut ready)
-        .map_err(HelloError::Launch)?;
+    let size =
+        encode_ready_for_profile(profile, transaction, &mut ready).map_err(HelloError::Launch)?;
     system
         .send_channel(bootstrap_channel, &ready[..size])
         .map_err(|cause| HelloError::Native {
             operation: HelloNativeOperation::SendReady,
             cause,
-        })?;
-    wait_for_release(system, bootstrap_channel)?;
-    close_bootstrap(system, bootstrap_channel)
+        })
 }
 
 fn run_profile<System: HelloSystem>(

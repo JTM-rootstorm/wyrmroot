@@ -357,42 +357,88 @@ fn stream_hello_uses_only_a_validated_native_stdout_record() {
     );
 }
 
-/// `run bin/hello on-demand` (Deepwyrm DW2 M6): the probe runs with the
-/// job's own self root before hello lets it go, and its line follows the
-/// greeting on stdout.
+/// `run bin/hello <mode>` (Deepwyrm DW2 M6 and M5): the probe runs once the
+/// job is running, after READY and the release, with the self root and
+/// stdout still held; its lines follow the greeting, its status is the
+/// job's, and only then are the root and streams let go.
 #[test]
-fn stream_hello_runs_its_probe_with_the_self_root_then_writes_its_line() {
+fn stream_hello_runs_its_probe_after_ready_with_the_self_root_and_stdout() {
     let mut fixture = StreamFixture::new();
     let mut seen = None;
-    let mut probe = |region: DwHandle, budget: u64| {
+    let mut probe = |region: DwHandle, budget: u64, write: &mut dyn FnMut(&[u8]) -> bool| {
         seen = Some((region, budget));
-        b"on-demand ok\n".as_slice()
+        assert!(write(b"probe one\n"));
+        assert!(write(b"probe two\n"));
+        7
     };
     assert_eq!(
         run_stream_hello_with(&mut fixture, CHANNEL, Some(&mut probe)),
-        Ok(())
+        Ok(7)
     );
     // The budget is the one its INIT carried.
     assert_eq!(seen, Some((ROOT, 16 << 20)));
     let payloads: Vec<_> = fixture
         .sent
         .iter()
-        .take(2)
-        .map(|record| {
-            wyrmroot_stream_proto::decode_data(record)
-                .unwrap()
-                .payload()
-                .to_vec()
-        })
+        .filter_map(|record| wyrmroot_stream_proto::decode_data(record).ok())
+        .map(|data| data.payload().to_vec())
         .collect();
     assert_eq!(
         payloads,
         [
             b"hello from native stdout\n".to_vec(),
-            b"on-demand ok\n".to_vec()
+            b"probe one\n".to_vec(),
+            b"probe two\n".to_vec(),
         ]
     );
-    assert_eq!(fixture.closed[0], ROOT);
+    assert_eq!(
+        fixture.events,
+        [
+            "stdout-data",
+            "ready",
+            "wait-release",
+            "close-bootstrap",
+            "stdout-data",
+            "stdout-data",
+            "close-root",
+            "close-stream",
+            "close-stream",
+            "close-stream",
+        ]
+    );
+}
+
+/// `spawn bin/hello <mode>`: a spawned job has no streams (JobV2), so the
+/// probe runs after READY with its self root and budget and nothing to
+/// write to; without a probe such an INIT is refused.
+#[test]
+fn a_spawned_probe_runs_without_streams() {
+    let mut fixture = StreamFixture::profile(LaunchProfile::JobV2);
+    let mut seen = None;
+    let mut probe = |region: DwHandle, budget: u64, write: &mut dyn FnMut(&[u8]) -> bool| {
+        seen = Some((region, budget, write(b"nobody reads this\n")));
+        3
+    };
+    assert_eq!(
+        run_stream_hello_with(&mut fixture, CHANNEL, Some(&mut probe)),
+        Ok(3)
+    );
+    assert_eq!(seen, Some((ROOT, 16 << 20, false)));
+    assert_eq!(
+        fixture.events,
+        ["ready", "wait-release", "close-bootstrap", "close-root"]
+    );
+    let ready = fixture.sent.last().unwrap();
+    assert!(
+        wyrmroot_loader::launch::parse_ready_for_profile(LaunchProfile::JobV2, ready, 9).is_ok()
+    );
+
+    let mut plain = StreamFixture::profile(LaunchProfile::JobV2);
+    assert!(matches!(
+        run_stream_hello(&mut plain, CHANNEL),
+        Err(HelloError::ReceiveCounts(_))
+    ));
+    assert!(plain.closed.is_empty());
 }
 
 #[test]
