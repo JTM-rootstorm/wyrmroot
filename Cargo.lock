@@ -23,12 +23,20 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "deepwyrm-abi"
 version = "0.0.0"
-source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=70383d44dcd07b2930a658f0da70d92bdd2f5760#70383d44dcd07b2930a658f0da70d92bdd2f5760"
+source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=5011b5dd9311e730ed5a7f86fc3bf4ff176ec269#5011b5dd9311e730ed5a7f86fc3bf4ff176ec269"
+
+[[package]]
+name = "deepwyrm-elf-corpus"
+version = "0.0.0"
+source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=5011b5dd9311e730ed5a7f86fc3bf4ff176ec269#5011b5dd9311e730ed5a7f86fc3bf4ff176ec269"
+dependencies = [
+ "deepwyrm-abi",
+]
 
 [[package]]
 name = "deepwyrm-syscall"
 version = "0.0.0"
-source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=70383d44dcd07b2930a658f0da70d92bdd2f5760#70383d44dcd07b2930a658f0da70d92bdd2f5760"
+source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=5011b5dd9311e730ed5a7f86fc3bf4ff176ec269#5011b5dd9311e730ed5a7f86fc3bf4ff176ec269"
 dependencies = [
  "deepwyrm-abi",
 ]
@@ -258,6 +266,7 @@ name = "wyrmroot-efi-loader"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-abi",
+ "deepwyrm-elf-corpus",
  "uefi",
 ]
 
@@ -329,6 +338,7 @@ version = "0.0.0"
 name = "wyrmroot-loader"
 version = "0.0.0"
 dependencies = [
+ "deepwyrm-elf-corpus",
  "deepwyrm-syscall",
  "wyrmroot-registry-proto",
  "wyrmroot-startup-proto",

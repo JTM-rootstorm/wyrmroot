@@ -631,3 +631,19 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
 fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
+
+/// The kernel parser reads kernel images, never user ones: it refuses every
+/// case of the shared user-image corpus, malformed or not, without panicking
+/// (root `OS_STACK_ARCHITECTURE_PLAN.md` Z1).
+#[test]
+fn the_kernel_parser_refuses_every_user_image_of_the_shared_corpus() {
+    for case in deepwyrm_elf_corpus::cases() {
+        let mut output = [EMPTY_SEGMENT; 16];
+        assert!(
+            plan_kernel_elf(&case.bytes, policy(), &mut output).is_err(),
+            "{}",
+            case.name
+        );
+        let _ = kernel_load_segment_capacity(&case.bytes, policy());
+    }
+}

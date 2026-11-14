@@ -561,3 +561,25 @@ fn a_second_note_header_is_refused() {
         Err(ElfError::DuplicateProgramHeaderType(4))
     );
 }
+
+/// The shared corpus's verdicts for this parser (root
+/// `OS_STACK_ARCHITECTURE_PLAN.md` Z1); Deepwyrm's primordial parser tests
+/// the same cases against its own column.
+#[test]
+fn the_shared_elf_corpus_gets_its_expected_verdicts() {
+    use deepwyrm_elf_corpus::{Verdict, cases};
+    let mut wrong = Vec::new();
+    for case in cases() {
+        let mut output = [empty_segment(); MAX_LOAD_SEGMENTS];
+        let result = elf::plan(&case.bytes, &mut output).map(|_| ());
+        let verdict = if result.is_ok() {
+            Verdict::Accept
+        } else {
+            Verdict::Reject
+        };
+        if verdict != case.loader {
+            wrong.push((case.name, result));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

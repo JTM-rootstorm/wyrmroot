@@ -26,3 +26,6 @@ required-features = ["firmware"]
 [dependencies]
 deepwyrm-abi.workspace = true
 uefi = { workspace = true, optional = true }
+
+[dev-dependencies]
+deepwyrm-elf-corpus.workspace = true

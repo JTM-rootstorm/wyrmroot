@@ -12,7 +12,7 @@ milestone = "WYR0"
 # `revision`; a host test checks them.
 [deepwyrm]
 repository = "https://github.com/JTM-rootstorm/deepwyrm"
-revision = "70383d44dcd07b2930a658f0da70d92bdd2f5760"
+revision = "5011b5dd9311e730ed5a7f86fc3bf4ff176ec269"
 abi_fingerprint = "5aa045d0e7328b15a9e25afd6c3aa9c381e481220be050b8f9f4422294d1fc44"
 abi_version = 0
 abi_dependency_state = "available"
