@@ -36,7 +36,9 @@ use deepwyrm_syscall::{
     DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwHandle, DwHandleTransferV1,
     DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
 };
-use wyrmroot_block_proto::{self as wrbd, Body, Info, MAX_BYTES, Message, Status, Transfer};
+use wyrmroot_block_proto::{
+    self as wrbd, Body, Info, MAX_BYTES, Message, ReplyTo, Status, Transfer, Version,
+};
 use wyrmroot_device_proto::manifest::{
     BOOT_DISK_PUBLICATION_POLICY, DATA_DISK_PUBLICATION_POLICY, PublicationPolicy,
 };
@@ -328,8 +330,9 @@ fn discover_volume<P: BlockmgrPlatform, M: Mapper<P>>(
 struct Link {
     client: DwHandle,
     driver: DwHandle,
-    /// The client transaction the driver is answering.
-    pending: Option<u64>,
+    /// The request out at the driver, passed on and answered in the
+    /// client's minor (X1).
+    pending: Option<ReplyTo>,
 }
 
 struct Server {
@@ -481,6 +484,10 @@ impl Server {
             close(platform, received);
             return false;
         };
+        let to = ReplyTo::new(
+            &bytes[..counts.bytes.min(bytes.len())],
+            message.transaction_id,
+        );
         let local = |status| Body::Complete(status);
         let forward = match message.body {
             Body::GetInfo => Err(Body::Info(self.info)),
@@ -509,14 +516,16 @@ impl Server {
                 None => Err(local(Status::OutOfRange)),
             },
             Body::Flush => Ok((Body::Flush, None)),
-            Body::Info(_) | Body::Complete(_) => return false,
+            // blockmgr is the client's responder: its own version.
+            Body::QueryVersion => Err(Body::Version(Version::current(0))),
+            Body::Info(_) | Body::Complete(_) | Body::Version(_) => return false,
         };
         match forward {
-            Err(reply) => send(platform, link.client, message.transaction_id, reply, None),
+            Err(reply) => send(platform, link.client, to, reply, None),
             Ok((body, memory)) => {
-                if send(platform, link.driver, message.transaction_id, body, memory) {
+                if send(platform, link.driver, to, body, memory) {
                     self.links[slot] = Some(Link {
-                        pending: Some(message.transaction_id),
+                        pending: Some(to),
                         ..link
                     });
                     true
@@ -557,9 +566,9 @@ impl Server {
                     body: body @ Body::Complete(_),
                 }),
                 Some(pending),
-            ) if transaction_id == pending => {
+            ) if transaction_id == pending.transaction_id => {
                 link.pending = None;
-                send(platform, link.client, transaction_id, body, None)
+                send(platform, link.client, pending, body, None)
             }
             _ => {
                 close(platform, &handles[..counts.handles.min(1)]);
@@ -579,18 +588,12 @@ fn close<P: BlockmgrPlatform>(platform: &mut P, received: &[DwReceivedHandleInfo
 fn send<P: BlockmgrPlatform>(
     platform: &mut P,
     channel: DwHandle,
-    transaction_id: u64,
+    to: ReplyTo,
     body: Body,
     memory: Option<DwHandle>,
 ) -> bool {
     let mut bytes = [0u8; MAX_BYTES];
-    let Ok(size) = wrbd::encode(
-        Message {
-            transaction_id,
-            body,
-        },
-        &mut bytes,
-    ) else {
+    let Ok(size) = wrbd::encode_reply(to, body, &mut bytes) else {
         return false;
     };
     let transfer = memory.map(|handle| DwHandleTransferV1 {

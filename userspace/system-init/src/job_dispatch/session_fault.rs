@@ -31,7 +31,7 @@ use deepwyrm_syscall::{
 /// READY timeout.
 pub(crate) const REPLY_PATIENCE_NS: u64 = WYR0_I_SUPERVISION_POLICY.ready_timeout_ns;
 
-/// The size of an `ERROR`, a job message or a `JOB_RESULT`.
+/// The size of an `ERROR`, a job message, a `VERSION` or a `JOB_RESULT`.
 pub(crate) const JOB_REPLY_BYTES: usize = 88;
 /// The size of the longest `JOB_LIST` the protocol admits.
 pub(crate) const JOB_LIST_REPLY_BYTES: usize = 56 + 8 * wyrmroot_launch_proto::MAX_LIVE_JOBS;

@@ -1518,3 +1518,114 @@ fn a_journal_too_small_to_free_an_orphan_keeps_names_and_leaves_orphans() {
     fs.server.retire(&mut fs.world);
     assert_eq!(fs.counts(), before);
 }
+
+// ------------------------------------------------------------ versions (X1)
+
+impl Fs {
+    /// Sends `body` on `channel` in `minor`, with `extra` trailing bytes,
+    /// and lets the server run once; its transaction.
+    fn send_in_minor(
+        &mut self,
+        channel: DwHandle,
+        body: Body<'_>,
+        minor: u16,
+        extra: &[u8],
+        handles: &[DwHandle],
+    ) -> u64 {
+        self.transaction += 1;
+        let mut bytes = vec![0u8; node::MAX_BYTES];
+        let size = node::encode(
+            &node::Message {
+                transaction_id: self.transaction,
+                body,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        bytes.truncate(size);
+        bytes.extend_from_slice(extra);
+        bytes[6..8].copy_from_slice(&minor.to_le_bytes());
+        let total = bytes.len() as u32;
+        bytes[12..16].copy_from_slice(&total.to_le_bytes());
+        self.world.send(channel, &bytes, handles);
+        self.step();
+        self.transaction
+    }
+}
+
+fn minor_of(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[6], bytes[7]])
+}
+
+#[test]
+fn answers_follow_the_request_minor_even_when_a_lock_waits() {
+    use wyrmroot_fs_proto::{MIN_MINOR, MINOR};
+    let mut fs = fs();
+    let root = fs.root;
+    // A 1.3 OPEN is answered with a 1.3 ON_OPEN.
+    let (waiter, far) = fs.world.pair();
+    let open = Body::Open {
+        flags: OPEN_READ,
+        path: b"etc/motd",
+        client: 0,
+    };
+    fs.send_in_minor(root, open, MIN_MINOR, &[], &[far]);
+    let (reply, _) = fs.world.receive(waiter);
+    assert_eq!(minor_of(&reply), MIN_MINOR);
+    assert!(matches!(
+        node::parse(&reply, 0).unwrap().body,
+        Body::OnOpen {
+            status: Status::Ok,
+            ..
+        }
+    ));
+    let (holder, _, _) = fs.open(root, OPEN_READ, b"etc/motd");
+    let taken = fs.lock_send(holder, lock(0, 0, LockMode::Exclusive), 0);
+    assert_eq!(fs.answer(holder, taken).0, Status::Ok);
+    // A 1.3 LOCK that waits ...
+    let waiting = fs.send_in_minor(
+        waiter,
+        Body::Lock {
+            lock: lock(0, 1, LockMode::Shared),
+            flags: LOCK_WAIT,
+        },
+        MIN_MINOR,
+        &[],
+        &[],
+    );
+    assert!(!fs.world.readable(waiter));
+    // ... while a later request, trailing bytes and all, is refused in its
+    // own minor ...
+    let refused = fs.send_in_minor(waiter, Body::GetAttr, MINOR + 1, &[3; 16], &[]);
+    let (reply, _) = fs.world.receive(waiter);
+    assert_eq!(minor_of(&reply), MINOR);
+    let message = node::parse(&reply, 0).unwrap();
+    assert_eq!(message.transaction_id, refused);
+    // ... is answered in 1.3 once granted.
+    fs.world.close_handle(holder).unwrap();
+    fs.step();
+    let (reply, _) = fs.world.receive(waiter);
+    assert_eq!(minor_of(&reply), MIN_MINOR);
+    let message = node::parse(&reply, 0).unwrap();
+    assert_eq!(message.transaction_id, waiting);
+    assert_eq!(
+        message.body,
+        Body::Status {
+            status: Status::Ok,
+            value: 0
+        }
+    );
+}
+
+#[test]
+fn ext4d_reports_its_version_with_locks() {
+    use wyrmroot_fs_proto::Version;
+    use wyrmroot_fs_proto::node::FEATURE_LOCKS;
+    let mut fs = fs();
+    let root = fs.root;
+    let reply = fs.request(root, Body::QueryVersion);
+    assert_eq!(
+        node::parse(&reply, 0).unwrap().body,
+        Body::Version(Version::current(FEATURE_LOCKS))
+    );
+}

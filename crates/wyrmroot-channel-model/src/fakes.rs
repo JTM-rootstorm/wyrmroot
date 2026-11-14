@@ -365,6 +365,8 @@ pub struct DiskState {
     pub flushes: usize,
     /// Rights each ATTACH's MemoryObject arrived with.
     pub attach_rights: Vec<DwRights>,
+    /// The header minor of every request the disk parsed.
+    pub minors: Vec<u16>,
 }
 
 /// Publishes a disk as `service` through `registry` and serves it.
@@ -388,6 +390,7 @@ pub fn serve_disk(
         reads: Vec::new(),
         flushes: 0,
         attach_rights: Vec::new(),
+        minors: Vec::new(),
     }));
     let peer_state = state.clone();
     world.add_peer(move |world| serve_disk_step(world, &mut peer_state.borrow_mut()));
@@ -436,14 +439,10 @@ fn serve_disk_step(world: &mut World, disk: &mut DiskState) -> bool {
             };
             let reply = disk_request(world, disk, index, request.body, &handles);
             let mut out = [0u8; wrbd::MAX_BYTES];
-            let size = wrbd::encode(
-                wrbd::Message {
-                    transaction_id: request.transaction_id,
-                    body: reply,
-                },
-                &mut out,
-            )
-            .unwrap();
+            // Answered in the request's minor, as a driver does.
+            let to = wrbd::ReplyTo::new(&bytes, request.transaction_id);
+            disk.minors.push(u16::from_le_bytes([bytes[6], bytes[7]]));
+            let size = wrbd::encode_reply(to, reply, &mut out).unwrap();
             let _ = world.send_channel(channel, &out[..size], &[]);
         } else if world.peer_closed(channel) {
             progressed = true;
@@ -504,6 +503,7 @@ fn disk_request(
             disk.flushes += 1;
             Body::Complete(Status::Ok)
         }
-        Body::Info(_) | Body::Complete(_) => Body::Complete(Status::Invalid),
+        Body::QueryVersion => Body::Version(wrbd::Version::current(0)),
+        Body::Info(_) | Body::Complete(_) | Body::Version(_) => Body::Complete(Status::Invalid),
     }
 }

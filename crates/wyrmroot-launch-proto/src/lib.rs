@@ -2,6 +2,40 @@
 //!
 //! Jobs are opaque identities scoped to one exact connection generation. The
 //! wire protocol exposes no PID, signal, descriptor, VFS, or ambient namespace.
+//!
+//! # Versions (root `OS_STACK_ARCHITECTURE_PLAN.md` X1)
+//!
+//! The header's minor has two uses, kept apart:
+//!
+//! - Minor 1 is not a version of the job protocol. It is the frozen
+//!   envelope of `LAUNCH_SHELL_V1` alone: only the `shell_v1` functions
+//!   read or write it, and they require exactly 1. The job decoders refuse
+//!   it, so the two can never be mistaken for each other.
+//! - The job protocol's minors are 0, then 2 ([`MINOR`], which added
+//!   QUERY_VERSION), 3 and on. Its decoders accept 0 and every minor from 2
+//!   up, including minors newer than this crate's.
+//!
+//! Minors are additive. A later minor may add message types; a type is
+//! accepted only in a header whose minor has it, so a newer type is still
+//! refused as unknown. A later minor may append fields to the end of a
+//! message, and every decoder (`LAUNCH_SHELL_V1`'s too) ignores the bytes
+//! past the body it knows: past a fixed body, or past the strings or job
+//! ids a body's own counts select. A LAUNCH's size field still equals the
+//! datagram's. Reserved fields, flags, identities and handle counts stay
+//! exact. Trailing bytes must fit the receiver's buffer: a LAUNCH at
+//! [`MAX_LAUNCH_MESSAGE_BYTES`] has none to spare, so a minor that extends
+//! LAUNCH raises that bound in the same change.
+//!
+//! Every message is sent in the oldest minor that has its layout: the
+//! messages of 1.0 in 0, QUERY_VERSION and VERSION in 2. A peer built
+//! before X1, whose decoder requires exactly minor 0, therefore reads
+//! every answer to a request it could send, and while no layout differs by
+//! minor this answers each request no newer than it asked. A later minor
+//! that changes an existing message's layout must instead answer each
+//! request in the request's own minor, carrying it with the deferred
+//! answers (`system-init`'s parked WAIT and launches) as WRFS does.
+//! QUERY_VERSION asks the controller for its [`Version`]; WRLJ defines no
+//! feature bits yet.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -47,9 +81,16 @@ pub const SHELL_V1_STARTUP_ABI: u16 = 2;
 pub const SHELL_V1_POLICY_PROFILE: u16 = 2;
 
 const MAGIC: [u8; 4] = *b"WRLJ";
-const MAJOR: u16 = 1;
-const MINOR: u16 = 0;
+pub const MAJOR: u16 = 1;
+/// The job protocol's minor this crate speaks.
+pub const MINOR: u16 = 2;
+/// The job protocol's first minor; minor 1 is `LAUNCH_SHELL_V1`'s envelope.
+const LEGACY_MINOR: u16 = 0;
+/// The minor that added QUERY_VERSION and VERSION.
+pub const VERSION_QUERY_MINOR: u16 = 2;
 const SHELL_V1_MINOR: u16 = 1;
+/// QUERY_VERSION's answer: the header and a 16-byte body.
+const VERSION_BYTES: usize = HEADER_BYTES + 16;
 const SHELL_V1_MESSAGE_TYPE: u32 = 16;
 const RECORD_BYTES: usize = 8;
 const LAUNCH_FIXED_BYTES: usize = 72;
@@ -118,6 +159,10 @@ pub enum MessageType {
     /// `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W5). The path is the file's display
     /// path without its leading slash; it names nothing in bootfs.
     LaunchImage = 17,
+    /// Asks the controller for its version (2).
+    QueryVersion = 18,
+    /// QUERY_VERSION's answer (2).
+    Version = 19,
 }
 
 impl MessageType {
@@ -139,8 +184,42 @@ impl MessageType {
             14 => Self::Closed,
             15 => Self::Error,
             17 => Self::LaunchImage,
+            18 => Self::QueryVersion,
+            19 => Self::Version,
             _ => return Err(Error::UnknownMessageType),
         })
+    }
+
+    /// The minor that introduced this message, which it is sent in.
+    pub const fn since(self) -> u16 {
+        match self {
+            Self::QueryVersion | Self::Version => VERSION_QUERY_MINOR,
+            _ => LEGACY_MINOR,
+        }
+    }
+}
+
+/// The controller's answer to QUERY_VERSION: the job protocol's version it
+/// speaks and its feature bits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Version {
+    /// Always [`MAJOR`].
+    pub major: u16,
+    /// At least [`VERSION_QUERY_MINOR`] and at least the answer's own minor.
+    pub minor: u16,
+    /// An open set of feature bits, none defined yet: a client ignores bits
+    /// it does not know.
+    pub features: u64,
+}
+
+impl Version {
+    /// This crate's version with `features`.
+    pub const fn current(features: u64) -> Self {
+        Self {
+            major: MAJOR,
+            minor: MINOR,
+            features,
+        }
     }
 }
 
@@ -347,6 +426,8 @@ pub enum Message<'a> {
     Error {
         code: ErrorCode,
     },
+    QueryVersion,
+    Version(Version),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -443,7 +524,7 @@ pub fn parse_shell_v1_request(
     bytes: &[u8],
     received_handles: usize,
 ) -> Result<ParsedShellV1Request, Error> {
-    require_size(bytes, SHELL_V1_REQUEST_BYTES)?;
+    require_at_least(bytes, SHELL_V1_REQUEST_BYTES)?;
     require_handles(received_handles, SHELL_V1_HANDLE_COUNT)?;
     let reservation = parse_envelope_version(bytes, SHELL_V1_MINOR)?;
     if read_u32(bytes, 40)? != SHELL_V1_MESSAGE_TYPE {
@@ -476,7 +557,7 @@ pub fn parse_shell_v1_request(
     if &bytes[112..112 + SHELL_V1_PATH.len()] != SHELL_V1_PATH.as_bytes() {
         return Err(Error::InvalidPath);
     }
-    if bytes[112 + SHELL_V1_PATH.len()..]
+    if bytes[112 + SHELL_V1_PATH.len()..SHELL_V1_REQUEST_BYTES]
         .iter()
         .any(|byte| *byte != 0)
     {
@@ -514,7 +595,7 @@ pub fn parse_shell_v1_reply(
     bytes: &[u8],
     received_handles: usize,
 ) -> Result<ParsedShellV1Reply, Error> {
-    require_size(bytes, SHELL_V1_REPLY_BYTES)?;
+    require_at_least(bytes, SHELL_V1_REPLY_BYTES)?;
     require_handles(received_handles, 0)?;
     let reservation = parse_envelope_version(bytes, SHELL_V1_MINOR)?;
     if read_u32(bytes, 44)? != 0 || read_u32(bytes, 52)? != 0 {
@@ -553,6 +634,10 @@ pub fn parse_message(bytes: &[u8], received_handles: usize) -> Result<ParsedMess
     }
     let reservation = parse_envelope(bytes)?;
     let message_type = MessageType::parse(read_u32(bytes, 40)?)?;
+    // A type exists only from the minor that introduced it.
+    if read_u16(bytes, 6)? < message_type.since() {
+        return Err(Error::UnknownMessageType);
+    }
     if read_u32(bytes, 44)? != 0 {
         return Err(Error::NonzeroFlags);
     }
@@ -569,7 +654,7 @@ pub fn parse_message(bytes: &[u8], received_handles: usize) -> Result<ParsedMess
         },
         MessageType::JobState => {
             require_handles(received_handles, 0)?;
-            require_size(bytes, 64)?;
+            require_at_least(bytes, 64)?;
             let job_id = nonzero(read_u64(bytes, 48)?)?;
             let phase = match read_u32(bytes, 56)? {
                 1 => JobPhase::Running,
@@ -588,7 +673,7 @@ pub fn parse_message(bytes: &[u8], received_handles: usize) -> Result<ParsedMess
         },
         MessageType::JobResult => {
             require_handles(received_handles, 0)?;
-            require_size(bytes, 88)?;
+            require_at_least(bytes, 88)?;
             if read_u32(bytes, 84)? != 0 {
                 return Err(Error::NonzeroReserved);
             }
@@ -612,7 +697,7 @@ pub fn parse_message(bytes: &[u8], received_handles: usize) -> Result<ParsedMess
         },
         MessageType::ListJobs => {
             require_handles(received_handles, 0)?;
-            require_size(bytes, HEADER_BYTES)?;
+            require_at_least(bytes, HEADER_BYTES)?;
             Message::ListJobs
         }
         MessageType::JobList => Message::JobList(parse_job_list(bytes, received_handles)?),
@@ -630,13 +715,37 @@ pub fn parse_message(bytes: &[u8], received_handles: usize) -> Result<ParsedMess
         },
         MessageType::Error => {
             require_handles(received_handles, 0)?;
-            require_size(bytes, 56)?;
+            require_at_least(bytes, 56)?;
             if read_u32(bytes, 52)? != 0 {
                 return Err(Error::NonzeroReserved);
             }
             Message::Error {
                 code: ErrorCode::parse(read_u32(bytes, 48)?)?,
             }
+        }
+        MessageType::QueryVersion => {
+            require_handles(received_handles, 0)?;
+            require_at_least(bytes, HEADER_BYTES)?;
+            Message::QueryVersion
+        }
+        MessageType::Version => {
+            require_handles(received_handles, 0)?;
+            require_at_least(bytes, VERSION_BYTES)?;
+            if read_u32(bytes, 52)? != 0 {
+                return Err(Error::NonzeroReserved);
+            }
+            let version = Version {
+                major: read_u16(bytes, 48)?,
+                minor: read_u16(bytes, 50)?,
+                features: read_u64(bytes, 56)?,
+            };
+            if version.major != MAJOR
+                || version.minor < VERSION_QUERY_MINOR
+                || version.minor < read_u16(bytes, 6)?
+            {
+                return Err(Error::UnsupportedVersion);
+            }
+            Message::Version(version)
         }
     };
     Ok(ParsedMessage {
@@ -844,6 +953,36 @@ pub fn encode_job_result(
     Ok(88)
 }
 
+/// Encodes QUERY_VERSION (2).
+pub fn encode_query_version(reservation: Reservation, out: &mut [u8]) -> Result<usize, Error> {
+    if out.len() < HEADER_BYTES {
+        return Err(Error::WrongSize);
+    }
+    out[..HEADER_BYTES].fill(0);
+    encode_prefix(reservation, MessageType::QueryVersion, out)?;
+    Ok(HEADER_BYTES)
+}
+
+/// Encodes QUERY_VERSION's answer (2).
+pub fn encode_version(
+    reservation: Reservation,
+    version: Version,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if version.major != MAJOR || version.minor < VERSION_QUERY_MINOR {
+        return Err(Error::UnsupportedVersion);
+    }
+    if out.len() < VERSION_BYTES {
+        return Err(Error::WrongSize);
+    }
+    out[..VERSION_BYTES].fill(0);
+    encode_prefix(reservation, MessageType::Version, out)?;
+    put_u16(out, 48, version.major)?;
+    put_u16(out, 50, version.minor)?;
+    put_u64(out, 56, version.features)?;
+    Ok(VERSION_BYTES)
+}
+
 /// Encodes a typed protocol/controller failure response.
 pub fn encode_error(
     reservation: Reservation,
@@ -956,7 +1095,8 @@ fn parse_launch(
     let strings_end = path_end
         .checked_add(string_bytes)
         .ok_or(Error::ArithmeticOverflow)?;
-    if strings_end != bytes.len() {
+    // Bytes past the strings are a later minor's.
+    if strings_end > bytes.len() {
         return Err(Error::WrongSize);
     }
     if stream_count == STREAM_COUNT {
@@ -977,7 +1117,7 @@ fn parse_launch(
         core::str::from_utf8(&bytes[stream_end..path_end]).map_err(|_| Error::InvalidUtf8)?;
     validate_path(path)?;
     let all_records = &bytes[LAUNCH_FIXED_BYTES..records_end];
-    let strings = &bytes[path_end..];
+    let strings = &bytes[path_end..strings_end];
     validate_records(all_records, strings, record_count)?;
     let argv = StringRecords {
         records: &all_records[..argc * RECORD_BYTES],
@@ -1004,10 +1144,11 @@ fn parse_job_list(bytes: &[u8], received_handles: usize) -> Result<JobIds<'_>, E
         return Err(Error::WrongSize);
     }
     let count = usize::try_from(read_u32(bytes, 48)?).map_err(|_| Error::WrongSize)?;
-    if count > MAX_LIVE_JOBS || read_u32(bytes, 52)? != 0 || bytes.len() != 56 + count * 8 {
+    // Bytes past the ids are a later minor's.
+    if count > MAX_LIVE_JOBS || read_u32(bytes, 52)? != 0 || bytes.len() < 56 + count * 8 {
         return Err(Error::WrongSize);
     }
-    let ids = JobIds(&bytes[56..]);
+    let ids = JobIds(&bytes[56..56 + count * 8]);
     for index in 0..ids.len() {
         nonzero(ids.get(index).ok_or(Error::WrongSize)?)?;
     }
@@ -1097,12 +1238,13 @@ fn environment_name(value: &str) -> Result<&str, Error> {
 
 fn parse_job_id(bytes: &[u8], handles: usize) -> Result<u64, Error> {
     require_handles(handles, 0)?;
-    require_size(bytes, 56)?;
+    require_at_least(bytes, 56)?;
     nonzero(read_u64(bytes, 48)?)
 }
 
+/// The compatibility envelope, in the job protocol's first minor.
 fn encode_envelope(value: Reservation, output: &mut [u8]) -> Result<(), Error> {
-    encode_envelope_version(value, MINOR, output)
+    encode_envelope_version(value, LEGACY_MINOR, output)
 }
 
 fn encode_envelope_version(value: Reservation, minor: u16, output: &mut [u8]) -> Result<(), Error> {
@@ -1130,7 +1272,8 @@ fn encode_prefix(
     if output.len() < HEADER_BYTES {
         return Err(Error::WrongSize);
     }
-    encode_envelope(value, output)?;
+    // Each message in the oldest minor that has its layout.
+    encode_envelope_version(value, message_type.since(), output)?;
     put_u32(output, 40, message_type as u32)?;
     Ok(())
 }
@@ -1149,18 +1292,29 @@ fn encode_prefix_version(
     Ok(())
 }
 
+/// The job protocol's envelope: minor 0 or any minor from 2 up, never the
+/// shell-V1 envelope's 1.
 fn parse_envelope(bytes: &[u8]) -> Result<Reservation, Error> {
-    parse_envelope_version(bytes, MINOR)
+    parse_envelope_minors(bytes, |minor| {
+        minor == LEGACY_MINOR || minor >= VERSION_QUERY_MINOR
+    })
 }
 
 fn parse_envelope_version(bytes: &[u8], minor: u16) -> Result<Reservation, Error> {
+    parse_envelope_minors(bytes, |found| found == minor)
+}
+
+fn parse_envelope_minors(
+    bytes: &[u8],
+    accepts: impl Fn(u16) -> bool,
+) -> Result<Reservation, Error> {
     if bytes.len() < ENVELOPE_BYTES {
         return Err(Error::WrongSize);
     }
     if bytes[..4] != MAGIC {
         return Err(Error::WrongMagic);
     }
-    if read_u16(bytes, 4)? != MAJOR || read_u16(bytes, 6)? != minor {
+    if read_u16(bytes, 4)? != MAJOR || !accepts(read_u16(bytes, 6)?) {
         return Err(Error::UnsupportedVersion);
     }
     if read_u64(bytes, 32)? != 0 {
@@ -1192,8 +1346,10 @@ fn parse_cleanup_result(value: u32) -> Result<u32, Error> {
         Ok(value)
     }
 }
-fn require_size(bytes: &[u8], expected: usize) -> Result<(), Error> {
-    if bytes.len() == expected {
+/// Checks the message holds a body of `expected` bytes; anything after it is
+/// a later minor's and ignored.
+fn require_at_least(bytes: &[u8], expected: usize) -> Result<(), Error> {
+    if bytes.len() >= expected {
         Ok(())
     } else {
         Err(Error::WrongSize)

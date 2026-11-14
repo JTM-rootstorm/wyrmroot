@@ -20,7 +20,7 @@ fn transfer() -> Transfer {
     }
 }
 
-fn every_body() -> [Body; 7] {
+fn every_body() -> [Body; 9] {
     [
         Body::GetInfo,
         Body::Info(info()),
@@ -31,6 +31,13 @@ fn every_body() -> [Body; 7] {
         Body::Write(transfer()),
         Body::Flush,
         Body::Complete(Status::OutOfRange),
+        Body::QueryVersion,
+        // A responder's own minor is never older than the one it answers
+        // in, whatever minor a test sends this in.
+        Body::Version(Version {
+            minor: u16::MAX,
+            ..Version::current(u64::MAX)
+        }),
     ]
 }
 
@@ -72,7 +79,7 @@ fn every_message_round_trips_at_its_fixed_size_and_handle_count() {
 fn the_wire_layout_is_little_endian_at_fixed_offsets() {
     let bytes = wire(Body::Read(transfer()));
     assert_eq!(&bytes[..4], b"WRBD");
-    assert_eq!(&bytes[4..8], &[1, 0, 0, 0]);
+    assert_eq!(&bytes[4..8], &[1, 0, 1, 0]);
     assert_eq!(&bytes[8..12], &4u32.to_le_bytes());
     assert_eq!(&bytes[12..16], &56u32.to_le_bytes());
     assert_eq!(&bytes[24..32], &0x55u64.to_le_bytes());
@@ -84,7 +91,10 @@ fn the_wire_layout_is_little_endian_at_fixed_offsets() {
 #[test]
 fn only_client_messages_are_requests() {
     let requests: Vec<bool> = every_body().iter().map(|body| body.is_request()).collect();
-    assert_eq!(requests, [true, false, true, true, true, true, false]);
+    assert_eq!(
+        requests,
+        [true, false, true, true, true, true, false, true, false]
+    );
 }
 
 #[test]
@@ -107,9 +117,6 @@ fn malformed_framing_is_refused_before_any_body_field_is_read() {
     cases.push((bad, Error::WrongMagic));
     let mut bad = good.clone();
     bad[4] = 2;
-    cases.push((bad, Error::WrongVersion));
-    let mut bad = good.clone();
-    bad[6] = 1;
     cases.push((bad, Error::WrongVersion));
     let mut bad = good.clone();
     bad[8] = 99;
@@ -261,4 +268,118 @@ fn encode_refuses_a_zero_transaction_and_a_short_buffer() {
         ),
         Err(Error::WrongSize)
     );
+}
+
+/// `bytes` as a later minor might send it: `minor` in the header and
+/// `extra` appended bytes the header's size counts.
+fn as_later_minor(bytes: &[u8], minor: u16, extra: &[u8]) -> Vec<u8> {
+    let mut later = bytes.to_vec();
+    later.extend_from_slice(extra);
+    later[6..8].copy_from_slice(&minor.to_le_bytes());
+    let size = later.len() as u32;
+    later[12..16].copy_from_slice(&size.to_le_bytes());
+    later
+}
+
+#[test]
+fn a_later_minor_with_trailing_bytes_is_read_as_this_minor_knows_it() {
+    let extra = [0xa5u8; EXTENSION_BYTES];
+    for body in every_body() {
+        for (minor, extra) in [(MINOR + 1, &extra[..]), (u16::MAX, &extra[..3])] {
+            let later = as_later_minor(&wire(body), minor, extra);
+            assert!(later.len() <= MAX_BYTES);
+            assert_eq!(
+                parse(&later, body.handle_count()).map(|message| message.body),
+                Ok(body),
+                "{body:?}"
+            );
+            // Handle counts stay exact.
+            assert_eq!(
+                parse(&later, 1 - body.handle_count()),
+                Err(Error::WrongHandleCount)
+            );
+        }
+    }
+    // Reserved fields in the known body stay zero, and the size still
+    // matches the datagram.
+    let mut later = as_later_minor(&wire(Body::Complete(Status::Ok)), MINOR + 1, &[0; 8]);
+    later[36] = 1;
+    assert_eq!(parse(&later, 0), Err(Error::NonzeroReserved));
+    let mut later = as_later_minor(&wire(Body::Flush), MINOR + 1, &[0; 8]);
+    later[12] = 32;
+    assert_eq!(parse(&later, 0), Err(Error::WrongSize));
+    later[12] = 40;
+    later[8] = 99;
+    assert_eq!(parse(&later, 0), Err(Error::UnknownMessage));
+    // A 1.0 message is still read.
+    let old = as_later_minor(&wire(Body::Read(transfer())), 0, &[]);
+    assert_eq!(
+        parse(&old, 0).map(|message| message.body),
+        Ok(Body::Read(transfer()))
+    );
+}
+
+#[test]
+fn replies_answer_in_the_request_minor() {
+    let old = as_later_minor(&wire(Body::GetInfo), 0, &[]);
+    let to = ReplyTo::new(&old, 0x55);
+    assert_eq!(to.minor, 0);
+    let mut bytes = [0u8; MAX_BYTES];
+    let size = encode_reply(to, Body::Info(info()), &mut bytes).unwrap();
+    // What this crate sends but for the minor: a 1.0 decoder reads it.
+    let mut current = wire(Body::Info(info()));
+    current[6] = 0;
+    assert_eq!(&bytes[..size], &current[..]);
+    let newer = as_later_minor(&wire(Body::GetInfo), MINOR + 5, &[1; 8]);
+    assert_eq!(reply_minor(&newer), MINOR);
+    assert_eq!(reply_minor(&[0; 8]), MINOR);
+    assert_eq!(
+        encode_at(
+            Message {
+                transaction_id: 1,
+                body: Body::Flush
+            },
+            MINOR + 1,
+            &mut bytes
+        ),
+        Err(Error::WrongVersion)
+    );
+}
+
+#[test]
+fn the_version_query_exists_only_from_its_minor() {
+    let version = Version::current(0);
+    for body in [Body::QueryVersion, Body::Version(version)] {
+        let old = as_later_minor(&wire(body), 0, &[]);
+        assert_eq!(parse(&old, 0), Err(Error::UnknownMessage));
+        let mut bytes = [0u8; MAX_BYTES];
+        let encoded = encode_at(
+            Message {
+                transaction_id: 1,
+                body,
+            },
+            0,
+            &mut bytes,
+        );
+        assert_eq!(encoded, Err(Error::WrongVersion));
+    }
+    let good = wire(Body::Version(version));
+    assert_eq!(good.len(), HEADER_BYTES + 16);
+    assert_eq!(
+        parse(&good, 0).map(|message| message.body),
+        Ok(Body::Version(version))
+    );
+    let patched = |offset: usize, value: &[u8]| {
+        let mut bytes = good.clone();
+        bytes[offset..offset + value.len()].copy_from_slice(value);
+        parse(&bytes, 0).map(|_| ())
+    };
+    assert_eq!(patched(32, &[2, 0]), Err(Error::InvalidField));
+    assert_eq!(patched(34, &[0, 0]), Err(Error::InvalidField));
+    assert_eq!(patched(36, &[1]), Err(Error::NonzeroReserved));
+    // Unknown feature bits are carried.
+    assert!(patched(40, &[0xff; 8]).is_ok());
+    // Older than the minor it came in.
+    let later = as_later_minor(&good, MINOR + 1, &[]);
+    assert_eq!(parse(&later, 0), Err(Error::InvalidField));
 }

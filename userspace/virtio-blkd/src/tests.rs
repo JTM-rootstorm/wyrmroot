@@ -1193,3 +1193,58 @@ fn a_launch_channel_closed_before_the_grant_stops_the_driver_unstaged() {
         Call::CloseHandle { handle: BOOTSTRAP },
     ]));
 }
+
+/// `bytes` in `minor`, with `extra` trailing bytes a later minor might
+/// append (X1).
+fn in_minor(mut bytes: Vec<u8>, minor: u16, extra: &[u8]) -> Vec<u8> {
+    bytes.extend_from_slice(extra);
+    bytes[6..8].copy_from_slice(&minor.to_le_bytes());
+    let size = bytes.len() as u32;
+    bytes[12..16].copy_from_slice(&size.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn the_driver_answers_in_the_request_minor_and_reports_its_version() {
+    use wyrmroot_block_proto::{MINOR, Version};
+    let mut script = startup_replies();
+    script.extend(stage_replies(BOOT_DISK_POLICY.pci.ids));
+    script.extend(bring_up_replies());
+    script.extend(publish_replies());
+    script.extend(accept_client());
+    // A 1.0 client.
+    script.extend(client_sends(
+        in_minor(wrbd_request(1, WrbdBody::GetInfo), 0, &[]),
+        vec![],
+    ));
+    script.push(Reply::Unit(Ok(())));
+    // A later one, with fields this driver does not know.
+    script.extend(client_sends(
+        in_minor(wrbd_request(2, WrbdBody::QueryVersion), MINOR + 1, &[7; 24]),
+        vec![],
+    ));
+    script.push(Reply::Unit(Ok(())));
+    // QUERY_VERSION in a 1.0 header is malformed: the connection closes.
+    script.extend(client_sends(
+        in_minor(wrbd_request(3, WrbdBody::QueryVersion), 0, &[]),
+        vec![],
+    ));
+    script.push(Reply::Unit(Ok(())));
+    script.push(ready_wait(0, DW_SIGNAL_PEER_CLOSED));
+    script.extend(retire_replies(0));
+    let (code, calls) = run_scripted(script);
+    assert_eq!(code, 0);
+    let sent = sent_on(&calls, CLIENT);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(&sent[0][6..8], &0u16.to_le_bytes());
+    assert!(matches!(
+        wyrmroot_block_proto::parse(&sent[0], 0).unwrap().body,
+        WrbdBody::Info(_)
+    ));
+    assert_eq!(&sent[1][6..8], &MINOR.to_le_bytes());
+    assert_eq!(
+        wyrmroot_block_proto::parse(&sent[1], 0).unwrap().body,
+        WrbdBody::Version(Version::current(0))
+    );
+    assert!(calls.contains(&Call::CloseHandle { handle: CLIENT }));
+}

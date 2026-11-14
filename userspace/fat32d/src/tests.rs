@@ -388,3 +388,72 @@ fn nodes_outlive_the_root_and_init_retires_the_role() {
         Ok(false)
     );
 }
+
+/// `bytes` in another minor, with `extra` trailing bytes a later minor
+/// might append.
+fn in_minor(bytes: &[u8], minor: u16, extra: &[u8]) -> Vec<u8> {
+    let mut patched = bytes.to_vec();
+    patched.extend_from_slice(extra);
+    patched[6..8].copy_from_slice(&minor.to_le_bytes());
+    let size = patched.len() as u32;
+    patched[12..16].copy_from_slice(&size.to_le_bytes());
+    patched
+}
+
+#[test]
+fn answers_follow_the_request_minor_and_the_version_query_has_no_locks() {
+    use wyrmroot_fs_proto::{MIN_MINOR, MINOR, Version};
+    let mut fs = sample();
+    let root = fs.root;
+    let request = |fs: &mut Fs, channel, body, minor, extra: &[u8], handles: &[DwHandle]| {
+        fs.transaction += 1;
+        let mut bytes = vec![0u8; node::MAX_BYTES];
+        let size = node::encode(
+            &node::Message {
+                transaction_id: fs.transaction,
+                body,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        fs.world
+            .send(channel, &in_minor(&bytes[..size], minor, extra), handles);
+        fs.step();
+    };
+    // A 1.3 OPEN gets a 1.3 ON_OPEN, and the node answers 1.3 requests in
+    // 1.3.
+    let (near, far) = fs.world.pair();
+    let open = Body::Open {
+        flags: OPEN_READ | OPEN_FILE,
+        path: b"readme.txt",
+        client: 0,
+    };
+    request(&mut fs, root, open, MIN_MINOR, &[], &[far]);
+    let (reply, _) = fs.world.receive(near);
+    assert_eq!(&reply[6..8], &MIN_MINOR.to_le_bytes());
+    assert!(matches!(
+        node::parse(&reply, 0).unwrap().body,
+        Body::OnOpen {
+            status: Status::Ok,
+            ..
+        }
+    ));
+    request(&mut fs, near, Body::GetAttr, MIN_MINOR, &[], &[]);
+    let (reply, _) = fs.world.receive(near);
+    assert_eq!(&reply[6..8], &MIN_MINOR.to_le_bytes());
+    // A later minor with trailing bytes is served in this one.
+    let read = Body::Read {
+        offset: 0,
+        length: 5,
+    };
+    request(&mut fs, near, read, MINOR + 1, &[9; 24], &[]);
+    let (reply, _) = fs.world.receive(near);
+    assert_eq!(&reply[6..8], &MINOR.to_le_bytes());
+    assert_eq!(node::parse(&reply, 0).unwrap().body, Body::Data(b"hello"));
+    // FAT takes no locks, so no feature bits.
+    let reply = fs.request(root, Body::QueryVersion);
+    assert_eq!(
+        node::parse(&reply, 0).unwrap().body,
+        Body::Version(Version::current(0))
+    );
+}

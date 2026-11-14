@@ -13,8 +13,8 @@ use deepwyrm_syscall::{
     DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
 };
 use wyrmroot_block_proto::{
-    self as wrbd, Body as WrbdBody, MAX_BYTES as WRBD_MAX_BYTES, Message as WrbdMessage,
-    Status as WrbdStatus,
+    self as wrbd, Body as WrbdBody, MAX_BYTES as WRBD_MAX_BYTES, ReplyTo, Status as WrbdStatus,
+    Version as WrbdVersion,
 };
 use wyrmroot_device_proto::manifest::{PublicationPolicy, disk_policy};
 use wyrmroot_device_proto::pci_driver::{
@@ -805,11 +805,18 @@ fn serve_request<P: BlockPlatform, H: Hardware>(
             .then(|| wrbd::parse(&bytes[..counts.bytes], counts.handles).ok())
             .flatten()
             .filter(|message| message.body.is_request())
+            // Answered in the request's minor (X1).
+            .map(|message| {
+                (
+                    message,
+                    ReplyTo::new(&bytes[..counts.bytes], message.transaction_id),
+                )
+            })
             .ok_or(counts.handles),
         // Too large for any WRBD message, or the peer went away.
         Err(_) => Err(0),
     };
-    let message = match message {
+    let (message, to) = match message {
         Ok(message) => message,
         Err(received) => {
             close_received(platform, &handles, received);
@@ -848,17 +855,11 @@ fn serve_request<P: BlockPlatform, H: Hardware>(
                 Err(status) => status,
             })
         }
-        WrbdBody::Info(_) | WrbdBody::Complete(_) => return Err(78),
+        WrbdBody::QueryVersion => WrbdBody::Version(WrbdVersion::current(0)),
+        WrbdBody::Info(_) | WrbdBody::Complete(_) | WrbdBody::Version(_) => return Err(78),
     };
     let mut reply_bytes = [0u8; WRBD_MAX_BYTES];
-    let size = wrbd::encode(
-        WrbdMessage {
-            transaction_id: message.transaction_id,
-            body: reply,
-        },
-        &mut reply_bytes,
-    )
-    .map_err(|_| 79u32)?;
+    let size = wrbd::encode_reply(to, reply, &mut reply_bytes).map_err(|_| 79u32)?;
     if platform
         .send_channel(connection.channel, &reply_bytes[..size], &[])
         .is_err()

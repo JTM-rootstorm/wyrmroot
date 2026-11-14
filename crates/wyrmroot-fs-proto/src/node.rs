@@ -1,4 +1,4 @@
-//! WRFS 1.3: the node protocol, on a Channel to one directory or file.
+//! WRFS 1.4: the node protocol, on a Channel to one directory or file.
 //!
 //! ```text
 //! client -> server  OPEN (+ new node Channel)   (one-way; ON_OPEN on that Channel)
@@ -10,8 +10,14 @@
 //! client -> server  QUERY_FILESYSTEM            -> FS_INFO
 //! client -> server  LOCK                        -> STATUS
 //! client -> server  TEST_LOCK                   -> LOCK_INFO
+//! client -> server  QUERY_VERSION               -> VERSION (1.4)
 //! server -> client  ON_OPEN                     (event, first on a new Channel)
 //! ```
+//!
+//! Versions follow the crate's rule: higher minors and trailing data are
+//! accepted, and a server answers each request in its minor (ON_OPEN in the
+//! OPEN's; a LOCK answered once granted in the LOCK's). VERSION's feature
+//! bits are the `FEATURE_*` constants, an open set.
 //!
 //! Locks (1.1, waiting 1.2) are advisory byte-range locks on a file,
 //! shared or exclusive. A lock belongs to the Channel it was taken on: locks
@@ -49,8 +55,10 @@
 //! at most [`MAX_IO_BYTES`] per message.
 
 use crate::{
-    Error, HEADER_BYTES, MAX_PATH_BYTES, Status, check_name, check_open_flags, check_relative,
-    get32, get64, put32, put64, read_header, tail, write_header,
+    EXTENSION_BYTES, Error, HEADER_BYTES, MAX_PATH_BYTES, MIN_MINOR, MINOR, ReplyTo, Status,
+    VERSION_BODY_BYTES, VERSION_QUERY_MINOR, Version, check_encode_minor, check_name,
+    check_open_flags, check_relative, check_version, fixed, get_version, get32, get64, put_version,
+    put32, put64, read_header, tail, write_header,
 };
 
 pub const MAGIC: [u8; 4] = *b"WRFS";
@@ -58,8 +66,12 @@ pub const MAGIC: [u8; 4] = *b"WRFS";
 pub const MAX_IO_BYTES: usize = 8192;
 /// The most encoded directory entries one DIRENTS carries.
 pub const MAX_DIRENT_BYTES: usize = 8192;
-/// The largest WRFS message, for receive buffers.
-pub const MAX_BYTES: usize = HEADER_BYTES + 16 + MAX_IO_BYTES;
+/// The largest WRFS message of any 1.x minor, for receive buffers.
+pub const MAX_BYTES: usize = HEADER_BYTES + 16 + MAX_IO_BYTES + EXTENSION_BYTES;
+
+/// VERSION feature bit: the server implements LOCK and TEST_LOCK on files.
+/// Without it they are answered NOT_SUPPORTED.
+pub const FEATURE_LOCKS: u64 = 1 << 0;
 
 const TYPE_OPEN: u32 = 1;
 const TYPE_GET_ATTR: u32 = 2;
@@ -73,6 +85,7 @@ const TYPE_QUERY_FILESYSTEM: u32 = 9;
 const TYPE_LOCK: u32 = 10;
 const TYPE_TEST_LOCK: u32 = 11;
 const TYPE_CLOSE: u32 = 12;
+const TYPE_QUERY_VERSION: u32 = 13;
 const TYPE_ON_OPEN: u32 = 16;
 const TYPE_STATUS: u32 = 17;
 const TYPE_ATTR: u32 = 18;
@@ -80,6 +93,7 @@ const TYPE_DIRENTS: u32 = 19;
 const TYPE_DATA: u32 = 20;
 const TYPE_FS_INFO: u32 = 21;
 const TYPE_LOCK_INFO: u32 = 22;
+const TYPE_VERSION: u32 = 23;
 
 /// Attribute access bit: the handle may read or list.
 pub const ACCESS_READ: u32 = 1 << 0;
@@ -265,6 +279,10 @@ pub enum Body<'a> {
     FsInfo(FsInfo),
     /// TEST_LOCK's answer: a conflicting lock, or `None`.
     LockInfo(Option<Lock>),
+    /// Asks the server for its version and features (1.4).
+    QueryVersion,
+    /// QUERY_VERSION's answer (1.4).
+    Version(Version),
 }
 
 impl Body<'_> {
@@ -284,13 +302,27 @@ impl Body<'_> {
                 | Self::Lock { .. }
                 | Self::TestLock(_)
                 | Self::Close
+                | Self::QueryVersion
         )
+    }
+
+    /// The minor that introduced this message.
+    pub const fn since(&self) -> u16 {
+        match self {
+            Self::QueryVersion | Self::Version(_) => VERSION_QUERY_MINOR,
+            _ => MIN_MINOR,
+        }
     }
 
     pub const fn wire_size(&self) -> usize {
         HEADER_BYTES
             + match self {
-                Self::GetAttr | Self::Sync | Self::QueryFilesystem | Self::Close => 0,
+                Self::GetAttr
+                | Self::Sync
+                | Self::QueryFilesystem
+                | Self::Close
+                | Self::QueryVersion => 0,
+                Self::Version(_) => VERSION_BODY_BYTES,
                 Self::ReadDir { .. } | Self::Truncate { .. } => 8,
                 Self::Open { path, .. } => 16 + path.len(),
                 Self::Unlink { name } => 8 + name.len(),
@@ -332,6 +364,8 @@ impl Body<'_> {
             Self::TestLock(_) => TYPE_TEST_LOCK,
             Self::Close => TYPE_CLOSE,
             Self::LockInfo(_) => TYPE_LOCK_INFO,
+            Self::QueryVersion => TYPE_QUERY_VERSION,
+            Self::Version(_) => TYPE_VERSION,
         }
     }
 }
@@ -436,9 +470,30 @@ impl<'b> EntryWriter<'b> {
     }
 }
 
-/// Encodes `message` into exactly `output[..wire_size]`, returning that size.
+/// Encodes `message` in [`MINOR`] into exactly `output[..wire_size]`,
+/// returning that size.
 pub fn encode(message: &Message<'_>, output: &mut [u8]) -> Result<usize, Error> {
+    encode_at(message, MINOR, output)
+}
+
+/// Encodes the reply `body` to `to` in its minor.
+pub fn encode_reply(to: ReplyTo, body: Body<'_>, output: &mut [u8]) -> Result<usize, Error> {
+    encode_at(
+        &Message {
+            transaction_id: to.transaction_id,
+            body,
+        },
+        to.minor,
+        output,
+    )
+}
+
+/// Encodes `message` in `minor`'s layout, which must be one this crate
+/// speaks and have the message: how a reply answers in the request's minor
+/// ([`crate::reply_minor`]).
+pub fn encode_at(message: &Message<'_>, minor: u16, output: &mut [u8]) -> Result<usize, Error> {
     let body = &message.body;
+    check_encode_minor(minor, body.since())?;
     let size = body.wire_size();
     let output = output.get_mut(..size).ok_or(Error::WrongSize)?;
     if message.transaction_id == 0 {
@@ -448,12 +503,14 @@ pub fn encode(message: &Message<'_>, output: &mut [u8]) -> Result<usize, Error> 
     write_header(
         output,
         MAGIC,
+        minor,
         body.message_type(),
         body.handle_count(),
         message.transaction_id,
     );
     match *body {
-        Body::GetAttr | Body::Sync | Body::QueryFilesystem | Body::Close => {}
+        Body::GetAttr | Body::Sync | Body::QueryFilesystem | Body::Close | Body::QueryVersion => {}
+        Body::Version(version) => put_version(output, 32, version),
         Body::Open {
             flags,
             path,
@@ -526,13 +583,7 @@ pub fn encode(message: &Message<'_>, output: &mut [u8]) -> Result<usize, Error> 
 /// Parses one datagram of `bytes` that arrived with `handle_count` handles.
 pub fn parse(bytes: &[u8], handle_count: usize) -> Result<Message<'_>, Error> {
     let header = read_header(bytes, MAGIC)?;
-    let fixed = |body: usize| {
-        if bytes.len() == HEADER_BYTES + body {
-            Ok(())
-        } else {
-            Err(Error::WrongSize)
-        }
-    };
+    let fixed = |body: usize| fixed(bytes, body);
     let zero32 = |offset: usize| {
         if get32(bytes, offset) == 0 {
             Ok(())
@@ -647,7 +698,7 @@ pub fn parse(bytes: &[u8], handle_count: usize) -> Result<Message<'_>, Error> {
         TYPE_LOCK => {
             fixed(24)?;
             let mut unflagged = [0u8; HEADER_BYTES + 24];
-            unflagged.copy_from_slice(bytes);
+            unflagged.copy_from_slice(&bytes[..HEADER_BYTES + 24]);
             put32(&mut unflagged, 36, 0);
             Body::Lock {
                 lock: get_lock(&unflagged)?,
@@ -668,6 +719,14 @@ pub fn parse(bytes: &[u8], handle_count: usize) -> Result<Message<'_>, Error> {
             } else {
                 Body::LockInfo(Some(get_lock(bytes)?))
             }
+        }
+        TYPE_QUERY_VERSION if header.minor >= VERSION_QUERY_MINOR => {
+            fixed(0)?;
+            Body::QueryVersion
+        }
+        TYPE_VERSION if header.minor >= VERSION_QUERY_MINOR => {
+            fixed(VERSION_BODY_BYTES)?;
+            Body::Version(get_version(bytes, 32, header.minor)?)
         }
         _ => return Err(Error::UnknownMessage),
     };
@@ -757,12 +816,14 @@ fn validate(body: &Body<'_>) -> Result<(), Error> {
                 }
             }
         }
+        Body::Version(version) => check_version(version)?,
         Body::GetAttr
         | Body::ReadDir { .. }
         | Body::Truncate { .. }
         | Body::Sync
         | Body::QueryFilesystem
         | Body::Close
+        | Body::QueryVersion
         | Body::Status { .. } => {}
     }
     Ok(())

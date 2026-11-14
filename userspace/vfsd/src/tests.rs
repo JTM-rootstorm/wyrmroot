@@ -868,3 +868,118 @@ mod role {
         assert!(!registry.state.borrow().published(SYSTEM_VFS.name));
     }
 }
+
+// ------------------------------------------------------------ versions (X1)
+
+/// `bytes` in another minor, with `extra` trailing bytes a later minor
+/// might append.
+fn in_minor(bytes: &[u8], minor: u16, extra: &[u8]) -> Vec<u8> {
+    let mut patched = bytes.to_vec();
+    patched.extend_from_slice(extra);
+    patched[6..8].copy_from_slice(&minor.to_le_bytes());
+    let size = patched.len() as u32;
+    patched[12..16].copy_from_slice(&size.to_le_bytes());
+    patched
+}
+
+fn minor_of(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[6], bytes[7]])
+}
+
+#[test]
+fn every_answer_and_forwarded_open_keeps_the_request_minor() {
+    use wyrmroot_fs_proto::{MIN_MINOR, MINOR};
+    let mut harness = Harness::new();
+    let filesystem = harness.mount(b"/boot", 0);
+
+    // A peer built for 1.3 opens the synthetic root: ON_OPEN comes in 1.3,
+    // as does every answer on the node.
+    let (root, server) = harness.world.create_channel(OPEN_CHANNEL_RIGHTS).unwrap();
+    let open = harness.ns_message(namespace::Body::Open {
+        flags: OPEN_READ | OPEN_DIRECTORY,
+        path: b"/",
+    });
+    let client = harness.client;
+    harness.send(
+        client,
+        &in_minor(&open, MIN_MINOR, &[]),
+        Some((server, OPEN_CHANNEL_RIGHTS)),
+    );
+    harness.settle();
+    let (bytes, _) = harness.receive(root);
+    assert_eq!(minor_of(&bytes), MIN_MINOR);
+    assert!(matches!(
+        node::parse(&bytes, 0).unwrap().body,
+        Body::OnOpen {
+            status: Status::Ok,
+            ..
+        }
+    ));
+    let attr = harness.node_message(Body::GetAttr);
+    harness.send(root, &in_minor(&attr, MIN_MINOR, &[]), None);
+    harness.settle();
+    let (bytes, _) = harness.receive(root);
+    assert_eq!(minor_of(&bytes), MIN_MINOR);
+    // A later peer with trailing bytes is served, in this minor.
+    harness.send(root, &in_minor(&attr, MINOR + 1, &[7; 16]), None);
+    harness.settle();
+    let (bytes, _) = harness.receive(root);
+    assert_eq!(minor_of(&bytes), MINOR);
+    assert!(matches!(
+        node::parse(&bytes, 0).unwrap().body,
+        Body::Attr(_)
+    ));
+
+    // An open below a mount reaches the filesystem in the client's minor,
+    // so the filesystem's ON_OPEN does too.
+    let (_node, server) = harness.world.create_channel(OPEN_CHANNEL_RIGHTS).unwrap();
+    let open = harness.ns_message(namespace::Body::Open {
+        flags: OPEN_READ,
+        path: b"/boot/x",
+    });
+    harness.send(
+        client,
+        &in_minor(&open, MIN_MINOR, &[]),
+        Some((server, OPEN_CHANNEL_RIGHTS)),
+    );
+    harness.settle();
+    let (bytes, handles) = harness.receive(filesystem);
+    assert_eq!(minor_of(&bytes), MIN_MINOR);
+    assert!(node::parse(&bytes, handles.len()).is_ok());
+    harness.world.close_handle(handles[0].handle).unwrap();
+
+    // WRNS STATUS follows the request too.
+    let unmount = harness.ns_message(namespace::Body::Unmount { path: b"/boot" });
+    harness.send(client, &in_minor(&unmount, MIN_MINOR, &[1, 2, 3]), None);
+    harness.settle();
+    let (bytes, _) = harness.receive(client);
+    assert_eq!(minor_of(&bytes), MIN_MINOR);
+    assert_eq!(
+        namespace::parse(&bytes, 0).unwrap().body,
+        namespace::Body::Status(Status::AccessDenied)
+    );
+}
+
+#[test]
+fn vfsd_answers_the_version_query_on_connections_and_synthetic_nodes() {
+    use wyrmroot_fs_proto::Version;
+    let mut harness = Harness::new();
+    for connection in [harness.client, harness.admin] {
+        let query = harness.ns_message(namespace::Body::QueryVersion);
+        harness.send(connection, &query, None);
+        harness.settle();
+        let (bytes, _) = harness.receive(connection);
+        assert_eq!(
+            namespace::parse(&bytes, 0).unwrap().body,
+            namespace::Body::Version(Version::current(0))
+        );
+    }
+    let root = harness.open(OPEN_READ | OPEN_DIRECTORY, b"/");
+    assert_eq!(harness.on_open(root).0, Status::Ok);
+    let reply = harness.request(root, Body::QueryVersion);
+    // A synthetic directory takes no locks.
+    assert_eq!(
+        node::parse(&reply, 0).unwrap().body,
+        Body::Version(Version::current(0))
+    );
+}

@@ -961,6 +961,59 @@ fn scoped_sessions_keep_minor_zero_job_operations() {
     }
 }
 
+#[test]
+fn the_controller_answers_the_version_query_and_later_minors() {
+    let authority = LoadAuthority {
+        parent_root: DwHandle(1),
+        bootfs: DwHandle(2),
+        task_group: DwHandle(3),
+    };
+    let mut platform = MockPlatform::new();
+    platform.fail_send = false;
+    let mut waits = TerminalWaits;
+    let mut loader = InitSendLoader::new();
+    let mut jobs = JobDispatcher::new();
+    let owner = grant(EndpointKind::LaunchSession, 1, 1);
+    jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ShellJobs)
+        .unwrap();
+    let mut dispatch = |platform: &mut MockPlatform, jobs: &mut JobDispatcher, bytes: &[u8]| {
+        platform.inbound[..bytes.len()].copy_from_slice(bytes);
+        platform.inbound_len = bytes.len();
+        dispatch_one_job_request(
+            platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            None,
+            jobs,
+            DwHandle(90),
+            owner,
+        )
+        .unwrap();
+        platform.sent[..platform.sent_len].to_vec()
+    };
+
+    let mut query = [0u8; wyrmroot_launch_proto::HEADER_BYTES];
+    wyrmroot_launch_proto::encode_query_version(reservation(1), &mut query).unwrap();
+    let reply = dispatch(&mut platform, &mut jobs, &query);
+    assert_eq!(
+        parse_launch_message(&reply, 0).unwrap().message,
+        LaunchMessage::Version(wyrmroot_launch_proto::Version::current(0))
+    );
+    // A later minor's LIST_JOBS, with fields this controller does not know,
+    // is answered as this minor knows it, in the minor that has the layout.
+    let mut list = [0u8; wyrmroot_launch_proto::HEADER_BYTES + 8];
+    wyrmroot_launch_proto::encode_list_jobs(reservation(2), &mut list).unwrap();
+    list[6..8].copy_from_slice(&(wyrmroot_launch_proto::MINOR + 1).to_le_bytes());
+    list[wyrmroot_launch_proto::HEADER_BYTES..].fill(0xa5);
+    let reply = dispatch(&mut platform, &mut jobs, &list);
+    assert!(matches!(
+        parse_launch_message(&reply, 0).unwrap().message,
+        LaunchMessage::JobList(ids) if ids.is_empty()
+    ));
+    assert_eq!(&reply[6..8], &0u16.to_le_bytes());
+}
+
 fn ready_registry() -> (SystemInit, RegistryNativeAttempt) {
     let mut controller = SystemInit {
         mode: SystemMode::Bootstrap,
