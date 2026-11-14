@@ -219,6 +219,7 @@ pub(crate) fn build(
         manifest.deepwyrm_abi_fingerprint()?,
     )?;
     eprintln!("xtask product: Deepwyrm kernel {deep_revision}, ABI fingerprint {abi_fingerprint}");
+    crate::kernel_demand::require(&deep_repository)?;
     if let Some(sdk) = sdk {
         crate::sdk_pairing::require(&repository, sdk, manifest.deepwyrm_revision()?)?;
     }
@@ -268,6 +269,13 @@ pub(crate) fn build(
             natives.insert(spec.label, bytes);
         }
 
+        // Every image the product loads carries this build's ABI note: the
+        // loader's own parser refuses it otherwise, and init, which the
+        // kernel loads, would fail its self-check at boot instead.
+        require_abi_note("bootstrap", &bootstrap)?;
+        for (label, bytes) in &natives {
+            require_abi_note(label, bytes)?;
+        }
         let assembled = assemble(&natives)?;
         let kernel = build_kernel(&deep_repository, assembled.bootfs.len().div_ceil(4096))?;
 
@@ -291,6 +299,9 @@ pub(crate) fn build(
                     MAX_SDK_PROGRAM_BYTES,
                     "SDK test file",
                 )?;
+                if name.ends_with(".elf") {
+                    require_abi_note(name, &bytes)?;
+                }
                 sdk_files.push((format!("sdk-{name}"), short_name, bytes));
             }
         }
@@ -434,6 +445,14 @@ fn build_native(
         MAX_ARTIFACT_BYTES as u64,
         spec.label,
     )
+}
+
+/// Refuses an image without this build's ABI note, through the loader's own
+/// parser (root `OS_STACK_ARCHITECTURE_PLAN.md` V1).
+fn require_abi_note(label: &str, image: &[u8]) -> Result<(), Failure> {
+    wyrmroot_loader::elf::required_segment_count(image)
+        .map(|_| ())
+        .map_err(|error| Failure::task(format!("{label} would not load: {error:?}")))
 }
 
 /// Builds the production Deepwyrm kernel: no selector, no test support, and

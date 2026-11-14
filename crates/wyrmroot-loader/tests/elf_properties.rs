@@ -62,7 +62,17 @@ fn image(headers: &[Ph], entry: u64, length: usize) -> Vec<u8> {
     put64(&mut bytes, 32, PH_OFFSET as u64);
     put16(&mut bytes, 52, 64);
     put16(&mut bytes, 54, PH_SIZE as u16);
-    put16(&mut bytes, 56, headers.len() as u16);
+    // Every image carries the ABI note after its given headers, in bytes
+    // appended past `length`.
+    put16(&mut bytes, 56, headers.len() as u16 + 1);
+    let note = elf::abi_note();
+    let note_at = PH_OFFSET + headers.len() * PH_SIZE;
+    put32(&mut bytes, note_at, 4);
+    put64(&mut bytes, note_at + 8, length as u64);
+    put64(&mut bytes, note_at + 32, note.len() as u64);
+    put64(&mut bytes, note_at + 40, note.len() as u64);
+    put64(&mut bytes, note_at + 48, 4);
+    bytes.extend_from_slice(&note);
     for (index, ph) in headers.iter().enumerate() {
         let at = PH_OFFSET + index * PH_SIZE;
         put32(&mut bytes, at, 1);

@@ -38,6 +38,9 @@ pub enum NativeOutputError {
     InvalidTaskTerminationInfo,
     /// A finite monotonic deadline could not be represented after the requested interval.
     DeadlineOverflow,
+    /// The running kernel reports another ABI fingerprint than the one this
+    /// binary was built against (root `OS_STACK_ARCHITECTURE_PLAN.md` V1).
+    AbiFingerprintMismatch,
 }
 
 /// Failure from a native runtime operation.
@@ -70,6 +73,7 @@ pub const fn native_error_code(error: NativeError) -> u32 {
                     NativeOutputError::InvalidWaitResult => 6,
                     NativeOutputError::InvalidTaskTerminationInfo => 7,
                     NativeOutputError::DeadlineOverflow => 8,
+                    NativeOutputError::AbiFingerprintMismatch => 9,
                 }
         }
     }

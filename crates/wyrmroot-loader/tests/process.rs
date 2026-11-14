@@ -2142,6 +2142,28 @@ fn auxv_of(image: &[u8]) -> wyrmroot_loader::image::ImageAuxv {
 }
 
 fn executable() -> Vec<u8> {
+    with_abi_note(unstamped_executable())
+}
+
+/// Appends the ABI note every loadable image carries: a `PT_NOTE` after the
+/// existing headers and the note's bytes after the file's end.
+fn with_abi_note(mut bytes: Vec<u8>) -> Vec<u8> {
+    let count = u16::from_le_bytes([bytes[56], bytes[57]]);
+    let header = 64 + 56 * usize::from(count);
+    let note = wyrmroot_loader::elf::abi_note();
+    put16(&mut bytes, 56, count + 1);
+    put32(&mut bytes, header, 4);
+    put32(&mut bytes, header + 4, 4);
+    let note_offset = bytes.len() as u64;
+    put64(&mut bytes, header + 8, note_offset);
+    put64(&mut bytes, header + 32, note.len() as u64);
+    put64(&mut bytes, header + 40, note.len() as u64);
+    put64(&mut bytes, header + 48, 4);
+    bytes.extend_from_slice(&note);
+    bytes
+}
+
+fn unstamped_executable() -> Vec<u8> {
     let mut bytes = vec![0_u8; 0x2000];
     bytes[..4].copy_from_slice(b"\x7fELF");
     bytes[4] = 2;
@@ -2167,7 +2189,7 @@ fn executable() -> Vec<u8> {
 }
 /// `executable` with `loads` page-separated PT_LOADs: R+X, then R, then RW.
 fn executable_with_loads(loads: u16) -> Vec<u8> {
-    let mut bytes = executable();
+    let mut bytes = unstamped_executable();
     bytes.resize(0x1000 * (usize::from(loads) + 1), 0);
     put16(&mut bytes, 56, loads);
     for index in 0..u64::from(loads) {
@@ -2181,7 +2203,7 @@ fn executable_with_loads(loads: u16) -> Vec<u8> {
         put64(&mut bytes, header + 40, 32);
         put64(&mut bytes, header + 48, 4096);
     }
-    bytes
+    with_abi_note(bytes)
 }
 fn put16(bytes: &mut [u8], at: usize, value: u16) {
     bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());

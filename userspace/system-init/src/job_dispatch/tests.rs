@@ -361,6 +361,16 @@ pub(crate) fn executable() -> Vec<u8> {
     bytes[96..104].copy_from_slice(&16_u64.to_le_bytes());
     bytes[104..112].copy_from_slice(&32_u64.to_le_bytes());
     bytes[112..120].copy_from_slice(&4096_u64.to_le_bytes());
+    // The ABI note every loadable image carries, after the file's end.
+    let note = wyrmroot_loader::elf::abi_note();
+    bytes[56..58].copy_from_slice(&2_u16.to_le_bytes());
+    bytes[120..124].copy_from_slice(&4_u32.to_le_bytes());
+    bytes[124..128].copy_from_slice(&4_u32.to_le_bytes());
+    bytes[128..136].copy_from_slice(&0x2000_u64.to_le_bytes());
+    bytes[152..160].copy_from_slice(&(note.len() as u64).to_le_bytes());
+    bytes[160..168].copy_from_slice(&(note.len() as u64).to_le_bytes());
+    bytes[168..176].copy_from_slice(&4_u64.to_le_bytes());
+    bytes.extend_from_slice(&note);
     bytes
 }
 

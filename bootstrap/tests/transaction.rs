@@ -1530,6 +1530,16 @@ fn executable() -> Vec<u8> {
     put64(&mut bytes, 96, 16);
     put64(&mut bytes, 104, 32);
     put64(&mut bytes, 112, 4096);
+    // The ABI note every loadable image carries, after the file's end.
+    let note = wyrmroot_loader::elf::abi_note();
+    put16(&mut bytes, 56, 2);
+    put32(&mut bytes, 120, 4);
+    put32(&mut bytes, 124, 4);
+    put64(&mut bytes, 128, 0x2000);
+    put64(&mut bytes, 152, note.len() as u64);
+    put64(&mut bytes, 160, note.len() as u64);
+    put64(&mut bytes, 168, 4);
+    bytes.extend_from_slice(&note);
     bytes
 }
 

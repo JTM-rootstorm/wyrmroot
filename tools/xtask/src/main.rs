@@ -6,6 +6,7 @@ mod elf_runtime;
 mod error;
 mod g3_image;
 mod gate;
+mod kernel_demand;
 mod metadata;
 mod product;
 mod product_engine;

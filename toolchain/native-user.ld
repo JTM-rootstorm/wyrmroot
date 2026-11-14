@@ -6,6 +6,7 @@ PHDRS
 {
     text PT_LOAD FILEHDR PHDRS FLAGS(5);
     data PT_LOAD FLAGS(6);
+    note PT_NOTE FLAGS(4);
     stack PT_GNU_STACK FLAGS(6);
 }
 
@@ -23,6 +24,13 @@ SECTIONS
     {
         *(.rodata .rodata.*)
     } :text
+
+    /* The Deepwyrm ABI note (root OS_STACK_ARCHITECTURE_PLAN.md V1): loaders
+       refuse an image without it. */
+    .note.deepwyrm.abi : ALIGN(4)
+    {
+        KEEP(*(.note.deepwyrm.abi))
+    } :text :note
 
     . = ALIGN(4096);
     .data : ALIGN(16)

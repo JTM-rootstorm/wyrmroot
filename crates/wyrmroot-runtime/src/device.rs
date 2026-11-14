@@ -3,8 +3,8 @@
 //! This module contains only ordinary generated ABI operations.
 
 use deepwyrm_syscall::{
-    DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT, DW_ABI_INFO_V1_SIZE, DW_ABI_VERSION,
-    DW_BASE_PAGE_SIZE, DW_DEVICE_RESOURCE_INFO_V1_SIZE, DW_INTERRUPT_INFO_V1_SIZE,
+    DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT, DW_ABI_FINGERPRINT, DW_ABI_INFO_V1_SIZE,
+    DW_ABI_VERSION, DW_BASE_PAGE_SIZE, DW_DEVICE_RESOURCE_INFO_V1_SIZE, DW_INTERRUPT_INFO_V1_SIZE,
     DW_OBJECT_INFO_DEVICE_RESOURCE_V1, DW_OBJECT_INFO_INTERRUPT_V1, DW_STATUS_NOT_SUPPORTED,
     DW_STATUS_SUCCESS, DwAbiInfoV1, DwDeviceResourceInfoV1, DwHandle, DwInterruptInfoV1, DwRights,
     DwStatus,
@@ -37,12 +37,22 @@ fn validate_abi_info(info: DwAbiInfoV1, required: u64) -> Result<(), NativeError
         || info.version != 1
         || info.abi_version != DW_ABI_VERSION
         || info.page_size != DW_BASE_PAGE_SIZE
-        || info.reserved != [0; 4]
     {
         Err(NativeError::Output(NativeOutputError::InvalidObjectInfo))
+    } else if info.abi_fingerprint != DW_ABI_FINGERPRINT {
+        Err(NativeError::Output(
+            NativeOutputError::AbiFingerprintMismatch,
+        ))
     } else {
         Ok(())
     }
+}
+
+/// Refuses to run against a kernel whose ABI fingerprint is not the one this
+/// binary was built for. The loader checks each image's note against its own
+/// build; the first process, which no Wyrmroot loader loaded, checks itself.
+pub fn require_kernel_abi() -> Result<(), NativeError> {
+    abi_info().map(|_| ())
 }
 
 /// Requires the complete generated DeviceResource/Interrupt family before a
@@ -300,7 +310,7 @@ mod tests {
             feature_bits: DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT,
             max_channel_payload: 0,
             max_channel_handles: 0,
-            reserved: [0; 4],
+            abi_fingerprint: DW_ABI_FINGERPRINT,
         }
     }
 
@@ -312,17 +322,25 @@ mod tests {
             Ok(())
         );
 
-        let mut cases = [canonical; 6];
+        let mut cases = [canonical; 4];
         cases[0].size = 63;
         cases[1].version = 2;
         cases[2].abi_version = DW_ABI_VERSION.wrapping_add(1);
         cases[3].page_size = DW_BASE_PAGE_SIZE * 2;
-        cases[4].reserved[0] = 1;
-        cases[5].reserved[3] = 1;
         for info in cases {
             assert_eq!(
                 validate_abi_info(info, u64::from(DW_ABI_INFO_V1_SIZE)),
                 Err(NativeError::Output(NativeOutputError::InvalidObjectInfo))
+            );
+        }
+        for byte in [0, 31] {
+            let mut stale = canonical;
+            stale.abi_fingerprint[byte] ^= 1;
+            assert_eq!(
+                validate_abi_info(stale, u64::from(DW_ABI_INFO_V1_SIZE)),
+                Err(NativeError::Output(
+                    NativeOutputError::AbiFingerprintMismatch
+                ))
             );
         }
         assert_eq!(

@@ -700,6 +700,7 @@ const fn native_output_code(output: wyrmroot_runtime::NativeOutputError) -> u32 
         NativeOutputError::InvalidWaitResult => 6,
         NativeOutputError::InvalidTaskTerminationInfo => 7,
         NativeOutputError::DeadlineOverflow => 8,
+        NativeOutputError::AbiFingerprintMismatch => 9,
     }
 }
 

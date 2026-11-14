@@ -30,7 +30,17 @@ fn image(headers: &[Ph], entry: u64, length: usize) -> Vec<u8> {
     put64(&mut bytes, 32, PH_OFFSET as u64);
     put16(&mut bytes, 52, 64);
     put16(&mut bytes, 54, PH_SIZE as u16);
-    put16(&mut bytes, 56, headers.len() as u16);
+    // Every image carries the ABI note after its given headers, in bytes
+    // appended past `length`.
+    put16(&mut bytes, 56, headers.len() as u16 + 1);
+    let note = elf::abi_note();
+    let note_at = PH_OFFSET + headers.len() * PH_SIZE;
+    put32(&mut bytes, note_at, 4);
+    put64(&mut bytes, note_at + 8, length as u64);
+    put64(&mut bytes, note_at + 32, note.len() as u64);
+    put64(&mut bytes, note_at + 40, note.len() as u64);
+    put64(&mut bytes, note_at + 48, 4);
+    bytes.extend_from_slice(&note);
     for (index, ph) in headers.iter().enumerate() {
         let at = PH_OFFSET + index * PH_SIZE;
         put32(&mut bytes, at, ph.kind);
@@ -132,7 +142,7 @@ fn malformed_ident_and_header_table_fail_closed() {
 
 #[test]
 fn unsupported_program_headers_and_executable_stack_are_rejected() {
-    for kind in [2, 3, 4, 0x6474_e552, 0x7000_0000] {
+    for kind in [2, 3, 0x6474_e552, 0x7000_0000] {
         let bytes = image(
             &[load(5, 0x1000, 0x400000, 1, 1), Ph { kind, ..stack() }],
             0x400000,
@@ -298,12 +308,13 @@ fn a_tls_template_inside_a_load_segment_is_accepted() {
             alignment: 8,
         })
     );
-    // The first segment maps file offset 0, so the table is at 0x400040.
+    // The first segment maps file offset 0, so the table is at 0x400040;
+    // the fixture's ABI note is its fourth header.
     assert_eq!(
         plan.program_headers,
         Some(elf::ProgramHeaderTable {
             address: 0x400040,
-            count: 3,
+            count: 4,
         })
     );
     // A template with no initialized bytes needs no file backing.
@@ -387,8 +398,9 @@ fn program_header_table_address_follows_the_mapping() {
         flags: 4,
         offset: PH_OFFSET as u64,
         address,
-        file_size: 2 * PH_SIZE as u64,
-        memory_size: 2 * PH_SIZE as u64,
+        // Two given headers and the fixture's ABI note.
+        file_size: 3 * PH_SIZE as u64,
+        memory_size: 3 * PH_SIZE as u64,
         alignment: 8,
     };
     let mapped = image(
@@ -400,7 +412,7 @@ fn program_header_table_address_follows_the_mapping() {
         elf::plan(&mapped, &mut output).unwrap().program_headers,
         Some(elf::ProgramHeaderTable {
             address: 0x400040,
-            count: 2
+            count: 3
         })
     );
     let wrong = image(
@@ -447,4 +459,105 @@ fn put32(bytes: &mut [u8], offset: usize, value: u32) {
 }
 fn put64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn note_header(offset: u64, size: u64) -> Ph {
+    Ph {
+        kind: 4,
+        flags: 4,
+        offset,
+        address: 0,
+        file_size: size,
+        memory_size: size,
+        alignment: 4,
+    }
+}
+
+/// Builds `valid()`'s headers with `note` in place of the fixture's own
+/// note: its header is written over the fixture's, and its bytes over the
+/// fixture's note bytes.
+fn with_note(header: Option<Ph>, note: &[u8]) -> Vec<u8> {
+    let mut bytes = valid();
+    let note_at = PH_OFFSET + 3 * PH_SIZE;
+    match header {
+        Some(ph) => {
+            put32(&mut bytes, note_at, ph.kind);
+            put32(&mut bytes, note_at + 4, ph.flags);
+            put64(&mut bytes, note_at + 8, ph.offset);
+            put64(&mut bytes, note_at + 32, ph.file_size);
+            put64(&mut bytes, note_at + 40, ph.memory_size);
+        }
+        None => put16(&mut bytes, 56, 3),
+    }
+    let length = 0x3000;
+    bytes.truncate(length);
+    bytes.extend_from_slice(note);
+    bytes
+}
+
+#[test]
+fn an_image_must_carry_exactly_one_abi_note_with_this_build_s_fingerprint() {
+    let note = elf::abi_note();
+    let good = note_header(0x3000, elf::ABI_NOTE_LEN as u64);
+    assert_eq!(
+        elf::required_segment_count(&with_note(Some(good), &note)),
+        Ok(2)
+    );
+
+    assert_eq!(
+        elf::required_segment_count(&with_note(None, &note)),
+        Err(ElfError::MissingAbiNote)
+    );
+
+    // A well-formed note naming another ABI is a stale binary.
+    for byte in [elf::ABI_NOTE_LEN - 32, elf::ABI_NOTE_LEN - 1] {
+        let mut stale = note;
+        stale[byte] ^= 0x80;
+        assert_eq!(
+            elf::required_segment_count(&with_note(Some(good), &stale)),
+            Err(ElfError::AbiFingerprintMismatch)
+        );
+    }
+
+    // Any other shape is not an ABI note: wrong sizes, type, owner name or
+    // padding, a size other than one note, or bytes past the file.
+    for (offset, value) in [(0, 8_u8), (4, 31), (8, 2), (12, b'd'), (20, 1), (23, 1)] {
+        let mut bad = note;
+        bad[offset] = value;
+        assert_eq!(
+            elf::required_segment_count(&with_note(Some(good), &bad)),
+            Err(ElfError::InvalidAbiNote { index: 3 }),
+            "byte {offset}"
+        );
+    }
+    for header in [
+        note_header(0x3000, elf::ABI_NOTE_LEN as u64 - 4),
+        note_header(0x3000, elf::ABI_NOTE_LEN as u64 + 4),
+        note_header(0x3004, elf::ABI_NOTE_LEN as u64),
+        note_header(u64::MAX - 8, elf::ABI_NOTE_LEN as u64),
+    ] {
+        assert_eq!(
+            elf::required_segment_count(&with_note(Some(header), &note)),
+            Err(ElfError::InvalidAbiNote { index: 3 })
+        );
+    }
+}
+
+#[test]
+fn a_second_note_header_is_refused() {
+    let note = elf::abi_note();
+    let bytes = image(
+        &[
+            load(5, 0x1000, 0x400000, 1, 1),
+            note_header(0x2000, elf::ABI_NOTE_LEN as u64),
+        ],
+        0x400000,
+        0x2000,
+    );
+    let mut bytes = bytes;
+    bytes[0x2000..0x2000 + note.len()].copy_from_slice(&note);
+    assert_eq!(
+        elf::required_segment_count(&bytes),
+        Err(ElfError::DuplicateProgramHeaderType(4))
+    );
 }

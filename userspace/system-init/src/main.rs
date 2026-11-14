@@ -159,6 +159,12 @@ impl ResidentPlatform for NativeSystem {
 }
 
 fn native_main(startup: StartupBlock<'_>) -> u32 {
+    // The kernel loads init without a Wyrmroot loader, so init checks its own
+    // ABI note's fingerprint against the running kernel's before it loads
+    // anything (root `OS_STACK_ARCHITECTURE_PLAN.md` V1).
+    if wyrmroot_runtime::require_kernel_abi().is_err() {
+        return wyrmroot_system_init::InitApplicationStatus::FatalRebootRequired as u32;
+    }
     let mut system = NativeSystem;
     let mut loader = NativeLoaderPlatform;
     let mut waits = NativeSupervisionPlatform;

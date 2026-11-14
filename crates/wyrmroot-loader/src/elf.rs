@@ -1,5 +1,7 @@
 //! Bounded hostile-input parser for the WYR0 static native ELF subset.
 
+use deepwyrm_syscall::{DW_ABI_FINGERPRINT, DW_ABI_NOTE_NAME, DW_ABI_NOTE_TYPE_FINGERPRINT};
+
 pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_ELF_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PROGRAM_HEADERS: usize = 16;
@@ -32,6 +34,11 @@ const PT_PHDR: u32 = 6;
 const PT_TLS: u32 = 7;
 const PT_GNU_STACK: u32 = 0x6474_e551;
 const PT_GNU_RELRO: u32 = 0x6474_e552;
+/// The one note an image's `PT_NOTE` holds: the Deepwyrm ABI note, a 12-byte
+/// header, the owner name padded to four bytes, and the 32-byte fingerprint
+/// (root `OS_STACK_ARCHITECTURE_PLAN.md` V1).
+const ABI_NOTE_NAME_BYTES: usize = DW_ABI_NOTE_NAME.len().next_multiple_of(4);
+const ABI_NOTE_BYTES: usize = 12 + ABI_NOTE_NAME_BYTES + DW_ABI_FINGERPRINT.len();
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -97,6 +104,22 @@ pub struct TlsTemplate {
     pub memory_size: u64,
     pub alignment: u64,
 }
+
+/// The exact bytes of the one note a loadable image's `PT_NOTE` holds, for
+/// tools and tests that build images.
+#[must_use]
+pub fn abi_note() -> [u8; ABI_NOTE_BYTES] {
+    let mut note = [0; ABI_NOTE_BYTES];
+    note[0..4].copy_from_slice(&(DW_ABI_NOTE_NAME.len() as u32).to_le_bytes());
+    note[4..8].copy_from_slice(&(DW_ABI_FINGERPRINT.len() as u32).to_le_bytes());
+    note[8..12].copy_from_slice(&DW_ABI_NOTE_TYPE_FINGERPRINT.to_le_bytes());
+    note[12..12 + DW_ABI_NOTE_NAME.len()].copy_from_slice(&DW_ABI_NOTE_NAME);
+    note[12 + ABI_NOTE_NAME_BYTES..].copy_from_slice(&DW_ABI_FINGERPRINT);
+    note
+}
+
+/// Length of [`abi_note`].
+pub const ABI_NOTE_LEN: usize = ABI_NOTE_BYTES;
 
 /// The ELF64 program-header entry size (`AT_PHENT`).
 pub const PROGRAM_HEADER_ENTRY_BYTES: u64 = PROGRAM_HEADER_BYTES as u64;
@@ -201,6 +224,15 @@ pub enum ElfError {
     MappedImageLimit,
     ZeroEntryPoint,
     EntryPointOutsideExecutableSegment,
+    /// No `PT_NOTE`: the image carries no ABI stamp, so it was not built
+    /// against any Deepwyrm ABI this loader can compare.
+    MissingAbiNote,
+    /// The `PT_NOTE` is not exactly one well-formed Deepwyrm ABI note.
+    InvalidAbiNote {
+        index: u16,
+    },
+    /// The image was built against another Deepwyrm ABI than this loader.
+    AbiFingerprintMismatch,
 }
 
 impl ElfError {
@@ -256,6 +288,9 @@ impl ElfError {
             Self::MappedImageLimit { .. } => 44,
             Self::ZeroEntryPoint { .. } => 45,
             Self::EntryPointOutsideExecutableSegment { .. } => 46,
+            Self::MissingAbiNote { .. } => 47,
+            Self::InvalidAbiNote { .. } => 48,
+            Self::AbiFingerprintMismatch { .. } => 49,
         }
     }
 }
@@ -273,6 +308,7 @@ pub fn required_segment_count(image: &[u8]) -> Result<usize, ElfError> {
     let mut saw_phdr = false;
     let mut saw_stack = false;
     let mut saw_tls = false;
+    let mut saw_note = false;
     for index in 0..header.program_count {
         let ph = program_header(image, header, index)?;
         let header_type = get_u32(ph, 0);
@@ -304,7 +340,14 @@ pub fn required_segment_count(image: &[u8]) -> Result<usize, ElfError> {
                 validate_tls_header(ph, index as u16)?;
                 saw_tls = true;
             }
-            PT_INTERP | PT_DYNAMIC | PT_NOTE | PT_GNU_RELRO => {
+            PT_NOTE => {
+                if saw_note {
+                    return Err(ElfError::DuplicateProgramHeaderType(PT_NOTE));
+                }
+                validate_abi_note(image, ph, index as u16)?;
+                saw_note = true;
+            }
+            PT_INTERP | PT_DYNAMIC | PT_GNU_RELRO => {
                 return Err(ElfError::UnsupportedProgramHeaderType {
                     index: index as u16,
                     header_type,
@@ -320,6 +363,9 @@ pub fn required_segment_count(image: &[u8]) -> Result<usize, ElfError> {
     }
     if count == 0 {
         return Err(ElfError::MissingProgramHeaders);
+    }
+    if !saw_note {
+        return Err(ElfError::MissingAbiNote);
     }
     Ok(count)
 }
@@ -606,6 +652,34 @@ fn validate_nonoverlap(segments: &[LoadSegment]) -> Result<(), ElfError> {
                 second: second.header_index,
             });
         }
+    }
+    Ok(())
+}
+
+/// The `PT_NOTE`'s file bytes are exactly one Deepwyrm ABI note: owner name,
+/// type and sizes as generated, and this loader's fingerprint. A well-formed
+/// note naming another fingerprint is a stale binary, reported as such.
+fn validate_abi_note(image: &[u8], ph: &[u8], index: u16) -> Result<(), ElfError> {
+    let invalid = ElfError::InvalidAbiNote { index };
+    let offset = usize::try_from(get_u64(ph, 8)).map_err(|_| invalid)?;
+    if get_u64(ph, 32) != ABI_NOTE_BYTES as u64 {
+        return Err(invalid);
+    }
+    let note = offset
+        .checked_add(ABI_NOTE_BYTES)
+        .and_then(|end| image.get(offset..end))
+        .ok_or(invalid)?;
+    let name = &note[12..12 + ABI_NOTE_NAME_BYTES];
+    if get_u32(note, 0) as usize != DW_ABI_NOTE_NAME.len()
+        || get_u32(note, 4) as usize != DW_ABI_FINGERPRINT.len()
+        || get_u32(note, 8) != DW_ABI_NOTE_TYPE_FINGERPRINT
+        || name[..DW_ABI_NOTE_NAME.len()] != DW_ABI_NOTE_NAME
+        || name[DW_ABI_NOTE_NAME.len()..].iter().any(|byte| *byte != 0)
+    {
+        return Err(invalid);
+    }
+    if note[12 + ABI_NOTE_NAME_BYTES..] != DW_ABI_FINGERPRINT {
+        return Err(ElfError::AbiFingerprintMismatch);
     }
     Ok(())
 }
