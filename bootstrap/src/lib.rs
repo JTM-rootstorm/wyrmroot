@@ -602,6 +602,7 @@ const fn launch_error_code(error: LaunchError) -> u32 {
         LaunchError::HandleCount => 11,
         LaunchError::HandleMetadata { index } => 0x200 | bounded_index(index),
         LaunchError::ProfileSpecificEncoderRequired => 0x300,
+        LaunchError::UnsupportedExecutionMode(_) => 12,
     }
 }
 

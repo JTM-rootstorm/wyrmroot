@@ -474,6 +474,53 @@ fn file_backed_address(segments: &[LoadSegment], offset: u64, length: u64) -> Op
     })
 }
 
+/// `EI_CLASS` of a 32-bit ELF image.
+pub const ELF_CLASS_32: u8 = 1;
+/// `EI_CLASS` of a 64-bit ELF image.
+pub const ELF_CLASS_64: u8 = 2;
+/// `e_machine` of an i386 image.
+pub const ELF_MACHINE_386: u16 = 3;
+/// `e_machine` of an x86-64 image.
+pub const ELF_MACHINE_X86_64: u16 = EM_X86_64;
+
+/// What an ELF image says it is, before any policy: its class and machine
+/// (root `I386_EXECUTION_MODE_CONTRACT.md` §8). A caller picks a loader by
+/// it; [`plan`] itself admits only ELF64 x86-64 until E4.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ElfIdentity {
+    pub class: u8,
+    pub machine: u16,
+}
+
+impl ElfIdentity {
+    /// Whether this is the native class and machine, the only one this
+    /// crate loads.
+    #[must_use]
+    pub const fn is_native(self) -> bool {
+        self.class == ELF_CLASS_64 && self.machine == ELF_MACHINE_X86_64
+    }
+}
+
+/// Reads an image's class and machine. `e_machine` sits at the same offset
+/// in ELF32 and ELF64, so only the magic, the bounds and little-endian data
+/// are required; nothing else in the image is trusted or checked.
+pub fn identify(image: &[u8]) -> Result<ElfIdentity, ElfError> {
+    if image.is_empty() || image.len() > MAX_ELF_BYTES {
+        return Err(ElfError::ImageSize);
+    }
+    let bytes = image.get(..20).ok_or(ElfError::HeaderTruncated)?;
+    if &bytes[..4] != b"\x7fELF" {
+        return Err(ElfError::BadMagic);
+    }
+    if bytes[5] != 1 {
+        return Err(ElfError::UnsupportedDataEncoding(bytes[5]));
+    }
+    Ok(ElfIdentity {
+        class: bytes[4],
+        machine: get_u16(bytes, 18),
+    })
+}
+
 fn parse_header(image: &[u8]) -> Result<Header, ElfError> {
     if image.is_empty() || image.len() > MAX_ELF_BYTES {
         return Err(ElfError::ImageSize);

@@ -107,6 +107,59 @@ fn valid_static_image_produces_sorted_complete_plan() {
 }
 
 #[test]
+fn identify_reports_class_and_machine_and_policy_refuses_foreign_images() {
+    use wyrmroot_loader::elf::{
+        ELF_CLASS_32, ELF_CLASS_64, ELF_MACHINE_386, ELF_MACHINE_X86_64, ElfIdentity,
+    };
+
+    let native = valid();
+    let identity = elf::identify(&native).unwrap();
+    assert_eq!(
+        identity,
+        ElfIdentity {
+            class: ELF_CLASS_64,
+            machine: ELF_MACHINE_X86_64
+        }
+    );
+    assert!(identity.is_native());
+
+    // An i386 header: ELF32 with EM_386 at the shared e_machine offset.
+    let mut i386 = valid();
+    i386[4] = ELF_CLASS_32;
+    put16(&mut i386, 18, ELF_MACHINE_386);
+    let identity = elf::identify(&i386).unwrap();
+    assert_eq!(
+        identity,
+        ElfIdentity {
+            class: ELF_CLASS_32,
+            machine: ELF_MACHINE_386
+        }
+    );
+    assert!(!identity.is_native());
+    assert_eq!(
+        elf::required_segment_count(&i386),
+        Err(ElfError::UnsupportedClass(ELF_CLASS_32))
+    );
+
+    // Only the first 20 bytes are read.
+    assert_eq!(
+        elf::identify(&native[..20]),
+        Ok(elf::identify(&native).unwrap())
+    );
+    assert_eq!(elf::identify(&native[..19]), Err(ElfError::HeaderTruncated));
+    assert_eq!(elf::identify(&[]), Err(ElfError::ImageSize));
+    let mut bytes = valid();
+    bytes[0] = 0;
+    assert_eq!(elf::identify(&bytes), Err(ElfError::BadMagic));
+    let mut bytes = valid();
+    bytes[5] = 2;
+    assert_eq!(
+        elf::identify(&bytes),
+        Err(ElfError::UnsupportedDataEncoding(2))
+    );
+}
+
+#[test]
 fn malformed_ident_and_header_table_fail_closed() {
     let mut bytes = valid();
     bytes[0] = 0;

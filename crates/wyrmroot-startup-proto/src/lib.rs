@@ -15,10 +15,10 @@
 #![forbid(unsafe_code)]
 
 use deepwyrm_syscall::{
-    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_MEMORY_OBJECT,
-    DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_MODIFY,
-    DW_RIGHT_READ, DW_RIGHT_RESOURCE, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
-    DwObjectType, DwReceivedHandleInfoV1, DwRights,
+    DW_EXECUTION_MODE_X86_64, DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL,
+    DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT,
+    DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_RESOURCE, DW_RIGHT_TRANSFER,
+    DW_RIGHT_WAIT, DW_RIGHT_WRITE, DwObjectType, DwReceivedHandleInfoV1, DwRights,
 };
 
 /// The startup ABI versions a child receives in RSI: 1 for the original
@@ -316,10 +316,18 @@ pub enum LaunchError {
     ZeroTransaction,
     TransactionMismatch,
     NonzeroReserved,
-    BadCapabilityRole { index: usize },
+    BadCapabilityRole {
+        index: usize,
+    },
     HandleCount,
-    HandleMetadata { index: usize },
+    HandleMetadata {
+        index: usize,
+    },
     ProfileSpecificEncoderRequired,
+    /// An INIT naming an execution mode other than `X86_64`, the only one a
+    /// child starts in until compatibility mode is built (root
+    /// `I386_EXECUTION_MODE_CONTRACT.md` §8).
+    UnsupportedExecutionMode(u32),
 }
 
 impl LaunchError {
@@ -343,6 +351,7 @@ impl LaunchError {
             Self::HandleCount { .. } => 12,
             Self::HandleMetadata { .. } => 13,
             Self::ProfileSpecificEncoderRequired { .. } => 14,
+            Self::UnsupportedExecutionMode { .. } => 15,
         }
     }
 }
@@ -1078,7 +1087,13 @@ fn parse_header(
     if transaction_id == 0 {
         return Err(LaunchError::ZeroTransaction);
     }
-    if get_u64(bytes, 32) != 0 {
+    // Bytes 32..36 of an INIT carry the child's initial execution mode
+    // (`DwExecutionMode`); READY leaves them zero.
+    let mode = get_u32(bytes, 32);
+    if message_type == TYPE_INIT && mode != DW_EXECUTION_MODE_X86_64.0 {
+        return Err(LaunchError::UnsupportedExecutionMode(mode));
+    }
+    if (message_type != TYPE_INIT && mode != 0) || get_u32(bytes, 36) != 0 {
         return Err(LaunchError::NonzeroReserved);
     }
     Ok(transaction_id)
@@ -1116,6 +1131,9 @@ fn write_header(
     put_u32(output, 16, total_size);
     put_u32(output, 20, capabilities);
     put_u64(output, 24, transaction_id);
+    if message_type == TYPE_INIT {
+        put_u32(output, 32, DW_EXECUTION_MODE_X86_64.0);
+    }
 }
 
 fn get_u16(bytes: &[u8], offset: usize) -> u16 {

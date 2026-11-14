@@ -219,7 +219,9 @@ impl LoaderPlatform for NativeLoaderPlatform {
             startup_argument0: child_bootstrap.0,
             startup_argument1: startup_abi,
             flags: 0,
-            reserved: [0; 3],
+            execution_mode: deepwyrm_syscall::DW_EXECUTION_MODE_X86_64,
+            reserved0: 0,
+            reserved: [0; 2],
         };
         success(deepwyrm_syscall::thread_start(&args))
     }

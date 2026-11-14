@@ -874,3 +874,41 @@ fn get16(bytes: &[u8], offset: usize) -> u16 {
 fn get64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
+
+#[test]
+fn init_carries_the_x86_64_execution_mode_and_ready_leaves_it_zero() {
+    let handles = init0_handles();
+    let mut init = [0xaa; INIT0_BYTES];
+    launch::encode_init(LaunchProfile::Init0, 7, &mut init).unwrap();
+    assert_eq!(get32(&init, 32), 1);
+    assert_eq!(get32(&init, 36), 0);
+    assert!(launch::parse_init(LaunchProfile::Init0, &init, &handles).is_ok());
+
+    for (mode, expected) in [
+        (0, LaunchError::UnsupportedExecutionMode(0)),
+        (2, LaunchError::UnsupportedExecutionMode(2)),
+        (u32::MAX, LaunchError::UnsupportedExecutionMode(u32::MAX)),
+    ] {
+        let mut bytes = init;
+        bytes[32..36].copy_from_slice(&mode.to_le_bytes());
+        assert_eq!(
+            launch::parse_init(LaunchProfile::Init0, &bytes, &handles).map(|_| ()),
+            Err(expected)
+        );
+    }
+    let mut bytes = init;
+    bytes[36] = 1;
+    assert_eq!(
+        launch::parse_init(LaunchProfile::Init0, &bytes, &handles).map(|_| ()),
+        Err(LaunchError::NonzeroReserved)
+    );
+
+    let mut ready = [0xaa; HEADER_BYTES];
+    launch::encode_ready(9, &mut ready).unwrap();
+    assert_eq!(get64(&ready, 32), 0);
+    ready[32] = 1;
+    assert_eq!(
+        launch::parse_ready(&ready, 9),
+        Err(LaunchError::NonzeroReserved)
+    );
+}
