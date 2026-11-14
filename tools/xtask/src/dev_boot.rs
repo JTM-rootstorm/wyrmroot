@@ -651,6 +651,40 @@ fn drive(
             com1.display()
         )));
     }
+    stack_marks_fit(&log).map_err(|reason| {
+        Failure::task(format!("dev-boot check: {reason}; see {}", com1.display()))
+    })?;
+    Ok(())
+}
+
+/// The kernel stack classes whose measured high-water marks the kernel logs at
+/// power-off (Deepwyrm `stack_watermark`, DW2 M5 §10.2 item 2).
+const STACK_CLASSES: [&str; 5] = ["thread", "privilege-entry", "reaper", "ist", "ap-bootstrap"];
+
+/// Every stack class is reported, and each deepest mark leaves a quarter of
+/// its usable size spare, the margin `xtask kernel-check` holds the static
+/// bound to.
+fn stack_marks_fit(log: &[u8]) -> Result<(), String> {
+    let text = String::from_utf8_lossy(log);
+    for class in STACK_CLASSES {
+        let prefix = format!("[stack] class={class} ");
+        let line = text
+            .lines()
+            .find_map(|line| line.split_once(&prefix).map(|(_, rest)| rest))
+            .ok_or_else(|| format!("the kernel logged no stack mark for {class}"))?;
+        let field = |name: &str| {
+            line.split_whitespace()
+                .find_map(|part| part.strip_prefix(name)?.strip_prefix('='))
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| format!("the {class} stack mark has no {name}: {line}"))
+        };
+        let (deepest, usable) = (field("deepest")?, field("usable")?);
+        if usable == 0 || deepest.saturating_mul(4) > usable.saturating_mul(3) {
+            return Err(format!(
+                "the {class} stack reached {deepest} of {usable} bytes, past three quarters"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -790,6 +824,41 @@ mod tests {
             args.iter()
                 .any(|arg| arg == "if=none,id=root,format=raw,file=/r.img")
         );
+    }
+
+    #[test]
+    fn stack_marks_must_all_be_logged_and_leave_a_quarter_spare() {
+        let good = "[DW0][INFO][stack] class=thread deepest=195416 usable=524288\n\
+                    [DW0][INFO][stack] class=privilege-entry deepest=83720 usable=262144\n\
+                    [DW0][INFO][stack] class=reaper deepest=118040 usable=262144\n\
+                    [DW0][INFO][stack] class=ist deepest=0 usable=16384\n\
+                    [DW0][INFO][stack] class=ap-bootstrap deepest=0 usable=65536\n";
+        assert_eq!(stack_marks_fit(good.as_bytes()), Ok(()));
+
+        let missing = good.replace("class=reaper", "class=other");
+        assert!(
+            stack_marks_fit(missing.as_bytes())
+                .unwrap_err()
+                .contains("reaper")
+        );
+
+        // Exactly three quarters passes; one byte more fails.
+        let edge = good.replace("deepest=195416", "deepest=393216");
+        assert_eq!(stack_marks_fit(edge.as_bytes()), Ok(()));
+        let over = good.replace("deepest=195416", "deepest=393217");
+        assert!(
+            stack_marks_fit(over.as_bytes())
+                .unwrap_err()
+                .contains("thread")
+        );
+
+        let garbled = good.replace("usable=16384", "usable=x");
+        assert!(
+            stack_marks_fit(garbled.as_bytes())
+                .unwrap_err()
+                .contains("ist")
+        );
+        assert!(stack_marks_fit(b"").is_err());
     }
 
     #[test]
