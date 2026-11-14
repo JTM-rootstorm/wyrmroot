@@ -50,7 +50,7 @@ fn validate_abi_info(info: DwAbiInfoV1, required: u64) -> Result<(), NativeError
 
 /// Refuses to run against a kernel whose ABI fingerprint is not the one this
 /// binary was built for. The loader checks each image's note against its own
-/// build; the first process, which no Wyrmroot loader loaded, checks itself.
+/// build; bootstrap, which the kernel loads, checks itself with this first.
 pub fn require_kernel_abi() -> Result<(), NativeError> {
     abi_info().map(|_| ())
 }

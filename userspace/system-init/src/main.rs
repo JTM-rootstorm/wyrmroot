@@ -159,9 +159,10 @@ impl ResidentPlatform for NativeSystem {
 }
 
 fn native_main(startup: StartupBlock<'_>) -> u32 {
-    // The kernel loads init without a Wyrmroot loader, so init checks its own
-    // ABI note's fingerprint against the running kernel's before it loads
-    // anything (root `OS_STACK_ARCHITECTURE_PLAN.md` V1).
+    // Bootstrap's loader already refused an init built for another ABI than
+    // bootstrap's; init also compares with the running kernel before it loads
+    // anything, which costs one syscall (root `OS_STACK_ARCHITECTURE_PLAN.md`
+    // V1).
     if wyrmroot_runtime::require_kernel_abi().is_err() {
         return wyrmroot_system_init::InitApplicationStatus::FatalRebootRequired as u32;
     }

@@ -162,6 +162,14 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 }
 
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
+    // The kernel loads this image itself, checking only that its ABI note is
+    // in bounds, so bootstrap compares the fingerprint it was built for with
+    // the kernel's before any other syscall (root
+    // `OS_STACK_ARCHITECTURE_PLAN.md` V1). Everything after it is loaded by
+    // the Wyrmroot loader, which refuses another fingerprint.
+    if let Err(error) = wyrmroot_runtime::require_kernel_abi() {
+        return 0xB300_0000 | wyrmroot_runtime::native_error_code(error);
+    }
     let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
         Ok(deadline) => deadline,
         Err(error) => return 0xB300_0000 | wyrmroot_runtime::native_error_code(error),
