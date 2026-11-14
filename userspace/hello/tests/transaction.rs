@@ -7,7 +7,9 @@ use wyrmroot_hello::{
     HelloError, HelloNativeOperation, HelloSystem, JobHelloSystem, run_hello, run_job_hello,
     run_stream_hello, run_stream_hello_with,
 };
-use wyrmroot_loader::launch::{LaunchProfile, encode_init, parse_ready, parse_ready_for_profile};
+use wyrmroot_loader::launch::{
+    LaunchProfile, encode_init, encode_job_init, parse_ready, parse_ready_for_profile,
+};
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, NativeError,
     ReceiveCounts, StreamSystem,
@@ -67,7 +69,7 @@ impl Fixture {
 
     fn profile(profile: LaunchProfile) -> Self {
         let mut init = vec![0_u8; profile.init_size()];
-        encode_init(profile, 2, &mut init).unwrap();
+        encode_any_init(profile, 2, &mut init);
         Self {
             init,
             wait_signals: DW_SIGNAL_PEER_CLOSED,
@@ -226,7 +228,7 @@ impl StreamFixture {
     }
     fn profile(profile: LaunchProfile) -> Self {
         let mut init = vec![0; profile.init_size()];
-        encode_init(profile, 9, &mut init).unwrap();
+        encode_any_init(profile, 9, &mut init);
         let handle = |raw| DwReceivedHandleInfoV1 {
             handle: DwHandle(raw),
             object_type: DW_OBJECT_TYPE_CHANNEL,
@@ -362,15 +364,16 @@ fn stream_hello_uses_only_a_validated_native_stdout_record() {
 fn stream_hello_runs_its_probe_with_the_self_root_then_writes_its_line() {
     let mut fixture = StreamFixture::new();
     let mut seen = None;
-    let mut probe = |region: DwHandle| {
-        seen = Some(region);
+    let mut probe = |region: DwHandle, budget: u64| {
+        seen = Some((region, budget));
         b"on-demand ok\n".as_slice()
     };
     assert_eq!(
         run_stream_hello_with(&mut fixture, CHANNEL, Some(&mut probe)),
         Ok(())
     );
-    assert_eq!(seen, Some(ROOT));
+    // The budget is the one its INIT carried.
+    assert_eq!(seen, Some((ROOT, 16 << 20)));
     let payloads: Vec<_> = fixture
         .sent
         .iter()
@@ -408,7 +411,7 @@ fn stream_hello_rejects_readable_post_ready_data() {
     assert_eq!(fixture.events.last(), Some(&"wait-release"));
 }
 
-/// A hello run from a file receives a namespace (WRLP 1.13), closes it with
+/// A hello run from a file receives a namespace (WRLP 1.15), closes it with
 /// its self root, and answers READY under the namespace profile.
 #[test]
 fn stream_hello_closes_a_namespace_and_answers_under_its_profile() {
@@ -439,4 +442,13 @@ fn stream_hello_closes_a_namespace_and_answers_under_its_profile() {
         Err(HelloError::ReceiveCounts(_))
     ));
     assert!(short.closed.is_empty());
+}
+
+/// A job's INIT with a 16 MiB budget, or any other profile's.
+fn encode_any_init(profile: LaunchProfile, transaction: u64, init: &mut [u8]) {
+    if profile.is_job() {
+        encode_job_init(profile, transaction, 16 << 20, init).unwrap();
+    } else {
+        encode_init(profile, transaction, init).unwrap();
+    }
 }

@@ -9,7 +9,7 @@ extern crate std;
 use super::*;
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_WRITABLE, DW_STATUS_BUFFER_TOO_SMALL, DW_STATUS_PEER_CLOSED,
-    DW_STATUS_WOULD_BLOCK, DwStatus, DwWaitResultV1,
+    DW_STATUS_WOULD_BLOCK, DwStatus, DwTaskGroupMemoryInfoV1, DwWaitResultV1,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -115,6 +115,12 @@ pub(crate) struct FakeKernel {
     pub(crate) fail_scratch: bool,
     pub(crate) scratch_mapped: usize,
     pub(crate) scratch_unmapped: usize,
+    /// Each TaskGroup init created, with its parent, in order.
+    pub(crate) groups_created: Vec<(u64, u64)>,
+    /// Each job TaskGroup init limited, with its MEMORY_PAGES limit.
+    pub(crate) job_limits: Vec<(u64, u32)>,
+    /// What the memory topic reports for each TaskGroup; others refuse.
+    pub(crate) group_memory: BTreeMap<u64, DwTaskGroupMemoryInfoV1>,
 }
 
 impl FakeKernel {
@@ -138,6 +144,9 @@ impl FakeKernel {
             fail_scratch: false,
             scratch_mapped: 0,
             scratch_unmapped: 0,
+            groups_created: Vec::new(),
+            job_limits: Vec::new(),
+            group_memory: BTreeMap::new(),
         };
         kernel.memory.insert(BOOTFS.0, Rc::new(bootfs()));
         kernel
@@ -372,11 +381,37 @@ impl InitPlatform for FakeKernel {
         self.memory.remove(&handle.0);
         Ok(())
     }
-    fn create_attempt_task_group(&mut self, _parent: DwHandle) -> Result<DwHandle, NativeError> {
-        Ok(self.fresh())
+    fn create_attempt_task_group(&mut self, parent: DwHandle) -> Result<DwHandle, NativeError> {
+        let group = self.fresh();
+        self.groups_created.push((parent.0, group.0));
+        Ok(group)
     }
-    fn limit_job_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+    fn limit_job_task_group(
+        &mut self,
+        task_group: DwHandle,
+        memory_pages: u32,
+    ) -> Result<(), NativeError> {
+        self.job_limits.push((task_group.0, memory_pages));
         Ok(())
+    }
+    fn limit_task_group(
+        &mut self,
+        _task_group: DwHandle,
+        _class: u32,
+        _limit: u32,
+    ) -> Result<(), NativeError> {
+        Ok(())
+    }
+    fn query_task_group_memory(
+        &mut self,
+        task_group: DwHandle,
+    ) -> Result<deepwyrm_syscall::DwTaskGroupMemoryInfoV1, NativeError> {
+        self.group_memory
+            .get(&task_group.0)
+            .copied()
+            .ok_or(NativeError::Status(
+                deepwyrm_syscall::DW_STATUS_NOT_SUPPORTED,
+            ))
     }
     fn terminate_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError> {
         self.children.borrow_mut().terminated.insert(task_group.0);
@@ -683,6 +718,7 @@ impl Rig {
                     LaunchMessage::JobList(ids) => Reply::JobList(ids.len()),
                     LaunchMessage::JobResult { job_id, .. } => Reply::Result(job_id),
                     LaunchMessage::Error { code } => Reply::Error(code),
+                    LaunchMessage::Memory(report) => Reply::Memory(report),
                     other => panic!("unexpected reply {other:?}"),
                 },
             )
@@ -696,6 +732,7 @@ pub(crate) enum Reply {
     JobList(usize),
     Result(u64),
     Error(LaunchErrorCode),
+    Memory(wyrmroot_launch_proto::MemoryReport),
 }
 
 /// A streamless LAUNCH of `bin/hello` from session `id`.
@@ -1277,4 +1314,99 @@ fn a_received_handle_that_cannot_be_closed_is_still_init_s_failure() {
     rig.kernel.deliver(channel(1), b"not a request", &[41]);
     let failed = rig.try_poll().unwrap_err();
     assert_eq!(failure_kind(&failed), 0x04);
+}
+
+/// A job's group goes under the jobs group with the budget init planned,
+/// and its INIT carries the same budget (DW2 §10.3 item 7).
+#[test]
+fn a_job_is_launched_under_the_jobs_group_with_the_planned_budget() {
+    use crate::job_memory::{FallbackCause, JobMemory, JobMemoryPlan, JobMemorySource};
+    let jobs_group = DwHandle(0x7700);
+    let mut jobs = one_session();
+    jobs.memory = JobMemory {
+        plan: JobMemoryPlan {
+            free_pages: 500_000,
+            reserve_pages: 65_536,
+            cap_pages: 131_072,
+            jobs_limit_pages: 434_464,
+            job_budget_pages: 131_072,
+            source: JobMemorySource::Capped,
+            cause: FallbackCause::None,
+        },
+        jobs_group: Some(jobs_group),
+        init_group: AUTHORITY.task_group,
+    };
+    let mut rig = Rig::new(jobs);
+    rig.launch(1, 1);
+    let (parent, group) = *rig.kernel.groups_created.last().unwrap();
+    assert_eq!(parent, jobs_group.0);
+    assert_eq!(rig.kernel.job_limits, [(group, 131_072)]);
+    let init = &rig.loader.sent_init;
+    assert_eq!(&init[init.len() - 8..], &(131_072_u64 * 4096).to_le_bytes());
+}
+
+/// QUERY_MEMORY is answered with the plan and live reads of the jobs group
+/// and of init's own group; a read that fails reports zero (WRLJ 3).
+#[test]
+fn the_memory_query_reports_the_plan_and_live_usage() {
+    use crate::job_memory::{FallbackCause, JobMemory, JobMemoryPlan, JobMemorySource};
+    use wyrmroot_launch_proto::MemoryReport;
+    let jobs_group = DwHandle(0x7700);
+    let mut jobs = one_session();
+    jobs.memory = JobMemory {
+        plan: JobMemoryPlan {
+            free_pages: 500_000,
+            reserve_pages: 65_536,
+            cap_pages: 131_072,
+            jobs_limit_pages: 434_464,
+            job_budget_pages: 131_072,
+            source: JobMemorySource::Capped,
+            cause: FallbackCause::None,
+        },
+        jobs_group: Some(jobs_group),
+        init_group: AUTHORITY.task_group,
+    };
+    let mut rig = Rig::new(jobs);
+    let info = |usage, free_pages| DwTaskGroupMemoryInfoV1 {
+        usage,
+        free_pages,
+        ..DwTaskGroupMemoryInfoV1::default()
+    };
+    rig.kernel.group_memory.insert(jobs_group.0, info(9_000, 0));
+    rig.kernel
+        .group_memory
+        .insert(AUTHORITY.task_group.0, info(70_000, 480_000));
+    let query = |transaction_id| {
+        let mut bytes = vec![0; wyrmroot_launch_proto::HEADER_BYTES];
+        wyrmroot_launch_proto::encode_query_memory(reservation(1, transaction_id), &mut bytes)
+            .unwrap();
+        bytes
+    };
+    rig.kernel.deliver(channel(1), &query(1), &[]);
+    assert_eq!(rig.tick(), JobDispatcherPoll::STABLE);
+    let expected = MemoryReport {
+        job_budget_pages: 131_072,
+        jobs_limit_pages: 434_464,
+        jobs_usage_pages: 9_000,
+        free_pages_at_plan: 500_000,
+        free_pages_now: 480_000,
+        reserve_pages: 65_536,
+        cap_pages: 131_072,
+        source: JobMemorySource::Capped,
+        fallback: FallbackCause::None,
+    };
+    assert_eq!(rig.replies(1), [Reply::Memory(expected)]);
+
+    rig.kernel.drain(channel(1));
+    rig.kernel.group_memory.clear();
+    rig.kernel.deliver(channel(1), &query(2), &[]);
+    assert_eq!(rig.tick(), JobDispatcherPoll::STABLE);
+    assert_eq!(
+        rig.replies(1).last(),
+        Some(&Reply::Memory(MemoryReport {
+            jobs_usage_pages: 0,
+            free_pages_now: 0,
+            ..expected
+        }))
+    );
 }

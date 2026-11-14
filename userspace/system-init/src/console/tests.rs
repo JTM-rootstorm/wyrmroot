@@ -119,8 +119,26 @@ impl InitPlatform for ObserverPlatform {
     fn create_attempt_task_group(&mut self, _parent: DwHandle) -> Result<DwHandle, NativeError> {
         Err(FAILURE)
     }
-    fn limit_job_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+    fn limit_job_task_group(
+        &mut self,
+        _task_group: DwHandle,
+        _memory_pages: u32,
+    ) -> Result<(), NativeError> {
         Ok(())
+    }
+    fn limit_task_group(
+        &mut self,
+        _task_group: DwHandle,
+        _class: u32,
+        _limit: u32,
+    ) -> Result<(), NativeError> {
+        Ok(())
+    }
+    fn query_task_group_memory(
+        &mut self,
+        _task_group: DwHandle,
+    ) -> Result<deepwyrm_syscall::DwTaskGroupMemoryInfoV1, NativeError> {
+        Err(FAILURE)
     }
 
     fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
@@ -313,7 +331,7 @@ fn generation_changed(observed: PublicationObserver) -> ([u8; 72], usize) {
 
 #[test]
 fn console_launch_budget_is_finite_and_only_fresh_registry_replenishes_it() {
-    let mut state = ConsoleState::new(7).unwrap();
+    let mut state = ConsoleState::new(7, crate::job_memory::JobMemory::UNPLANNED).unwrap();
     let first = state.take_console_transaction().unwrap();
     assert_eq!(first, FIRST_CONSOLE_TRANSACTION);
     for _ in 1..WYR0_I_SUPERVISION_POLICY.max_attempts {
@@ -334,7 +352,7 @@ fn console_launch_budget_is_finite_and_only_fresh_registry_replenishes_it() {
 #[test]
 fn closed_console_session_discards_stale_owner_and_requests_fresh_launch() {
     let peer = console_peer();
-    let mut state = ConsoleState::new(7).unwrap();
+    let mut state = ConsoleState::new(7, crate::job_memory::JobMemory::UNPLANNED).unwrap();
     state.console = Some(peer);
     state.awaiting_ready = true;
     state.bootstrap_released = true;
@@ -362,7 +380,7 @@ fn closed_console_session_discards_stale_owner_and_requests_fresh_launch() {
 #[test]
 fn a_closed_console_session_after_shutdown_completes_the_session() {
     let peer = console_peer();
-    let mut state = ConsoleState::new(7).unwrap();
+    let mut state = ConsoleState::new(7, crate::job_memory::JobMemory::UNPLANNED).unwrap();
     state.console = Some(peer);
     state.shell.observe_session_shutdown();
 
@@ -407,7 +425,7 @@ fn only_a_console_departure_after_shutdown_completes_the_session() {
 #[test]
 fn closed_console_session_with_wrong_grant_fails_without_discarding_owner() {
     let peer = console_peer();
-    let mut state = ConsoleState::new(7).unwrap();
+    let mut state = ConsoleState::new(7, crate::job_memory::JobMemory::UNPLANNED).unwrap();
     state.console = Some(peer);
     let mut wrong_grant = peer.grant;
     wrong_grant.endpoint_generation += 1;
@@ -433,7 +451,7 @@ fn closed_console_session_with_wrong_grant_fails_without_discarding_owner() {
 #[test]
 fn a_failed_console_retirement_is_not_a_completed_session() {
     let peer = console_peer();
-    let mut state = ConsoleState::new(7).unwrap();
+    let mut state = ConsoleState::new(7, crate::job_memory::JobMemory::UNPLANNED).unwrap();
     state.console = Some(peer);
     state.shell.observe_session_shutdown();
     assert!(state.shell.session_shutdown());
@@ -455,7 +473,7 @@ fn a_failed_console_retirement_is_not_a_completed_session() {
 #[test]
 fn coordinated_retirement_keeps_an_exited_console_owned_for_the_recovery_join() {
     let peer = console_peer();
-    let mut state = ConsoleState::new(7).unwrap();
+    let mut state = ConsoleState::new(7, crate::job_memory::JobMemory::UNPLANNED).unwrap();
     state.console = Some(peer);
     state.awaiting_ready = true;
     state.bootstrap_released = true;
@@ -580,7 +598,11 @@ fn publication_watch_requires_exact_tuple_generation_and_predeadline_validation(
 #[test]
 fn observer_deadline_wins_before_receive_and_after_exact_reply_validation() {
     let observed = observer();
-    let mut session = ConsoleState::new(observed.grant.registry_generation).unwrap();
+    let mut session = ConsoleState::new(
+        observed.grant.registry_generation,
+        crate::job_memory::JobMemory::UNPLANNED,
+    )
+    .unwrap();
     session.publication_observer = Some(observed);
     let mut platform = ObserverPlatform::generation(observed, observed.deadline);
     let mut waits = ObserverWaits {
@@ -626,7 +648,11 @@ fn observer_deadline_wins_before_receive_and_after_exact_reply_validation() {
 #[test]
 fn exact_queued_watch_cannot_launch_an_already_exited_driver() {
     let observed = observer();
-    let mut session = ConsoleState::new(observed.grant.registry_generation).unwrap();
+    let mut session = ConsoleState::new(
+        observed.grant.registry_generation,
+        crate::job_memory::JobMemory::UNPLANNED,
+    )
+    .unwrap();
     session.publication_observer = Some(observed);
     let mut platform = ObserverPlatform::generation(observed, observed.deadline - 1);
     let mut waits = ObserverWaits {
@@ -652,7 +678,11 @@ fn exact_queued_watch_cannot_launch_an_already_exited_driver() {
 #[test]
 fn exact_queued_watch_requires_driver_to_be_running() {
     let observed = observer();
-    let mut session = ConsoleState::new(observed.grant.registry_generation).unwrap();
+    let mut session = ConsoleState::new(
+        observed.grant.registry_generation,
+        crate::job_memory::JobMemory::UNPLANNED,
+    )
+    .unwrap();
     session.publication_observer = Some(observed);
     let mut platform = ObserverPlatform::generation(observed, observed.deadline - 1);
     let mut waits = ObserverWaits {
@@ -718,7 +748,8 @@ mod session_faults {
 
     /// A shell whose job session sends bytes that are no request.
     fn faulting_shell(poisoned: bool) -> (ResidentSystemInit, FakeKernel) {
-        let mut state = ConsoleState::new(GENERATION).unwrap();
+        let mut state =
+            ConsoleState::new(GENERATION, crate::job_memory::JobMemory::UNPLANNED).unwrap();
         state
             .jobs
             .install_scoped_session(session(1), channel(1), LaunchSessionScope::ShellJobs)
@@ -758,7 +789,8 @@ mod session_faults {
     /// A console whose launcher session sends bytes that are no request.
     fn faulting_console(poisoned: bool) -> (ResidentSystemInit, FakeKernel, InstalledPeer) {
         let peer = console_peer();
-        let mut state = ConsoleState::new(GENERATION).unwrap();
+        let mut state =
+            ConsoleState::new(GENERATION, crate::job_memory::JobMemory::UNPLANNED).unwrap();
         state.console = Some(peer);
         state
             .jobs

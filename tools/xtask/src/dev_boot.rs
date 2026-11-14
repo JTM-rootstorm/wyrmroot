@@ -135,7 +135,7 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
         .map_err(|error| Failure::task(format!("could not create dev-boot root: {error}")))?;
     let product = root.join("product");
     let sdk = boot.sdk.as_ref().map(PathBuf::from);
-    product::build(&product, &deep, sdk.as_deref())?;
+    product::build(&product, &deep, sdk.as_deref(), product::DEV_BOOT_PLATFORM)?;
 
     // The product's firmware vars are sealed read-only; the run gets its own copy.
     let vars = root.join("OVMF_VARS.fd");
@@ -308,6 +308,13 @@ fn first_boot(shell: &mut Shell<'_>, token: &str, sdk: bool) -> Result<(), Failu
         ESP_LISTING.iter().all(|line| contains(output, line))
     })?;
     shell.expect("cat /boot/EFI/WYRMROOT/README.TXT", ESP_README)?;
+    // Init read the free count on the root group and planned the jobs'
+    // memory; in this 2 GiB guest the product's cap binds (DW2 §10.3 item 7).
+    let budget = format!(
+        "memory source=capped fallback=none job-budget-kib={}",
+        crate::product::DEV_BOOT_PLATFORM.job_memory_bytes_max / 1024
+    );
+    shell.expect("memory", budget.as_bytes())?;
     // Two hogs hold their own FP registers and FS base and preempt each
     // other (and everything else) until they are terminated; a hog that saw
     // its state change, or did not start from the initial FP state, exits on

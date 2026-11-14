@@ -35,7 +35,8 @@
 //! request in the request's own minor, carrying it with the deferred
 //! answers (`system-init`'s parked WAIT and launches) as WRFS does.
 //! QUERY_VERSION asks the controller for its [`Version`]; WRLJ defines no
-//! feature bits yet.
+//! feature bits yet. Minor 3 adds QUERY_MEMORY and its answer MEMORY: the
+//! jobs' memory plan and the jobs group's live usage (DW2 §10.3 item 7).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -83,7 +84,7 @@ pub const SHELL_V1_POLICY_PROFILE: u16 = 2;
 const MAGIC: [u8; 4] = *b"WRLJ";
 pub const MAJOR: u16 = 1;
 /// The job protocol's minor this crate speaks.
-pub const MINOR: u16 = 2;
+pub const MINOR: u16 = 3;
 /// The job protocol's first minor; minor 1 is `LAUNCH_SHELL_V1`'s envelope.
 const LEGACY_MINOR: u16 = 0;
 /// The minor that added QUERY_VERSION and VERSION.
@@ -91,6 +92,10 @@ pub const VERSION_QUERY_MINOR: u16 = 2;
 const SHELL_V1_MINOR: u16 = 1;
 /// QUERY_VERSION's answer: the header and a 16-byte body.
 const VERSION_BYTES: usize = HEADER_BYTES + 16;
+/// The minor that added QUERY_MEMORY and MEMORY.
+pub const MEMORY_QUERY_MINOR: u16 = 3;
+/// MEMORY: the header and a 64-byte body.
+pub const MEMORY_BYTES: usize = HEADER_BYTES + 64;
 const SHELL_V1_MESSAGE_TYPE: u32 = 16;
 const RECORD_BYTES: usize = 8;
 const LAUNCH_FIXED_BYTES: usize = 72;
@@ -163,6 +168,10 @@ pub enum MessageType {
     QueryVersion = 18,
     /// QUERY_VERSION's answer (2).
     Version = 19,
+    /// Asks the controller for the jobs' memory plan and usage (3).
+    QueryMemory = 20,
+    /// QUERY_MEMORY's answer (3).
+    Memory = 21,
 }
 
 impl MessageType {
@@ -186,6 +195,8 @@ impl MessageType {
             17 => Self::LaunchImage,
             18 => Self::QueryVersion,
             19 => Self::Version,
+            20 => Self::QueryMemory,
+            21 => Self::Memory,
             _ => return Err(Error::UnknownMessageType),
         })
     }
@@ -194,6 +205,7 @@ impl MessageType {
     pub const fn since(self) -> u16 {
         match self {
             Self::QueryVersion | Self::Version => VERSION_QUERY_MINOR,
+            Self::QueryMemory | Self::Memory => MEMORY_QUERY_MINOR,
             _ => LEGACY_MINOR,
         }
     }
@@ -221,6 +233,85 @@ impl Version {
             features,
         }
     }
+}
+
+/// How the controller reached each job's memory budget (3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MemorySource {
+    /// Half of free memory less the residents' reserve.
+    Computed = 1,
+    /// The product's cap, below that half.
+    Capped = 2,
+    /// The fixed 16 MiB, for a [`MemoryFallback`] cause.
+    Fallback = 3,
+}
+
+impl MemorySource {
+    fn parse(value: u32) -> Result<Self, Error> {
+        Ok(match value {
+            1 => Self::Computed,
+            2 => Self::Capped,
+            3 => Self::Fallback,
+            _ => return Err(Error::InvalidMemoryReport),
+        })
+    }
+}
+
+/// Why the controller fell back to the fixed budget (3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MemoryFallback {
+    None = 0,
+    /// The memory topic on the controller's group could not be read.
+    TopicUnreadable = 1,
+    /// The topic carried no free count: the group is not the root.
+    NoFreeCount = 2,
+    /// The product has no platform config.
+    ConfigMissing = 3,
+    /// The platform config is malformed.
+    ConfigMalformed = 4,
+    /// Free memory is not above the reserve.
+    FreeNotAboveReserve = 5,
+    /// The jobs group could not be created or limited.
+    JobsGroup = 6,
+}
+
+impl MemoryFallback {
+    fn parse(value: u32) -> Result<Self, Error> {
+        Ok(match value {
+            0 => Self::None,
+            1 => Self::TopicUnreadable,
+            2 => Self::NoFreeCount,
+            3 => Self::ConfigMissing,
+            4 => Self::ConfigMalformed,
+            5 => Self::FreeNotAboveReserve,
+            6 => Self::JobsGroup,
+            _ => return Err(Error::InvalidMemoryReport),
+        })
+    }
+}
+
+/// MEMORY: the jobs' memory plan, made once per boot, and what the jobs
+/// group and the machine hold now, in 4 KiB pages (3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryReport {
+    /// Each job's MEMORY_PAGES limit.
+    pub job_budget_pages: u64,
+    /// The jobs group's MEMORY_PAGES limit.
+    pub jobs_limit_pages: u64,
+    /// Pages charged to the jobs group now; zero without a jobs group.
+    pub jobs_usage_pages: u64,
+    /// Free frames when the plan was made; zero if they could not be read.
+    pub free_pages_at_plan: u64,
+    /// Free frames now; zero if they could not be read.
+    pub free_pages_now: u64,
+    /// The residents' reserve.
+    pub reserve_pages: u64,
+    /// The product's cap on a budget; zero for none.
+    pub cap_pages: u64,
+    pub source: MemorySource,
+    pub fallback: MemoryFallback,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -428,6 +519,8 @@ pub enum Message<'a> {
     },
     QueryVersion,
     Version(Version),
+    QueryMemory,
+    Memory(MemoryReport),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -460,6 +553,9 @@ pub enum Error {
     InvalidTerminationClassification,
     InvalidCleanupResult,
     ArithmeticOverflow,
+    /// A MEMORY whose source or fallback is unknown, or whose fallback does
+    /// not match its source.
+    InvalidMemoryReport,
 }
 
 /// Compatibility envelope encoder retained for WYR1-A callers.
@@ -739,6 +835,31 @@ pub fn parse_message(bytes: &[u8], received_handles: usize) -> Result<ParsedMess
             }
             Message::Version(version)
         }
+        MessageType::QueryMemory => {
+            require_handles(received_handles, 0)?;
+            require_at_least(bytes, HEADER_BYTES)?;
+            Message::QueryMemory
+        }
+        MessageType::Memory => {
+            require_handles(received_handles, 0)?;
+            require_at_least(bytes, MEMORY_BYTES)?;
+            let source = MemorySource::parse(read_u32(bytes, 104)?)?;
+            let fallback = MemoryFallback::parse(read_u32(bytes, 108)?)?;
+            if (source == MemorySource::Fallback) != (fallback != MemoryFallback::None) {
+                return Err(Error::InvalidMemoryReport);
+            }
+            Message::Memory(MemoryReport {
+                job_budget_pages: read_u64(bytes, 48)?,
+                jobs_limit_pages: read_u64(bytes, 56)?,
+                jobs_usage_pages: read_u64(bytes, 64)?,
+                free_pages_at_plan: read_u64(bytes, 72)?,
+                free_pages_now: read_u64(bytes, 80)?,
+                reserve_pages: read_u64(bytes, 88)?,
+                cap_pages: read_u64(bytes, 96)?,
+                source,
+                fallback,
+            })
+        }
     };
     Ok(ParsedMessage {
         reservation,
@@ -973,6 +1094,42 @@ pub fn encode_version(
     put_u16(out, 50, version.minor)?;
     put_u64(out, 56, version.features)?;
     Ok(VERSION_BYTES)
+}
+
+/// Encodes QUERY_MEMORY (3).
+pub fn encode_query_memory(reservation: Reservation, out: &mut [u8]) -> Result<usize, Error> {
+    if out.len() < HEADER_BYTES {
+        return Err(Error::WrongSize);
+    }
+    out[..HEADER_BYTES].fill(0);
+    encode_prefix(reservation, MessageType::QueryMemory, out)?;
+    Ok(HEADER_BYTES)
+}
+
+/// Encodes QUERY_MEMORY's answer (3).
+pub fn encode_memory(
+    reservation: Reservation,
+    report: MemoryReport,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if (report.source == MemorySource::Fallback) != (report.fallback != MemoryFallback::None) {
+        return Err(Error::InvalidMemoryReport);
+    }
+    if out.len() < MEMORY_BYTES {
+        return Err(Error::WrongSize);
+    }
+    out[..MEMORY_BYTES].fill(0);
+    encode_prefix(reservation, MessageType::Memory, out)?;
+    put_u64(out, 48, report.job_budget_pages)?;
+    put_u64(out, 56, report.jobs_limit_pages)?;
+    put_u64(out, 64, report.jobs_usage_pages)?;
+    put_u64(out, 72, report.free_pages_at_plan)?;
+    put_u64(out, 80, report.free_pages_now)?;
+    put_u64(out, 88, report.reserve_pages)?;
+    put_u64(out, 96, report.cap_pages)?;
+    put_u32(out, 104, report.source as u32)?;
+    put_u32(out, 108, report.fallback as u32)?;
+    Ok(MEMORY_BYTES)
 }
 
 /// Encodes a typed protocol/controller failure response.

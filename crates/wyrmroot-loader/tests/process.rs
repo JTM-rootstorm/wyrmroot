@@ -1517,7 +1517,7 @@ fn failed_service_init_send_leaves_endpoint_with_caller() {
 }
 
 /// Root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W3 and W5: a fourth handle is the
-/// namespace, moved fifth under WRLP 1.13, and argv[0] need not be the path.
+/// namespace, moved fifth under WRLP 1.15, and argv[0] need not be the path.
 #[test]
 fn job_v2_with_a_namespace_moves_it_after_the_streams() {
     let image = executable();
@@ -1539,6 +1539,7 @@ fn job_v2_with_a_namespace_moves_it_after_the_streams() {
             environment: &[],
             streams: &handles,
             transaction_id: 0x1305,
+            memory_budget_bytes: 16 << 20,
         },
     )
     .unwrap();
@@ -1554,7 +1555,10 @@ fn job_v2_with_a_namespace_moves_it_after_the_streams() {
     assert!(transfers[1..].iter().all(|transfer| {
         transfer.requested_rights == wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
     }));
-    assert_eq!(&platform.sent_init[6..8], &13_u16.to_le_bytes());
+    assert_eq!(&platform.sent_init[6..8], &15_u16.to_le_bytes());
+    // The budget follows the five capability records (DW2 §10.3 item 7).
+    assert_eq!(platform.sent_init.len(), 88);
+    assert_eq!(&platform.sent_init[80..88], &(16_u64 << 20).to_le_bytes());
 
     // Two handles are neither shape.
     let mut refused = Mock::new(None);
@@ -1568,6 +1572,7 @@ fn job_v2_with_a_namespace_moves_it_after_the_streams() {
             environment: &[],
             streams: &handles[..2],
             transaction_id: 0x1306,
+            memory_budget_bytes: 16 << 20,
         },
     )
     .unwrap_err();
@@ -1591,6 +1596,7 @@ fn job_v2_selects_zero_or_three_stream_profile_and_retains_streams_on_failed_mov
             environment: &[],
             streams: &streams,
             transaction_id: 0x1302,
+            memory_budget_bytes: 16 << 20,
         },
     )
     .unwrap();
@@ -1613,7 +1619,10 @@ fn job_v2_selects_zero_or_three_stream_profile_and_retains_streams_on_failed_mov
     assert!(transfers[1..].iter().all(|transfer| {
         transfer.requested_rights == wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
     }));
-    assert_eq!(&platform.sent_init[6..8], &12_u16.to_le_bytes());
+    assert_eq!(&platform.sent_init[6..8], &14_u16.to_le_bytes());
+    // The budget follows the four capability records (DW2 §10.3 item 7).
+    assert_eq!(platform.sent_init.len(), 80);
+    assert_eq!(&platform.sent_init[72..80], &(16_u64 << 20).to_le_bytes());
     // The parent keeps no handle to the child's root once INIT moved it.
     assert!(
         !platform
@@ -1632,6 +1641,7 @@ fn job_v2_selects_zero_or_three_stream_profile_and_retains_streams_on_failed_mov
             environment: &[],
             streams: &[],
             transaction_id: 0x1304,
+            memory_budget_bytes: 16 << 20,
         },
     )
     .unwrap();
@@ -1652,6 +1662,7 @@ fn job_v2_selects_zero_or_three_stream_profile_and_retains_streams_on_failed_mov
             environment: &[],
             streams: &streams,
             transaction_id: 0x1303,
+            memory_budget_bytes: 16 << 20,
         },
     )
     .unwrap_err();
@@ -1686,6 +1697,7 @@ fn job_images_are_bounded_to_the_kernel_budget_of_load_segments() {
                 environment: &[],
                 streams: &[],
                 transaction_id: 0x1330,
+                memory_budget_bytes: 16 << 20,
             },
         );
         (
@@ -1724,6 +1736,7 @@ fn job_load_reports_stream_ownership_after_successful_init_move() {
             environment: &[],
             streams: &streams,
             transaction_id: 0x1320,
+            memory_budget_bytes: 16 << 20,
         },
     )
     .expect_err("post-INIT cleanup must report transferred stream ownership");

@@ -288,7 +288,7 @@ const REPLACEMENT_GENERATIONS: usize = 1;
 /// `MAX_SHELL_JOBS`.
 const LIVE_SHELL_JOBS: usize = 4;
 /// The wait items, MemoryObjects and Channel pairs one job may create itself
-/// (init's `JOB_TASK_GROUP_LIMITS`): a small wait-many, `mmap` objects whose
+/// (init's `job_task_group_limits`): a small wait-many, `mmap` objects whose
 /// RAM the MEMORY_PAGES limit bounds, and a sleeping pair plus one per open
 /// file.
 const JOB_OWN_WAITS: usize = 4;
@@ -296,11 +296,14 @@ const JOB_OWN_MEMORY_OBJECTS: usize = 64;
 const JOB_OWN_CHANNEL_PAIRS: usize = 5;
 /// Init holds each live job's Process, TaskGroup and launch Channel.
 const JOB_HELD_HANDLES: usize = 3;
+/// Init holds the jobs group for the whole boot (DW2 §10.3 item 7).
+const JOBS_GROUP_HANDLES: usize = 1;
 
 const LIVE_PROCESSES: usize = RESIDENT_IMAGES + REPLACEMENT_GENERATIONS + LIVE_SHELL_JOBS;
-/// The bootstrap root, the long-lived resource domain, and the driver-attempt
-/// group, a domain sibling because the driver outlives a devmgr generation.
-const STRUCTURAL_TASK_GROUPS: usize = 3;
+/// The bootstrap root, the long-lived resource domain, the driver-attempt
+/// group, a domain sibling because the driver outlives a devmgr generation,
+/// and the jobs group every job's group sits under (DW2 §10.3 item 7).
+const STRUCTURAL_TASK_GROUPS: usize = 4;
 const LIVE_TASK_GROUPS: usize = LIVE_PROCESSES + STRUCTURAL_TASK_GROUPS;
 /// Process, Thread, address space and TaskGroup share one identity pool, so
 /// the peak is the larger live count. Primordial has retired by then.
@@ -322,6 +325,7 @@ const HANDLE_PEAK: usize = INIT_BASELINE_HANDLES
     + IMAGE_LAUNCH_HANDLES
     + REQUEST_RECEIVE_HANDLES
     + REPLACEMENT_STAGING_HANDLES
+    + JOBS_GROUP_HANDLES
     + LIVE_SHELL_JOBS * JOB_HELD_HANDLES;
 const MEMORY_PEAK: usize = BASELINE_MEMORY
     + REPLACEMENT_GENERATIONS * RESIDENT_IMAGE_OBJECTS
@@ -417,12 +421,12 @@ mod tests {
     fn the_product_s_peaks_are_the_documented_arithmetic() {
         let demand = Demand::PRODUCT;
         assert_eq!(INIT_BASELINE_HANDLES, 47);
-        assert_eq!(demand.handles, 83);
-        assert_eq!(demand.identities, 21);
+        assert_eq!(demand.handles, 84);
+        assert_eq!(demand.identities, 22);
         assert_eq!(demand.memory_objects, 321);
         assert_eq!(demand.mapping_peak(64), 309);
         assert_eq!(CHANNEL_PAIR_PEAK, 92);
-        assert_eq!(demand.registry_objects, 586);
+        assert_eq!(demand.registry_objects, 587);
         assert_eq!(STORAGE_WAITS, 55);
         assert_eq!(demand.wait_registrations, 144);
     }
@@ -445,7 +449,7 @@ mod tests {
         assert_eq!(
             shortfalls(&pools, &Demand::PRODUCT),
             vec![
-                "handles_per_process: 83 > 82".to_owned(),
+                "handles_per_process: 84 > 82".to_owned(),
                 "wait_registrations: 144 > 4".to_owned(),
             ]
         );

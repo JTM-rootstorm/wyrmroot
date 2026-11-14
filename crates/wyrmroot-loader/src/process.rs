@@ -87,6 +87,9 @@ pub struct JobLoadRequest<'a> {
     /// stderr order.
     pub streams: &'a [DwHandle],
     pub transaction_id: u64,
+    /// The job's memory budget in bytes, which its INIT carries (DW2 §10.3
+    /// item 7): its TaskGroup's MEMORY_PAGES limit, set by the launcher.
+    pub memory_budget_bytes: u64,
 }
 
 /// WYR1-B bootstrap child request carrying one controller-issued endpoint.
@@ -260,6 +263,8 @@ pub(crate) struct InternalLoadRequest<'a> {
     consoled_correlation: Option<(u64, u64, u64, u64, u64)>,
     wyrmsh_correlation: Option<WyrmshCorrelation>,
     resource_domain: Option<DwHandle>,
+    /// Present exactly for the job profiles.
+    memory_budget_bytes: Option<u64>,
 }
 
 /// Explicitly selected, test-only corruption of one child-launch boundary.

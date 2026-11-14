@@ -47,12 +47,16 @@ pub(crate) const MAX_REPLY_BYTES: usize = {
     if wyrmroot_launch_proto::SHELL_V1_REPLY_BYTES > largest {
         largest = wyrmroot_launch_proto::SHELL_V1_REPLY_BYTES;
     }
+    if wyrmroot_launch_proto::MEMORY_BYTES > largest {
+        largest = wyrmroot_launch_proto::MEMORY_BYTES;
+    }
     largest
 };
 const _: () = assert!(
     JOB_REPLY_BYTES <= MAX_REPLY_BYTES
         && JOB_LIST_REPLY_BYTES <= MAX_REPLY_BYTES
         && wyrmroot_launch_proto::SHELL_V1_REPLY_BYTES <= MAX_REPLY_BYTES
+        && wyrmroot_launch_proto::MEMORY_BYTES <= MAX_REPLY_BYTES
         && MAX_REPLY_BYTES <= u16::MAX as usize
 );
 

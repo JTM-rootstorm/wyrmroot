@@ -741,6 +741,7 @@ fn request_kind(bytes: &[u8], handles: usize) -> LaunchMessageType {
         LaunchMessage::Cancel { .. } => LaunchMessageType::Cancel,
         LaunchMessage::CloseJob { .. } => LaunchMessageType::CloseJob,
         LaunchMessage::ListJobs => LaunchMessageType::ListJobs,
+        LaunchMessage::QueryMemory => LaunchMessageType::QueryMemory,
         _ => panic!("request kind"),
     }
 }
@@ -2925,4 +2926,78 @@ fn file_commands_end_their_node_with_close_before_closing_it() {
             .count(),
         1
     );
+}
+
+fn memory_reply(transaction: u64, report: wyrmroot_launch_proto::MemoryReport) -> Vec<u8> {
+    let mut bytes = [0_u8; wyrmroot_launch_proto::MEMORY_BYTES];
+    let size = wyrmroot_launch_proto::encode_memory(
+        Reservation {
+            connection_id: 5,
+            generation: 6,
+            transaction_id: transaction,
+        },
+        report,
+        &mut bytes,
+    )
+    .unwrap();
+    bytes[..size].to_vec()
+}
+
+/// `memory` asks init over the ShellJobs connection and prints the plan in
+/// KiB (DW2 §10.3 item 7); an ERROR is reported as unavailable and ends the
+/// shell, as for `tasks`.
+#[test]
+fn memory_prints_init_s_plan_and_live_usage_in_kib() {
+    use wyrmroot_launch_proto::{MemoryFallback, MemoryReport, MemorySource};
+    let mut fixture = Fixture::new(&[b"memory\nmemory\nmemory\nexit\n"]);
+    let capped = MemoryReport {
+        job_budget_pages: 131_072,
+        jobs_limit_pages: 400_000,
+        jobs_usage_pages: 9_000,
+        free_pages_at_plan: 500_000,
+        free_pages_now: 480_000,
+        reserve_pages: 65_536,
+        cap_pages: 131_072,
+        source: MemorySource::Capped,
+        fallback: MemoryFallback::None,
+    };
+    fixture.queue_control(SHELL_JOBS, &memory_reply(1, capped));
+    fixture.queue_control(
+        SHELL_JOBS,
+        &memory_reply(
+            2,
+            MemoryReport {
+                job_budget_pages: 4096,
+                jobs_limit_pages: 16_384,
+                source: MemorySource::Fallback,
+                fallback: MemoryFallback::ConfigMissing,
+                ..capped
+            },
+        ),
+    );
+    fixture.queue_control(SHELL_JOBS, &launch_error(3, LaunchErrorCode::Capacity));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Err(ShellError::InspectionProtocol)
+    );
+    let requests: Vec<_> = fixture
+        .control_requests
+        .iter()
+        .filter(|(channel, _)| *channel == SHELL_JOBS)
+        .map(|(_, bytes)| parse_launch_message(bytes, 0).unwrap().message)
+        .collect();
+    assert_eq!(requests, [LaunchMessage::QueryMemory; 3]);
+    let stdout = fixture.output(STDOUT);
+    let has =
+        |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
+    assert!(has(
+        &stdout,
+        b"memory source=capped fallback=none job-budget-kib=524288 jobs-limit-kib=1600000 \
+jobs-used-kib=36000 free-kib=1920000 plan-free-kib=2000000 reserve-kib=262144 cap-kib=524288\n"
+    ));
+    assert!(has(
+        &stdout,
+        b"memory source=fallback fallback=config-missing job-budget-kib=16384 jobs-limit-kib=65536"
+    ));
+    assert!(has(&fixture.output(STDERR), b"unavailable: "));
 }

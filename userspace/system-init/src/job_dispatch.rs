@@ -8,7 +8,7 @@ use deepwyrm_syscall::{DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_TASK_STATE_
 use wyrmroot_launch_proto::{
     ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchMessageType,
     Reservation as LaunchReservation, TerminationResult, encode_job_list, encode_job_message,
-    encode_job_result, encode_job_state, encode_shell_v1_accepted, encode_version,
+    encode_job_result, encode_job_state, encode_memory, encode_shell_v1_accepted, encode_version,
     parse_message as parse_launch_message, parse_reservation_prefix, parse_shell_v1_request,
     parse_shell_v1_reservation_prefix,
 };
@@ -168,6 +168,15 @@ where
         )
         .map(Some)
         .map_err(|_| JobError::WrongState),
+        // The jobs' memory plan and live usage (WRLJ 3, DW2 §10.3 item 7).
+        LaunchMessage::QueryMemory => {
+            let report = jobs
+                .memory
+                .report(&mut crate::job_memory::InitJobGroups(system));
+            encode_memory(reservation, report, &mut response)
+                .map(Some)
+                .map_err(|_| JobError::WrongState)
+        }
         _ => Err(JobError::WrongState),
     };
     match result {

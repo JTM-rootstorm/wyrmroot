@@ -122,8 +122,8 @@ rights before use.
 | `BootstrapService` | self root; publication-authority Channel |
 | `RegistryClient` | self root; registry-client Channel |
 | `LaunchClient` | self root; launch-session Channel |
-| `JobV2` | self root; then zero or exactly three stream Channels in stdin, stdout, stderr order (WRLP 1.12, below) |
-| `JobV2Namespace` | self root; the three stream Channels; then one namespace Channel (WRLP 1.13, below) |
+| `JobV2` | self root; then zero or exactly three stream Channels in stdin, stdout, stderr order; then the memory budget (WRLP 1.14, below) |
+| `JobV2Namespace` | self root; the three stream Channels; then one namespace Channel; then the memory budget (WRLP 1.15, below) |
 
 Jobs moved to WRLP minor `12` on 2026-11-11 (root
 `TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W1): a job's INIT names its own
@@ -144,8 +144,16 @@ out of `system.vfs`. `vfsd` serves `SYSTEM_VFS_MAX_CLIENTS` (16,
 `wyrmroot-service-proto`), and init fails to build unless its
 `MAX_SHELL_JOBS` (4, orphans included) is at most half of that. Its working directory is not a
 startup role: a POSIX program takes it from its `PWD` environment entry and
-starts at `/` without one. Bootfs launches keep WRLP 1.12 and receive no
-namespace.
+starts at `/` without one. Bootfs launches receive no namespace.
+
+Jobs moved to WRLP minors `14` (`JobV2`, from 12) and `15`
+(`JobV2Namespace`, from 13) on 2026-11-14 (Deepwyrm
+`DW2_LARGE_MEMORY_PLAN.md` §10.3 item 7). After its role descriptors a
+job's INIT carries one `u64`: its memory budget in bytes, nonzero and a
+multiple of 4096, which is its TaskGroup's `MEMORY_PAGES` limit. The field
+grants nothing (the kernel enforces the limit); it tells the job's runtime
+how much it may reserve. A zero or partial-page budget is malformed. Minors
+12 and 13 are no longer accepted.
 
 The WRRM v1 startup-profile field truthfully encodes `BootstrapRegistry` as
 wire value `2`. WYR1-A manifests continue to encode `EarlyBootStub` as `1`;
@@ -570,8 +578,24 @@ Every complete message appends an eight-byte prefix: `type: u32` and zero
 | 14 | `CLOSED` |
 | 15 | `ERROR` |
 | 17 | `LAUNCH_IMAGE` |
+| 18 | `QUERY_VERSION` (minor 2) |
+| 19 | `VERSION` (minor 2) |
+| 20 | `QUERY_MEMORY` (minor 3) |
+| 21 | `MEMORY` (minor 3) |
 
 Type 16 is `LAUNCH_SHELL_V1` under minor `1` (`WYR1_E_WYRMSH_CONTRACT.md`).
+
+`QUERY_MEMORY` (2026-11-14, Deepwyrm `DW2_LARGE_MEMORY_PLAN.md` §10.3
+item 7) has no body and moves no handle. Its answer `MEMORY` reports init's
+plan for the jobs' memory, made once per boot, and two live reads, in 4 KiB
+pages: at 48 each job's budget, 56 the jobs group's limit, 64 the jobs
+group's usage now, 72 the free frames when the plan was made, 80 the free
+frames now, 88 the residents' reserve, 96 the product's cap (zero for
+none); at 104 a `u32` source (1 computed, 2 capped, 3 fallback) and at 108
+a `u32` fallback cause (0 none, 1 topic unreadable, 2 no free count, 3
+config missing, 4 config malformed, 5 free not above the reserve, 6 jobs
+group). A cause is nonzero exactly when the source is fallback. A live read
+that fails reports zero. The shell's `memory` command prints it.
 
 ### 9.1 Launch body
 
@@ -598,7 +622,7 @@ fails before loader construction.
 `LAUNCH_IMAGE` (root `STORAGE_PLAN.md` W6) has the `LAUNCH` body with
 exactly three stream roles and moves five handles: the three streams, a WRFS
 file Channel holding the executable, and a WRNS namespace Channel for the job
-(WRLP 1.13, §4), each with `READ | WRITE | WAIT | INSPECT | TRANSFER`. Any
+(WRLP 1.15, §4), each with `READ | WRITE | WAIT | INSPECT | TRANSFER`. Any
 other handle count is malformed. Init reads the image through the file Channel
 and closes it; the job is built from those bytes without a launch-policy
 identity, and its path is the file's display path without the leading slash.

@@ -603,6 +603,7 @@ const fn launch_error_code(error: LaunchError) -> u32 {
         LaunchError::HandleMetadata { index } => 0x200 | bounded_index(index),
         LaunchError::ProfileSpecificEncoderRequired => 0x300,
         LaunchError::UnsupportedExecutionMode(_) => 12,
+        LaunchError::BadMemoryBudget => 13,
     }
 }
 
@@ -702,6 +703,7 @@ const fn native_output_code(output: wyrmroot_runtime::NativeOutputError) -> u32 
         NativeOutputError::InvalidTaskTerminationInfo => 7,
         NativeOutputError::DeadlineOverflow => 8,
         NativeOutputError::AbiFingerprintMismatch => 9,
+        NativeOutputError::InvalidTaskGroupMemoryInfo => 10,
     }
 }
 

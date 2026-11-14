@@ -567,7 +567,93 @@ fn every_job_message() -> Vec<(Vec<u8>, usize)> {
         },
         0,
     );
+    push(&|out| encode_query_memory(R, out), 0);
+    push(&|out| encode_memory(R, REPORT, out), 0);
     all
+}
+
+const REPORT: MemoryReport = MemoryReport {
+    job_budget_pages: 131_072,
+    jobs_limit_pages: 434_000,
+    jobs_usage_pages: 9_000,
+    free_pages_at_plan: 500_000,
+    free_pages_now: 490_000,
+    reserve_pages: 65_536,
+    cap_pages: 131_072,
+    source: MemorySource::Capped,
+    fallback: MemoryFallback::None,
+};
+
+#[test]
+fn the_memory_query_round_trips_and_exists_only_from_minor_three() {
+    let mut bytes = [0u8; 128];
+    let size = encode_query_memory(R, &mut bytes).unwrap();
+    assert_eq!(size, HEADER_BYTES);
+    assert_eq!(
+        parse_message(&bytes[..size], 0).unwrap().message,
+        Message::QueryMemory
+    );
+    assert_eq!(
+        parse_message(&in_minor(&bytes[..size], 2, &[]), 0),
+        Err(Error::UnknownMessageType)
+    );
+    assert_eq!(
+        parse_message(&bytes[..size], 1),
+        Err(Error::WrongHandleCount)
+    );
+
+    let size = encode_memory(R, REPORT, &mut bytes).unwrap();
+    assert_eq!(size, MEMORY_BYTES);
+    let good = bytes[..size].to_vec();
+    assert_eq!(
+        parse_message(&good, 0).unwrap().message,
+        Message::Memory(REPORT)
+    );
+    assert_eq!(
+        parse_message(&in_minor(&good, 2, &[]), 0),
+        Err(Error::UnknownMessageType)
+    );
+    assert_eq!(parse_message(&good[..size - 1], 0), Err(Error::WrongSize));
+    let patched = |offset: usize, value: u32| {
+        let mut bytes = good.clone();
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        parse_message(&bytes, 0).map(|_| ())
+    };
+    // Unknown source or cause, and a cause that does not match the source.
+    assert_eq!(patched(104, 0), Err(Error::InvalidMemoryReport));
+    assert_eq!(patched(104, 4), Err(Error::InvalidMemoryReport));
+    assert_eq!(patched(108, 7), Err(Error::InvalidMemoryReport));
+    assert_eq!(patched(108, 3), Err(Error::InvalidMemoryReport));
+    assert_eq!(patched(104, 3), Err(Error::InvalidMemoryReport));
+    let fallback = MemoryReport {
+        source: MemorySource::Fallback,
+        fallback: MemoryFallback::ConfigMissing,
+        ..REPORT
+    };
+    let size = encode_memory(R, fallback, &mut bytes).unwrap();
+    assert_eq!(
+        parse_message(&bytes[..size], 0).unwrap().message,
+        Message::Memory(fallback)
+    );
+    for mismatched in [
+        MemoryReport {
+            fallback: MemoryFallback::None,
+            ..fallback
+        },
+        MemoryReport {
+            fallback: MemoryFallback::JobsGroup,
+            ..REPORT
+        },
+    ] {
+        assert_eq!(
+            encode_memory(R, mismatched, &mut bytes),
+            Err(Error::InvalidMemoryReport)
+        );
+    }
+    assert_eq!(
+        encode_memory(R, REPORT, &mut bytes[..MEMORY_BYTES - 1]),
+        Err(Error::WrongSize)
+    );
 }
 
 #[test]
@@ -584,7 +670,9 @@ fn every_message_is_sent_in_the_oldest_minor_with_its_layout() {
     assert_eq!(minor_of(&bytes[..size]), 0);
     let size = encode_query_version(R, &mut bytes).unwrap();
     assert_eq!(minor_of(&bytes[..size]), VERSION_QUERY_MINOR);
-    assert_eq!(MINOR, VERSION_QUERY_MINOR);
+    let size = encode_query_memory(R, &mut bytes).unwrap();
+    assert_eq!(minor_of(&bytes[..size]), MEMORY_QUERY_MINOR);
+    assert_eq!(MINOR, MEMORY_QUERY_MINOR);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! The shell's inspection commands: services, tasks and status.
+//! The shell's inspection commands: services, tasks, status and memory.
 
 use super::*;
 
@@ -500,6 +500,99 @@ pub(crate) fn inspect_status<System: WyrmshSystem>(
         snapshot.last_failure as u64,
     )?;
     write_stdout(system, stdout, stderr.endpoint().handle(), controls, b"\n")
+}
+
+/// `memory`: init's plan for the jobs' memory and what the jobs group and
+/// the machine hold now (WRLJ 3, DW2 §10.3 item 7), in KiB.
+pub(crate) fn inspect_memory<System: WyrmshSystem>(
+    system: &mut System,
+    stdout: &mut NativeOutput,
+    stderr: &mut NativeOutput,
+    identity: ShellIdentity,
+    controls: Controls,
+    transactions: &mut TransactionIds,
+) -> Result<(), ShellError> {
+    let transaction = match transactions.launch() {
+        Ok(value) => value,
+        Err(error) => return inspection_failure(system, stderr, stdout, controls, "memory", error),
+    };
+    let mut request = [0_u8; wyrmroot_launch_proto::HEADER_BYTES];
+    let size = inspection::encode_memory_request(identity, transaction, &mut request)
+        .map_err(|_| ShellError::InspectionProtocol)?;
+    let deadline = control_deadline(system)?;
+    if let Err(error) = send_control(
+        system,
+        controls.shell_jobs,
+        EndpointRole::ShellJobs,
+        controls,
+        stdout.endpoint().handle(),
+        stderr.endpoint().handle(),
+        &request[..size],
+        deadline,
+    ) {
+        return control_transport_failure(system, stderr, stdout, controls, "memory", error);
+    }
+    let mut response = [0_u8; JOB_REPLY_BYTES];
+    let used = match receive_control(
+        system,
+        controls.shell_jobs,
+        EndpointRole::ShellJobs,
+        controls,
+        stdout.endpoint().handle(),
+        stderr.endpoint().handle(),
+        &mut response,
+        deadline,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return control_transport_failure(system, stderr, stdout, controls, "memory", error);
+        }
+    };
+    let report = match inspection::decode_memory(identity, transaction, &response[..used], 0) {
+        Ok(value) => value,
+        Err(error) => return inspection_failure(system, stderr, stdout, controls, "memory", error),
+    };
+    if let Err(error) = ensure_before_control_deadline(system, deadline) {
+        return control_transport_failure(system, stderr, stdout, controls, "memory", error);
+    }
+    let source: &[u8] = match report.source {
+        wyrmroot_launch_proto::MemorySource::Computed => b"computed",
+        wyrmroot_launch_proto::MemorySource::Capped => b"capped",
+        wyrmroot_launch_proto::MemorySource::Fallback => b"fallback",
+    };
+    let fallback: &[u8] = match report.fallback {
+        wyrmroot_launch_proto::MemoryFallback::None => b"none",
+        wyrmroot_launch_proto::MemoryFallback::TopicUnreadable => b"topic-unreadable",
+        wyrmroot_launch_proto::MemoryFallback::NoFreeCount => b"no-free-count",
+        wyrmroot_launch_proto::MemoryFallback::ConfigMissing => b"config-missing",
+        wyrmroot_launch_proto::MemoryFallback::ConfigMalformed => b"config-malformed",
+        wyrmroot_launch_proto::MemoryFallback::FreeNotAboveReserve => b"free-not-above-reserve",
+        wyrmroot_launch_proto::MemoryFallback::JobsGroup => b"jobs-group",
+    };
+    let stderr_handle = stderr.endpoint().handle();
+    write_stdout(system, stdout, stderr_handle, controls, b"memory source=")?;
+    write_stdout(system, stdout, stderr_handle, controls, source)?;
+    write_stdout(system, stdout, stderr_handle, controls, b" fallback=")?;
+    write_stdout(system, stdout, stderr_handle, controls, fallback)?;
+    for (label, pages) in [
+        (&b" job-budget-kib="[..], report.job_budget_pages),
+        (b" jobs-limit-kib=", report.jobs_limit_pages),
+        (b" jobs-used-kib=", report.jobs_usage_pages),
+        (b" free-kib=", report.free_pages_now),
+        (b" plan-free-kib=", report.free_pages_at_plan),
+        (b" reserve-kib=", report.reserve_pages),
+        (b" cap-kib=", report.cap_pages),
+    ] {
+        write_stdout(system, stdout, stderr_handle, controls, label)?;
+        write_u64(
+            system,
+            stdout,
+            stderr_handle,
+            controls,
+            pages.saturating_mul(4),
+        )?;
+    }
+    write_stdout(system, stdout, stderr_handle, controls, b"\n")
 }
 
 pub(crate) fn inspection_failure<System: WyrmshSystem>(

@@ -126,9 +126,14 @@ pub(crate) fn reconcile_job_dispatcher_outcome(
 }
 
 impl ConsoleState {
-    pub(super) fn new(registry_generation: u64) -> Result<Self, InitError> {
+    pub(super) fn new(
+        registry_generation: u64,
+        memory: crate::job_memory::JobMemory,
+    ) -> Result<Self, InitError> {
+        let mut jobs = JobDispatcher::new();
+        jobs.memory = memory;
         Ok(Self {
-            jobs: JobDispatcher::new(),
+            jobs,
             console: None,
             shell: ShellControllerState::new(registry_generation)?,
             publication_observer: None,

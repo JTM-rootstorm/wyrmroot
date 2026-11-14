@@ -129,6 +129,9 @@ pub enum BuildError {
     /// An admitted payload's identity was zero or did not match its policy
     /// record.
     PayloadIdentityMismatch,
+    /// The platform configuration could not be encoded (a byte count that
+    /// is not a whole number of pages).
+    InvalidPlatformConfig,
 }
 
 /// The only regular-file metadata forms permitted in a WYR0 bootfs archive.

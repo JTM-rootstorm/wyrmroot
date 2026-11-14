@@ -40,6 +40,7 @@ use wyrmroot_bootfs::{
         WYRMSH_PROFILE_ID, encode as encode_policy,
     },
     paths::{BLOCKMGR_PATH, EXT4D_PATH, FAT32D_PATH, VFSD_PATH},
+    platform_config::PlatformConfig,
     product::{Product, ServiceArtifact, build as build_bootfs},
 };
 use wyrmroot_device_proto::manifest::{
@@ -190,13 +191,30 @@ pub(crate) const SDK_FILES: [(&str, [u8; 11]); 6] = [
 /// The largest SDK file the ESP takes; init reads at most 8 MiB.
 const MAX_SDK_PROGRAM_BYTES: u64 = 8 << 20;
 
+/// The platform configuration `xtask product` writes: no cap on a job's
+/// budget and init's default resident reserve (DW2 §10.3 item 6).
+pub(crate) const PRODUCT_PLATFORM: PlatformConfig = PlatformConfig {
+    job_memory_bytes_max: 0,
+    resident_reserve_bytes: 0,
+};
+
+/// The platform configuration dev-boot's product writes: a 512 MiB cap on a
+/// job's budget, below what a 2 GiB guest would otherwise give, so the
+/// guest proof sees the cap bind (DW2 §10.5 item 16), and the default
+/// reserve.
+pub(crate) const DEV_BOOT_PLATFORM: PlatformConfig = PlatformConfig {
+    job_memory_bytes_max: 512 << 20,
+    resident_reserve_bytes: 0,
+};
+
 /// Builds the product into `output`. With `sdk`, a built Wyrmroot SDK
 /// (`wyrmroot-sdk/out`), its [`SDK_FILES`] go on the ESP for dev-boot to
-/// run.
+/// run. `platform` is written to bootfs as the platform configuration.
 pub(crate) fn build(
     output: &Path,
     deep_repository: &Path,
     sdk: Option<&Path>,
+    platform: PlatformConfig,
 ) -> Result<(), Failure> {
     let repository = tasks::repository_root()?;
     let project = tasks::canonical_project_root(&repository)?;
@@ -276,7 +294,7 @@ pub(crate) fn build(
         for (label, bytes) in &natives {
             require_abi_note(label, bytes)?;
         }
-        let assembled = assemble(&natives)?;
+        let assembled = assemble(&natives, platform)?;
         let kernel = build_kernel(&deep_repository, assembled.bootfs.len().div_ceil(4096))?;
 
         fs::create_dir(output)
@@ -503,7 +521,10 @@ struct Assembled {
 }
 
 /// Assembles the bootfs and the three manifests it carries.
-fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
+fn assemble(
+    natives: &BTreeMap<&str, Vec<u8>>,
+    platform: PlatformConfig,
+) -> Result<Assembled, Failure> {
     let identity = |label: &str| sha256::bytes_digest_array(&natives[label]);
     let role_hashes = [
         identity("registryd"),
@@ -602,6 +623,7 @@ fn assemble(natives: &BTreeMap<&str, Vec<u8>>) -> Result<Assembled, Failure> {
         rrc_manifest: &rrc_manifest,
         device_manifest: &device_manifest,
         launch_policy: &launch_policy,
+        platform,
         uart16550d_identity: role_hashes[2],
         virtio_blkd_identity: block_identity,
         wyrmsh_identity: role_hashes[4],

@@ -3,7 +3,7 @@
 //!
 //! The shell opens the file through vfsd and moves its WRFS Channel to init
 //! with a three-stream LAUNCH_IMAGE, followed by a WRNS connection to vfsd
-//! that init passes to the job untouched as its namespace (WRLP 1.13, root
+//! that init passes to the job untouched as its namespace (WRLP 1.15, root
 //! `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W5). Init never uses the namespace. Init
 //! reads the whole file, at most [`MAX_IMAGE_BYTES`] and within
 //! [`IMAGE_READ_TIMEOUT_NS`], into private memory no other process can reach,

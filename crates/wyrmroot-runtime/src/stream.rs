@@ -9,7 +9,7 @@ use deepwyrm_syscall::{
     DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_PEER_CLOSED,
     DW_STATUS_WOULD_BLOCK, DwHandle, DwReceivedHandleInfoV1, DwRights, DwSignals,
 };
-use wyrmroot_loader::launch::{CHILD_CHANNEL_RIGHTS, LaunchError, LaunchProfile, parse_init};
+use wyrmroot_loader::launch::{CHILD_CHANNEL_RIGHTS, LaunchError, LaunchProfile, parse_job_init};
 use wyrmroot_stream_proto::{MAX_PAYLOAD_BYTES, MAX_RECORD_BYTES, decode_data, encode_data};
 
 use crate::{NativeError, ReceiveCounts};
@@ -68,8 +68,8 @@ impl StreamEndpoint {
 }
 
 /// The job's self root and the exact stdin, stdout, stderr tuple
-/// transferred by JobV2Streams (WRLP 1.12), with the namespace a job
-/// launched from a file also receives (JobV2Namespace, WRLP 1.13).
+/// transferred by JobV2Streams (WRLP 1.14), with the namespace a job
+/// launched from a file also receives (JobV2Namespace, WRLP 1.15).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobV2Streams {
     /// The profile INIT was validated against; READY must use the same one.
@@ -83,6 +83,8 @@ pub struct JobV2Streams {
     /// A WRNS namespace Channel, present only under JobV2Namespace. A job
     /// that opens no paths closes it.
     pub namespace: Option<DwHandle>,
+    /// The job's memory budget in bytes, from its INIT (DW2 §10.3 item 7).
+    pub memory_budget_bytes: u64,
 }
 
 /// Validates the reached JobV2 stream-role record before exposing handles.
@@ -97,7 +99,7 @@ pub fn extract_job_v2_streams(
         5 => LaunchProfile::JobV2Namespace,
         _ => return Err(LaunchError::HandleCount),
     };
-    parse_init(profile, bytes, handles)?;
+    let init = parse_job_init(profile, bytes, handles)?;
     Ok(JobV2Streams {
         profile,
         self_root: handles[0].handle,
@@ -105,6 +107,7 @@ pub fn extract_job_v2_streams(
         stdout: StreamEndpoint(handles[2].handle),
         stderr: StreamEndpoint(handles[3].handle),
         namespace: handles.get(4).map(|info| info.handle),
+        memory_budget_bytes: init.memory_budget_bytes,
     })
 }
 

@@ -75,31 +75,37 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
         .flatten();
     let exhaust = mode == Some("on-demand-exhaust");
     let mut last_touch = None;
-    let mut probe = |region: DwHandle| on_demand::probe(region, exhaust, &mut last_touch);
-    let probe: Option<&mut dyn FnMut(DwHandle) -> &'static [u8]> = match mode {
+    let mut probe =
+        |region: DwHandle, budget: u64| on_demand::probe(region, budget, exhaust, &mut last_touch);
+    let probe: Option<&mut dyn FnMut(DwHandle, u64) -> &'static [u8]> = match mode {
         Some("on-demand" | "on-demand-exhaust") => Some(&mut probe),
         _ => None,
     };
     let status = run_stream_hello_with(&mut system, startup.bootstrap_channel().as_abi(), probe)
         .map_or_else(|error| error.exit_code(), |_| 0);
-    // The exhausting touch comes once the job is running, not during its
-    // launch, so it ends a job and init reports its termination.
-    if let Some(address) = last_touch {
-        on_demand::touch(address);
-        return 1;
+    // Spending the quota and the touch past it come once the job is
+    // running, not during its launch: committing a whole budget takes longer
+    // than init waits for READY, and the touch must end a job, not a launch.
+    if let Some(exhaust) = last_touch {
+        if status != 0 {
+            return status;
+        }
+        return on_demand::exhaust(exhaust);
     }
     status
 }
 
 /// `run bin/hello on-demand`: exercises an on-demand MemoryObject end to
 /// end in a real job (Deepwyrm DW2 M6 §8.7 step 5). It creates and maps a
-/// 64 MiB object, larger than the job's whole page budget, touches pages
-/// across it (each a served page fault), reads untouched ones as zero, has
-/// a syscall write into a page never touched (the fill-in phase), and
-/// commits a page. With `on-demand-exhaust` it then spends the job's page
-/// quota, and the job touches one more page once it is running, which ends
-/// it with `DW_TERMINATION_RESOURCE_POLICY`. The line it returns names the
-/// first step that failed.
+/// 64 MiB object, touches pages across it (each a served page fault), reads
+/// untouched ones as zero, has a syscall write into a page never touched
+/// (the fill-in phase), and commits a page. All of that runs before READY,
+/// so it stays small. With `on-demand-exhaust`, once the job is running and
+/// has written its line, it commits a second object four times its memory
+/// budget (from its INIT, DW2 M5), which stops at the quota, and touches an
+/// untouched page of the first, which ends it with
+/// `DW_TERMINATION_RESOURCE_POLICY`. The line it returns names the first
+/// step that failed.
 #[allow(
     unsafe_code,
     reason = "reads and writes the probe's own fresh mapping through raw pointers"
@@ -115,6 +121,7 @@ mod on_demand {
     };
 
     const MIB: u64 = 1 << 20;
+    /// The mapped object's size, which the fixed offsets below fit in.
     const SIZE: u64 = 64 * MIB;
     const MARK: u64 = 0x4f4e_2d44_454d_414e;
 
@@ -129,20 +136,55 @@ mod on_demand {
     }
 
     /// Writes one word of the probe's mapping.
-    pub(super) fn touch(address: u64) {
+    fn touch(address: u64) {
         write(address, MARK);
+    }
+
+    /// What `on-demand-exhaust` needs after READY: the job's budget and the
+    /// probe's mapping, left in place.
+    #[derive(Clone, Copy)]
+    pub(super) struct Exhaust {
+        base: u64,
+        budget: u64,
+    }
+
+    /// Commits a new object four times the job's budget, so the commit stops
+    /// at the quota with `NO_RESOURCES`; then touches an untouched page of
+    /// the probe's mapping, which ends the job. Exit status 2 if the object
+    /// could not be made or the commit was not refused.
+    pub(super) fn exhaust(exhaust: Exhaust) -> u32 {
+        let Some(size) = exhaust.budget.checked_mul(4) else {
+            return 2;
+        };
+        let mut object = DwHandle(0);
+        if deepwyrm_syscall::memory_object_create(
+            DwSize(size),
+            DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND,
+            // Commit needs MAP.
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0),
+            &mut object,
+        ) != DW_STATUS_SUCCESS
+            || deepwyrm_syscall::memory_object_commit(object, DwOffset(0), DwSize(size))
+                != DW_STATUS_NO_RESOURCES
+        {
+            return 2;
+        }
+        touch(exhaust.base + 50 * MIB);
+        1
     }
 
     pub(super) fn probe(
         region: DwHandle,
+        budget: u64,
         exhaust: bool,
-        last_touch: &mut Option<u64>,
+        last_touch: &mut Option<Exhaust>,
     ) -> &'static [u8] {
+        let size = SIZE;
         let mut object = DwHandle(0);
         let rights =
             DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0);
         if deepwyrm_syscall::memory_object_create(
-            DwSize(SIZE),
+            DwSize(size),
             DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND,
             rights,
             &mut object,
@@ -155,7 +197,7 @@ mod on_demand {
         if deepwyrm_syscall::object_get_memory_object_info_v1(object, &mut info, &mut required)
             != DW_STATUS_SUCCESS
             || info.flags != DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND
-            || info.byte_size != SIZE
+            || info.byte_size != size
         {
             return b"on-demand failed: info\n";
         }
@@ -163,7 +205,7 @@ mod on_demand {
             size: DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE,
             version: DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
             memory_object_offset: DwOffset(0),
-            byte_len: DwSize(SIZE),
+            byte_len: DwSize(size),
             protections: DwMemoryProtection(
                 DW_MEMORY_PROTECTION_READ.0 | DW_MEMORY_PROTECTION_WRITE.0,
             ),
@@ -180,9 +222,9 @@ mod on_demand {
             return b"on-demand failed: first read\n";
         }
         write(base + 40 * MIB + 8, MARK);
-        write(base + SIZE - 8, !MARK);
+        write(base + size - 8, !MARK);
         if read(base + 40 * MIB + 8) != MARK
-            || read(base + SIZE - 8) != !MARK
+            || read(base + size - 8) != !MARK
             || read(base + 40 * MIB + 4096) != 0
             || read(base + 8) != 0
         {
@@ -233,18 +275,10 @@ mod on_demand {
             return b"on-demand failed: read fill-in\n";
         }
         if exhaust {
-            // The whole object is four times the job's page budget.
-            if deepwyrm_syscall::memory_object_commit(object, DwOffset(0), DwSize(SIZE))
-                != DW_STATUS_NO_RESOURCES
-            {
-                return b"on-demand failed: commit past the quota\n";
-            }
-            // Untouched and past what the commit reached: the caller's
-            // touch of it ends the job.
-            *last_touch = Some(base + 50 * MIB);
-            return b"on-demand quota spent\n";
+            *last_touch = Some(Exhaust { base, budget });
+            return b"on-demand quota next\n";
         }
-        if deepwyrm_syscall::address_region_unmap(region, at, DwSize(SIZE)) != DW_STATUS_SUCCESS
+        if deepwyrm_syscall::address_region_unmap(region, at, DwSize(size)) != DW_STATUS_SUCCESS
             || deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS
         {
             return b"on-demand failed: teardown\n";

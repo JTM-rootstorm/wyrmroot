@@ -559,20 +559,20 @@ fn wyr1_b_profiles_are_exact_wrlp_1_3_shapes() {
     }
 }
 
-/// Root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W1: WRLP 1.12 jobs receive their
+/// Root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W1: jobs (WRLP 1.14) receive their
 /// self root ahead of any stream roles, and nothing else may stand in for it.
 #[test]
-fn jobs_receive_their_self_root_first_under_wrlp_1_12() {
+fn jobs_receive_their_self_root_first() {
     let root = received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS);
-    let mut no_streams = [0xaa; HEADER_BYTES + 8];
-    launch::encode_init(LaunchProfile::JobV2, 0x1301, &mut no_streams).unwrap();
+    let mut no_streams = [0xaa; HEADER_BYTES + 16];
+    launch::encode_job_init(LaunchProfile::JobV2, 0x1301, 4096, &mut no_streams).unwrap();
     assert_eq!(
         (
             get16(&no_streams, 6),
             get32(&no_streams, 16),
             get32(&no_streams, 20)
         ),
-        (12, 48, 1)
+        (14, 56, 1)
     );
     assert_eq!(get32(&no_streams, 40), 1);
     assert!(launch::parse_init(LaunchProfile::JobV2, &no_streams, &[root]).is_ok());
@@ -581,9 +581,9 @@ fn jobs_receive_their_self_root_first_under_wrlp_1_12() {
         Err(LaunchError::HandleCount)
     );
 
-    let mut streams = [0xaa; HEADER_BYTES + 32];
-    launch::encode_init(LaunchProfile::JobV2Streams, 0x1302, &mut streams).unwrap();
-    assert_eq!((get16(&streams, 6), get32(&streams, 20)), (12, 4));
+    let mut streams = [0xaa; HEADER_BYTES + 40];
+    launch::encode_job_init(LaunchProfile::JobV2Streams, 0x1302, 4096, &mut streams).unwrap();
+    assert_eq!((get16(&streams, 6), get32(&streams, 20)), (14, 4));
     assert_eq!(
         [
             get32(&streams, 40),
@@ -609,30 +609,33 @@ fn jobs_receive_their_self_root_first_under_wrlp_1_12() {
         launch::parse_init(LaunchProfile::JobV2Streams, &streams, &wide),
         Err(LaunchError::HandleMetadata { index: 0 })
     );
-    // The WRLP 1.3 job shape is no longer accepted.
-    let mut old = streams;
-    old[6..8].copy_from_slice(&3u16.to_le_bytes());
-    assert_eq!(
-        launch::parse_init(LaunchProfile::JobV2Streams, &old, &handles),
-        Err(LaunchError::BadVersion)
-    );
+    // The WRLP 1.3 and 1.12 job shapes are no longer accepted.
+    for minor in [3u16, 12] {
+        let mut old = streams;
+        old[6..8].copy_from_slice(&minor.to_le_bytes());
+        assert_eq!(
+            launch::parse_init(LaunchProfile::JobV2Streams, &old, &handles),
+            Err(LaunchError::BadVersion)
+        );
+    }
 }
 
 /// Root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W5: a job launched from a file
-/// receives a namespace Channel after its streams, under WRLP 1.13, and the
-/// stream-only shape cannot stand in for it.
+/// receives a namespace Channel after its streams, under WRLP 1.15 (1.13
+/// before the memory budget), and the stream-only shape cannot stand in for
+/// it.
 #[test]
-fn file_jobs_receive_a_namespace_after_their_streams_under_wrlp_1_13() {
+fn file_jobs_receive_a_namespace_after_their_streams() {
     let root = received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS);
     let channel = |id| received(id, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS);
-    let mut init = [0xaa; HEADER_BYTES + 40];
+    let mut init = [0xaa; HEADER_BYTES + 48];
     assert_eq!(
-        launch::encode_init(LaunchProfile::JobV2Namespace, 0x1303, &mut init),
-        Ok(HEADER_BYTES + 40)
+        launch::encode_job_init(LaunchProfile::JobV2Namespace, 0x1303, 4096, &mut init),
+        Ok(HEADER_BYTES + 48)
     );
     assert_eq!(
         (get16(&init, 6), get32(&init, 16), get32(&init, 20)),
-        (13, 80, 5)
+        (15, 88, 5)
     );
     let roles: Vec<u32> = (0..5).map(|index| get32(&init, 40 + index * 8)).collect();
     assert_eq!(roles, [1, 8, 9, 10, 17]);
@@ -651,8 +654,8 @@ fn file_jobs_receive_a_namespace_after_their_streams_under_wrlp_1_13() {
     );
     // Neither profile accepts the other's INIT.
     assert!(launch::parse_init(LaunchProfile::JobV2Streams, &init, &handles[..4]).is_err());
-    let mut streams = [0xaa; HEADER_BYTES + 32];
-    launch::encode_init(LaunchProfile::JobV2Streams, 0x1304, &mut streams).unwrap();
+    let mut streams = [0xaa; HEADER_BYTES + 40];
+    launch::encode_job_init(LaunchProfile::JobV2Streams, 0x1304, 4096, &mut streams).unwrap();
     assert!(launch::parse_init(LaunchProfile::JobV2Namespace, &streams, &handles).is_err());
     // READY is bound to the namespace profile's minor.
     let mut ready = [0_u8; HEADER_BYTES];
@@ -910,5 +913,85 @@ fn init_carries_the_x86_64_execution_mode_and_ready_leaves_it_zero() {
     assert_eq!(
         launch::parse_ready(&ready, 9),
         Err(LaunchError::NonzeroReserved)
+    );
+}
+
+fn job_handles(profile: LaunchProfile) -> Vec<DwReceivedHandleInfoV1> {
+    (0..profile.capability_count())
+        .map(|index| {
+            if index == 0 {
+                received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS)
+            } else {
+                received(
+                    index as u64 + 1,
+                    DW_OBJECT_TYPE_CHANNEL,
+                    CHILD_CHANNEL_RIGHTS,
+                )
+            }
+        })
+        .collect()
+}
+
+/// A job's INIT carries its memory budget after its capability records, in
+/// WRLP 1.14 (JobV2, JobV2Streams) and 1.15 (JobV2Namespace) (DW2 §10.3
+/// item 7).
+#[test]
+fn a_job_init_carries_its_memory_budget() {
+    for (profile, minor, size) in [
+        (LaunchProfile::JobV2, 14, 56),
+        (LaunchProfile::JobV2Streams, 14, 80),
+        (LaunchProfile::JobV2Namespace, 15, 88),
+    ] {
+        let mut init = [0xaa; WYRMSH_BYTES];
+        assert_eq!(
+            launch::encode_init(profile, 7, &mut init),
+            Err(LaunchError::ProfileSpecificEncoderRequired)
+        );
+        let budget = 512_u64 << 20;
+        assert_eq!(
+            launch::encode_job_init(profile, 7, budget, &mut init),
+            Ok(size)
+        );
+        assert_eq!((get16(&init, 6), get32(&init, 16)), (minor, size as u32));
+        assert_eq!(get64(&init, size - 8), budget);
+        let handles = job_handles(profile);
+        let parsed = launch::parse_job_init(profile, &init[..size], &handles).unwrap();
+        assert_eq!(
+            (
+                parsed.transaction_id,
+                parsed.profile,
+                parsed.memory_budget_bytes
+            ),
+            (7, profile, budget)
+        );
+        assert!(launch::parse_init(profile, &init[..size], &handles).is_ok());
+
+        // A zero or partial-page budget is refused at both ends.
+        for bad in [0, 4095, budget + 1] {
+            assert_eq!(
+                launch::encode_job_init(profile, 7, bad, &mut init),
+                Err(LaunchError::BadMemoryBudget)
+            );
+            let mut forged = init;
+            forged[size - 8..size].copy_from_slice(&bad.to_le_bytes());
+            assert_eq!(
+                launch::parse_job_init(profile, &forged[..size], &handles),
+                Err(LaunchError::BadMemoryBudget)
+            );
+            assert_eq!(
+                launch::parse_init(profile, &forged[..size], &handles),
+                Err(LaunchError::BadMemoryBudget)
+            );
+        }
+        // The record without its budget is the wrong size.
+        assert_eq!(
+            launch::parse_job_init(profile, &init[..size - 8], &handles),
+            Err(LaunchError::BufferSize)
+        );
+    }
+    let mut init = [0; WYRMSH_BYTES];
+    assert_eq!(
+        launch::encode_job_init(LaunchProfile::Consoled, 7, 4096, &mut init),
+        Err(LaunchError::ProfileSpecificEncoderRequired)
     );
 }

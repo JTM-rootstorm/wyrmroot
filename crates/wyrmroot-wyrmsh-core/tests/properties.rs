@@ -222,8 +222,10 @@ fn generated_valid_argv_roundtrips_against_independent_values() {
 #[test]
 fn command_arity_is_bounded_at_every_public_shape() {
     let mut parser = Parser::new();
-    let zero_arity = ["help", "clear", "exit", "services", "tasks", "status"];
-    assert_eq!(zero_arity.len(), 6);
+    let zero_arity = [
+        "help", "clear", "exit", "services", "tasks", "status", "memory",
+    ];
+    assert_eq!(zero_arity.len(), 7);
 
     for spelling in zero_arity {
         assert!(parser.parse(spelling.as_bytes()).unwrap().command().is_ok());
@@ -296,7 +298,7 @@ fn command_arity_is_bounded_at_every_public_shape() {
         );
     }
 
-    assert_eq!(COMMANDS.len(), 17);
+    assert_eq!(COMMANDS.len(), 18);
 }
 
 #[test]

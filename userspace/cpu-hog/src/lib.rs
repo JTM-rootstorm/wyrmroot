@@ -19,8 +19,8 @@ use wyrmroot_runtime::{
 };
 
 pub const JOB_CPU_HOG_PATH: &str = "bin/cpu-hog";
-/// A JobV2 INIT: the header and the self-root role.
-const JOB_INIT_BYTES: usize = HEADER_BYTES + 8;
+/// A JobV2 INIT: the header, the self-root role and the memory budget.
+const JOB_INIT_BYTES: usize = LaunchProfile::JobV2.init_size();
 
 pub trait JobActorSystem {
     fn query_capability_info(
@@ -121,8 +121,9 @@ pub fn prepare_job_cpu_hog<System: JobActorSystem>(
         validate_bootstrap_channel(info, BOOTSTRAP_CHANNEL_EXPECTATION)
             .map_err(|_| JobActorError::Bootstrap)?;
 
-        // INIT carries exactly the job's self root (WRLP 1.12). The hog maps
-        // nothing, so it checks the root and closes it at once.
+        // INIT carries exactly the job's self root and its memory budget
+        // (WRLP 1.14). The hog maps nothing, so it checks the root and closes
+        // it at once.
         let mut bytes = [0u8; JOB_INIT_BYTES];
         let mut received = [DwReceivedHandleInfoV1::default(); 2];
         let counts = system
@@ -294,8 +295,13 @@ mod tests {
     impl JobFixture {
         fn new(transaction: u64) -> Self {
             let mut init = [0; JOB_INIT_BYTES];
-            wyrmroot_loader::launch::encode_init(LaunchProfile::JobV2, transaction, &mut init)
-                .unwrap();
+            wyrmroot_loader::launch::encode_job_init(
+                LaunchProfile::JobV2,
+                transaction,
+                16 << 20,
+                &mut init,
+            )
+            .unwrap();
             Self {
                 init,
                 rights: BOOTSTRAP_CHANNEL_EXPECTATION.rights,

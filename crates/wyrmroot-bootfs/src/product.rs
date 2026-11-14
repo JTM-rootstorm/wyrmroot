@@ -2,7 +2,7 @@
 //!
 //! Callers supply the exact immutable bytes of every entry; the builder checks
 //! the device manifest and launch policy against the identities the producer
-//! computed, then emits the sixteen entries in the existing `cpio newc`
+//! computed, then emits the eighteen entries in the existing `cpio newc`
 //! format. Content admission for arbitrary archives stays in
 //! [`crate::content`].
 
@@ -18,6 +18,7 @@ use crate::{
         JOB_V2_PROFILE_ID, LaunchPolicy, SERVICE_ROLE_PROFILE_ID,
         WYRMSH_PATH as POLICY_WYRMSH_PATH, WYRMSH_PROFILE_ID,
     },
+    platform_config::{PLATFORM_CONFIG_BYTES, PlatformConfig},
 };
 use wyrmroot_device_proto::{Manifest as DeviceManifest, manifest::ContentIdentity};
 
@@ -39,6 +40,9 @@ pub struct Product<'a> {
     pub rrc_manifest: &'a [u8],
     pub device_manifest: &'a [u8],
     pub launch_policy: &'a [u8],
+    /// The memory policy init applies to jobs, written as
+    /// [`PLATFORM_CONFIG_PATH`].
+    pub platform: PlatformConfig,
     /// Identity of `uart16550d`, which the device manifest's COM2 role must
     /// name. Bootfs does not parse WRRM (that crate depends on this one), so
     /// the producer supplies the identity it also wrote into WRRM.
@@ -61,7 +65,10 @@ pub struct ServiceArtifact<'a> {
 }
 
 impl Product<'_> {
-    fn entries(&self) -> [(&'static str, &[u8], FileMode); 17] {
+    fn entries<'b>(
+        &'b self,
+        platform: &'b [u8; PLATFORM_CONFIG_BYTES],
+    ) -> [(&'static str, &'b [u8], FileMode); 18] {
         use FileMode::{Executable, ReadOnly};
         [
             (INIT_PATH, self.init, Executable),
@@ -77,6 +84,7 @@ impl Product<'_> {
             (MARKER_PATH, MARKER, ReadOnly),
             (DEVICE_MANIFEST_PATH, self.device_manifest, ReadOnly),
             (LAUNCH_POLICY_PATH, self.launch_policy, ReadOnly),
+            (PLATFORM_CONFIG_PATH, platform, ReadOnly),
             (BLOCKMGR_PATH, self.services[0].bytes, Executable),
             (FAT32D_PATH, self.services[1].bytes, Executable),
             (EXT4D_PATH, self.services[2].bytes, Executable),
@@ -88,8 +96,12 @@ impl Product<'_> {
 /// Validates the product and builds its deterministic archive.
 pub fn build(product: Product<'_>) -> Result<Vec<u8>, BuildError> {
     validate(&product)?;
+    let platform = product
+        .platform
+        .encode()
+        .map_err(|_| BuildError::InvalidPlatformConfig)?;
     let mut builder = Builder::new();
-    for (path, bytes, mode) in product.entries() {
+    for (path, bytes, mode) in product.entries(&platform) {
         if bytes.is_empty() {
             return Err(BuildError::EmptyArtifact);
         }
@@ -271,6 +283,10 @@ mod tests {
             rrc_manifest: b"WRRM",
             device_manifest,
             launch_policy,
+            platform: PlatformConfig {
+                job_memory_bytes_max: 512 << 20,
+                resident_reserve_bytes: 0,
+            },
             uart16550d_identity: UART,
             virtio_blkd_identity: BLOCK,
             wyrmsh_identity: SHELL,
@@ -298,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_the_seventeen_entry_product_deterministically() {
+    fn builds_the_eighteen_entry_product_deterministically() {
         let manifest = wrdm(UART);
         let policy = policy(false, true);
         let product = product(&manifest, &policy);
@@ -314,6 +330,7 @@ mod tests {
                 b"system/blockmgr".as_slice(),
                 b"system/bootstrap/device-manifest-v1".as_slice(),
                 b"system/bootstrap/launch-policy-v1".as_slice(),
+                b"system/bootstrap/platform-config-v1".as_slice(),
                 b"system/bootstrap/product-v1".as_slice(),
                 b"system/bootstrap/rrc-a-v1".as_slice(),
                 b"system/consoled".as_slice(),
@@ -346,6 +363,18 @@ mod tests {
                 .data(),
             manifest
         );
+        let platform = archive.lookup(PLATFORM_CONFIG_PATH.as_bytes()).unwrap();
+        assert!(!platform.is_executable());
+        assert_eq!(PlatformConfig::parse(platform.data()), Ok(product.platform));
+    }
+
+    #[test]
+    fn refuses_an_unencodable_platform_config() {
+        let manifest = wrdm(UART);
+        let policy = policy(false, true);
+        let mut changed = product(&manifest, &policy);
+        changed.platform.resident_reserve_bytes = 1;
+        assert_eq!(build(changed), Err(BuildError::InvalidPlatformConfig));
     }
 
     #[test]

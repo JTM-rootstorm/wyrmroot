@@ -438,7 +438,7 @@ fn a_job_exit_is_reaped_by_the_real_tick_while_an_image_is_read() {
     let (mut resident, _, _) = crate::recovery_fixture_resident(
         [0x5A; 32],
         GENERATION,
-        ConsoleState::new(GENERATION).unwrap(),
+        ConsoleState::new(GENERATION, crate::job_memory::JobMemory::UNPLANNED).unwrap(),
         RegistryTopology::new(GENERATION).unwrap(),
         None,
     )

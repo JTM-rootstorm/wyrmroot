@@ -4,7 +4,7 @@ use wyrmroot_console_proto::{
     ErrorCode as ConsoleErrorCode, Header as ConsoleHeader, Message as ConsoleMessage, Snapshot,
 };
 use wyrmroot_launch_proto::{
-    ErrorCode as LaunchErrorCode, JobIds, Message as LaunchMessage, Reservation,
+    ErrorCode as LaunchErrorCode, JobIds, MemoryReport, Message as LaunchMessage, Reservation,
 };
 use wyrmroot_registry_proto::{
     ErrorCode as RegistryErrorCode, Header as RegistryHeader, Message as RegistryMessage,
@@ -90,6 +90,15 @@ pub(crate) fn encode_launch_request(
     output: &mut [u8],
 ) -> Result<usize, InspectionError> {
     wyrmroot_launch_proto::encode_list_jobs(launch_reservation(identity, transaction), output)
+        .map_err(|_| InspectionError::Encode)
+}
+
+pub(crate) fn encode_memory_request(
+    identity: ShellIdentity,
+    transaction: u64,
+    output: &mut [u8],
+) -> Result<usize, InspectionError> {
+    wyrmroot_launch_proto::encode_query_memory(launch_reservation(identity, transaction), output)
         .map_err(|_| InspectionError::Encode)
 }
 
@@ -266,6 +275,24 @@ pub(crate) fn decode_jobs<'a>(
     }
 }
 
+pub(crate) fn decode_memory(
+    identity: ShellIdentity,
+    transaction: u64,
+    bytes: &[u8],
+    handles: usize,
+) -> Result<MemoryReport, InspectionError> {
+    let parsed = wyrmroot_launch_proto::parse_message(bytes, handles)
+        .map_err(|_| InspectionError::Malformed)?;
+    if parsed.reservation != launch_reservation(identity, transaction) {
+        return Err(InspectionError::Correlation);
+    }
+    match parsed.message {
+        LaunchMessage::Memory(report) => Ok(report),
+        LaunchMessage::Error { code } => Err(InspectionError::Launch(code)),
+        _ => Err(InspectionError::Malformed),
+    }
+}
+
 pub(crate) fn decode_status(
     identity: ShellIdentity,
     transaction: u64,
@@ -354,6 +381,14 @@ mod tests {
                 .unwrap()
                 .message,
             LaunchMessage::ListJobs
+        ));
+
+        let size = encode_memory_request(IDENTITY, 3, &mut bytes).unwrap();
+        assert!(matches!(
+            wyrmroot_launch_proto::parse_message(&bytes[..size], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::QueryMemory
         ));
 
         let size = encode_status_request(IDENTITY, 1, &mut bytes).unwrap();

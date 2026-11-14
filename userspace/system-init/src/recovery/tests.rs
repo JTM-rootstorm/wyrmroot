@@ -129,8 +129,26 @@ impl InitPlatform for RebindPlatform {
     fn create_attempt_task_group(&mut self, _parent: DwHandle) -> Result<DwHandle, NativeError> {
         Err(FAILURE)
     }
-    fn limit_job_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+    fn limit_job_task_group(
+        &mut self,
+        _task_group: DwHandle,
+        _memory_pages: u32,
+    ) -> Result<(), NativeError> {
         Ok(())
+    }
+    fn limit_task_group(
+        &mut self,
+        _task_group: DwHandle,
+        _class: u32,
+        _limit: u32,
+    ) -> Result<(), NativeError> {
+        Ok(())
+    }
+    fn query_task_group_memory(
+        &mut self,
+        _task_group: DwHandle,
+    ) -> Result<deepwyrm_syscall::DwTaskGroupMemoryInfoV1, NativeError> {
+        Err(FAILURE)
     }
 
     fn terminate_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError> {
@@ -839,8 +857,26 @@ impl InitPlatform for ControlInputPlatform {
     fn create_attempt_task_group(&mut self, _parent: DwHandle) -> Result<DwHandle, NativeError> {
         Err(FAILURE)
     }
-    fn limit_job_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+    fn limit_job_task_group(
+        &mut self,
+        _task_group: DwHandle,
+        _memory_pages: u32,
+    ) -> Result<(), NativeError> {
         Ok(())
+    }
+    fn limit_task_group(
+        &mut self,
+        _task_group: DwHandle,
+        _class: u32,
+        _limit: u32,
+    ) -> Result<(), NativeError> {
+        Ok(())
+    }
+    fn query_task_group_memory(
+        &mut self,
+        _task_group: DwHandle,
+    ) -> Result<deepwyrm_syscall::DwTaskGroupMemoryInfoV1, NativeError> {
+        Err(FAILURE)
     }
     fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
         Err(FAILURE)
@@ -1106,7 +1142,7 @@ mod session_shutdown {
         let (mut resident, devmgr, _) = recovery_fixture_resident(
             [0x5A; 32],
             GENERATION,
-            ConsoleState::new(GENERATION).unwrap(),
+            ConsoleState::new(GENERATION, crate::job_memory::JobMemory::UNPLANNED).unwrap(),
             RegistryTopology::new(GENERATION).unwrap(),
             None,
         )

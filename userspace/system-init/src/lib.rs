@@ -18,9 +18,10 @@ mod errors;
 mod image_launch;
 mod job_dispatch;
 mod job_launch;
+pub mod job_memory;
 mod job_sessions;
 mod jobs;
-pub use jobs::JOB_TASK_GROUP_LIMITS;
+pub use jobs::job_task_group_limits;
 mod launch_transaction;
 mod product;
 mod recovery;
@@ -286,9 +287,26 @@ pub trait InitPlatform {
     fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError>;
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError>;
     fn create_attempt_task_group(&mut self, parent: DwHandle) -> Result<DwHandle, NativeError>;
-    /// Applies [`JOB_TASK_GROUP_LIMITS`] to a fresh job TaskGroup
-    /// before anything runs in it (F4 DW1-F4-M1).
-    fn limit_job_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError>;
+    /// Applies [`job_task_group_limits`] with the job's budget to a fresh
+    /// job TaskGroup before anything runs in it (F4 DW1-F4-M1, DW2 §10.3
+    /// item 7).
+    fn limit_job_task_group(
+        &mut self,
+        task_group: DwHandle,
+        memory_pages: u32,
+    ) -> Result<(), NativeError>;
+    /// Sets one limit class on a TaskGroup.
+    fn limit_task_group(
+        &mut self,
+        task_group: DwHandle,
+        class: u32,
+        limit: u32,
+    ) -> Result<(), NativeError>;
+    /// Reads a TaskGroup's memory record (DW2 §10.2 item 1).
+    fn query_task_group_memory(
+        &mut self,
+        task_group: DwHandle,
+    ) -> Result<deepwyrm_syscall::DwTaskGroupMemoryInfoV1, NativeError>;
     fn terminate_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError>;
     fn now(&mut self) -> Result<u64, NativeError>;
     fn wait_until(&mut self, deadline_ns: u64) -> Result<(), NativeError>;
@@ -786,8 +804,28 @@ mod native_cleanup_tests {
             Err(FAILURE)
         }
 
-        fn limit_job_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+        fn limit_job_task_group(
+            &mut self,
+            _task_group: DwHandle,
+            _memory_pages: u32,
+        ) -> Result<(), NativeError> {
             Ok(())
+        }
+
+        fn limit_task_group(
+            &mut self,
+            _task_group: DwHandle,
+            _class: u32,
+            _limit: u32,
+        ) -> Result<(), NativeError> {
+            Err(FAILURE)
+        }
+
+        fn query_task_group_memory(
+            &mut self,
+            _task_group: DwHandle,
+        ) -> Result<deepwyrm_syscall::DwTaskGroupMemoryInfoV1, NativeError> {
+            Err(FAILURE)
         }
 
         fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {

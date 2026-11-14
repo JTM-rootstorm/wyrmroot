@@ -169,12 +169,13 @@ pub fn run_stream_hello<System: StreamHelloSystem>(
 }
 
 /// [`run_stream_hello`], and when `probe` is given, runs it with the job's
-/// own AddressRegion before letting that go and writes the line it returns
-/// after the greeting (`run bin/hello on-demand`, Deepwyrm DW2 M6).
+/// own AddressRegion and its memory budget in bytes (from its INIT) before
+/// letting the region go, and writes the line it returns after the greeting
+/// (`run bin/hello on-demand`, Deepwyrm DW2 M6).
 pub fn run_stream_hello_with<System: StreamHelloSystem>(
     system: &mut System,
     bootstrap_channel: DwHandle,
-    mut probe: Option<&mut dyn FnMut(DwHandle) -> &'static [u8]>,
+    mut probe: Option<&mut dyn FnMut(DwHandle, u64) -> &'static [u8]>,
 ) -> Result<(), HelloError> {
     let channel = system
         .query_capability_info(bootstrap_channel)
@@ -185,8 +186,8 @@ pub fn run_stream_hello_with<System: StreamHelloSystem>(
     validate_bootstrap_channel(channel, BOOTSTRAP_CHANNEL_EXPECTATION)
         .map_err(HelloError::BootstrapChannel)?;
     // A bootfs launch carries the streams; a file launch also carries a
-    // namespace (WRLP 1.13), which is one record and one handle longer.
-    let mut init = [0_u8; 80];
+    // namespace (WRLP 1.15), which is one record and one handle longer.
+    let mut init = [0_u8; LaunchProfile::JobV2Namespace.init_size()];
     let mut handles = [DwReceivedHandleInfoV1::default(); 5];
     let counts = system
         .receive_channel(bootstrap_channel, &mut init, &mut handles)
@@ -201,7 +202,9 @@ pub fn run_stream_hello_with<System: StreamHelloSystem>(
         .map_err(HelloError::StreamLaunch)?;
     // Hello maps nothing and opens no paths, so its self root and any
     // namespace go at once, after the probe if there is one.
-    let probed = probe.as_mut().map(|probe| probe(streams.self_root));
+    let probed = probe
+        .as_mut()
+        .map(|probe| probe(streams.self_root, streams.memory_budget_bytes));
     for handle in core::iter::once(streams.self_root).chain(streams.namespace) {
         system
             .close_handle(handle)
@@ -283,9 +286,9 @@ fn run_profile_ready<System: HelloSystem>(
     validate_bootstrap_channel(channel, BOOTSTRAP_CHANNEL_EXPECTATION)
         .map_err(HelloError::BootstrapChannel)?;
 
-    // A JobV2 INIT carries the job's self root (WRLP 1.12); the WYR0-G
-    // profile carries nothing.
-    let mut init = [0_u8; HEADER_BYTES + 8];
+    // A JobV2 INIT carries the job's self root and memory budget (WRLP
+    // 1.14); the WYR0-G profile carries nothing.
+    let mut init = [0_u8; LaunchProfile::JobV2.init_size()];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
     let expected = profile.capability_count();
     let counts = system

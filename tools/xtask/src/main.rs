@@ -63,7 +63,12 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
                     tasks::canonical_project_root(&repository)?.join("deepwyrm")
                 }
             };
-            product::build(&PathBuf::from(&output), &deep, None)?;
+            product::build(
+                &PathBuf::from(&output),
+                &deep,
+                None,
+                product::PRODUCT_PLATFORM,
+            )?;
             Ok(Some(format!("PRODUCT_BUILT output={output}\n")))
         }
         Action::Test(scope) => gate::run(scope).map(|()| None),

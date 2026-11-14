@@ -234,7 +234,11 @@ where
         *slot = info.handle;
     }
     let streams = &streams[..handle_count];
-    let task_group = match system.create_attempt_task_group(authority.task_group) {
+    // Every job's group sits under the jobs group, limited to the budget
+    // init planned for this boot (DW2 §10.3 item 7).
+    let memory = jobs.memory;
+    let task_group = match system.create_attempt_task_group(memory.job_parent(authority.task_group))
+    {
         Ok(task_group) => task_group,
         Err(error) => {
             return Err(
@@ -248,7 +252,7 @@ where
             );
         }
     };
-    if let Err(error) = system.limit_job_task_group(task_group) {
+    if let Err(error) = system.limit_job_task_group(task_group, memory.plan.job_budget_pages) {
         return Err(
             if system.close_handle(task_group).is_err()
                 | close_received_reverse(system, received, handle_count)
@@ -266,6 +270,7 @@ where
         loader,
         authority,
         task_group.0,
+        memory.plan.job_budget_bytes(),
         reservation,
         ticket,
         request,

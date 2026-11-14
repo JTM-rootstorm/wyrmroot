@@ -20,6 +20,8 @@ pub const HELLO_PATH: &str = "bin/hello";
 pub const CPU_HOG_PATH: &str = "bin/cpu-hog";
 pub const RRC_MANIFEST_PATH: &str = "system/bootstrap/rrc-a-v1";
 pub const LAUNCH_POLICY_PATH: &str = crate::launch_policy::LAUNCH_POLICY_PATH;
+/// The product's platform configuration (`WRPC` v1, DW2 §10.3 item 6).
+pub const PLATFORM_CONFIG_PATH: &str = crate::platform_config::PLATFORM_CONFIG_PATH;
 /// The product marker `system-init` checks before it reads the device
 /// manifest.
 pub const MARKER_PATH: &str = "system/bootstrap/product-v1";

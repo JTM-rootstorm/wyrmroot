@@ -15,6 +15,7 @@ pub mod launch_policy;
 mod limits;
 pub mod path;
 pub mod paths;
+pub mod platform_config;
 #[cfg(feature = "builder")]
 pub mod product;
 

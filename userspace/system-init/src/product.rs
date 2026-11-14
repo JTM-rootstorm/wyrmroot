@@ -432,7 +432,14 @@ where
         &mut topology,
         &mut publication_allocator,
     );
-    let session = Some(ConsoleState::new(topology.generation())?);
+    // The resident roles have started; plan the jobs' memory before any
+    // shell can ask for a job (DW2 §10.3 item 7).
+    let memory = crate::job_memory::establish(
+        &mut crate::job_memory::InitJobGroups(system),
+        authority.task_group,
+        bootfs,
+    )?;
+    let session = Some(ConsoleState::new(topology.generation(), memory)?);
     let state = ResidentState {
         session,
         resource_domain,

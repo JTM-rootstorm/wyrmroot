@@ -446,8 +446,26 @@ impl InitPlatform for MockPlatform {
     fn create_attempt_task_group(&mut self, _parent: DwHandle) -> Result<DwHandle, NativeError> {
         self.task_group.ok_or(FAILURE)
     }
-    fn limit_job_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+    fn limit_job_task_group(
+        &mut self,
+        _task_group: DwHandle,
+        _memory_pages: u32,
+    ) -> Result<(), NativeError> {
         Ok(())
+    }
+    fn limit_task_group(
+        &mut self,
+        _task_group: DwHandle,
+        _class: u32,
+        _limit: u32,
+    ) -> Result<(), NativeError> {
+        Ok(())
+    }
+    fn query_task_group_memory(
+        &mut self,
+        _task_group: DwHandle,
+    ) -> Result<deepwyrm_syscall::DwTaskGroupMemoryInfoV1, NativeError> {
+        Err(FAILURE)
     }
     fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
         self.terminate_count += 1;
@@ -1201,10 +1219,11 @@ fn consoled_stream_descriptors_survive_init_then_reduce_at_actual_loader_move() 
             environment: &[],
             streams: &streams,
             transaction_id: 0xd500,
+            memory_budget_bytes: 16 << 20,
         },
     )
     .unwrap();
-    // The job's own root comes first (WRLP 1.12), then the three streams.
+    // The job's own root comes first (WRLP 1.14), then the three streams.
     assert_eq!(loader.sent_transfers.len(), 4);
     let root = loader.sent_transfers[0];
     assert_eq!(

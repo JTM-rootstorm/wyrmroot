@@ -71,7 +71,8 @@ pub use native::{
     MappedBootfs, NativeError, NativeOutputError, PANIC_EXIT_CODE, ReceiveCounts, close_handle,
     exit_process, map_bootfs_read_only, monotonic_active_now, monotonic_deadline_after,
     native_error_code, panic_abort, query_capability_info, query_memory_object_size,
-    query_task_termination_info, receive_channel, send_channel, unmap_bootfs, wait_many,
+    query_task_group_memory, query_task_termination_info, receive_channel, send_channel,
+    unmap_bootfs, wait_many,
 };
 pub use platform::{
     ChannelPlatform, ClockPlatform, DevicePlatform, EvidencePlatform, HandlePlatform,

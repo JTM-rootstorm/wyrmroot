@@ -30,7 +30,7 @@ pub(crate) const MAX_ORPHAN_CONNECTIONS: usize = 8;
 /// (F4 DW1-F4-M1).
 pub(crate) const MAX_SHELL_JOBS: usize = 4;
 // Every running file job holds one of vfsd's client connections as its
-// namespace (WRLP 1.13). Jobs may take at most half of them, so they can
+// namespace (WRLP 1.15). Jobs may take at most half of them, so they can
 // never shut the shells and services out of `system.vfs`.
 const _: () = assert!(MAX_SHELL_JOBS <= wyrmroot_service_proto::roles::SYSTEM_VFS_MAX_CLIENTS / 2);
 /// Live orphan jobs across every closed connection. The rest of
@@ -46,52 +46,55 @@ pub(crate) const MAX_ORPHAN_JOBS: usize = MAX_SHELL_JOBS / 2;
 /// Live shell jobs one ShellJobs connection may hold, so one shell cannot
 /// take every `MAX_SHELL_JOBS` slot from another.
 pub(crate) const MAX_JOBS_PER_SHELL: usize = MAX_SHELL_JOBS - 1;
-/// Each job's own TaskGroup limits. Init creates the job's Process, Thread,
-/// image memory and launch channels, so those are charged to init and
-/// bounded by `MAX_SHELL_JOBS`. What the job creates itself is what a POSIX
-/// program needs (root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W9): four
-/// MemoryObjects for `mmap`, together at most 16 MiB of RAM (Deepwyrm D6's
-/// page class), and ten Channel endpoints, five pairs, for sleeping and up to
-/// four open files. No Events, Timers, Threads, Processes or TaskGroups yet.
-/// At most four wait items, enough for a small wait-many. Deepwyrm's
-/// production ledger counts every one of these per live job
-/// (`JOB_OWN_MEMORY_OBJECTS`, `JOB_OWN_CHANNEL_PAIRS`, `JOB_OWN_WAITS`).
-pub const JOB_TASK_GROUP_LIMITS: [(u32, u32); 9] = [
-    (
-        deepwyrm_syscall::DW_TASK_GROUP_LIMIT_CHANNEL,
-        JOB_CHANNEL_ENDPOINTS,
-    ),
-    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_EVENT, 0),
-    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_TIMER, 0),
-    (
-        deepwyrm_syscall::DW_TASK_GROUP_LIMIT_MEMORY_OBJECT,
-        JOB_MEMORY_OBJECTS,
-    ),
-    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_THREAD, 0),
-    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_PROCESS, 0),
-    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_TASK_GROUP, 0),
-    (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_WAIT, 4),
-    (
-        deepwyrm_syscall::DW_TASK_GROUP_LIMIT_MEMORY_PAGES,
-        JOB_MEMORY_PAGES,
-    ),
-];
+/// Each job's own TaskGroup limits, built when the job is launched: every
+/// class but MEMORY_PAGES is fixed, and MEMORY_PAGES is the job's budget,
+/// which init computes once per boot (DW2 §10.3 item 7,
+/// [`crate::job_memory`]). Init creates the job's Process, Thread, image
+/// memory and launch channels, so those are charged to init and bounded by
+/// `MAX_SHELL_JOBS`. What the job creates itself is what a POSIX program
+/// needs (root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W9): 64 MemoryObjects for
+/// `mmap`, whose RAM the budget bounds, and ten Channel endpoints, five
+/// pairs, for sleeping and up to four open files. No Events, Timers,
+/// Threads, Processes or TaskGroups yet. At most four wait items, enough
+/// for a small wait-many. Wyrmroot's kernel demand ledger counts every one
+/// of these per live job (`JOB_OWN_MEMORY_OBJECTS`, `JOB_OWN_CHANNEL_PAIRS`,
+/// `JOB_OWN_WAITS`).
+pub const fn job_task_group_limits(memory_pages: u32) -> [(u32, u32); 9] {
+    [
+        (
+            deepwyrm_syscall::DW_TASK_GROUP_LIMIT_CHANNEL,
+            JOB_CHANNEL_ENDPOINTS,
+        ),
+        (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_EVENT, 0),
+        (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_TIMER, 0),
+        (
+            deepwyrm_syscall::DW_TASK_GROUP_LIMIT_MEMORY_OBJECT,
+            JOB_MEMORY_OBJECTS,
+        ),
+        (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_THREAD, 0),
+        (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_PROCESS, 0),
+        (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_TASK_GROUP, 0),
+        (deepwyrm_syscall::DW_TASK_GROUP_LIMIT_WAIT, 4),
+        (
+            deepwyrm_syscall::DW_TASK_GROUP_LIMIT_MEMORY_PAGES,
+            memory_pages,
+        ),
+    ]
+}
 /// Channel endpoints a job may create: one `channel_create` uses two.
 pub const JOB_CHANNEL_ENDPOINTS: u32 = 10;
-pub const JOB_MEMORY_OBJECTS: u32 = 4;
-/// 16 MiB of 4 KiB pages.
-pub const JOB_MEMORY_PAGES: u32 = 4096;
+/// MemoryObjects a job may create (DW2 §10.2 item 3).
+pub const JOB_MEMORY_OBJECTS: u32 = 64;
 // Every class has exactly one limit.
 const _: () = {
-    assert!(
-        JOB_TASK_GROUP_LIMITS.len() == deepwyrm_syscall::DW_TASK_GROUP_LIMIT_CLASS_COUNT as usize
-    );
+    let limits = job_task_group_limits(1);
+    assert!(limits.len() == deepwyrm_syscall::DW_TASK_GROUP_LIMIT_CLASS_COUNT as usize);
     let mut class = 0;
-    while class < JOB_TASK_GROUP_LIMITS.len() {
+    while class < limits.len() {
         let mut found = 0;
         let mut index = 0;
-        while index < JOB_TASK_GROUP_LIMITS.len() {
-            if JOB_TASK_GROUP_LIMITS[index].0 as usize == class {
+        while index < limits.len() {
+            if limits[index].0 as usize == class {
                 found += 1;
             }
             index += 1;
@@ -1351,6 +1354,7 @@ pub(crate) fn prepare_reserved_job<'a, L: LoaderPlatform>(
     loader: &mut L,
     authority: LoadAuthority,
     task_group: u64,
+    memory_budget_bytes: u64,
     reservation: Reservation,
     ticket: LaunchTicket,
     request: wyrmroot_launch_proto::LaunchRequest<'a>,
@@ -1431,6 +1435,7 @@ pub(crate) fn prepare_reserved_job<'a, L: LoaderPlatform>(
             environment: &environment[..request.environment_count()],
             streams,
             transaction_id: reservation.transaction_id,
+            memory_budget_bytes,
         },
     ) {
         Ok(loaded) => loaded,

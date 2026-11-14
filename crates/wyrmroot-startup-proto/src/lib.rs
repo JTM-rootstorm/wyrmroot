@@ -59,12 +59,15 @@ const MINOR_V1_8_TEST: u16 = 8;
 const MINOR_V1_9: u16 = 9;
 const MINOR_V1_10: u16 = 10;
 const MINOR_V1_11: u16 = 11;
-/// Jobs receive their self root ahead of their stream roles (root
-/// `TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W1).
-const MINOR_V1_12: u16 = 12;
-/// Jobs launched from a file also receive a namespace Channel after their
-/// streams (root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W5).
-const MINOR_V1_13: u16 = 13;
+// Minors 12 (a job's self root ahead of its stream roles, root
+// `TOOLCHAIN_POSIX_LAYER_DESIGN.md` request W1) and 13 (a namespace Channel
+// after the streams for a job launched from a file, W5) were replaced by 14
+// and 15, which keep those roles and add the job's memory budget.
+/// A job's INIT carries its memory budget after its capability records
+/// (DW2 §10.3 item 7): JobV2 and JobV2Streams.
+const MINOR_V1_14: u16 = 14;
+/// JobV2Namespace with the memory budget.
+const MINOR_V1_15: u16 = 15;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
@@ -170,7 +173,7 @@ pub enum LaunchProfile {
     JobV2Streams,
     /// Launched job with its self root, its three stream roles and one WRNS
     /// namespace Channel, through which it opens paths. Jobs launched from a
-    /// file receive it (WRLP 1.13).
+    /// file receive it (WRLP 1.15).
     JobV2Namespace,
     /// Selector-26-only progress peer with exactly one test data Channel.
     Dw1bProgress,
@@ -223,8 +226,8 @@ impl LaunchProfile {
             | Self::BootstrapService
             | Self::RegistryClient
             | Self::LaunchClient => MINOR_V1_3,
-            Self::JobV2 | Self::JobV2Streams => MINOR_V1_12,
-            Self::JobV2Namespace => MINOR_V1_13,
+            Self::JobV2 | Self::JobV2Streams => MINOR_V1_14,
+            Self::JobV2Namespace => MINOR_V1_15,
             Self::Dw1bProgress => MINOR_V1_4_TEST,
             Self::DeviceCoordinator => MINOR_V1_5,
             Self::DeviceCoordinatorResourceDomain => MINOR_V1_9,
@@ -246,6 +249,8 @@ impl LaunchProfile {
             DEVICE_COORDINATOR_RESOURCE_BYTES
         } else if matches!(self, Self::DeviceDriver) {
             DEVICE_DRIVER_BYTES
+        } else if self.is_job() {
+            HEADER_BYTES + self.capability_count() * 8 + JOB_MEMORY_BUDGET_BYTES
         } else {
             HEADER_BYTES + self.capability_count() * 8
         }
@@ -257,6 +262,23 @@ pub struct ParsedMessage {
     pub transaction_id: u64,
     pub profile: LaunchProfile,
 }
+
+/// A job's INIT: its transaction, its profile and the memory budget its
+/// launcher set for it (DW2 §10.3 item 7). The budget is a fact about the
+/// job's TaskGroup limit, not authority: the kernel enforces the limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobInit {
+    pub transaction_id: u64,
+    pub profile: LaunchProfile,
+    /// The job's MEMORY_PAGES limit in bytes: nonzero, a multiple of
+    /// [`JOB_MEMORY_BUDGET_GRANULE`].
+    pub memory_budget_bytes: u64,
+}
+
+/// The field a job's INIT appends after its capability records.
+const JOB_MEMORY_BUDGET_BYTES: usize = 8;
+/// A job's budget is whole pages.
+pub const JOB_MEMORY_BUDGET_GRANULE: u64 = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceCoordinatorInit {
@@ -328,6 +350,8 @@ pub enum LaunchError {
     /// child starts in until compatibility mode is built (root
     /// `I386_EXECUTION_MODE_CONTRACT.md` §8).
     UnsupportedExecutionMode(u32),
+    /// A job's INIT whose memory budget is zero or not whole pages.
+    BadMemoryBudget,
 }
 
 impl LaunchError {
@@ -352,6 +376,7 @@ impl LaunchError {
             Self::HandleMetadata { .. } => 13,
             Self::ProfileSpecificEncoderRequired { .. } => 14,
             Self::UnsupportedExecutionMode { .. } => 15,
+            Self::BadMemoryBudget => 16,
         }
     }
 }
@@ -368,10 +393,51 @@ pub fn encode_init(
             | LaunchProfile::DeviceDriver
             | LaunchProfile::Consoled
             | LaunchProfile::Wyrmsh
-    ) {
+    ) || profile.is_job()
+    {
         return Err(LaunchError::ProfileSpecificEncoderRequired);
     }
     encode_init_inner(profile, transaction_id, output)
+}
+
+/// A job's INIT with its memory budget (DW2 §10.3 item 7).
+pub fn encode_job_init(
+    profile: LaunchProfile,
+    transaction_id: u64,
+    memory_budget_bytes: u64,
+    output: &mut [u8],
+) -> Result<usize, LaunchError> {
+    if !profile.is_job() {
+        return Err(LaunchError::ProfileSpecificEncoderRequired);
+    }
+    validate_memory_budget(memory_budget_bytes)?;
+    let size = encode_init_inner(profile, transaction_id, output)?;
+    put_u64(output, size - JOB_MEMORY_BUDGET_BYTES, memory_budget_bytes);
+    Ok(size)
+}
+
+/// Validates a job's INIT and returns its memory budget with it.
+pub fn parse_job_init(
+    profile: LaunchProfile,
+    bytes: &[u8],
+    handles: &[DwReceivedHandleInfoV1],
+) -> Result<JobInit, LaunchError> {
+    if !profile.is_job() {
+        return Err(LaunchError::ProfileSpecificEncoderRequired);
+    }
+    let parsed = parse_init(profile, bytes, handles)?;
+    Ok(JobInit {
+        transaction_id: parsed.transaction_id,
+        profile,
+        memory_budget_bytes: get_u64(bytes, profile.init_size() - JOB_MEMORY_BUDGET_BYTES),
+    })
+}
+
+fn validate_memory_budget(bytes: u64) -> Result<(), LaunchError> {
+    if bytes == 0 || !bytes.is_multiple_of(JOB_MEMORY_BUDGET_GRANULE) {
+        return Err(LaunchError::BadMemoryBudget);
+    }
+    Ok(())
 }
 
 fn encode_init_inner(
@@ -845,6 +911,12 @@ pub fn parse_init(
             validate_handle(handles[1], DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS, 1)?;
         }
     }
+    if profile.is_job() {
+        validate_memory_budget(get_u64(
+            bytes,
+            profile.init_size() - JOB_MEMORY_BUDGET_BYTES,
+        ))?;
+    }
     Ok(ParsedMessage {
         transaction_id,
         profile,
@@ -959,6 +1031,14 @@ pub fn parse_device_driver_init(
 
 /// Facts about each profile's INIT that the loader uses to build it.
 impl LaunchProfile {
+    /// A launched job, whose INIT carries its memory budget.
+    pub const fn is_job(self) -> bool {
+        matches!(
+            self,
+            Self::JobV2 | Self::JobV2Streams | Self::JobV2Namespace
+        )
+    }
+
     /// INIT carries the self root, bootfs and loader TaskGroup.
     pub const fn has_loader_authority_trio(self) -> bool {
         matches!(

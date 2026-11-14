@@ -100,6 +100,9 @@ pub(crate) struct JobDispatcher {
     /// whoever holds it for its session. Kept here, not in the error the
     /// send returns, so no dispatch frame carries a reply by value.
     pub(crate) staged_reply: Option<crate::HeldReply>,
+    /// Each job's budget and the jobs group, planned once per boot before
+    /// the first job (DW2 §10.3 item 7).
+    pub(crate) memory: crate::job_memory::JobMemory,
 }
 
 impl JobDispatcher {
@@ -116,6 +119,7 @@ impl JobDispatcher {
             image: None,
             image_fault: None,
             staged_reply: None,
+            memory: crate::job_memory::JobMemory::UNPLANNED,
         }
     }
 

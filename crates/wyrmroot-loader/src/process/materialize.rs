@@ -232,6 +232,15 @@ pub(crate) fn load_process_materialized<P: LoaderPlatform>(
             endpoint_generation,
             &mut init,
         )
+    } else if request.profile.is_job() {
+        launch::encode_job_init(
+            request.profile,
+            request.transaction_id,
+            request
+                .memory_budget_bytes
+                .ok_or(LoadError::Launch(LaunchError::BadMemoryBudget))?,
+            &mut init,
+        )
     } else {
         launch::encode_init(request.profile, request.transaction_id, &mut init)
     }

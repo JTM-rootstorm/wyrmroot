@@ -5,11 +5,11 @@ use deepwyrm_syscall::{
     DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_CLOCK_MONOTONIC_ACTIVE,
     DW_MEMORY_OBJECT_CREATE_FLAGS_SUPPORTED_MASK, DW_MEMORY_OBJECT_INFO_V1_SIZE,
     DW_MEMORY_PROTECTION_READ, DW_OBJECT_INFO_V1_SIZE, DW_SIGNALS_KNOWN_MASK, DW_STATUS_SUCCESS,
-    DW_TASK_TERMINATION_INFO_V1_SIZE, DW_WAIT_MODE_ANY, DW_WAIT_RESULT_V1_SIZE,
-    DwAddressRegionMapArgsV1, DwAddressRegionMapFlags, DwChannelReceiveResultV1, DwDeadline,
-    DwHandle, DwHandleTransferV1, DwMemoryObjectInfoV1, DwObjectInfoV1, DwObjectType, DwOffset,
-    DwReceivedHandleInfoV1, DwRights, DwSize, DwStatus, DwTaskTerminationInfoV1, DwUserAddress,
-    DwWaitItemV1, DwWaitResultV1,
+    DW_TASK_GROUP_MEMORY_INFO_V1_SIZE, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_WAIT_MODE_ANY,
+    DW_WAIT_RESULT_V1_SIZE, DwAddressRegionMapArgsV1, DwAddressRegionMapFlags,
+    DwChannelReceiveResultV1, DwDeadline, DwHandle, DwHandleTransferV1, DwMemoryObjectInfoV1,
+    DwObjectInfoV1, DwObjectType, DwOffset, DwReceivedHandleInfoV1, DwRights, DwSize, DwStatus,
+    DwTaskGroupMemoryInfoV1, DwTaskTerminationInfoV1, DwUserAddress, DwWaitItemV1, DwWaitResultV1,
 };
 
 use crate::{CapabilityInfo, MappingPlan};
@@ -41,6 +41,9 @@ pub enum NativeOutputError {
     /// The running kernel reports another ABI fingerprint than the one this
     /// binary was built against (root `OS_STACK_ARCHITECTURE_PLAN.md` V1).
     AbiFingerprintMismatch,
+    /// A TaskGroup memory record had the wrong size, version or reserved
+    /// fields, or usage above a finite limit.
+    InvalidTaskGroupMemoryInfo,
 }
 
 /// Failure from a native runtime operation.
@@ -74,6 +77,7 @@ pub const fn native_error_code(error: NativeError) -> u32 {
                     NativeOutputError::InvalidTaskTerminationInfo => 7,
                     NativeOutputError::DeadlineOverflow => 8,
                     NativeOutputError::AbiFingerprintMismatch => 9,
+                    NativeOutputError::InvalidTaskGroupMemoryInfo => 10,
                 }
         }
     }
@@ -211,6 +215,20 @@ pub fn query_task_termination_info(
         &mut required_size,
     ))?;
     validate_task_termination_info(&info, required_size)?;
+    Ok(info)
+}
+
+/// Queries a TaskGroup's MEMORY_PAGES limit, usage and headroom, and on the
+/// root TaskGroup the free frame count (DW2 §10.2 item 1). Needs INSPECT.
+pub fn query_task_group_memory(handle: DwHandle) -> Result<DwTaskGroupMemoryInfoV1, NativeError> {
+    let mut info = DwTaskGroupMemoryInfoV1::default();
+    let mut required_size = 0;
+    require_success(deepwyrm_syscall::object_get_task_group_memory_info_v1(
+        handle,
+        &mut info,
+        &mut required_size,
+    ))?;
+    validate_task_group_memory_info(&info, required_size)?;
     Ok(info)
 }
 
@@ -413,6 +431,29 @@ fn validate_memory_object_info(
     }
 }
 
+fn validate_task_group_memory_info(
+    info: &DwTaskGroupMemoryInfoV1,
+    required_size: u64,
+) -> Result<(), NativeError> {
+    // Usage may exceed the limit only when the limit is unlimited: a limit
+    // is checked before each charge.
+    let usage_fits = info.limit == deepwyrm_syscall::DW_TASK_GROUP_LIMIT_UNLIMITED
+        || info.usage <= u64::from(info.limit);
+    if required_size == u64::from(DW_TASK_GROUP_MEMORY_INFO_V1_SIZE)
+        && info.size == DW_TASK_GROUP_MEMORY_INFO_V1_SIZE
+        && info.version == 1
+        && info.reserved0 == 0
+        && info.reserved == 0
+        && usage_fits
+    {
+        Ok(())
+    } else {
+        Err(NativeError::Output(
+            NativeOutputError::InvalidTaskGroupMemoryInfo,
+        ))
+    }
+}
+
 fn validate_task_termination_info(
     info: &DwTaskTerminationInfoV1,
     required_size: u64,
@@ -544,6 +585,56 @@ mod tests {
         assert_eq!(
             deadline_after(u64::MAX, 1),
             Err(NativeError::Output(NativeOutputError::DeadlineOverflow))
+        );
+    }
+
+    #[test]
+    fn validates_task_group_memory_records() {
+        let size = u64::from(DW_TASK_GROUP_MEMORY_INFO_V1_SIZE);
+        let good = DwTaskGroupMemoryInfoV1 {
+            size: DW_TASK_GROUP_MEMORY_INFO_V1_SIZE,
+            version: 1,
+            limit: 4096,
+            usage: 4096,
+            headroom: 0,
+            free_pages: 500_000,
+            ..DwTaskGroupMemoryInfoV1::default()
+        };
+        assert_eq!(validate_task_group_memory_info(&good, size), Ok(()));
+        let unlimited = DwTaskGroupMemoryInfoV1 {
+            limit: deepwyrm_syscall::DW_TASK_GROUP_LIMIT_UNLIMITED,
+            usage: 1 << 40,
+            headroom: u64::MAX,
+            ..good
+        };
+        assert_eq!(validate_task_group_memory_info(&unlimited, size), Ok(()));
+        let bad = Err(NativeError::Output(
+            NativeOutputError::InvalidTaskGroupMemoryInfo,
+        ));
+        assert_eq!(validate_task_group_memory_info(&good, size - 8), bad);
+        for record in [
+            DwTaskGroupMemoryInfoV1 { size: 40, ..good },
+            DwTaskGroupMemoryInfoV1 { version: 2, ..good },
+            DwTaskGroupMemoryInfoV1 {
+                reserved0: 1,
+                ..good
+            },
+            DwTaskGroupMemoryInfoV1 {
+                reserved: 1,
+                ..good
+            },
+            DwTaskGroupMemoryInfoV1 {
+                usage: 4097,
+                ..good
+            },
+        ] {
+            assert_eq!(validate_task_group_memory_info(&record, size), bad);
+        }
+        assert_eq!(
+            native_error_code(NativeError::Output(
+                NativeOutputError::InvalidTaskGroupMemoryInfo
+            )),
+            0x800a
         );
     }
 

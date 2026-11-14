@@ -671,6 +671,9 @@ fn dispatch_local<System: WyrmshSystem>(
         Command::Status => {
             inspect_status(system, stdout, stderr, identity, controls, transactions)?
         }
+        Command::Memory => {
+            inspect_memory(system, stdout, stderr, identity, controls, transactions)?
+        }
         Command::Run { path, argv } => jobs::run(
             system,
             stdout,

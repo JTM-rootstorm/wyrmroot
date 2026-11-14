@@ -164,6 +164,7 @@ fn fixed_commands_and_usage_are_exact() {
         ("services", Command::Services),
         ("tasks", Command::Tasks),
         ("status", Command::Status),
+        ("memory", Command::Memory),
     ] {
         assert_eq!(
             parser.parse(line.as_bytes()).unwrap().command(),
@@ -196,7 +197,7 @@ fn fixed_commands_and_usage_are_exact() {
             Err(UsageError::ArgumentCount { .. })
         ));
     }
-    assert_eq!(COMMANDS.len(), 17);
+    assert_eq!(COMMANDS.len(), 18);
     // The W7 file commands: `write` takes the path and the rest as text.
     let Ok(Command::Write { path, text }) = parser
         .parse(b"write /etc/motd hello  world")

@@ -26,6 +26,8 @@ pub enum CommandName {
     Services,
     Tasks,
     Status,
+    /// The jobs' memory plan and usage, from init (DW2 §10.3 item 7).
+    Memory,
     Run,
     Spawn,
     Wait,
@@ -59,7 +61,7 @@ pub struct CommandSpec {
 }
 
 /// The same fixed metadata supports classification and the future help builtin.
-pub const COMMANDS: [CommandSpec; 17] = [
+pub const COMMANDS: [CommandSpec; 18] = [
     CommandSpec {
         name: CommandName::Help,
         spelling: "help",
@@ -106,6 +108,12 @@ pub const COMMANDS: [CommandSpec; 17] = [
         name: CommandName::Status,
         spelling: "status",
         usage: "status",
+        arity: Arity::Exact(0),
+    },
+    CommandSpec {
+        name: CommandName::Memory,
+        spelling: "memory",
+        usage: "memory",
         arity: Arity::Exact(0),
     },
     CommandSpec {
@@ -235,6 +243,7 @@ pub enum Command<'a> {
     Services,
     Tasks,
     Status,
+    Memory,
     /// `argv` includes the path as child `argv[0]`, without the shell command name.
     Run {
         path: &'a str,
@@ -296,6 +305,7 @@ impl<'a> Arguments<'a> {
             CommandName::Services => Command::Services,
             CommandName::Tasks => Command::Tasks,
             CommandName::Status => Command::Status,
+            CommandName::Memory => Command::Memory,
             CommandName::Run | CommandName::Spawn => {
                 let path = operands.get(0).ok_or(UsageError::InvalidPath)?;
                 if spec.name == CommandName::Run && path.starts_with('/') {
