@@ -18,6 +18,13 @@
 //! that a Stop or an ended parked call landed inside a map in steps. Those
 //! inside a create or a commit are reported but not required, since a kill
 //! lands in them only by chance (see [`steps_report`]).
+//!
+//! The idle-BSP probe (Deepwyrm DW2 §10.19 revision 3) runs earlier, before
+//! the hogs, while the system is quiet: `hello close-spin` closes a
+//! committed 512 MiB on-demand object and spins about a second with no
+//! syscall, so only a woken BSP steps its owed finalization when the job is
+//! on an AP. The report's longest finalize gap must then stay below half the
+//! shortest spin (see [`finalize_gap`]).
 
 use std::{thread, time::Duration};
 
@@ -283,6 +290,64 @@ pub(super) fn probes(shell: &mut Shell<'_>) -> Result<(), Failure> {
     Ok(())
 }
 
+/// How many separate `close-spin` jobs run, so the scheduler places each
+/// afresh.
+const CLOSE_SPIN_RUNS: usize = 3;
+
+/// The idle-BSP probe, run while nothing else does: each `hello close-spin`
+/// must exit normally with its line, and the system must get its memory
+/// back before the next. The measured spins, in microseconds.
+pub(super) fn close_spin(shell: &mut Shell<'_>) -> Result<Vec<u64>, Failure> {
+    let base = settle(shell, "a settled usage before `hello close-spin`", |_| true)?;
+    let mut spins = Vec::with_capacity(CLOSE_SPIN_RUNS);
+    for _ in 0..CLOSE_SPIN_RUNS {
+        let output = shell.run("run bin/hello close-spin")?;
+        let spin = line_field(&output, "spin-us")
+            .filter(|_| contains(&output, b"classification=normal application=0 "));
+        let Some(spin) = spin else {
+            return Err(Failure::task(format!(
+                "dev-boot check: `run bin/hello close-spin` printed {:?}",
+                String::from_utf8_lossy(&output)
+            )));
+        };
+        eprintln!("dev-boot: close-spin spin-us={spin}");
+        spins.push(spin);
+        back_to(shell, &base, "`hello close-spin`")?;
+    }
+    Ok(spins)
+}
+
+/// The step report's longest finalize gap against the spins `close-spin`
+/// measured in the same boot: the gap must be below half the shortest, or
+/// owed work waited for a syscall or a deadline while the BSP was halted
+/// (DW2 §10.19). A kernel that does not report the gap is skipped, with a
+/// line saying so.
+pub(super) fn finalize_gap(lines: &[String], spins: &[u64]) -> Result<String, String> {
+    let Some(value) = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("finalize-gap-longest-us="))
+    else {
+        return Ok("finalize gap check skipped: the kernel does not report the gap".into());
+    };
+    let gap = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("the finalize gap line is not a number: {value:?}"))?;
+    let Some(&shortest) = spins.iter().min() else {
+        return Err("no `close-spin` run measured a spin".into());
+    };
+    if gap.saturating_mul(2) < shortest {
+        Ok(format!(
+            "finalize gap {gap} us is below half the shortest spin {shortest} us"
+        ))
+    } else {
+        Err(format!(
+            "owed finalization went {gap} us without a step, not below half the \
+             shortest `close-spin` spin ({shortest} us): the idle BSP was not woken"
+        ))
+    }
+}
+
 /// How many times probe 15 kills `churn-map` in one boot. The kernel counts a
 /// kill only when it lands between two steps of a map or while the map call
 /// is parked; a kill at a map call's first safe point, or between two map
@@ -378,5 +443,42 @@ mod tests {
         let unmap = String::from_utf8_lossy(log).replace("map=2 unmap=0", "map=0 unmap=1");
         assert!(steps_report(unmap.as_bytes()).is_err());
         assert!(steps_report(b"").is_err());
+    }
+
+    fn report(log: &str) -> Vec<String> {
+        let full = format!(
+            "[DW0][INFO][steps] stops-between-steps map=1 unmap=0 protect=0 fill=0 commit=0 create=0\n\
+             [DW0][INFO][steps] parked-ended map=0 unmap=0 protect=0 fill=0 commit=0 create=0\n{log}"
+        );
+        steps_report(full.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn the_finalize_gap_must_stay_below_half_the_shortest_spin() {
+        let lines = report(
+            "[DW0][INFO][steps] finalize-wait-longest-us=179030 pages=131071\n\
+             [DW0][INFO][steps] finalize-gap-longest-us=5212\n\
+             [DW0][INFO][steps] finalize-steps gate=1307 syscall=4649 fault=0 idle=20 other=1\n",
+        );
+        assert!(finalize_gap(&lines, &[1_000_400, 1_020_000, 998_000]).is_ok());
+        // The shortest spin sets the bound, and half of it is not below.
+        let at_half = report("[DW0][INFO][steps] finalize-gap-longest-us=499000\n");
+        assert!(finalize_gap(&at_half, &[998_000, 1_200_000]).is_err());
+        assert!(finalize_gap(&at_half, &[998_002, 1_200_000]).is_ok());
+        // A gap near the spin, as without the wake, fails.
+        let long = report("[DW0][INFO][steps] finalize-gap-longest-us=987654\n");
+        assert!(finalize_gap(&long, &[1_000_000; 3]).is_err());
+        // No spin measured is a failure, not a pass.
+        assert!(finalize_gap(&lines, &[]).is_err());
+    }
+
+    #[test]
+    fn a_kernel_without_the_gap_line_is_skipped_and_a_garbled_one_fails() {
+        let lines = report("[DW0][INFO][steps] longest-step-us=3100 call=create\n");
+        let skipped = finalize_gap(&lines, &[1_000_000]).unwrap();
+        assert!(skipped.contains("skipped"), "{skipped}");
+        // A line that is there but garbled is a failure, not a skip.
+        let garbled = report("[DW0][INFO][steps] finalize-gap-longest-us=lots\n");
+        assert!(finalize_gap(&garbled, &[1_000_000]).is_err());
     }
 }

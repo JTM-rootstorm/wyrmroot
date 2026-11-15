@@ -104,6 +104,10 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
 ///   (keeping the mappings until a map is refused), eager create, or
 ///   on-demand commit forever, for the check to stop mid-call (probe 15).
 /// - `slow-ready`: commits forever before READY (see `hello_main`).
+/// - `close-spin`: commits a 512 MiB on-demand object, closes it (its
+///   finalization is then owed) and spins about a second in user mode with
+///   no syscall and no fault, then prints `close-spin spin-us=` (DW2 §10.19:
+///   with the job on an AP, only a woken BSP steps the owed work).
 #[allow(
     unsafe_code,
     reason = "reads and writes the probe's own fresh mappings through raw pointers"
@@ -113,15 +117,21 @@ mod memory {
         DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
         DW_CLOCK_MONOTONIC_ACTIVE, DW_DEADLINE_INFINITE, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND,
         DW_MEMORY_PROTECTION_READ, DW_MEMORY_PROTECTION_WRITE, DW_RIGHT_MAP, DW_RIGHT_READ,
-        DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_READABLE, DW_STATUS_SUCCESS,
-        DwAddressRegionMapArgsV1, DwHandle, DwMemoryObjectCreateFlags, DwMemoryProtection,
-        DwOffset, DwRights, DwSize, DwUserAddress, DwWaitResultV1,
+        DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_READABLE, DW_STATUS_NO_RESOURCES,
+        DW_STATUS_SUCCESS, DwAddressRegionMapArgsV1, DwHandle, DwMemoryObjectCreateFlags,
+        DwMemoryProtection, DwOffset, DwRights, DwSize, DwUserAddress, DwWaitResultV1,
     };
 
     const MIB: u64 = 1 << 20;
     const PAGE: u64 = 4096;
     const CHURN: u64 = 256 * MIB;
     const HOLD: u64 = 64 * MIB;
+    /// `close-spin`'s object: about 256 finalize steps of 512 entries.
+    const SPIN_OBJECT: u64 = 512 * MIB;
+    /// How long `close-spin` spins after the close, and how long one
+    /// calibration call must take at least.
+    const SPIN_US: u64 = 1_000_000;
+    const SPIN_CALIBRATION_US: u64 = 100_000;
     const RW: DwMemoryProtection =
         DwMemoryProtection(DW_MEMORY_PROTECTION_READ.0 | DW_MEMORY_PROTECTION_WRITE.0);
 
@@ -136,6 +146,7 @@ mod memory {
                 | "churn-map"
                 | "churn-create"
                 | "churn-commit"
+                | "close-spin"
         )
     }
 
@@ -182,6 +193,7 @@ mod memory {
                     return 2;
                 }
             },
+            "close-spin" => close_spin(write),
             _ => 2,
         }
     }
@@ -381,6 +393,57 @@ mod memory {
                 Err(_) => return 2,
             }
         }
+    }
+
+    /// `close-spin`: a committed on-demand object closed, then a spin of
+    /// about [`SPIN_US`] with no syscall and no page fault, timed by one
+    /// clock read after it. The object fills the job's budget, so its
+    /// commit may stop at the quota; what was committed is kept.
+    fn close_spin(write: &mut dyn FnMut(&[u8]) -> bool) -> u32 {
+        let Ok(object) = create(SPIN_OBJECT, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND) else {
+            return 2;
+        };
+        let committed =
+            deepwyrm_syscall::memory_object_commit(object, DwOffset(0), DwSize(SPIN_OBJECT));
+        if committed != DW_STATUS_SUCCESS && committed != DW_STATUS_NO_RESOURCES {
+            return 2;
+        }
+        // Calibrated before the close, with the same function, so its code
+        // and stack are already touched when it runs after the close.
+        let mut iterations: u64 = 1 << 16;
+        let elapsed = loop {
+            let start = now_us();
+            spin(iterations);
+            let elapsed = now_us().saturating_sub(start);
+            if elapsed >= SPIN_CALIBRATION_US || iterations >= 1 << 40 {
+                break elapsed.max(1);
+            }
+            iterations *= 2;
+        };
+        let target =
+            u64::try_from(u128::from(iterations) * u128::from(SPIN_US) / u128::from(elapsed))
+                .unwrap_or(u64::MAX);
+        let start = now_us();
+        if deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS {
+            return 2;
+        }
+        spin(target);
+        let spun = now_us().saturating_sub(start);
+        let mut line = Line::new();
+        line.text("close-spin spin-us=").number(spun).text("\n");
+        write(line.bytes());
+        0
+    }
+
+    /// Counts to `iterations` in registers or on the touched stack: no
+    /// syscall, no new page.
+    #[inline(never)]
+    fn spin(iterations: u64) -> u64 {
+        let mut count = 0_u64;
+        while count < iterations {
+            count = core::hint::black_box(count) + 1;
+        }
+        count
     }
 
     fn wait_forever() -> u32 {

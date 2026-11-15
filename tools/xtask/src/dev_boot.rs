@@ -13,7 +13,10 @@
 //! `device.block.virtio1`, `volume.boot0`, `volume.root0` and `system.vfs`
 //! (W6, W7) are all published; lists `/` until ext4d's root (with its
 //! `lost+found`) is mounted there; lists `/boot/EFI/WYRMROOT` and `cat`s its
-//! README through vfsd, fat32d and blockmgr; spawns two `bin/cpu-hog` jobs,
+//! README through vfsd, fat32d and blockmgr; runs the idle-BSP probe
+//! `bin/hello close-spin` three times while the system is quiet, whose spins
+//! bound the first boot's longest finalize gap (Deepwyrm DW2 §10.19,
+//! `memory.rs`); spawns two `bin/cpu-hog` jobs,
 //! which hold their own FP registers and FS base while they preempt each
 //! other; runs `bin/hello` with its on-demand MemoryObject probe, which must
 //! pass and then end in `resource-policy` once its page quota is spent
@@ -293,8 +296,9 @@ fn check(
 ) -> Result<String, Failure> {
     let started = Instant::now();
     let token = format!("dev-boot persisted {unique}");
+    let mut spins = Vec::new();
     let first = boot_once(boots[0].0, boots[0].1, &root.join("com2.log"), |shell| {
-        first_boot(shell, &token, sdk)
+        first_boot(shell, &token, sdk, &mut spins)
     });
     first?;
     // The kernel's step report from the first boot, which ran the probes.
@@ -305,9 +309,18 @@ fn check(
             boots[0].1.display()
         ))
     })?;
-    for line in steps {
+    for line in &steps {
         eprintln!("dev-boot: kernel steps {line}");
     }
+    // The idle-BSP probe's owed work was stepped while its job spun (DW2
+    // §10.19).
+    let gap = memory::finalize_gap(&steps, &spins).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
+    eprintln!("dev-boot: {gap}");
     let second = boot_once(
         boots[1].0,
         boots[1].1,
@@ -322,8 +335,14 @@ fn check(
     ))
 }
 
-/// Everything the first boot checks, ending with the persistent write.
-fn first_boot(shell: &mut Shell<'_>, token: &str, sdk: bool) -> Result<(), Failure> {
+/// Everything the first boot checks, ending with the persistent write;
+/// `spins` gets what the idle-BSP probe measured.
+fn first_boot(
+    shell: &mut Shell<'_>,
+    token: &str,
+    sdk: bool,
+    spins: &mut Vec<u64>,
+) -> Result<(), Failure> {
     shell.retry("services", "every storage service published", |output| {
         SERVICES.iter().all(|service| contains(output, service))
     })?;
@@ -341,6 +360,10 @@ fn first_boot(shell: &mut Shell<'_>, token: &str, sdk: bool) -> Result<(), Failu
         crate::product::DEV_BOOT_PLATFORM.job_memory_bytes_max / 1024
     );
     shell.expect("memory", budget.as_bytes())?;
+    // The idle-BSP probe (DW2 §10.19), while nothing else runs and nothing
+    // is owed yet: the shell waits on the job, so the BSP is idle unless
+    // the job is on it.
+    *spins = memory::close_spin(shell)?;
     // Two hogs hold their own FP registers and FS base and preempt each
     // other (and everything else) until they are terminated; a hog that saw
     // its state change, or did not start from the initial FP state, exits on
