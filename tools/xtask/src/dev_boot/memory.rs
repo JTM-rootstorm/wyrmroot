@@ -310,7 +310,14 @@ pub(super) fn close_spin(shell: &mut Shell<'_>) -> Result<Vec<u64>, Failure> {
                 String::from_utf8_lossy(&output)
             )));
         };
-        eprintln!("dev-boot: close-spin spin-us={spin}");
+        // With the APIC IDs it spun on (0 is the BSP) and whether its
+        // commit stopped at the quota.
+        for line in String::from_utf8_lossy(&output)
+            .lines()
+            .filter(|line| line.starts_with("close-spin "))
+        {
+            eprintln!("dev-boot: {line}");
+        }
         spins.push(spin);
         back_to(shell, &base, "`hello close-spin`")?;
     }

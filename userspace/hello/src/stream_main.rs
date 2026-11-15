@@ -106,8 +106,9 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
 /// - `slow-ready`: commits forever before READY (see `hello_main`).
 /// - `close-spin`: commits a 512 MiB on-demand object, closes it (its
 ///   finalization is then owed) and spins about a second in user mode with
-///   no syscall and no fault, then prints `close-spin spin-us=` (DW2 §10.19:
-///   with the job on an AP, only a woken BSP steps the owed work).
+///   no syscall and no fault, then prints `close-spin spin-us=` with the
+///   APIC IDs it spun on (DW2 §10.19: with the job on an AP, only a woken
+///   BSP steps the owed work).
 #[allow(
     unsafe_code,
     reason = "reads and writes the probe's own fresh mappings through raw pointers"
@@ -427,12 +428,31 @@ mod memory {
         if deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS {
             return 2;
         }
+        let cpu_before = cpu();
         spin(target);
+        let cpu_after = cpu();
         let spun = now_us().saturating_sub(start);
         let mut line = Line::new();
-        line.text("close-spin spin-us=").number(spun).text("\n");
+        line.text("close-spin spin-us=")
+            .number(spun)
+            .text(" apic-before=")
+            .number(cpu_before)
+            .text(" apic-after=")
+            .number(cpu_after)
+            .text(if committed == DW_STATUS_SUCCESS {
+                " commit=full\n"
+            } else {
+                " commit=quota\n"
+            });
         write(line.bytes());
         0
+    }
+
+    /// The initial APIC ID of the CPU running this, from `cpuid` (no
+    /// syscall, no fault), so the check can tell a spin on the BSP (0)
+    /// from one on an AP.
+    fn cpu() -> u64 {
+        u64::from(core::arch::x86_64::__cpuid(1).ebx >> 24)
     }
 
     /// Counts to `iterations` in registers or on the touched stack: no
