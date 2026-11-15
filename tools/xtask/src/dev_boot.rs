@@ -14,9 +14,10 @@
 //! (W6, W7) are all published; lists `/` until ext4d's root (with its
 //! `lost+found`) is mounted there; lists `/boot/EFI/WYRMROOT` and `cat`s its
 //! README through vfsd, fat32d and blockmgr; runs the idle-BSP probe
-//! `bin/hello close-spin` three times while the system is quiet, whose spins
-//! bound the first boot's longest finalize gap (Deepwyrm DW2 §10.19,
-//! `memory.rs`); spawns two `bin/cpu-hog` jobs,
+//! `bin/hello close-spin` three times while the system is quiet, after
+//! which the first boot's report must show an owed-work wake for each run
+//! that spun on an AP, and its longest finalize gap is reported (Deepwyrm
+//! DW2 §10.19, `memory.rs`); spawns two `bin/cpu-hog` jobs,
 //! which hold their own FP registers and FS base while they preempt each
 //! other; runs `bin/hello` with its on-demand MemoryObject probe, which must
 //! pass and then end in `resource-policy` once its page quota is spent
@@ -312,15 +313,16 @@ fn check(
     for line in &steps {
         eprintln!("dev-boot: kernel steps {line}");
     }
-    // The idle-BSP probe's owed work was stepped while its job spun (DW2
-    // §10.19).
-    let gap = memory::finalize_gap(&steps, &spins).map_err(|reason| {
+    // The idle-BSP probe: each run that spun on an AP had the kernel wake
+    // the idle BSP for its owed work (DW2 §10.19); the gap is reported.
+    eprintln!("dev-boot: {}", memory::close_spin_summary(&steps, &spins));
+    let wakes = memory::owed_wakes(&steps, &spins).map_err(|reason| {
         Failure::task(format!(
             "dev-boot check: {reason}; see {}",
             boots[0].1.display()
         ))
     })?;
-    eprintln!("dev-boot: {gap}");
+    eprintln!("dev-boot: {wakes}");
     let second = boot_once(
         boots[1].0,
         boots[1].1,
@@ -336,12 +338,12 @@ fn check(
 }
 
 /// Everything the first boot checks, ending with the persistent write;
-/// `spins` gets what the idle-BSP probe measured.
+/// `spins` gets the idle-BSP probe's runs.
 fn first_boot(
     shell: &mut Shell<'_>,
     token: &str,
     sdk: bool,
-    spins: &mut Vec<u64>,
+    spins: &mut Vec<memory::Spin>,
 ) -> Result<(), Failure> {
     shell.retry("services", "every storage service published", |output| {
         SERVICES.iter().all(|service| contains(output, service))

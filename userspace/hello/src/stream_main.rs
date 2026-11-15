@@ -105,10 +105,10 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
 ///   on-demand commit forever, for the check to stop mid-call (probe 15).
 /// - `slow-ready`: commits forever before READY (see `hello_main`).
 /// - `close-spin`: commits a 512 MiB on-demand object, closes it (its
-///   finalization is then owed) and spins about a second in user mode with
+///   finalization is then owed) and spins half a second in user mode with
 ///   no syscall and no fault, then prints `close-spin spin-us=` with the
-///   APIC IDs it spun on (DW2 §10.19: with the job on an AP, only a woken
-///   BSP steps the owed work).
+///   APIC IDs it spun on (DW2 §10.19: a job on an AP that queues owed work
+///   while the BSP is idle has the kernel wake the BSP for it).
 #[allow(
     unsafe_code,
     reason = "reads and writes the probe's own fresh mappings through raw pointers"
@@ -131,7 +131,7 @@ mod memory {
     const SPIN_OBJECT: u64 = 512 * MIB;
     /// How long `close-spin` spins after the close, and how long one
     /// calibration call must take at least.
-    const SPIN_US: u64 = 1_000_000;
+    const SPIN_US: u64 = 500_000;
     const SPIN_CALIBRATION_US: u64 = 100_000;
     const RW: DwMemoryProtection =
         DwMemoryProtection(DW_MEMORY_PROTECTION_READ.0 | DW_MEMORY_PROTECTION_WRITE.0);

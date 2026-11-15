@@ -21,10 +21,12 @@
 //!
 //! The idle-BSP probe (Deepwyrm DW2 §10.19 revision 3) runs earlier, before
 //! the hogs, while the system is quiet: `hello close-spin` closes a
-//! committed 512 MiB on-demand object and spins about a second with no
-//! syscall, so only a woken BSP steps its owed finalization when the job is
-//! on an AP. The report's longest finalize gap must then stay below half the
-//! shortest spin (see [`finalize_gap`]).
+//! committed 512 MiB on-demand object into an empty queue and spins half a
+//! second with no syscall. When its job is on an AP from start to end, the
+//! kernel must send the idle BSP an owed-work wake for it; the report's
+//! `owed-wakes` line must show at least that many wakes and none unsent
+//! (see [`owed_wakes`]). The longest finalize gap is reported, not bounded:
+//! init's 25 ms resident tick wakes the BSP even without the wake.
 
 use std::{thread, time::Duration};
 
@@ -294,15 +296,43 @@ pub(super) fn probes(shell: &mut Shell<'_>) -> Result<(), Failure> {
 /// afresh.
 const CLOSE_SPIN_RUNS: usize = 3;
 
+/// One `close-spin` run: the microseconds it spun and the APIC IDs it
+/// spun on (0 is the BSP).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Spin {
+    pub(super) us: u64,
+    pub(super) apic_before: u64,
+    pub(super) apic_after: u64,
+}
+
+impl Spin {
+    /// The run's line, as `hello close-spin` prints it.
+    fn parse(output: &[u8]) -> Option<Self> {
+        Some(Self {
+            us: line_field(output, "spin-us")?,
+            apic_before: line_field(output, "apic-before")?,
+            apic_after: line_field(output, "apic-after")?,
+        })
+    }
+
+    /// Whether the job stayed on one AP from the close to the end of its
+    /// spin: then its close queued owed work off the BSP, into an empty
+    /// queue, with the BSP idle, which is one owed-work wake.
+    const fn on_an_ap(self) -> bool {
+        self.apic_before == self.apic_after && self.apic_before != 0
+    }
+}
+
 /// The idle-BSP probe, run while nothing else does: each `hello close-spin`
 /// must exit normally with its line, and the system must get its memory
-/// back before the next. The measured spins, in microseconds.
-pub(super) fn close_spin(shell: &mut Shell<'_>) -> Result<Vec<u64>, Failure> {
+/// back before the next, so each close finds the queue of owed work empty.
+pub(super) fn close_spin(shell: &mut Shell<'_>) -> Result<Vec<Spin>, Failure> {
+    // Settled first, as for the memory probes: nothing a job left is owed.
     let base = settle(shell, "a settled usage before `hello close-spin`", |_| true)?;
     let mut spins = Vec::with_capacity(CLOSE_SPIN_RUNS);
     for _ in 0..CLOSE_SPIN_RUNS {
         let output = shell.run("run bin/hello close-spin")?;
-        let spin = line_field(&output, "spin-us")
+        let spin = Spin::parse(&output)
             .filter(|_| contains(&output, b"classification=normal application=0 "));
         let Some(spin) = spin else {
             return Err(Failure::task(format!(
@@ -310,8 +340,6 @@ pub(super) fn close_spin(shell: &mut Shell<'_>) -> Result<Vec<u64>, Failure> {
                 String::from_utf8_lossy(&output)
             )));
         };
-        // With the APIC IDs it spun on (0 is the BSP) and whether its
-        // commit stopped at the quota.
         for line in String::from_utf8_lossy(&output)
             .lines()
             .filter(|line| line.starts_with("close-spin "))
@@ -324,35 +352,65 @@ pub(super) fn close_spin(shell: &mut Shell<'_>) -> Result<Vec<u64>, Failure> {
     Ok(spins)
 }
 
-/// The step report's longest finalize gap against the spins `close-spin`
-/// measured in the same boot: the gap must be below half the shortest, or
-/// owed work waited for a syscall or a deadline while the BSP was halted
-/// (DW2 §10.19). A kernel that does not report the gap is skipped, with a
-/// line saying so.
-pub(super) fn finalize_gap(lines: &[String], spins: &[u64]) -> Result<String, String> {
-    let Some(value) = lines
+/// One line for the log: each spin with the APIC IDs it ran on, and the
+/// kernel's longest finalize gap (reported, not bounded).
+pub(super) fn close_spin_summary(lines: &[String], spins: &[Spin]) -> String {
+    let runs: Vec<String> = spins
+        .iter()
+        .map(|spin| {
+            format!(
+                "{} us on APIC {}->{}",
+                spin.us, spin.apic_before, spin.apic_after
+            )
+        })
+        .collect();
+    let gap = lines
         .iter()
         .find_map(|line| line.strip_prefix("finalize-gap-longest-us="))
-    else {
-        return Ok("finalize gap check skipped: the kernel does not report the gap".into());
+        .map_or("not reported".to_owned(), |gap| {
+            format!("{} us", gap.trim())
+        });
+    format!(
+        "close-spin runs: {}; longest finalize gap {gap}",
+        runs.join(", ")
+    )
+}
+
+/// The kernel's owed-work wakes against the probe (DW2 §10.19): the
+/// `owed-wakes` line must be there and parse, none may be unsent, and there
+/// must be at least one wake per run that spun on one AP from start to end.
+/// A run that moved or ran on the BSP counts for nothing.
+pub(super) fn owed_wakes(lines: &[String], spins: &[Spin]) -> Result<String, String> {
+    let Some(line) = lines.iter().find(|line| line.starts_with("owed-wakes=")) else {
+        return Err(
+            "the kernel reports no owed-work wakes (no `owed-wakes` line, DW2 §10.19)".into(),
+        );
     };
-    let gap = value
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| format!("the finalize gap line is not a number: {value:?}"))?;
-    let Some(&shortest) = spins.iter().min() else {
-        return Err("no `close-spin` run measured a spin".into());
+    let field = |name: &str| line_field(line.as_bytes(), name);
+    let (Some(sent), Some(unsent), Some(_), Some(_)) = (
+        field("owed-wakes"),
+        field("unsent"),
+        field("queue"),
+        field("retirement"),
+    ) else {
+        return Err(format!(
+            "the kernel's owed-wakes line does not parse: {line:?}"
+        ));
     };
-    if gap.saturating_mul(2) < shortest {
-        Ok(format!(
-            "finalize gap {gap} us is below half the shortest spin {shortest} us"
-        ))
-    } else {
-        Err(format!(
-            "owed finalization went {gap} us without a step, not below half the \
-             shortest `close-spin` spin ({shortest} us): the idle BSP was not woken"
-        ))
+    if unsent != 0 {
+        return Err(format!(
+            "the kernel could not send {unsent} owed-work wakes: {line:?}"
+        ));
     }
+    let on_aps = spins.iter().filter(|spin| spin.on_an_ap()).count() as u64;
+    if sent < on_aps {
+        return Err(format!(
+            "{on_aps} close-spin runs spun on an AP but the kernel sent {sent} owed-work wakes"
+        ));
+    }
+    Ok(format!(
+        "{on_aps} close-spin runs spun on an AP and the kernel sent {sent} owed-work wakes, none unsent"
+    ))
 }
 
 /// How many times probe 15 kills `churn-map` in one boot. The kernel counts a
@@ -460,32 +518,77 @@ mod tests {
         steps_report(full.as_bytes()).unwrap()
     }
 
-    #[test]
-    fn the_finalize_gap_must_stay_below_half_the_shortest_spin() {
-        let lines = report(
-            "[DW0][INFO][steps] finalize-wait-longest-us=179030 pages=131071\n\
-             [DW0][INFO][steps] finalize-gap-longest-us=5212\n\
-             [DW0][INFO][steps] finalize-steps gate=1307 syscall=4649 fault=0 idle=20 other=1\n",
-        );
-        assert!(finalize_gap(&lines, &[1_000_400, 1_020_000, 998_000]).is_ok());
-        // The shortest spin sets the bound, and half of it is not below.
-        let at_half = report("[DW0][INFO][steps] finalize-gap-longest-us=499000\n");
-        assert!(finalize_gap(&at_half, &[998_000, 1_200_000]).is_err());
-        assert!(finalize_gap(&at_half, &[998_002, 1_200_000]).is_ok());
-        // A gap near the spin, as without the wake, fails.
-        let long = report("[DW0][INFO][steps] finalize-gap-longest-us=987654\n");
-        assert!(finalize_gap(&long, &[1_000_000; 3]).is_err());
-        // No spin measured is a failure, not a pass.
-        assert!(finalize_gap(&lines, &[]).is_err());
+    const fn spin(apic_before: u64, apic_after: u64) -> Spin {
+        Spin {
+            us: 500_000,
+            apic_before,
+            apic_after,
+        }
     }
 
     #[test]
-    fn a_kernel_without_the_gap_line_is_skipped_and_a_garbled_one_fails() {
-        let lines = report("[DW0][INFO][steps] longest-step-us=3100 call=create\n");
-        let skipped = finalize_gap(&lines, &[1_000_000]).unwrap();
-        assert!(skipped.contains("skipped"), "{skipped}");
-        // A line that is there but garbled is a failure, not a skip.
-        let garbled = report("[DW0][INFO][steps] finalize-gap-longest-us=lots\n");
-        assert!(finalize_gap(&garbled, &[1_000_000]).is_err());
+    fn a_close_spin_line_is_parsed() {
+        let output = b"job budget-kib=524288\r\nclose-spin spin-us=501234 apic-before=2 \
+            apic-after=2 commit=quota\r\n";
+        assert_eq!(
+            Spin::parse(output),
+            Some(Spin {
+                us: 501_234,
+                apic_before: 2,
+                apic_after: 2
+            })
+        );
+        assert_eq!(Spin::parse(b"close-spin spin-us=501234\r\n"), None);
+    }
+
+    #[test]
+    fn each_run_on_one_ap_needs_an_owed_work_wake() {
+        let wakes = |sent: u64| {
+            report(&format!(
+                "[DW0][INFO][steps] owed-wakes={sent} unsent=0 queue={sent} retirement=0\n"
+            ))
+        };
+        let on_aps = [spin(2, 2), spin(3, 3), spin(1, 1)];
+        assert!(owed_wakes(&wakes(3), &on_aps).is_ok());
+        assert!(owed_wakes(&wakes(40), &on_aps).is_ok());
+        assert_eq!(
+            owed_wakes(&wakes(2), &on_aps),
+            Err("3 close-spin runs spun on an AP but the kernel sent 2 owed-work wakes".into())
+        );
+        // A run that moved between CPUs, or ran on the BSP, counts for
+        // nothing.
+        let mixed = [spin(0, 1), spin(0, 0), spin(2, 2)];
+        assert!(owed_wakes(&wakes(1), &mixed).is_ok());
+        assert!(owed_wakes(&wakes(0), &mixed).is_err());
+        // On one CPU only the line and `unsent=0` are required.
+        assert!(owed_wakes(&wakes(0), &[spin(0, 0); 3]).is_ok());
+    }
+
+    #[test]
+    fn an_unsent_missing_or_garbled_wake_line_fails() {
+        let on_aps = [spin(2, 2)];
+        let unsent = report("[DW0][INFO][steps] owed-wakes=5 unsent=1 queue=5 retirement=0\n");
+        assert!(owed_wakes(&unsent, &on_aps).is_err());
+        let missing = report("[DW0][INFO][steps] finalize-gap-longest-us=19390\n");
+        assert_eq!(
+            owed_wakes(&missing, &[spin(0, 0)]),
+            Err("the kernel reports no owed-work wakes (no `owed-wakes` line, DW2 §10.19)".into())
+        );
+        let garbled = report("[DW0][INFO][steps] owed-wakes=5 unsent=none queue=5\n");
+        assert!(owed_wakes(&garbled, &on_aps).is_err());
+    }
+
+    #[test]
+    fn the_summary_names_each_spin_and_the_gap() {
+        let lines = report("[DW0][INFO][steps] finalize-gap-longest-us=5217\n");
+        assert_eq!(
+            close_spin_summary(&lines, &[spin(2, 2), spin(0, 1)]),
+            "close-spin runs: 500000 us on APIC 2->2, 500000 us on APIC 0->1; \
+             longest finalize gap 5217 us"
+        );
+        assert_eq!(
+            close_spin_summary(&report(""), &[spin(0, 0)]),
+            "close-spin runs: 500000 us on APIC 0->0; longest finalize gap not reported"
+        );
     }
 }
