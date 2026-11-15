@@ -252,7 +252,9 @@ pub(super) fn probes(shell: &mut Shell<'_>) -> Result<(), Failure> {
     back_to(shell, &base, "`hello hold-released`")?;
 
     // Probe 15: stopped mid-call, nothing is left behind.
-    for mode in ["churn-map", "churn-create", "churn-commit"] {
+    let churn_modes =
+        std::iter::repeat_n("churn-map", CHURN_MAP_RUNS).chain(["churn-create", "churn-commit"]);
+    for mode in churn_modes {
         let job = spawn_job(shell, &format!("bin/hello {mode}"))?;
         // A churn's usage swings with each round, so one read past the mark
         // shows it is in its loop.
@@ -281,10 +283,20 @@ pub(super) fn probes(shell: &mut Shell<'_>) -> Result<(), Failure> {
     Ok(())
 }
 
+/// How many times probe 15 kills `churn-map` in one boot. The kernel counts a
+/// kill only when it lands between two steps of a map or while the map call
+/// is parked; a kill at a map call's first safe point, or between two map
+/// calls, is counted nowhere. One kill misses the counted window now and
+/// then, so several are run and the report needs only one counted.
+const CHURN_MAP_RUNS: usize = 3;
+
 /// The kernel's `[steps]` report from a COM1 log: its three lines, which
 /// must show a Stop or an ended parked call inside a map in steps (plan
-/// item 15; `churn-map` is nearly always mapping). Creates and commits are
-/// reported, not required: a kill lands in them only by chance.
+/// item 15). Only a kill between two steps of a map, or one that ends a
+/// parked map call, is counted; a kill at a map call's first safe point or
+/// between two map calls is not, which is why the probe kills `churn-map`
+/// `CHURN_MAP_RUNS` times and one counted kill suffices. Creates and commits
+/// are reported, not required: a kill lands in them only by chance.
 pub(super) fn steps_report(log: &[u8]) -> Result<Vec<String>, String> {
     let text = String::from_utf8_lossy(log);
     let lines: Vec<String> = text
