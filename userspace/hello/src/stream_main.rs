@@ -98,11 +98,12 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
 /// which the check compares with init's plan (probe 12).
 /// - `on-demand`, `on-demand-exhaust`: an on-demand object end to end
 ///   (M6); the second then spends the quota and touches past it.
-/// - `eager`: eager objects of 4, 8, 256 and 448 MiB created, mapped,
-///   touched in every page, protected, unmapped in steps and closed, each
-///   timed (probes 13 and 14).
-/// - `fragment <MiB>`, `fragmented <MiB>`: the fragmented-guest
-///   probe (DW2 §12.10, part 1; see `fragment` and `fragmented` below).
+/// - `eager`: eager objects of 4, 8 and 256 MiB created, mapped, touched
+///   in every page, protected, unmapped in steps and closed, each timed
+///   (probes 13 and 14).
+/// - `unfragmented`, `fragment <MiB>`, `fragmented <MiB>`: the
+///   fragmented-guest probe (DW2 §12.10, part 1; see `fragment` and
+///   `measure` below).
 /// - `hold-touched`, `hold-released`: maps 64 MiB on demand with no handle
 ///   left, touches every page and, for the second, unmaps the top half;
 ///   then waits forever, for the check to read usage (probe 13).
@@ -168,6 +169,7 @@ mod memory {
                 | "close-spin"
                 | "fragment"
                 | "fragmented"
+                | "unfragmented"
         )
     }
 
@@ -220,7 +222,9 @@ mod memory {
                 Some(filler) => fragment(budget, filler * MIB),
                 None => 2,
             },
-            "fragmented" => fragmented(region, size_mib.unwrap_or(0) * MIB, write),
+            "fragmented" | "unfragmented" => {
+                measure(mode, region, size_mib.unwrap_or(0) * MIB, write)
+            }
             _ => 2,
         }
     }
@@ -301,7 +305,7 @@ mod memory {
     }
 
     fn eager(region: DwHandle, write: &mut dyn FnMut(&[u8]) -> bool) -> u32 {
-        for size_mib in [4, 8, 256, MEASURED_MIB] {
+        for size_mib in [4, 8, 256] {
             match eager_once(region, size_mib * MIB) {
                 Ok(times) => {
                     write(timed_line("eager", size_mib, times).bytes());
@@ -596,41 +600,48 @@ mod memory {
         sleeper.forever()
     }
 
-    /// `fragmented <MiB>`: an eager top-up of that size (none for 0) held
-    /// while one eager object of [`MEASURED_MIB`] runs `eager`'s cycle,
-    /// each call timed, on a guest `fragment` has fragmented.
-    fn fragmented(region: DwHandle, top_up: u64, write: &mut dyn FnMut(&[u8]) -> bool) -> u32 {
+    /// `fragmented <MiB>` and `unfragmented`: an eager top-up of that size
+    /// (none for 0) held while one eager object of [`MEASURED_MIB`] runs
+    /// `eager`'s cycle, each call timed; `name` (the mode) starts each line.
+    /// The check runs `unfragmented` before `fragment` and `fragmented`
+    /// after, so the two lines come from the same code on the same guest,
+    /// unfragmented and fragmented.
+    fn measure(
+        name: &str,
+        region: DwHandle,
+        top_up: u64,
+        write: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> u32 {
+        let failed = |write: &mut dyn FnMut(&[u8]) -> bool, step: &str| {
+            let mut line = Line::new();
+            line.text(name).text(" failed: ").text(step).text("\n");
+            write(line.bytes());
+            2
+        };
         let held = if top_up == 0 {
             None
         } else {
             match create(top_up, DwMemoryObjectCreateFlags(0)) {
                 Ok(object) => Some(object),
-                Err(()) => {
-                    write(b"fragmented failed: top-up\n");
-                    return 2;
-                }
+                Err(()) => return failed(write, "top-up"),
             }
         };
         let status = match eager_once(region, MEASURED_MIB * MIB) {
             Ok(times) => {
-                write(timed_line("fragmented", MEASURED_MIB, times).bytes());
+                write(timed_line(name, MEASURED_MIB, times).bytes());
                 0
             }
-            Err(step) => {
-                let mut line = Line::new();
-                line.text("fragmented failed: ").text(step).text("\n");
-                write(line.bytes());
-                2
-            }
+            Err(step) => failed(write, step),
         };
         if let Some(object) = held
             && deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS
         {
-            write(b"fragmented failed: top-up close\n");
-            return 2;
+            return failed(write, "top-up close");
         }
         if status == 0 {
-            write(b"fragmented ok\n");
+            let mut line = Line::new();
+            line.text(name).text(" ok\n");
+            write(line.bytes());
         }
         status
     }

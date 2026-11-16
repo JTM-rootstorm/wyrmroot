@@ -417,6 +417,9 @@ pub(super) fn owed_wakes(lines: &[String], spins: &[Spin]) -> Result<String, Str
 /// the hogs have ended, since a shell may hold three jobs at once and it
 /// needs all three. Each job's budget is capped well below free memory, so
 /// two jobs fragment, one after the other:
+/// - first, the baseline: `run bin/hello unfragmented` times the same
+///   cycle as `hello fragmented` below, on the same size, before anything
+///   is fragmented;
 /// - `spawn bin/hello fragment 0` commits two on-demand objects without
 ///   mapping them, alternately one page of pins for [`HOLE_PAGES`] pages of
 ///   holes, to [`Fragmentation::commit_target`]; closes the holes, whose
@@ -440,6 +443,11 @@ pub(super) fn fragmented(shell: &mut Shell<'_>) -> Result<(), Failure> {
     let base = settle(shell, "a settled usage before the fragmented probe", |_| {
         true
     })?;
+    // The baseline: the same cycle on the same size, before anything is
+    // fragmented and with the hogs ended.
+    let output = shell.run("run bin/hello unfragmented")?;
+    measured(&output, "run bin/hello unfragmented", "unfragmented", &base)?;
+    back_to(shell, &base, "`hello unfragmented`")?;
     let plan = Fragmentation::new(&base);
     eprintln!(
         "dev-boot: fragmented probe: free {} KiB, reserve {} KiB, budget {} KiB, jobs limit {} KiB, \
@@ -484,25 +492,33 @@ pub(super) fn fragmented(shell: &mut Shell<'_>) -> Result<(), Failure> {
     );
     let command = format!("run bin/hello fragmented {}", top_up / MIB_KIB);
     let output = shell.run(&command)?;
-    if line_field(&output, "budget-kib") != Some(base.budget)
-        || !contains(&output, b"fragmented ok")
-        || !contains(&output, b"classification=normal application=0 ")
-    {
-        return Err(Failure::task(format!(
-            "dev-boot check: `{command}` printed {:?}",
-            String::from_utf8_lossy(&output)
-        )));
-    }
-    for line in String::from_utf8_lossy(&output)
-        .lines()
-        .filter(|line| line.starts_with("fragmented size-mib="))
-    {
-        eprintln!("dev-boot: {line}");
-    }
+    measured(&output, &command, "fragmented", &base)?;
     for job in jobs {
         end(shell, job)?;
     }
     back_to(shell, &base, "the fragmented probe")
+}
+
+/// `hello unfragmented`'s or `hello fragmented`'s output (`name`): the
+/// planned budget, `<name> ok` and a normal exit; echoes its timed line.
+fn measured(output: &[u8], command: &str, name: &str, base: &Memory) -> Result<(), Failure> {
+    if line_field(output, "budget-kib") != Some(base.budget)
+        || !contains(output, format!("{name} ok").as_bytes())
+        || !contains(output, b"classification=normal application=0 ")
+    {
+        return Err(Failure::task(format!(
+            "dev-boot check: `{command}` printed {:?}",
+            String::from_utf8_lossy(output)
+        )));
+    }
+    let prefix = format!("{name} size-mib=");
+    for line in String::from_utf8_lossy(output)
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+    {
+        eprintln!("dev-boot: {line}");
+    }
+    Ok(())
 }
 
 /// The measured eager object of `hello fragmented`, as `hello eager`'s
