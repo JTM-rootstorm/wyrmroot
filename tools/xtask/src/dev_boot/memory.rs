@@ -27,6 +27,12 @@
 //! `owed-wakes` line must show at least that many wakes and none unsent
 //! (see [`owed_wakes`]). The longest finalize gap is reported, not bounded:
 //! init's 25 ms resident tick wakes the BSP even without the wake.
+//!
+//! The report must also show the fragmented probe's object in many runs
+//! (DW2 §12.10, see [`backing_runs`]), the longest first hold of an eager
+//! backing's allocation within [`MAX_FIRST_HOLD_RUNS`] runs (DW2 §12.11, see
+//! [`backing_alloc`]), and exactly one finalize step in any one hold of the
+//! runtime lock (DW2 §12.11, see [`finalize_hold`]).
 
 use std::{thread, time::Duration};
 
@@ -660,6 +666,67 @@ pub(super) fn backing_runs(lines: &[String]) -> Result<String, String> {
     Ok(line.clone())
 }
 
+/// The most runs the first hold of an eager backing's allocation may take
+/// (Deepwyrm DW2 plan §12.11 part 2 item 2).
+const MAX_FIRST_HOLD_RUNS: u64 = 16;
+
+/// The kernel's `backing-alloc-longest-us` line (the longest first hold of
+/// an eager backing's allocation a create made, with the runs that hold took
+/// and the pages wanted): it must be there, parse, and show at most
+/// [`MAX_FIRST_HOLD_RUNS`] runs (DW2 §12.11 part 2 item 2).
+pub(super) fn backing_alloc(lines: &[String]) -> Result<String, String> {
+    let Some(line) = lines
+        .iter()
+        .find(|line| line.starts_with("backing-alloc-longest-us="))
+    else {
+        return Err("the kernel reports no `backing-alloc-longest-us` line (DW2 §12.11)".into());
+    };
+    let (Some(_), Some(runs), Some(_)) = (
+        line_field(line.as_bytes(), "backing-alloc-longest-us"),
+        line_field(line.as_bytes(), "runs"),
+        line_field(line.as_bytes(), "pages"),
+    ) else {
+        return Err(format!(
+            "the kernel's backing-alloc-longest-us line does not parse: {line:?}"
+        ));
+    };
+    if runs > MAX_FIRST_HOLD_RUNS {
+        return Err(format!(
+            "the first allocation hold took {runs} runs, more than {MAX_FIRST_HOLD_RUNS}: {line:?}"
+        ));
+    }
+    Ok(line.clone())
+}
+
+/// The kernel's `finalize-steps-in-one-hold` line (the most finalize steps
+/// any one hold of the runtime lock ran since boot): it must be there,
+/// parse, and show exactly one (DW2 §12.11 part 2 item 11). Zero fails too:
+/// the check's probes close objects whose freeing is stepped, so a boot that
+/// ran no finalize step did not exercise the rule.
+pub(super) fn finalize_hold(lines: &[String]) -> Result<String, String> {
+    let Some(line) = lines
+        .iter()
+        .find(|line| line.starts_with("finalize-steps-in-one-hold "))
+    else {
+        return Err("the kernel reports no `finalize-steps-in-one-hold` line (DW2 §12.11)".into());
+    };
+    let Some(longest) = line_field(line.as_bytes(), "longest") else {
+        return Err(format!(
+            "the kernel's finalize-steps-in-one-hold line does not parse: {line:?}"
+        ));
+    };
+    match longest {
+        1 => Ok(line.clone()),
+        0 => Err(format!(
+            "no hold of the runtime lock ran a finalize step, so the probes' stepped frees \
+             did not exercise the one-step rule: {line:?}"
+        )),
+        _ => Err(format!(
+            "one hold of the runtime lock ran {longest} finalize steps, more than 1: {line:?}"
+        )),
+    }
+}
+
 /// How many times probe 15 kills `churn-map` in one boot. The kernel counts a
 /// kill only when it lands between two steps of a map or while the map call
 /// is parked; a kill at a map call's first safe point, or between two map
@@ -928,6 +995,50 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn the_first_allocation_hold_takes_at_most_16_runs() {
+        let line = |runs: &str| {
+            report(&format!(
+                "[DW0][INFO][steps] backing-alloc-longest-us=13 runs={runs} pages=114688\n"
+            ))
+        };
+        assert_eq!(
+            backing_alloc(&line("16")),
+            Ok("backing-alloc-longest-us=13 runs=16 pages=114688".into())
+        );
+        assert!(backing_alloc(&line("1")).is_ok());
+        assert!(backing_alloc(&line("17")).is_err());
+        assert!(backing_alloc(&line("many")).is_err());
+        assert!(
+            backing_alloc(&report(
+                "[DW0][INFO][steps] backing-alloc-longest-us=13 pages=114688\n"
+            ))
+            .is_err()
+        );
+        assert!(backing_alloc(&report("")).is_err());
+        // The backing-runs line is not this one, nor the reverse.
+        let runs = report("[DW0][INFO][steps] backing-runs longest=9856 pages=114688\n");
+        assert!(backing_alloc(&runs).is_err());
+        assert!(backing_runs(&line("16")).is_err());
+    }
+
+    #[test]
+    fn one_hold_runs_exactly_one_finalize_step() {
+        let line = |longest: &str| {
+            report(&format!(
+                "[DW0][INFO][steps] finalize-steps-in-one-hold longest={longest}\n"
+            ))
+        };
+        assert_eq!(
+            finalize_hold(&line("1")),
+            Ok("finalize-steps-in-one-hold longest=1".into())
+        );
+        assert!(finalize_hold(&line("2")).is_err());
+        assert!(finalize_hold(&line("0")).is_err());
+        assert!(finalize_hold(&line("one")).is_err());
+        assert!(finalize_hold(&report("")).is_err());
     }
 
     #[test]

@@ -386,6 +386,22 @@ fn check(
         ))
     })?;
     eprintln!("dev-boot: fragmented object {runs}");
+    // The first allocation hold takes few runs, and one hold of the runtime
+    // lock runs one finalize step (DW2 §12.11).
+    let alloc = memory::backing_alloc(&steps).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
+    eprintln!("dev-boot: first allocation hold {alloc}");
+    let finalize = memory::finalize_hold(&steps).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
+    eprintln!("dev-boot: {finalize}");
     let second = boot_once(
         boots[1].0,
         boots[1].1,
