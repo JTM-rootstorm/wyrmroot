@@ -413,6 +413,253 @@ pub(super) fn owed_wakes(lines: &[String], spins: &[Spin]) -> Result<String, Str
     ))
 }
 
+/// The fragmented-guest probe (Deepwyrm DW2 §12.10, part 1). It runs once
+/// the hogs have ended, since a shell may hold three jobs at once and it
+/// needs all three. Each job's budget is capped well below free memory, so
+/// two jobs fragment, one after the other:
+/// - first, the baseline: `run bin/hello unfragmented` times the same
+///   cycle as `hello fragmented` below, on the same size, before anything
+///   is fragmented;
+/// - `spawn bin/hello fragment 0` commits two on-demand objects without
+///   mapping them, alternately one page of pins for [`HOLE_PAGES`] pages of
+///   holes, to [`Fragmentation::commit_target`]; closes the holes, whose
+///   pages then come free as runs of one and two pages that cannot merge
+///   past a pin; and once its budget has room again creates an eager object
+///   that brings it to [`Fragmentation::fragment_final`], above anything it
+///   held while committing, which is the sign the harness waits for. Being
+///   eager, that object takes large blocks, not holes.
+/// - `spawn bin/hello fragment <MiB>` does the same after first committing
+///   a filler of that many MiB, which takes the first job's holes (single
+///   pages come from the smallest free blocks), so its own pins and holes
+///   land in large blocks; it closes the filler with its holes, which gives
+///   the first job's holes back as they were.
+/// - `run bin/hello fragmented <MiB>` creates an eager top-up of that size,
+///   then times the eager cycle on [`MEASURED_KIB`], which takes what is
+///   left of the large blocks and then holes.
+///
+/// The kernel's `backing-runs` line must then show at least
+/// [`MIN_BACKING_RUNS`] runs (see [`backing_runs`]).
+pub(super) fn fragmented(shell: &mut Shell<'_>) -> Result<(), Failure> {
+    let base = settle(shell, "a settled usage before the fragmented probe", |_| {
+        true
+    })?;
+    // The baseline: the same cycle on the same size, before anything is
+    // fragmented and with the hogs ended.
+    let output = shell.run("run bin/hello unfragmented")?;
+    measured(&output, "run bin/hello unfragmented", "unfragmented", &base)?;
+    back_to(shell, &base, "`hello unfragmented`")?;
+    let plan = Fragmentation::new(&base);
+    eprintln!(
+        "dev-boot: fragmented probe: free {} KiB, reserve {} KiB, budget {} KiB, jobs limit {} KiB, \
+         jobs used {} KiB; first pins {} + holes {} KiB, filler {} KiB, second pins {} + holes {} KiB, \
+         each then {} KiB",
+        base.free,
+        base.reserve,
+        base.budget,
+        base.jobs_limit,
+        base.jobs_used,
+        plan.first().0,
+        plan.first().1,
+        plan.filler(),
+        plan.second().0,
+        plan.second().1,
+        plan.fragment_final()
+    );
+    let mut before = base;
+    let mut jobs = [0; 2];
+    for (index, filler) in [0, plan.filler()].into_iter().enumerate() {
+        let job = spawn_job(shell, &format!("bin/hello fragment {}", filler / MIB_KIB))?;
+        jobs[index] = job;
+        // Above anything the job held before its holes were freed.
+        let threshold = before.jobs_used + plan.fragment_final() - FRAGMENT_SLACK_KIB;
+        let held = settle(
+            shell,
+            "`hello fragment` holding its pins and its final object",
+            |memory| memory.jobs_used >= threshold,
+        );
+        before = explain(shell, job, held)?;
+    }
+    let top_up = plan
+        .top_up(&before)
+        .map_err(|reason| Failure::task(format!("dev-boot check: fragmented probe: {reason}")))?;
+    eprintln!(
+        "dev-boot: fragmented probe: free {} KiB with {} KiB of holes, jobs used {} KiB; \
+         top-up {} KiB",
+        before.free,
+        plan.holes(),
+        before.jobs_used,
+        top_up
+    );
+    let command = format!("run bin/hello fragmented {}", top_up / MIB_KIB);
+    let output = shell.run(&command)?;
+    measured(&output, &command, "fragmented", &base)?;
+    for job in jobs {
+        end(shell, job)?;
+    }
+    back_to(shell, &base, "the fragmented probe")
+}
+
+/// `hello unfragmented`'s or `hello fragmented`'s output (`name`): the
+/// planned budget, `<name> ok` and a normal exit; echoes its timed line.
+fn measured(output: &[u8], command: &str, name: &str, base: &Memory) -> Result<(), Failure> {
+    if line_field(output, "budget-kib") != Some(base.budget)
+        || !contains(output, format!("{name} ok").as_bytes())
+        || !contains(output, b"classification=normal application=0 ")
+    {
+        return Err(Failure::task(format!(
+            "dev-boot check: `{command}` printed {:?}",
+            String::from_utf8_lossy(output)
+        )));
+    }
+    let prefix = format!("{name} size-mib=");
+    for line in String::from_utf8_lossy(output)
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+    {
+        eprintln!("dev-boot: {line}");
+    }
+    Ok(())
+}
+
+/// The measured eager object of `hello fragmented`, as `hello eager`'s
+/// largest.
+const MEASURED_KIB: u64 = 448 * MIB_KIB;
+/// About this much of the measured object should come from holes.
+const FROM_HOLES_KIB: u64 = 96 * MIB_KIB;
+/// At least this much must, or the probe cannot be fragmented.
+const MIN_FROM_HOLES_KIB: u64 = 16 * MIB_KIB;
+/// Pages of holes committed per pinned page (`hello fragment`'s k).
+const HOLE_PAGES: u64 = 3;
+/// One pinned page and its holes.
+const GROUP_KIB: u64 = 4 * (1 + HOLE_PAGES);
+/// What `hello fragment` leaves unused of its budget while it commits, and
+/// after its final object (`COMMIT_SPARE` and `FINAL_SPARE` there).
+const COMMIT_SPARE_KIB: u64 = 4 * MIB_KIB;
+const FINAL_SPARE_KIB: u64 = MIB_KIB;
+/// The harness's threshold for the final object is this far below it, and
+/// still above the commits' peak with the job's own charges.
+const FRAGMENT_SLACK_KIB: u64 = MIB_KIB;
+/// The filler covers the first job's holes and this much more, for small
+/// blocks that were free before.
+const FILLER_SLACK_KIB: u64 = MIB_KIB;
+/// What the measuring job keeps unused of its budget besides its objects,
+/// for its own charges (the measured object's page tables and the like).
+const MEASURE_SPARE_KIB: u64 = 4 * MIB_KIB;
+/// The fewest runs the measured object must land in.
+const MIN_BACKING_RUNS: u64 = 1000;
+
+/// The probe's sizes, in KiB, from the job budget. Pins and holes are whole
+/// groups of one pin page and [`HOLE_PAGES`] hole pages, as `hello
+/// fragment` commits them; the filler and the top-up are whole MiB.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Fragmentation {
+    budget: u64,
+}
+
+impl Fragmentation {
+    pub(super) const fn new(memory: &Memory) -> Self {
+        Self {
+            budget: memory.budget,
+        }
+    }
+
+    /// What each fragmenting job commits: filler, pins and holes together.
+    const fn commit_target(self) -> u64 {
+        self.budget.saturating_sub(COMMIT_SPARE_KIB)
+    }
+
+    /// Pins and holes of `groups` groups.
+    const fn groups(groups: u64) -> (u64, u64) {
+        (groups * 4, groups * 4 * HOLE_PAGES)
+    }
+
+    /// The first job's pins and holes.
+    pub(super) const fn first(self) -> (u64, u64) {
+        Self::groups(self.commit_target() / GROUP_KIB)
+    }
+
+    /// The second job's filler: the first job's holes and a little more,
+    /// whole MiB.
+    pub(super) const fn filler(self) -> u64 {
+        (self.first().1 + FILLER_SLACK_KIB).div_ceil(MIB_KIB) * MIB_KIB
+    }
+
+    /// The second job's pins and holes, after its filler.
+    pub(super) const fn second(self) -> (u64, u64) {
+        Self::groups(self.commit_target().saturating_sub(self.filler()) / GROUP_KIB)
+    }
+
+    pub(super) const fn holes(self) -> u64 {
+        self.first().1 + self.second().1
+    }
+
+    /// What each fragmenting job holds at the end: pins and its final
+    /// object.
+    pub(super) const fn fragment_final(self) -> u64 {
+        self.budget.saturating_sub(FINAL_SPARE_KIB)
+    }
+
+    /// The most the measuring job can top up besides the measured object.
+    const fn top_up_most(self) -> u64 {
+        self.budget.saturating_sub(MEASURED_KIB + MEASURE_SPARE_KIB) / MIB_KIB * MIB_KIB
+    }
+
+    /// The measuring job's top-up from the reading with both fragmenting
+    /// jobs in place: what leaves the free memory outside the holes about
+    /// [`FROM_HOLES_KIB`] short of the measured object, within the job's
+    /// budget and the jobs' limit. An error if even the most it may take
+    /// leaves the measured object fewer than [`MIN_FROM_HOLES_KIB`] of
+    /// holes, or if the holes cannot hold what it needs from them.
+    pub(super) fn top_up(self, now: &Memory) -> Result<u64, String> {
+        let large = now.free.saturating_sub(self.holes());
+        let room = now
+            .jobs_limit
+            .saturating_sub(now.jobs_used + MEASURED_KIB + MEASURE_SPARE_KIB);
+        let most = self.top_up_most().min(room / MIB_KIB * MIB_KIB);
+        let wanted = large.saturating_sub(MEASURED_KIB - FROM_HOLES_KIB);
+        let top_up = wanted.div_ceil(MIB_KIB).saturating_mul(MIB_KIB).min(most);
+        let left = large.saturating_sub(top_up);
+        if left + MIN_FROM_HOLES_KIB > MEASURED_KIB {
+            return Err(format!(
+                "{left} KiB outside the holes would be left for the {MEASURED_KIB} KiB object \
+                 (top-up {top_up} KiB of at most {most}); it would not reach the holes"
+            ));
+        }
+        if left + self.holes() < MEASURED_KIB {
+            return Err(format!(
+                "{left} KiB outside the holes and {} KiB of holes cannot hold the \
+                 {MEASURED_KIB} KiB object",
+                self.holes()
+            ));
+        }
+        Ok(top_up)
+    }
+}
+
+/// The kernel's `backing-runs` line (the eager backing with the most runs
+/// since boot): it must be there, parse, and show at least
+/// [`MIN_BACKING_RUNS`] runs, which only the fragmented probe's object
+/// reaches.
+pub(super) fn backing_runs(lines: &[String]) -> Result<String, String> {
+    let Some(line) = lines.iter().find(|line| line.starts_with("backing-runs ")) else {
+        return Err("the kernel reports no `backing-runs` line (DW2 §12.10)".into());
+    };
+    let (Some(runs), Some(_)) = (
+        line_field(line.as_bytes(), "longest"),
+        line_field(line.as_bytes(), "pages"),
+    ) else {
+        return Err(format!(
+            "the kernel's backing-runs line does not parse: {line:?}"
+        ));
+    };
+    if runs < MIN_BACKING_RUNS {
+        return Err(format!(
+            "the fragmented object landed in {runs} runs, fewer than {MIN_BACKING_RUNS}: {line:?}"
+        ));
+    }
+    Ok(line.clone())
+}
+
 /// How many times probe 15 kills `churn-map` in one boot. The kernel counts a
 /// kill only when it lands between two steps of a map or while the map call
 /// is parked; a kill at a map call's first safe point, or between two map
@@ -576,6 +823,111 @@ mod tests {
         );
         let garbled = report("[DW0][INFO][steps] owed-wakes=5 unsent=none queue=5\n");
         assert!(owed_wakes(&garbled, &on_aps).is_err());
+    }
+
+    /// A `memory` reading in MiB.
+    fn reading(free: u64, jobs_used: u64) -> Memory {
+        Memory {
+            capped: true,
+            fallback_none: true,
+            budget: 512 * MIB_KIB,
+            jobs_limit: 1536 * MIB_KIB,
+            jobs_used: jobs_used * MIB_KIB,
+            free: free * MIB_KIB,
+            plan_free: 1792 * MIB_KIB,
+            reserve: 256 * MIB_KIB,
+            cap: 512 * MIB_KIB,
+        }
+    }
+
+    #[test]
+    fn two_jobs_fragment_and_the_second_fills_the_first_ones_holes() {
+        let plan = Fragmentation::new(&reading(1927, 0));
+        // 508 MiB in groups of four pages: a quarter pins.
+        assert_eq!(plan.first(), (127 * MIB_KIB, 381 * MIB_KIB));
+        // The first job's holes and a MiB, whole MiB.
+        assert_eq!(plan.filler(), 382 * MIB_KIB);
+        // The rest of the 508 MiB.
+        assert_eq!(plan.second(), (32_256, 96_768));
+        assert_eq!(plan.holes(), 381 * MIB_KIB + 96_768);
+        // Each ends above its commits' peak, and the harness's threshold is
+        // between them.
+        assert_eq!(plan.fragment_final(), 511 * MIB_KIB);
+        assert!(plan.fragment_final() - FRAGMENT_SLACK_KIB > plan.commit_target());
+        assert_eq!(plan.top_up_most(), 60 * MIB_KIB);
+        // A budget that is not whole groups rounds the groups down.
+        let odd = Fragmentation {
+            budget: 512 * MIB_KIB + 12,
+        };
+        assert_eq!(odd.first().0 + odd.first().1, 508 * MIB_KIB);
+    }
+
+    #[test]
+    fn the_top_up_aims_the_measured_object_into_the_holes() {
+        let plan = Fragmentation::new(&reading(1927, 0));
+        // 905 MiB free with 475.5 of holes: 429.5 large; 352 wanted left,
+        // so 78, held to 60: 369.5 left, 78.5 MiB from the holes.
+        assert_eq!(plan.top_up(&reading(905, 1022)), Ok(60 * MIB_KIB));
+        // 850 free: 374.5 large, 22.5 tops it up, rounded up to 23.
+        assert_eq!(plan.top_up(&reading(850, 1022)), Ok(23 * MIB_KIB));
+        // Already short of large blocks: no top-up.
+        assert_eq!(plan.top_up(&reading(800, 1022)), Ok(0));
+    }
+
+    #[test]
+    fn the_top_up_keeps_to_the_jobs_limit() {
+        let plan = Fragmentation::new(&reading(1927, 0));
+        // 1536 - 1080 - 448 - 4 = 4 MiB of room.
+        assert_eq!(plan.top_up(&reading(850, 1080)), Ok(4 * MIB_KIB));
+        assert_eq!(plan.top_up(&reading(850, 1090)), Ok(0));
+    }
+
+    #[test]
+    fn a_guest_the_probe_cannot_fragment_is_refused() {
+        let plan = Fragmentation::new(&reading(1927, 0));
+        // 920 free: 444.5 large less 60 leaves 384.5, 63.5 from holes.
+        assert!(plan.top_up(&reading(920, 1022)).is_ok());
+        // 975: 499.5 - 60 leaves 439.5, 8.5 MiB from holes: too few.
+        assert!(plan.top_up(&reading(975, 1022)).is_err());
+        // 1000: past the object even with the top-up.
+        assert!(plan.top_up(&reading(1000, 1022)).is_err());
+        // Holes and large blocks together too small for the object.
+        let small = Memory {
+            budget: 256 * MIB_KIB,
+            ..reading(400, 0)
+        };
+        let plan = Fragmentation::new(&small);
+        assert!(plan.holes() < MEASURED_KIB);
+        assert!(plan.top_up(&small).is_err());
+        assert!(
+            plan.top_up(&Memory {
+                free: 600 * MIB_KIB,
+                ..small
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_backing_runs_line_needs_a_fragmented_object() {
+        let line = |runs: u64| {
+            report(&format!(
+                "[DW0][INFO][steps] backing-runs longest={runs} pages=114688\n"
+            ))
+        };
+        assert_eq!(
+            backing_runs(&line(9856)),
+            Ok("backing-runs longest=9856 pages=114688".into())
+        );
+        assert!(backing_runs(&line(1000)).is_ok());
+        assert!(backing_runs(&line(999)).is_err());
+        assert!(backing_runs(&report("")).is_err());
+        assert!(
+            backing_runs(&report(
+                "[DW0][INFO][steps] backing-runs longest=many pages=1\n"
+            ))
+            .is_err()
+        );
     }
 
     #[test]
