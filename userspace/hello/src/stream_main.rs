@@ -77,8 +77,12 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
         // Never answers INIT: init's READY timeout ends it mid-commit.
         memory::slow_ready();
     }
+    let size_mib = (startup.argc() >= 3)
+        .then(|| startup.arg(2).map(|argument| argument.as_str()))
+        .flatten()
+        .and_then(memory::parse_mib);
     let mut run = |region: DwHandle, budget: u64, write: &mut dyn FnMut(&[u8]) -> bool| {
-        memory::run(mode.unwrap_or(""), region, budget, write)
+        memory::run(mode.unwrap_or(""), size_mib, region, budget, write)
     };
     let probe: Option<Probe<'_>> = mode.filter(|mode| memory::is_mode(mode)).map(|_| {
         let run: Probe<'_> = &mut run;
@@ -94,9 +98,11 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
 /// which the check compares with init's plan (probe 12).
 /// - `on-demand`, `on-demand-exhaust`: an on-demand object end to end
 ///   (M6); the second then spends the quota and touches past it.
-/// - `eager`: eager objects of 4, 8 and 256 MiB created, mapped, touched in
-///   every page, protected and unmapped in steps, each timed (probes 13
-///   and 14).
+/// - `eager`: eager objects of 4, 8, 256 and 448 MiB created, mapped,
+///   touched in every page, protected, unmapped in steps and closed, each
+///   timed (probes 13 and 14).
+/// - `soak <MiB>`, `fragment`, `fragmented <MiB>`: the fragmented-guest
+///   probe (DW2 §12.10, part 1; see `fragment` and `fragmented` below).
 /// - `hold-touched`, `hold-released`: maps 64 MiB on demand with no handle
 ///   left, touches every page and, for the second, unmaps the top half;
 ///   then waits forever, for the check to read usage (probe 13).
@@ -119,8 +125,9 @@ mod memory {
         DW_CLOCK_MONOTONIC_ACTIVE, DW_DEADLINE_INFINITE, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND,
         DW_MEMORY_PROTECTION_READ, DW_MEMORY_PROTECTION_WRITE, DW_RIGHT_MAP, DW_RIGHT_READ,
         DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_READABLE, DW_STATUS_NO_RESOURCES,
-        DW_STATUS_SUCCESS, DwAddressRegionMapArgsV1, DwHandle, DwMemoryObjectCreateFlags,
-        DwMemoryProtection, DwOffset, DwRights, DwSize, DwUserAddress, DwWaitResultV1,
+        DW_STATUS_SUCCESS, DwAddressRegionMapArgsV1, DwDeadline, DwHandle,
+        DwMemoryObjectCreateFlags, DwMemoryProtection, DwOffset, DwRights, DwSize, DwUserAddress,
+        DwWaitResultV1,
     };
 
     const MIB: u64 = 1 << 20;
@@ -133,6 +140,17 @@ mod memory {
     /// calibration call must take at least.
     const SPIN_US: u64 = 500_000;
     const SPIN_CALIBRATION_US: u64 = 100_000;
+    /// The fragmented probe's measured object, and `eager`'s largest.
+    const MEASURED_MIB: u64 = 448;
+    /// What `fragment` leaves of its budget while it commits, and after its
+    /// final object (the harness's `FRAGMENT_SPARE_KIB` and
+    /// `FRAGMENT_FINAL_SPARE_KIB`).
+    const FRAGMENT_SPARE: u64 = 32 * MIB;
+    const FRAGMENT_FINAL_SPARE: u64 = 16 * MIB;
+    /// Hole pages committed per pinned page (the harness's `HOLE_PAGES`).
+    const HOLE_PAGES: u64 = 3;
+    /// How long `fragment` sleeps between tries of its final object.
+    const RETRY_US: u64 = 10_000;
     const RW: DwMemoryProtection =
         DwMemoryProtection(DW_MEMORY_PROTECTION_READ.0 | DW_MEMORY_PROTECTION_WRITE.0);
 
@@ -148,11 +166,15 @@ mod memory {
                 | "churn-create"
                 | "churn-commit"
                 | "close-spin"
+                | "soak"
+                | "fragment"
+                | "fragmented"
         )
     }
 
     pub(super) fn run(
         mode: &str,
+        size_mib: Option<u64>,
         region: DwHandle,
         budget: u64,
         write: &mut dyn FnMut(&[u8]) -> bool,
@@ -195,6 +217,12 @@ mod memory {
                 }
             },
             "close-spin" => close_spin(write),
+            "soak" => match size_mib {
+                Some(size) => soak(size * MIB),
+                None => 2,
+            },
+            "fragment" => fragment(budget),
+            "fragmented" => fragmented(region, size_mib.unwrap_or(0) * MIB, write),
             _ => 2,
         }
     }
@@ -275,23 +303,9 @@ mod memory {
     }
 
     fn eager(region: DwHandle, write: &mut dyn FnMut(&[u8]) -> bool) -> u32 {
-        for size_mib in [4, 8, 256] {
+        for size_mib in [4, 8, 256, MEASURED_MIB] {
             match eager_once(region, size_mib * MIB) {
-                Ok(times) => {
-                    let mut line = Line::new();
-                    line.text("eager size-mib=").number(size_mib);
-                    for (name, value) in [
-                        (" create-us=", times[0]),
-                        (" map-us=", times[1]),
-                        (" touch-us=", times[2]),
-                        (" protect-us=", times[3]),
-                        (" unmap-us=", times[4]),
-                    ] {
-                        line.text(name).number(value);
-                    }
-                    line.text("\n");
-                    write(line.bytes());
-                }
+                Ok(times) => write(timed_line("eager", size_mib, times).bytes()),
                 Err(step) => {
                     let mut line = Line::new();
                     line.text("eager failed: ").text(step).text("\n");
@@ -304,9 +318,28 @@ mod memory {
         0
     }
 
+    /// `<name> size-mib=N create-us= map-us= touch-us= protect-us=
+    /// unmap-us= close-us=`.
+    fn timed_line(name: &str, size_mib: u64, times: [u64; 6]) -> Line {
+        let mut line = Line::new();
+        line.text(name).text(" size-mib=").number(size_mib);
+        for (name, value) in [
+            (" create-us=", times[0]),
+            (" map-us=", times[1]),
+            (" touch-us=", times[2]),
+            (" protect-us=", times[3]),
+            (" unmap-us=", times[4]),
+            (" close-us=", times[5]),
+        ] {
+            line.text(name).number(value);
+        }
+        line.text("\n");
+        line
+    }
+
     /// One eager object of `size`: create, map, touch, protect read-only,
-    /// unmap; the microseconds each took.
-    fn eager_once(region: DwHandle, size: u64) -> Result<[u64; 5], &'static str> {
+    /// unmap, close; the microseconds each took.
+    fn eager_once(region: DwHandle, size: u64) -> Result<[u64; 6], &'static str> {
         let start = now_us();
         let object = create(size, DwMemoryObjectCreateFlags(0)).map_err(|()| "create")?;
         let created = now_us();
@@ -334,12 +367,14 @@ mod memory {
         if deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS {
             return Err("close");
         }
+        let closed = now_us();
         Ok([
             created - start,
             mapped - created,
             touched - mapped,
             protected - touched,
             unmapped - protected,
+            closed - unmapped,
         ])
     }
 
@@ -466,25 +501,173 @@ mod memory {
         count
     }
 
-    fn wait_forever() -> u32 {
-        let (mut sender, mut receiver) = (DwHandle(0), DwHandle(0));
-        if deepwyrm_syscall::channel_create(
-            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0),
-            &mut sender,
-            &mut receiver,
-        ) != DW_STATUS_SUCCESS
-        {
+    /// A decimal argument of whole MiB.
+    pub(super) fn parse_mib(text: &str) -> Option<u64> {
+        if text.is_empty() || text.len() > 6 {
+            return None;
+        }
+        text.bytes().try_fold(0_u64, |value, digit| {
+            digit
+                .is_ascii_digit()
+                .then(|| value * 10 + u64::from(digit - b'0'))
+        })
+    }
+
+    /// `soak <MiB>`: one eager object of `size`, held with its handle, then
+    /// waits forever. It takes the largest free blocks.
+    fn soak(size: u64) -> u32 {
+        if size == 0 || create(size, DwMemoryObjectCreateFlags(0)).is_err() {
             return 2;
         }
-        // Nothing is ever sent, and the sender stays open.
-        let mut result = DwWaitResultV1::default();
-        deepwyrm_syscall::wait_one(
-            receiver,
-            DW_SIGNAL_READABLE,
-            DW_DEADLINE_INFINITE,
-            &mut result,
-        );
-        2
+        wait_forever()
+    }
+
+    /// `fragment`: commits two on-demand objects without mapping them,
+    /// alternately one page of the pins and [`HOLE_PAGES`] of the holes,
+    /// to the budget less [`FRAGMENT_SPARE`]. Single pages come out of the
+    /// buddy allocator ascending and adjacent, so each pinned page is
+    /// followed by its holes. Then it closes the holes: their pages are
+    /// freed in owed steps, as a page and a pair that cannot merge past
+    /// the pin. Once its budget has room again it creates one eager object
+    /// that brings it to the budget less [`FRAGMENT_FINAL_SPARE`], more
+    /// than it held before, which is what the harness waits for; being
+    /// eager, it takes large blocks, not holes. Then it waits forever.
+    fn fragment(budget: u64) -> u32 {
+        let target = budget.saturating_sub(FRAGMENT_SPARE);
+        let group = PAGE * (1 + HOLE_PAGES);
+        let groups = target / group;
+        let (Ok(pins), Ok(holes)) = (
+            create(groups * PAGE, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND),
+            create(
+                groups * PAGE * HOLE_PAGES,
+                DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND,
+            ),
+        ) else {
+            return 2;
+        };
+        for index in 0..groups {
+            let hole_size = PAGE * HOLE_PAGES;
+            if deepwyrm_syscall::memory_object_commit(pins, DwOffset(index * PAGE), DwSize(PAGE))
+                != DW_STATUS_SUCCESS
+                || deepwyrm_syscall::memory_object_commit(
+                    holes,
+                    DwOffset(index * hole_size),
+                    DwSize(hole_size),
+                ) != DW_STATUS_SUCCESS
+            {
+                return 2;
+            }
+        }
+        if deepwyrm_syscall::handle_close(holes) != DW_STATUS_SUCCESS {
+            return 2;
+        }
+        let Ok(sleeper) = Sleeper::new() else {
+            return 2;
+        };
+        let last = budget.saturating_sub(FRAGMENT_FINAL_SPARE + groups * PAGE);
+        loop {
+            let mut object = DwHandle(0);
+            let status = deepwyrm_syscall::memory_object_create(
+                DwSize(last),
+                DwMemoryObjectCreateFlags(0),
+                DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0),
+                &mut object,
+            );
+            if status == DW_STATUS_SUCCESS {
+                break;
+            }
+            if status != DW_STATUS_NO_RESOURCES {
+                return 2;
+            }
+            sleeper.sleep(RETRY_US);
+        }
+        sleeper.forever()
+    }
+
+    /// `fragmented <MiB>`: an eager top-up of that size (none for 0) held
+    /// while one eager object of [`MEASURED_MIB`] runs `eager`'s cycle,
+    /// each call timed, on a guest `fragment` has fragmented.
+    fn fragmented(region: DwHandle, top_up: u64, write: &mut dyn FnMut(&[u8]) -> bool) -> u32 {
+        let held = if top_up == 0 {
+            None
+        } else {
+            match create(top_up, DwMemoryObjectCreateFlags(0)) {
+                Ok(object) => Some(object),
+                Err(()) => {
+                    write(b"fragmented failed: top-up\n");
+                    return 2;
+                }
+            }
+        };
+        let status = match eager_once(region, MEASURED_MIB * MIB) {
+            Ok(times) => {
+                write(timed_line("fragmented", MEASURED_MIB, times).bytes());
+                0
+            }
+            Err(step) => {
+                let mut line = Line::new();
+                line.text("fragmented failed: ").text(step).text("\n");
+                write(line.bytes());
+                2
+            }
+        };
+        if let Some(object) = held
+            && deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS
+        {
+            write(b"fragmented failed: top-up close\n");
+            return 2;
+        }
+        if status == 0 {
+            write(b"fragmented ok\n");
+        }
+        status
+    }
+
+    /// A channel nothing is ever sent on, to wait on with a deadline.
+    struct Sleeper {
+        receiver: DwHandle,
+    }
+
+    impl Sleeper {
+        fn new() -> Result<Self, ()> {
+            let (mut sender, mut receiver) = (DwHandle(0), DwHandle(0));
+            // The sender stays open, so the receiver never becomes readable.
+            (deepwyrm_syscall::channel_create(
+                DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0),
+                &mut sender,
+                &mut receiver,
+            ) == DW_STATUS_SUCCESS)
+                .then_some(Self { receiver })
+                .ok_or(())
+        }
+
+        /// Waits about `us` microseconds of active time.
+        fn sleep(&self, us: u64) {
+            let mut now = 0;
+            deepwyrm_syscall::clock_get(DW_CLOCK_MONOTONIC_ACTIVE.0, &mut now);
+            let mut result = DwWaitResultV1::default();
+            deepwyrm_syscall::wait_one(
+                self.receiver,
+                DW_SIGNAL_READABLE,
+                DwDeadline(now.saturating_add(us * 1000)),
+                &mut result,
+            );
+        }
+
+        fn forever(&self) -> u32 {
+            let mut result = DwWaitResultV1::default();
+            deepwyrm_syscall::wait_one(
+                self.receiver,
+                DW_SIGNAL_READABLE,
+                DW_DEADLINE_INFINITE,
+                &mut result,
+            );
+            2
+        }
+    }
+
+    fn wait_forever() -> u32 {
+        Sleeper::new().map_or(2, |sleeper| sleeper.forever())
     }
 
     /// A line built without allocation; text past its size is dropped.

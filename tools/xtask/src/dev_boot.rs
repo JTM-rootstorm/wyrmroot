@@ -378,6 +378,14 @@ fn check(
         ))
     })?;
     eprintln!("dev-boot: {wakes}");
+    // The fragmented-guest probe's object landed in many runs (DW2 §12.10).
+    let runs = memory::backing_runs(&steps).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
+    eprintln!("dev-boot: fragmented object {runs}");
     let second = boot_once(
         boots[1].0,
         boots[1].1,
@@ -525,6 +533,9 @@ fn first_boot(
             )));
         }
     }
+    // The fragmented-guest probe (DW2 §12.10, part 1) needs all three of
+    // the shell's job slots, so it runs once the hogs have ended.
+    memory::fragmented(shell)?;
     shell.quiet(&format!("write {PERSISTED_PATH} {token}"))?;
     shell.quiet("mkdir /home")?;
     shell.expect(&format!("cat {PERSISTED_PATH}"), token.as_bytes())?;
