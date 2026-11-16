@@ -415,16 +415,21 @@ pub(super) fn owed_wakes(lines: &[String], spins: &[Spin]) -> Result<String, Str
 
 /// The fragmented-guest probe (Deepwyrm DW2 §12.10, part 1). It runs once
 /// the hogs have ended, since a shell may hold three jobs at once and it
-/// needs all three:
-/// - `spawn bin/hello soak <MiB>` holds one eager object, taking the
-///   largest free blocks;
-/// - `spawn bin/hello fragment` commits two on-demand objects alternately,
-///   one page of the pins for [`HOLE_PAGES`] of the holes, to
-///   [`Fragmentation::fragment_target`]; closes the holes, so their pages
-///   come free as runs of one and two pages that cannot merge past a pin;
-///   then, once its budget has room again, creates one eager object that
-///   brings it to [`Fragmentation::fragment_final`], which takes large
-///   blocks, not holes, and is the sign the harness waits for;
+/// needs all three. Each job's budget is capped well below free memory, so
+/// two jobs fragment, one after the other:
+/// - `spawn bin/hello fragment 0` commits two on-demand objects without
+///   mapping them, alternately one page of pins for [`HOLE_PAGES`] pages of
+///   holes, to [`Fragmentation::commit_target`]; closes the holes, whose
+///   pages then come free as runs of one and two pages that cannot merge
+///   past a pin; and once its budget has room again creates an eager object
+///   that brings it to [`Fragmentation::fragment_final`], above anything it
+///   held while committing, which is the sign the harness waits for. Being
+///   eager, that object takes large blocks, not holes.
+/// - `spawn bin/hello fragment <MiB>` does the same after first committing
+///   a filler of that many MiB, which takes the first job's holes (single
+///   pages come from the smallest free blocks), so its own pins and holes
+///   land in large blocks; it closes the filler with its holes, which gives
+///   the first job's holes back as they were.
 /// - `run bin/hello fragmented <MiB>` creates an eager top-up of that size,
 ///   then times the eager cycle on [`MEASURED_KIB`], which takes what is
 ///   left of the large blocks and then holes.
@@ -436,40 +441,46 @@ pub(super) fn fragmented(shell: &mut Shell<'_>) -> Result<(), Failure> {
         true
     })?;
     let plan = Fragmentation::new(&base);
-    let soak_kib = plan.soak();
     eprintln!(
         "dev-boot: fragmented probe: free {} KiB, reserve {} KiB, budget {} KiB, jobs limit {} KiB, \
-         jobs used {} KiB; soak {} KiB, fragment pins {} KiB + holes {} KiB, then {} KiB",
+         jobs used {} KiB; first pins {} + holes {} KiB, filler {} KiB, second pins {} + holes {} KiB, \
+         each then {} KiB",
         base.free,
         base.reserve,
         base.budget,
         base.jobs_limit,
         base.jobs_used,
-        soak_kib,
-        plan.pins(),
-        plan.holes(),
+        plan.first().0,
+        plan.first().1,
+        plan.filler(),
+        plan.second().0,
+        plan.second().1,
         plan.fragment_final()
     );
-    let soak = spawn_job(shell, &format!("bin/hello soak {}", soak_kib / MIB_KIB))?;
-    let soaked = settle(shell, "`hello soak` holding its object", |memory| {
-        memory.jobs_used >= base.jobs_used + soak_kib
-    });
-    let soaked = explain(shell, soak, soaked)?;
-    let fragment = spawn_job(shell, "bin/hello fragment")?;
-    // Above anything the fragment held before its holes were freed.
-    let threshold = soaked.jobs_used + plan.fragment_final() - FRAGMENT_SLACK_KIB;
-    let fragmented = settle(
-        shell,
-        "`hello fragment` holding its pins and its final object",
-        |memory| memory.jobs_used >= threshold,
-    );
-    let fragmented = explain(shell, fragment, fragmented)?;
+    let mut before = base;
+    let mut jobs = [0; 2];
+    for (index, filler) in [0, plan.filler()].into_iter().enumerate() {
+        let job = spawn_job(shell, &format!("bin/hello fragment {}", filler / MIB_KIB))?;
+        jobs[index] = job;
+        // Above anything the job held before its holes were freed.
+        let threshold = before.jobs_used + plan.fragment_final() - FRAGMENT_SLACK_KIB;
+        let held = settle(
+            shell,
+            "`hello fragment` holding its pins and its final object",
+            |memory| memory.jobs_used >= threshold,
+        );
+        before = explain(shell, job, held)?;
+    }
     let top_up = plan
-        .top_up(&fragmented)
+        .top_up(&before)
         .map_err(|reason| Failure::task(format!("dev-boot check: fragmented probe: {reason}")))?;
     eprintln!(
-        "dev-boot: fragmented probe: free {} KiB with the holes, jobs used {} KiB; top-up {} KiB",
-        fragmented.free, fragmented.jobs_used, top_up
+        "dev-boot: fragmented probe: free {} KiB with {} KiB of holes, jobs used {} KiB; \
+         top-up {} KiB",
+        before.free,
+        plan.holes(),
+        before.jobs_used,
+        top_up
     );
     let command = format!("run bin/hello fragmented {}", top_up / MIB_KIB);
     let output = shell.run(&command)?;
@@ -488,8 +499,9 @@ pub(super) fn fragmented(shell: &mut Shell<'_>) -> Result<(), Failure> {
     {
         eprintln!("dev-boot: {line}");
     }
-    end(shell, fragment)?;
-    end(shell, soak)?;
+    for job in jobs {
+        end(shell, job)?;
+    }
     back_to(shell, &base, "the fragmented probe")
 }
 
@@ -502,82 +514,82 @@ const FROM_HOLES_KIB: u64 = 96 * MIB_KIB;
 const MIN_FROM_HOLES_KIB: u64 = 16 * MIB_KIB;
 /// Pages of holes committed per pinned page (`hello fragment`'s k).
 const HOLE_PAGES: u64 = 3;
+/// One pinned page and its holes.
+const GROUP_KIB: u64 = 4 * (1 + HOLE_PAGES);
 /// What `hello fragment` leaves unused of its budget while it commits, and
-/// after its final object.
-const FRAGMENT_SPARE_KIB: u64 = 32 * MIB_KIB;
-const FRAGMENT_FINAL_SPARE_KIB: u64 = 16 * MIB_KIB;
+/// after its final object (`COMMIT_SPARE` and `FINAL_SPARE` there).
+const COMMIT_SPARE_KIB: u64 = 4 * MIB_KIB;
+const FINAL_SPARE_KIB: u64 = MIB_KIB;
 /// The harness's threshold for the final object is this far below it, and
-/// still above the commits' peak.
-const FRAGMENT_SLACK_KIB: u64 = 8 * MIB_KIB;
-/// What a job keeps unused of its budget besides its objects (its own
-/// charges: page tables and the like).
-const JOB_SPARE_KIB: u64 = 8 * MIB_KIB;
+/// still above the commits' peak with the job's own charges.
+const FRAGMENT_SLACK_KIB: u64 = MIB_KIB;
+/// The filler covers the first job's holes and this much more, for small
+/// blocks that were free before.
+const FILLER_SLACK_KIB: u64 = MIB_KIB;
+/// What the measuring job keeps unused of its budget besides its objects,
+/// for its own charges (the measured object's page tables and the like).
+const MEASURE_SPARE_KIB: u64 = 4 * MIB_KIB;
 /// The fewest runs the measured object must land in.
 const MIN_BACKING_RUNS: u64 = 1000;
 
-/// The probe's sizes, in KiB, from the `memory` reply it starts from. Every
-/// size is whole MiB except the pins and holes, which are whole groups of
-/// one pin page and [`HOLE_PAGES`] hole pages, as `hello fragment` commits
-/// them.
+/// The probe's sizes, in KiB, from the job budget. Pins and holes are whole
+/// groups of one pin page and [`HOLE_PAGES`] hole pages, as `hello
+/// fragment` commits them; the filler and the top-up are whole MiB.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Fragmentation {
     budget: u64,
-    free: u64,
 }
 
 impl Fragmentation {
     pub(super) const fn new(memory: &Memory) -> Self {
         Self {
             budget: memory.budget,
-            free: memory.free,
         }
     }
 
-    /// What the fragment commits, pins and holes together.
-    const fn fragment_target(self) -> u64 {
-        self.budget.saturating_sub(FRAGMENT_SPARE_KIB)
+    /// What each fragmenting job commits: filler, pins and holes together.
+    const fn commit_target(self) -> u64 {
+        self.budget.saturating_sub(COMMIT_SPARE_KIB)
     }
 
-    const fn groups(self) -> u64 {
-        self.fragment_target() / (4 * (1 + HOLE_PAGES))
+    /// Pins and holes of `groups` groups.
+    const fn groups(groups: u64) -> (u64, u64) {
+        (groups * 4, groups * 4 * HOLE_PAGES)
     }
 
-    pub(super) const fn pins(self) -> u64 {
-        self.groups() * 4
+    /// The first job's pins and holes.
+    pub(super) const fn first(self) -> (u64, u64) {
+        Self::groups(self.commit_target() / GROUP_KIB)
+    }
+
+    /// The second job's filler: the first job's holes and a little more,
+    /// whole MiB.
+    pub(super) const fn filler(self) -> u64 {
+        (self.first().1 + FILLER_SLACK_KIB).div_ceil(MIB_KIB) * MIB_KIB
+    }
+
+    /// The second job's pins and holes, after its filler.
+    pub(super) const fn second(self) -> (u64, u64) {
+        Self::groups(self.commit_target().saturating_sub(self.filler()) / GROUP_KIB)
     }
 
     pub(super) const fn holes(self) -> u64 {
-        self.groups() * 4 * HOLE_PAGES
+        self.first().1 + self.second().1
     }
 
-    /// What the fragment holds at the end: pins and its final object.
+    /// What each fragmenting job holds at the end: pins and its final
+    /// object.
     pub(super) const fn fragment_final(self) -> u64 {
-        self.budget.saturating_sub(FRAGMENT_FINAL_SPARE_KIB)
+        self.budget.saturating_sub(FINAL_SPARE_KIB)
     }
 
     /// The most the measuring job can top up besides the measured object.
     const fn top_up_most(self) -> u64 {
-        self.budget.saturating_sub(MEASURED_KIB + JOB_SPARE_KIB) / MIB_KIB * MIB_KIB
+        self.budget.saturating_sub(MEASURED_KIB + MEASURE_SPARE_KIB) / MIB_KIB * MIB_KIB
     }
 
-    /// The soak job's object: what leaves the free memory outside the
-    /// holes, after the fragment, about [`FROM_HOLES_KIB`] short of the
-    /// measured object with half the most top-up still to come, and no more
-    /// than a job may hold. Whole MiB.
-    pub(super) const fn soak(self) -> u64 {
-        let wanted = self.free.saturating_sub(
-            self.fragment_final()
-                + self.holes()
-                + MEASURED_KIB.saturating_sub(FROM_HOLES_KIB)
-                + self.top_up_most() / 2,
-        );
-        let most = self.budget.saturating_sub(JOB_SPARE_KIB);
-        let soak = if wanted < most { wanted } else { most };
-        soak / MIB_KIB * MIB_KIB
-    }
-
-    /// The measuring job's top-up from the reading with the fragment in
-    /// place: what leaves the free memory outside the holes about
+    /// The measuring job's top-up from the reading with both fragmenting
+    /// jobs in place: what leaves the free memory outside the holes about
     /// [`FROM_HOLES_KIB`] short of the measured object, within the job's
     /// budget and the jobs' limit. An error if even the most it may take
     /// leaves the measured object fewer than [`MIN_FROM_HOLES_KIB`] of
@@ -586,7 +598,7 @@ impl Fragmentation {
         let large = now.free.saturating_sub(self.holes());
         let room = now
             .jobs_limit
-            .saturating_sub(now.jobs_used + MEASURED_KIB + JOB_SPARE_KIB);
+            .saturating_sub(now.jobs_used + MEASURED_KIB + MEASURE_SPARE_KIB);
         let most = self.top_up_most().min(room / MIB_KIB * MIB_KIB);
         let wanted = large.saturating_sub(MEASURED_KIB - FROM_HOLES_KIB);
         let top_up = wanted.div_ceil(MIB_KIB).saturating_mul(MIB_KIB).min(most);
@@ -813,76 +825,71 @@ mod tests {
     }
 
     #[test]
-    fn the_fragment_commits_one_pin_page_for_three_hole_pages() {
-        let plan = Fragmentation::new(&reading(1700, 1));
-        // 480 MiB in groups of four pages.
-        assert_eq!(plan.pins(), 120 * MIB_KIB);
-        assert_eq!(plan.holes(), 360 * MIB_KIB);
-        assert_eq!(plan.fragment_final(), 496 * MIB_KIB);
-        assert_eq!(plan.top_up_most(), 56 * MIB_KIB);
+    fn two_jobs_fragment_and_the_second_fills_the_first_ones_holes() {
+        let plan = Fragmentation::new(&reading(1927, 0));
+        // 508 MiB in groups of four pages: a quarter pins.
+        assert_eq!(plan.first(), (127 * MIB_KIB, 381 * MIB_KIB));
+        // The first job's holes and a MiB, whole MiB.
+        assert_eq!(plan.filler(), 382 * MIB_KIB);
+        // The rest of the 508 MiB.
+        assert_eq!(plan.second(), (32_256, 96_768));
+        assert_eq!(plan.holes(), 381 * MIB_KIB + 96_768);
+        // Each ends above its commits' peak, and the harness's threshold is
+        // between them.
+        assert_eq!(plan.fragment_final(), 511 * MIB_KIB);
+        assert!(plan.fragment_final() - FRAGMENT_SLACK_KIB > plan.commit_target());
+        assert_eq!(plan.top_up_most(), 60 * MIB_KIB);
         // A budget that is not whole groups rounds the groups down.
         let odd = Fragmentation {
             budget: 512 * MIB_KIB + 12,
-            free: 0,
         };
-        assert_eq!(odd.pins() + odd.holes(), 480 * MIB_KIB);
-    }
-
-    #[test]
-    fn the_soak_leaves_the_measured_object_short_of_large_blocks() {
-        // 1100 MiB free: 1100 - 496 - 360 - 352 - 28 = -136, so nothing.
-        assert_eq!(Fragmentation::new(&reading(1100, 1)).soak(), 0);
-        // 1500 MiB: 264 MiB.
-        assert_eq!(Fragmentation::new(&reading(1500, 1)).soak(), 264 * MIB_KIB);
-        // 1787 MiB: 551 wanted, held to the budget less the spare.
-        assert_eq!(Fragmentation::new(&reading(1787, 1)).soak(), 504 * MIB_KIB);
-        // Whole MiB.
-        let odd = Fragmentation::new(&Memory {
-            free: 1500 * MIB_KIB + 100,
-            ..reading(0, 1)
-        });
-        assert_eq!(odd.soak(), 264 * MIB_KIB);
+        assert_eq!(odd.first().0 + odd.first().1, 508 * MIB_KIB);
     }
 
     #[test]
     fn the_top_up_aims_the_measured_object_into_the_holes() {
-        let plan = Fragmentation::new(&reading(1787, 1));
-        // 787 free with 360 of holes: 427 large; 352 wanted left, so 75,
-        // held to 56: 371 left, 77 MiB from the holes.
-        assert_eq!(plan.top_up(&reading(787, 1001)), Ok(56 * MIB_KIB));
-        // 740 free: 380 large, 28 MiB tops it up to 352.
-        assert_eq!(plan.top_up(&reading(740, 1001)), Ok(28 * MIB_KIB));
+        let plan = Fragmentation::new(&reading(1927, 0));
+        // 905 MiB free with 475.5 of holes: 429.5 large; 352 wanted left,
+        // so 78, held to 60: 369.5 left, 78.5 MiB from the holes.
+        assert_eq!(plan.top_up(&reading(905, 1022)), Ok(60 * MIB_KIB));
+        // 850 free: 374.5 large, 22.5 tops it up, rounded up to 23.
+        assert_eq!(plan.top_up(&reading(850, 1022)), Ok(23 * MIB_KIB));
         // Already short of large blocks: no top-up.
-        assert_eq!(plan.top_up(&reading(650, 1001)), Ok(0));
-        // A fraction of a MiB is rounded up.
-        assert_eq!(
-            plan.top_up(&Memory {
-                free: 740 * MIB_KIB + 1,
-                ..reading(0, 1001)
-            }),
-            Ok(29 * MIB_KIB)
-        );
+        assert_eq!(plan.top_up(&reading(800, 1022)), Ok(0));
     }
 
     #[test]
     fn the_top_up_keeps_to_the_jobs_limit() {
-        let plan = Fragmentation::new(&reading(1787, 1));
-        // 1536 - 1050 - 448 - 8 = 30 MiB of room.
-        assert_eq!(plan.top_up(&reading(740, 1050)), Ok(28 * MIB_KIB));
-        assert_eq!(plan.top_up(&reading(742, 1060)), Ok(20 * MIB_KIB));
+        let plan = Fragmentation::new(&reading(1927, 0));
+        // 1536 - 1080 - 448 - 4 = 4 MiB of room.
+        assert_eq!(plan.top_up(&reading(850, 1080)), Ok(4 * MIB_KIB));
+        assert_eq!(plan.top_up(&reading(850, 1090)), Ok(0));
     }
 
     #[test]
     fn a_guest_the_probe_cannot_fragment_is_refused() {
-        let plan = Fragmentation::new(&reading(1787, 1));
-        // 900 free: 540 large, 56 top-up leaves 484, past the object.
-        assert!(plan.top_up(&reading(900, 1001)).is_err());
-        // 790: 430 large less 56 leaves 374, 74 from holes: fine.
-        assert!(plan.top_up(&reading(790, 1001)).is_ok());
-        // 850: 490 - 56 = 434 leaves 14 MiB from holes: too few.
-        assert!(plan.top_up(&reading(850, 1001)).is_err());
-        // Too little memory in all for the object.
-        assert!(plan.top_up(&reading(440, 1001)).is_err());
+        let plan = Fragmentation::new(&reading(1927, 0));
+        // 920 free: 444.5 large less 60 leaves 384.5, 63.5 from holes.
+        assert!(plan.top_up(&reading(920, 1022)).is_ok());
+        // 975: 499.5 - 60 leaves 439.5, 8.5 MiB from holes: too few.
+        assert!(plan.top_up(&reading(975, 1022)).is_err());
+        // 1000: past the object even with the top-up.
+        assert!(plan.top_up(&reading(1000, 1022)).is_err());
+        // Holes and large blocks together too small for the object.
+        let small = Memory {
+            budget: 256 * MIB_KIB,
+            ..reading(400, 0)
+        };
+        let plan = Fragmentation::new(&small);
+        assert!(plan.holes() < MEASURED_KIB);
+        assert!(plan.top_up(&small).is_err());
+        assert!(
+            plan.top_up(&Memory {
+                free: 600 * MIB_KIB,
+                ..small
+            })
+            .is_ok()
+        );
     }
 
     #[test]

@@ -101,7 +101,7 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
 /// - `eager`: eager objects of 4, 8, 256 and 448 MiB created, mapped,
 ///   touched in every page, protected, unmapped in steps and closed, each
 ///   timed (probes 13 and 14).
-/// - `soak <MiB>`, `fragment`, `fragmented <MiB>`: the fragmented-guest
+/// - `fragment <MiB>`, `fragmented <MiB>`: the fragmented-guest
 ///   probe (DW2 §12.10, part 1; see `fragment` and `fragmented` below).
 /// - `hold-touched`, `hold-released`: maps 64 MiB on demand with no handle
 ///   left, touches every page and, for the second, unmaps the top half;
@@ -143,10 +143,10 @@ mod memory {
     /// The fragmented probe's measured object, and `eager`'s largest.
     const MEASURED_MIB: u64 = 448;
     /// What `fragment` leaves of its budget while it commits, and after its
-    /// final object (the harness's `FRAGMENT_SPARE_KIB` and
-    /// `FRAGMENT_FINAL_SPARE_KIB`).
-    const FRAGMENT_SPARE: u64 = 32 * MIB;
-    const FRAGMENT_FINAL_SPARE: u64 = 16 * MIB;
+    /// final object (the harness's `COMMIT_SPARE_KIB` and
+    /// `FINAL_SPARE_KIB`).
+    const COMMIT_SPARE: u64 = 4 * MIB;
+    const FINAL_SPARE: u64 = MIB;
     /// Hole pages committed per pinned page (the harness's `HOLE_PAGES`).
     const HOLE_PAGES: u64 = 3;
     /// How long `fragment` sleeps between tries of its final object.
@@ -166,7 +166,6 @@ mod memory {
                 | "churn-create"
                 | "churn-commit"
                 | "close-spin"
-                | "soak"
                 | "fragment"
                 | "fragmented"
         )
@@ -217,11 +216,10 @@ mod memory {
                 }
             },
             "close-spin" => close_spin(write),
-            "soak" => match size_mib {
-                Some(size) => soak(size * MIB),
+            "fragment" => match size_mib {
+                Some(filler) => fragment(budget, filler * MIB),
                 None => 2,
             },
-            "fragment" => fragment(budget),
             "fragmented" => fragmented(region, size_mib.unwrap_or(0) * MIB, write),
             _ => 2,
         }
@@ -515,29 +513,36 @@ mod memory {
         })
     }
 
-    /// `soak <MiB>`: one eager object of `size`, held with its handle, then
-    /// waits forever. It takes the largest free blocks.
-    fn soak(size: u64) -> u32 {
-        if size == 0 || create(size, DwMemoryObjectCreateFlags(0)).is_err() {
-            return 2;
-        }
-        wait_forever()
-    }
-
-    /// `fragment`: commits two on-demand objects without mapping them,
-    /// alternately one page of the pins and [`HOLE_PAGES`] of the holes,
-    /// to the budget less [`FRAGMENT_SPARE`]. Single pages come out of the
-    /// buddy allocator ascending and adjacent, so each pinned page is
-    /// followed by its holes. Then it closes the holes: their pages are
-    /// freed in owed steps, as a page and a pair that cannot merge past
-    /// the pin. Once its budget has room again it creates one eager object
-    /// that brings it to the budget less [`FRAGMENT_FINAL_SPARE`], more
+    /// `fragment <MiB>`: commits a filler of that many MiB (none for 0),
+    /// then two on-demand objects, alternately one page of the pins and
+    /// [`HOLE_PAGES`] of the holes, all without mapping them, to the budget
+    /// less [`COMMIT_SPARE`]. Single pages come out of the buddy allocator
+    /// from the smallest free block, ascending and adjacent, so the filler
+    /// takes the small blocks already free (the holes of a `fragment` run
+    /// before) and each pinned page after it is followed by its holes in
+    /// large blocks. Then it closes the filler and the holes: their pages
+    /// are freed in owed steps, the holes as a page and a pair that cannot
+    /// merge past the pin. Once its budget has room again it creates one
+    /// eager object that brings it to the budget less [`FINAL_SPARE`], more
     /// than it held before, which is what the harness waits for; being
     /// eager, it takes large blocks, not holes. Then it waits forever.
-    fn fragment(budget: u64) -> u32 {
-        let target = budget.saturating_sub(FRAGMENT_SPARE);
+    fn fragment(budget: u64, filler: u64) -> u32 {
+        let target = budget.saturating_sub(COMMIT_SPARE + filler);
         let group = PAGE * (1 + HOLE_PAGES);
         let groups = target / group;
+        let filled = if filler == 0 {
+            None
+        } else {
+            let Ok(object) = create(filler, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND) else {
+                return 2;
+            };
+            if deepwyrm_syscall::memory_object_commit(object, DwOffset(0), DwSize(filler))
+                != DW_STATUS_SUCCESS
+            {
+                return 2;
+            }
+            Some(object)
+        };
         let (Ok(pins), Ok(holes)) = (
             create(groups * PAGE, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND),
             create(
@@ -560,13 +565,18 @@ mod memory {
                 return 2;
             }
         }
+        if let Some(object) = filled
+            && deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS
+        {
+            return 2;
+        }
         if deepwyrm_syscall::handle_close(holes) != DW_STATUS_SUCCESS {
             return 2;
         }
         let Ok(sleeper) = Sleeper::new() else {
             return 2;
         };
-        let last = budget.saturating_sub(FRAGMENT_FINAL_SPARE + groups * PAGE);
+        let last = budget.saturating_sub(FINAL_SPARE + groups * PAGE);
         loop {
             let mut object = DwHandle(0);
             let status = deepwyrm_syscall::memory_object_create(
