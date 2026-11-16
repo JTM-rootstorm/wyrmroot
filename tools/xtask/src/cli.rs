@@ -3,7 +3,7 @@ use crate::{error::Failure, gate::Scope};
 pub(crate) const USAGE: &str = r#"Wyrmroot development task dispatcher
 
 Usage:
-    tools/pinned-cargo xtask dev-boot [--smp] [--check] [--deep-repository <path>] [--sdk <path>]
+    tools/pinned-cargo xtask dev-boot [--smp] [--check] [--icount] [--deep-repository <path>] [--sdk <path>]
     tools/pinned-cargo xtask product --output <fresh-directory> [--deep-repository <path>]
     tools/pinned-cargo xtask test [all|fmt|clippy|unit|root]
 
@@ -11,7 +11,9 @@ dev-boot builds the current product from both working trees and boots it in
 local QEMU; COM2 is the `wyrmsh` console. --check drives the prompt, sends
 Ctrl-D and requires the kernel's power-off line instead. --sdk names a built
 Wyrmroot SDK (`wyrmroot-sdk/out`): its test programs (hello, zlib, Lua) go
-on the ESP, and --check runs them.
+on the ESP, and --check runs them. --icount runs QEMU with `-icount shift=0`,
+so guest time counts instructions (one per nanosecond) and the kernel's step
+report reads as guest instructions; --check then waits four times as long.
 
 product builds the same product into a directory: artifacts/esp.img plus the
 loader, kernel, bootstrap, natives, bootfs and OVMF pair.
@@ -34,6 +36,7 @@ pub(crate) enum Action {
     DevBoot {
         check: bool,
         smp: bool,
+        icount: bool,
         deep_repository: Option<String>,
         sdk: Option<String>,
     },
@@ -69,6 +72,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
 fn dispatch_dev_boot(arguments: &[String]) -> Result<Action, Failure> {
     let mut check = false;
     let mut smp = false;
+    let mut icount = false;
     let mut deep_repository = None;
     let mut sdk = None;
     let mut rest = arguments.iter();
@@ -82,11 +86,15 @@ fn dispatch_dev_boot(arguments: &[String]) -> Result<Action, Failure> {
                 smp = true;
                 continue;
             }
+            "--icount" if !icount => {
+                icount = true;
+                continue;
+            }
             "--deep-repository" if deep_repository.is_none() => &mut deep_repository,
             "--sdk" if sdk.is_none() => &mut sdk,
             _ => {
                 return Err(Failure::usage(
-                    "dev-boot accepts [--smp] [--check] [--deep-repository <path>] [--sdk <path>]",
+                    "dev-boot accepts [--smp] [--check] [--icount] [--deep-repository <path>] [--sdk <path>]",
                 ));
             }
         };
@@ -99,6 +107,7 @@ fn dispatch_dev_boot(arguments: &[String]) -> Result<Action, Failure> {
     Ok(Action::DevBoot {
         check,
         smp,
+        icount,
         deep_repository,
         sdk,
     })
@@ -146,6 +155,7 @@ mod tests {
             Ok(Action::DevBoot {
                 check: true,
                 smp: false,
+                icount: false,
                 deep_repository: None,
                 sdk: None
             })
@@ -160,6 +170,7 @@ mod tests {
             Ok(Action::DevBoot {
                 check: true,
                 smp: false,
+                icount: false,
                 deep_repository: None,
                 sdk: Some("../wyrmroot-sdk/out".into())
             })
@@ -182,6 +193,71 @@ mod tests {
     }
 
     #[test]
+    fn icount_parses_alone_and_with_every_other_flag_in_any_order() {
+        let boot = |icount, check, smp, deep: Option<&str>, sdk: Option<&str>| Action::DevBoot {
+            check,
+            smp,
+            icount,
+            deep_repository: deep.map(Into::into),
+            sdk: sdk.map(Into::into),
+        };
+        assert_eq!(
+            dispatch(&arguments(&["dev-boot", "--icount"])),
+            Ok(boot(true, false, false, None, None))
+        );
+        for order in [
+            &[
+                "--icount",
+                "--check",
+                "--smp",
+                "--sdk",
+                "s",
+                "--deep-repository",
+                "d",
+            ][..],
+            &[
+                "--check",
+                "--icount",
+                "--smp",
+                "--deep-repository",
+                "d",
+                "--sdk",
+                "s",
+            ],
+            &[
+                "--sdk",
+                "s",
+                "--deep-repository",
+                "d",
+                "--smp",
+                "--check",
+                "--icount",
+            ],
+            &[
+                "--smp",
+                "--sdk",
+                "s",
+                "--icount",
+                "--deep-repository",
+                "d",
+                "--check",
+            ],
+        ] {
+            let mut command = vec!["dev-boot"];
+            command.extend_from_slice(order);
+            assert_eq!(
+                dispatch(&arguments(&command)),
+                Ok(boot(true, true, true, Some("d"), Some("s"))),
+                "{order:?}"
+            );
+        }
+        assert_eq!(
+            dispatch(&arguments(&["dev-boot", "--check", "--icount"])),
+            Ok(boot(true, true, false, None, None))
+        );
+    }
+
+    #[test]
     fn malformed_commands_are_refused() {
         for bad in [
             &["product"][..],
@@ -189,6 +265,8 @@ mod tests {
             &["dev-boot", "--check", "--check"],
             &["dev-boot", "--sdk"],
             &["dev-boot", "--sdk", "a", "--sdk", "b"],
+            &["dev-boot", "--icount", "--icount"],
+            &["dev-boot", "--icount", "--check", "--icount"],
             &["test", "native"],
             &["wyr1f", "prepare"],
         ] {

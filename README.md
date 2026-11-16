@@ -54,12 +54,12 @@ Architecture documents define design contracts. Validation and security evidence
 Development tasks run through one dispatcher, with the pinned toolchain:
 
 ```text
-tools/pinned-cargo xtask dev-boot [--smp] [--check] [--deep-repository <path>] [--sdk <path>]
+tools/pinned-cargo xtask dev-boot [--smp] [--check] [--icount] [--deep-repository <path>] [--sdk <path>]
 tools/pinned-cargo xtask product --output <fresh-directory> [--deep-repository <path>]
 tools/pinned-cargo xtask test [all|fmt|clippy|unit|root]
 ```
 
-- `dev-boot` builds the product from the Wyrmroot and Deepwyrm working trees and boots it in local QEMU; `--check` drives the shell prompt and requires a clean power-off instead of an interactive session.
+- `dev-boot` builds the product from the Wyrmroot and Deepwyrm working trees and boots it in local QEMU; `--check` drives the shell prompt and requires a clean power-off instead of an interactive session. `--icount` runs QEMU with `-icount shift=0`, so guest time counts instructions and the kernel's step report reads as guest instructions; it is a measurement mode, and `--check` waits four times as long under it.
 - `product` builds the same product into a fresh directory: the ESP image plus the loader, kernel, bootstrap, native services, bootfs and firmware pair.
 - `test` runs the host gate: formatting, warnings-denied Clippy, the workspace tests and the root Python suites.
 

@@ -30,7 +30,7 @@
 
 use std::{thread, time::Duration};
 
-use super::{ATTEMPTS, Shell, contains, spawn_job};
+use super::{Shell, contains, spawn_job};
 use crate::error::Failure;
 
 const MIB_KIB: u64 = 1024;
@@ -132,7 +132,7 @@ fn settle(
 ) -> Result<Memory, Failure> {
     let mut previous: Option<Memory> = None;
     let mut last = None;
-    for _ in 0..ATTEMPTS {
+    for _ in 0..shell.attempts() {
         let memory = read(shell)?;
         if done(&memory) && previous.is_some_and(|before| before.jobs_used == memory.jobs_used) {
             return Ok(memory);
@@ -268,7 +268,7 @@ pub(super) fn probes(shell: &mut Shell<'_>) -> Result<(), Failure> {
         // A churn's usage swings with each round, so one read past the mark
         // shows it is in its loop.
         let mut churning = None;
-        for _ in 0..ATTEMPTS {
+        for _ in 0..shell.attempts() {
             let memory = read(shell)?;
             if memory.jobs_used >= base.jobs_used + CHURNING_KIB {
                 churning = Some(memory);

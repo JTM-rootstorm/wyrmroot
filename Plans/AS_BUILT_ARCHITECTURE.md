@@ -12,7 +12,7 @@ Wyrmroot is the platform over the Deepwyrm kernel: the EFI loader, the first use
 | `bootstrap/` | The first process, which the kernel loads; checks its ABI against the kernel's, loads `system/init` from the bootfs, passes it authority and retires |
 | `userspace/` | 13 programs: `system-init`, `registryd`, `devmgr`, `uart16550d`, `virtio-blkd`, `blockmgr`, `fat32d`, `ext4d`, `vfsd`, `consoled`, `wyrmsh`, `hello`, `cpu-hog` |
 | `crates/` | 22 libraries: the loader, the runtime (startup, syscalls, supervision), one codec crate per protocol, the bootfs and RRC manifest builders, ext4, FAT and partition parsers, the shell's grammar |
-| `tools/xtask` | `dev-boot [--smp] [--check] [--sdk]`, `product --output`, `test [all|fmt|clippy|unit|root]` |
+| `tools/xtask` | `dev-boot [--smp] [--check] [--icount] [--sdk]`, `product --output`, `test [all|fmt|clippy|unit|root]` |
 | `toolchain/versions.toml` | The one pin record: Deepwyrm revision and ABI fingerprint, the Rust fork and its `x86_64-unknown-wyrmroot` target |
 
 Native programs are Rust, static ET_EXEC x86-64, linked against `deepwyrm-syscall` at the pinned revision, which stamps each with the ABI fingerprint note.

@@ -31,6 +31,16 @@
 //! The second boot `cat`s the file back, removes it and shuts down. Each
 //! boot must end with the kernel's power-off line on its COM1 log. That is the smoke check for development commits.
 //!
+//! `--icount` is a measurement mode: QEMU runs with `-icount shift=0`, so
+//! guest time advances by one nanosecond per guest instruction and the
+//! kernel's clock counts instructions. The `[steps]` report then counts guest
+//! instructions per step, independent of host load and of how TCG chains its
+//! translations. QEMU runs every vCPU on one thread under `-icount`, so the
+//! check waits four times as long ([`Patience`]), and its pass line ends in
+//! `icount=1`. In every mode the check prints each call's mean step from the
+//! report's `call-total-us` and `call-steps` lines ([`step_means`]), in
+//! microseconds, or under `--icount` in thousands of guest instructions.
+//!
 //! The persistent root is a second, writable virtio disk at 00:02.0: a copy
 //! of the product's empty ext4 `root.img`. `--check` makes a fresh copy per
 //! run; an interactive run keeps one at `OS-Project/.tmp/dev-boot/root.img`
@@ -59,6 +69,8 @@ mod memory;
 pub(crate) struct DevBoot {
     pub(crate) check: bool,
     pub(crate) smp: bool,
+    /// QEMU's `-icount shift=0`: guest time counts guest instructions.
+    pub(crate) icount: bool,
     pub(crate) deep_repository: Option<String>,
     /// A built Wyrmroot SDK (`wyrmroot-sdk/out`) whose test programs go on
     /// the ESP and, under `--check`, run (root `TOOLCHAIN_PLAN.md` step 2).
@@ -132,6 +144,33 @@ const SDK_RUNS: [(&str, &[u8]); 7] = [
 const SDK_LEFTOVERS: [&str; 1] = ["/zlib-example.gz"];
 /// Services and mounts come up beside the shell, so their checks are retried.
 const ATTEMPTS: usize = 20;
+/// How much longer the check waits under `--icount`, where QEMU runs every
+/// vCPU on one thread and counts instructions exactly.
+const ICOUNT_PATIENCE: u32 = 4;
+/// The calls the kernel's step report times in steps, in its order.
+const STEP_CALLS: [&str; 9] = [
+    "map", "unmap", "protect", "fill", "commit", "create", "teardown", "release", "finalize",
+];
+
+/// How long a check waits on the guest: the boot's deadline and the number
+/// of attempts of every loop that polls it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Patience {
+    timeout: Duration,
+    attempts: usize,
+}
+
+impl Patience {
+    /// The base waits, or under `--icount` [`ICOUNT_PATIENCE`] times them.
+    fn new(icount: bool) -> Self {
+        let factor = if icount { ICOUNT_PATIENCE } else { 1 };
+        Self {
+            timeout: CHECK_TIMEOUT * factor,
+            attempts: ATTEMPTS * factor as usize,
+        }
+    }
+}
+
 /// What the first boot writes and the second reads back.
 const PERSISTED_PATH: &str = "/persist.txt";
 
@@ -174,16 +213,17 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
     if !root_disk.exists() {
         create_root_disk(&product, &root_disk)?;
     }
-    let args = qemu_arguments(boot.smp, &product, &vars, &com1, &root_disk);
+    let args = qemu_arguments(boot.smp, boot.icount, &product, &vars, &com1, &root_disk);
 
     if boot.check {
         let reboot = root.join("com1-reboot.log");
-        let second = qemu_arguments(boot.smp, &product, &vars, &reboot, &root_disk);
+        let second = qemu_arguments(boot.smp, boot.icount, &product, &vars, &reboot, &root_disk);
         check(
             &[(&args, &com1), (&second, &reboot)],
             &root,
             unique,
             sdk.is_some(),
+            boot.icount,
         )
     } else {
         eprintln!(
@@ -223,6 +263,7 @@ fn create_root_disk(product: &Path, path: &Path) -> Result<(), Failure> {
 
 fn qemu_arguments(
     smp: bool,
+    icount: bool,
     product: &Path,
     vars: &Path,
     com1: &Path,
@@ -285,6 +326,11 @@ fn qemu_arguments(
     ];
     // The second ISA serial port is COM2, where the product runs `wyrmsh`.
     args.extend(["-serial".into(), "stdio".into()]);
+    if icount {
+        // One guest instruction is one nanosecond of guest time; `sleep`
+        // stays on, so an idle guest's clock follows real time.
+        args.extend(["-icount".into(), "shift=0".into()]);
+    }
     args
 }
 
@@ -294,13 +340,19 @@ fn check(
     root: &Path,
     unique: u128,
     sdk: bool,
+    icount: bool,
 ) -> Result<String, Failure> {
     let started = Instant::now();
+    let patience = Patience::new(icount);
     let token = format!("dev-boot persisted {unique}");
     let mut spins = Vec::new();
-    let first = boot_once(boots[0].0, boots[0].1, &root.join("com2.log"), |shell| {
-        first_boot(shell, &token, sdk, &mut spins)
-    });
+    let first = boot_once(
+        boots[0].0,
+        boots[0].1,
+        &root.join("com2.log"),
+        patience,
+        |shell| first_boot(shell, &token, sdk, &mut spins),
+    );
     first?;
     // The kernel's step report from the first boot, which ran the probes.
     let log = fs::read(boots[0].1).map_err(|error| Failure::task(format!("COM1 log: {error}")))?;
@@ -312,6 +364,9 @@ fn check(
     })?;
     for line in &steps {
         eprintln!("dev-boot: kernel steps {line}");
+    }
+    for line in step_means(&steps, icount) {
+        eprintln!("dev-boot: {line}");
     }
     // The idle-BSP probe: each run that spun on an AP had the kernel wake
     // the idle BSP for its owed work (DW2 §10.19); the gap is reported.
@@ -327,14 +382,56 @@ fn check(
         boots[1].0,
         boots[1].1,
         &root.join("com2-reboot.log"),
+        patience,
         |shell| second_boot(shell, &token),
     );
     second?;
-    Ok(format!(
-        "DEV_BOOT_CHECK_PASS seconds={} root={}\n",
-        started.elapsed().as_secs(),
-        root.display()
-    ))
+    Ok(pass_line(started.elapsed().as_secs(), root, icount))
+}
+
+/// The check's result line; under `--icount` it says so, so the result
+/// cannot be taken for a wall-time one.
+fn pass_line(seconds: u64, root: &Path, icount: bool) -> String {
+    format!(
+        "DEV_BOOT_CHECK_PASS seconds={seconds} root={}{}\n",
+        root.display(),
+        if icount { " icount=1" } else { "" }
+    )
+}
+
+/// Each timed call's mean step from the kernel's step report (`lines`, as
+/// [`memory::steps_report`] returns them): `call-total-us / call-steps`.
+/// Under `--icount` a guest microsecond is a thousand guest instructions, so
+/// the unit is `kinstr` and a line before says so. A call with no steps is
+/// left out; without both source lines there is nothing to print.
+fn step_means(lines: &[String], icount: bool) -> Vec<String> {
+    let source = |prefix: &str| lines.iter().find_map(|line| line.strip_prefix(prefix));
+    let (Some(steps), Some(totals)) = (source("call-steps "), source("call-total-us ")) else {
+        return Vec::new();
+    };
+    let field = |line: &str, call: &str| {
+        line.split_whitespace()
+            .find_map(|part| part.strip_prefix(call)?.strip_prefix('='))
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let means: Vec<String> = STEP_CALLS
+        .iter()
+        .filter_map(|call| {
+            let count = field(steps, call).filter(|&count| count != 0)?;
+            Some(format!("{call}={}", field(totals, call)? / count))
+        })
+        .collect();
+    let mut out = Vec::with_capacity(2);
+    if icount {
+        out.push(
+            "icount: guest time counts instructions (1 ns each); \
+             step times are thousands of guest instructions"
+                .to_owned(),
+        );
+    }
+    let unit = if icount { "kinstr" } else { "us" };
+    out.push(format!("step means {unit} {}", means.join(" ")));
+    out
 }
 
 /// Everything the first boot checks, ending with the persistent write;
@@ -470,9 +567,15 @@ struct Shell<'a> {
     input: &'a mut std::process::ChildStdin,
     com2: &'a Arc<Mutex<Vec<u8>>>,
     deadline: Instant,
+    patience: Patience,
 }
 
 impl Shell<'_> {
+    /// How many times a loop that polls the guest tries before it fails.
+    const fn attempts(&self) -> usize {
+        self.patience.attempts
+    }
+
     fn length(&self) -> usize {
         self.com2.lock().map(|com2| com2.len()).unwrap_or(0)
     }
@@ -543,7 +646,7 @@ impl Shell<'_> {
         what: &str,
         done: impl Fn(&[u8]) -> bool,
     ) -> Result<(), Failure> {
-        for _ in 0..ATTEMPTS {
+        for _ in 0..self.attempts() {
             if done(&self.run(command)?) {
                 return Ok(());
             }
@@ -565,6 +668,7 @@ fn boot_once(
     args: &[String],
     com1: &Path,
     transcript: &Path,
+    patience: Patience,
     script: impl FnOnce(&mut Shell<'_>) -> Result<(), Failure>,
 ) -> Result<(), Failure> {
     let mut child = Command::new("qemu-system-x86_64")
@@ -575,7 +679,7 @@ fn boot_once(
         .spawn()
         .map_err(|error| Failure::task(format!("could not launch QEMU: {error}")))?;
     let com2 = Arc::new(Mutex::new(Vec::new()));
-    let result = drive(&mut child, com1, &com2, script);
+    let result = drive(&mut child, com1, &com2, patience, script);
     if result.is_err() {
         record_cpu_state(&monitor_socket(com1), &com1.with_extension("cpu-state.txt"));
         let _ = child.kill();
@@ -655,9 +759,10 @@ fn drive(
     child: &mut Child,
     com1: &Path,
     com2: &Arc<Mutex<Vec<u8>>>,
+    patience: Patience,
     script: impl FnOnce(&mut Shell<'_>) -> Result<(), Failure>,
 ) -> Result<(), Failure> {
-    let deadline = Instant::now() + CHECK_TIMEOUT;
+    let deadline = Instant::now() + patience.timeout;
     let mut stdout = child
         .stdout
         .take()
@@ -689,6 +794,7 @@ fn drive(
         input,
         com2,
         deadline,
+        patience,
     })?;
     let input = child
         .stdin
@@ -842,6 +948,7 @@ mod tests {
     fn the_shell_console_is_the_second_serial_port_after_the_kernel_log() {
         let args = qemu_arguments(
             false,
+            false,
             Path::new("/p"),
             Path::new("/v.fd"),
             Path::new("/c1.log"),
@@ -860,6 +967,7 @@ mod tests {
     #[test]
     fn the_esp_is_a_modern_virtio_disk_behind_the_iommu() {
         let args = qemu_arguments(
+            false,
             false,
             Path::new("/p"),
             Path::new("/v"),
@@ -939,6 +1047,7 @@ mod tests {
     fn the_guest_cpu_has_gigabyte_pages_smep_and_smap() {
         let args = qemu_arguments(
             false,
+            false,
             Path::new("product"),
             Path::new("vars"),
             Path::new("com1"),
@@ -958,9 +1067,117 @@ mod tests {
     }
 
     #[test]
+    fn icount_adds_shift_zero_and_changes_nothing_else() {
+        for smp in [false, true] {
+            let arguments = |icount| {
+                qemu_arguments(
+                    smp,
+                    icount,
+                    Path::new("/p"),
+                    Path::new("/v"),
+                    Path::new("/c"),
+                    Path::new("/r.img"),
+                )
+            };
+            let (plain, counted) = (arguments(false), arguments(true));
+            assert!(!plain.iter().any(|arg| arg == "-icount"));
+            let at = counted
+                .iter()
+                .position(|arg| arg == "-icount")
+                .expect("-icount is passed");
+            assert_eq!(counted.get(at + 1).map(String::as_str), Some("shift=0"));
+            assert_eq!(counted.iter().filter(|arg| *arg == "-icount").count(), 1);
+            let mut rest = counted.clone();
+            rest.drain(at..at + 2);
+            assert_eq!(rest, plain);
+        }
+    }
+
+    #[test]
+    fn patience_is_the_base_waits_or_four_times_them_under_icount() {
+        assert_eq!(
+            Patience::new(false),
+            Patience {
+                timeout: Duration::from_secs(180),
+                attempts: 20
+            }
+        );
+        assert_eq!(
+            Patience::new(true),
+            Patience {
+                timeout: Duration::from_secs(720),
+                attempts: 80
+            }
+        );
+    }
+
+    const STEP_LINES: [&str; 3] = [
+        "stops-between-steps map=1 unmap=0 protect=0 fill=0 commit=0 create=0",
+        "call-steps map=4 unmap=3 protect=0 fill=243437 commit=7 create=3665 teardown=526 \
+         release=255 finalize=5432",
+        "call-total-us map=8306099 unmap=1182542 protect=0 fill=3907919 commit=5281586 \
+         create=7050383 teardown=50469 release=592 finalize=3402532",
+    ];
+
+    fn step_lines() -> Vec<String> {
+        STEP_LINES.iter().map(|line| (*line).to_owned()).collect()
+    }
+
+    #[test]
+    fn step_means_divide_each_total_by_its_steps_and_leave_out_idle_calls() {
+        assert_eq!(
+            step_means(&step_lines(), false),
+            [
+                "step means us map=2076524 unmap=394180 fill=16 commit=754512 create=1923 \
+              teardown=95 release=2 finalize=626"
+            ]
+        );
+    }
+
+    #[test]
+    fn under_icount_step_means_are_thousands_of_instructions() {
+        assert_eq!(
+            step_means(&step_lines(), true),
+            [
+                "icount: guest time counts instructions (1 ns each); \
+                 step times are thousands of guest instructions",
+                "step means kinstr map=2076524 unmap=394180 fill=16 commit=754512 create=1923 \
+                 teardown=95 release=2 finalize=626"
+            ]
+        );
+    }
+
+    #[test]
+    fn step_means_need_both_source_lines() {
+        for missing in ["call-steps ", "call-total-us "] {
+            let lines: Vec<String> = step_lines()
+                .into_iter()
+                .filter(|line| !line.starts_with(missing))
+                .collect();
+            assert!(step_means(&lines, false).is_empty(), "{missing}");
+            assert!(step_means(&lines, true).is_empty(), "{missing}");
+        }
+        assert!(step_means(&[], true).is_empty());
+    }
+
+    #[test]
+    fn the_pass_line_marks_an_icount_result() {
+        let root = Path::new("/t/run");
+        assert_eq!(
+            pass_line(42, root, false),
+            "DEV_BOOT_CHECK_PASS seconds=42 root=/t/run\n"
+        );
+        assert_eq!(
+            pass_line(42, root, true),
+            "DEV_BOOT_CHECK_PASS seconds=42 root=/t/run icount=1\n"
+        );
+    }
+
+    #[test]
     fn smp_uses_the_f_matrix_cpu_count() {
         let args = qemu_arguments(
             true,
+            false,
             Path::new("/p"),
             Path::new("/v"),
             Path::new("/c"),
