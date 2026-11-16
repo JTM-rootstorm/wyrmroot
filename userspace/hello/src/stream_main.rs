@@ -305,7 +305,9 @@ mod memory {
     fn eager(region: DwHandle, write: &mut dyn FnMut(&[u8]) -> bool) -> u32 {
         for size_mib in [4, 8, 256, MEASURED_MIB] {
             match eager_once(region, size_mib * MIB) {
-                Ok(times) => write(timed_line("eager", size_mib, times).bytes()),
+                Ok(times) => {
+                    write(timed_line("eager", size_mib, times).bytes());
+                }
                 Err(step) => {
                     let mut line = Line::new();
                     line.text("eager failed: ").text(step).text("\n");
