@@ -1,9 +1,9 @@
-use crate::{error::Failure, gate::Scope};
+use crate::{dev_boot::Clock, error::Failure, gate::Scope};
 
 pub(crate) const USAGE: &str = r#"Wyrmroot development task dispatcher
 
 Usage:
-    tools/pinned-cargo xtask dev-boot [--smp] [--check] [--icount] [--deep-repository <path>] [--sdk <path>]
+    tools/pinned-cargo xtask dev-boot [--smp] [--check] [--icount|--kvm] [--deep-repository <path>] [--sdk <path>]
     tools/pinned-cargo xtask product --output <fresh-directory> [--deep-repository <path>]
     tools/pinned-cargo xtask test [all|fmt|clippy|unit|root]
 
@@ -14,6 +14,10 @@ Wyrmroot SDK (`wyrmroot-sdk/out`): its test programs (hello, zlib, Lua) go
 on the ESP, and --check runs them. --icount runs QEMU with `-icount shift=0`,
 so guest time counts instructions (one per nanosecond) and the kernel's step
 report reads as guest instructions; --check then waits four times as long.
+--kvm is the timing mode: QEMU runs the guest under KVM on the host CPU, so
+the step report is real time under virtualization and --check prints step
+means in nanoseconds. It needs /dev/kvm read-write and is refused with
+--icount, which is a different clock.
 
 product builds the same product into a directory: artifacts/esp.img plus the
 loader, kernel, bootstrap, natives, bootfs and OVMF pair.
@@ -36,7 +40,7 @@ pub(crate) enum Action {
     DevBoot {
         check: bool,
         smp: bool,
-        icount: bool,
+        clock: Clock,
         deep_repository: Option<String>,
         sdk: Option<String>,
     },
@@ -73,6 +77,7 @@ fn dispatch_dev_boot(arguments: &[String]) -> Result<Action, Failure> {
     let mut check = false;
     let mut smp = false;
     let mut icount = false;
+    let mut kvm = false;
     let mut deep_repository = None;
     let mut sdk = None;
     let mut rest = arguments.iter();
@@ -90,11 +95,15 @@ fn dispatch_dev_boot(arguments: &[String]) -> Result<Action, Failure> {
                 icount = true;
                 continue;
             }
+            "--kvm" if !kvm => {
+                kvm = true;
+                continue;
+            }
             "--deep-repository" if deep_repository.is_none() => &mut deep_repository,
             "--sdk" if sdk.is_none() => &mut sdk,
             _ => {
                 return Err(Failure::usage(
-                    "dev-boot accepts [--smp] [--check] [--icount] [--deep-repository <path>] [--sdk <path>]",
+                    "dev-boot accepts [--smp] [--check] [--icount|--kvm] [--deep-repository <path>] [--sdk <path>]",
                 ));
             }
         };
@@ -104,10 +113,20 @@ fn dispatch_dev_boot(arguments: &[String]) -> Result<Action, Failure> {
                 .ok_or_else(|| Failure::usage(format!("dev-boot {argument} requires a path")))?,
         );
     }
+    let clock = match (icount, kvm) {
+        (false, false) => Clock::Emulated,
+        (true, false) => Clock::Icount,
+        (false, true) => Clock::Kvm,
+        (true, true) => {
+            return Err(Failure::usage(
+                "dev-boot --icount and --kvm are different clocks; pass one of them",
+            ));
+        }
+    };
     Ok(Action::DevBoot {
         check,
         smp,
-        icount,
+        clock,
         deep_repository,
         sdk,
     })
@@ -155,7 +174,7 @@ mod tests {
             Ok(Action::DevBoot {
                 check: true,
                 smp: false,
-                icount: false,
+                clock: Clock::Emulated,
                 deep_repository: None,
                 sdk: None
             })
@@ -170,7 +189,7 @@ mod tests {
             Ok(Action::DevBoot {
                 check: true,
                 smp: false,
-                icount: false,
+                clock: Clock::Emulated,
                 deep_repository: None,
                 sdk: Some("../wyrmroot-sdk/out".into())
             })
@@ -197,7 +216,11 @@ mod tests {
         let boot = |icount, check, smp, deep: Option<&str>, sdk: Option<&str>| Action::DevBoot {
             check,
             smp,
-            icount,
+            clock: if icount {
+                Clock::Icount
+            } else {
+                Clock::Emulated
+            },
             deep_repository: deep.map(Into::into),
             sdk: sdk.map(Into::into),
         };
@@ -258,6 +281,96 @@ mod tests {
     }
 
     #[test]
+    fn kvm_parses_alone_and_with_every_other_flag_in_any_order() {
+        let boot = |check, smp, deep: Option<&str>, sdk: Option<&str>| Action::DevBoot {
+            check,
+            smp,
+            clock: Clock::Kvm,
+            deep_repository: deep.map(Into::into),
+            sdk: sdk.map(Into::into),
+        };
+        assert_eq!(
+            dispatch(&arguments(&["dev-boot", "--kvm"])),
+            Ok(boot(false, false, None, None))
+        );
+        let flags = [
+            "--kvm",
+            "--check",
+            "--smp",
+            "--sdk s",
+            "--deep-repository d",
+        ];
+        // Every order of the five flags.
+        let mut orders = vec![Vec::new()];
+        for _ in 0..flags.len() {
+            orders = orders
+                .into_iter()
+                .flat_map(|order: Vec<&str>| {
+                    flags
+                        .iter()
+                        .filter(|flag| !order.contains(*flag))
+                        .map(|flag| {
+                            let mut next = order.clone();
+                            next.push(*flag);
+                            next
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+        }
+        assert_eq!(orders.len(), 120);
+        for order in orders {
+            let mut command = vec!["dev-boot"];
+            command.extend(order.iter().flat_map(|flag| flag.split(' ')));
+            assert_eq!(
+                dispatch(&arguments(&command)),
+                Ok(boot(true, true, Some("d"), Some("s"))),
+                "{order:?}"
+            );
+        }
+        for (with, check, smp, deep, sdk) in [
+            ("--check", true, false, None, None),
+            ("--smp", false, true, None, None),
+            ("--sdk", false, false, None, Some("s")),
+            ("--deep-repository", false, false, Some("d"), None),
+        ] {
+            let mut alone = vec![with];
+            if let Some(path) = deep.or(sdk) {
+                alone.push(path);
+            }
+            for kvm_first in [true, false] {
+                let mut command = vec!["dev-boot"];
+                if kvm_first {
+                    command.push("--kvm");
+                    command.extend(&alone);
+                } else {
+                    command.extend(&alone);
+                    command.push("--kvm");
+                }
+                assert_eq!(
+                    dispatch(&arguments(&command)),
+                    Ok(boot(check, smp, deep, sdk)),
+                    "{command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kvm_is_refused_with_icount_in_either_order() {
+        for bad in [
+            &["dev-boot", "--kvm", "--icount"][..],
+            &["dev-boot", "--icount", "--kvm"],
+            &["dev-boot", "--check", "--icount", "--smp", "--kvm"],
+        ] {
+            let failure = dispatch(&arguments(bad)).unwrap_err();
+            assert!(failure.message.contains("--icount"), "{bad:?}");
+            assert!(failure.message.contains("--kvm"), "{bad:?}");
+            assert!(failure.message.contains("different clocks"), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn malformed_commands_are_refused() {
         for bad in [
             &["product"][..],
@@ -267,6 +380,8 @@ mod tests {
             &["dev-boot", "--sdk", "a", "--sdk", "b"],
             &["dev-boot", "--icount", "--icount"],
             &["dev-boot", "--icount", "--check", "--icount"],
+            &["dev-boot", "--kvm", "--kvm"],
+            &["dev-boot", "--kvm", "--check", "--kvm"],
             &["test", "native"],
             &["wyr1f", "prepare"],
         ] {
