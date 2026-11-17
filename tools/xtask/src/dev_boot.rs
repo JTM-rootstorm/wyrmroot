@@ -17,7 +17,10 @@
 //! `bin/hello close-spin` three times while the system is quiet, after
 //! which the first boot's report must show an owed-work wake for each run
 //! that spun on an AP, and its longest finalize gap is reported (Deepwyrm
-//! DW2 §10.19, `memory.rs`); spawns two `bin/cpu-hog` jobs,
+//! DW2 §10.19, `memory.rs`); runs `bin/hello touch-loop 64 20`, which
+//! times a first touch of an on-demand page, and requires the kernel's
+//! `faults` line to count its pages (DW2 M8 §13.5, `touch.rs`); spawns two
+//! `bin/cpu-hog` jobs,
 //! which hold their own FP registers and FS base while they preempt each
 //! other; runs `bin/hello` with its on-demand MemoryObject probe, which must
 //! pass and then end in `resource-policy` once its page quota is spent
@@ -28,7 +31,9 @@
 //! also the SDK's programs); terminates the hogs and requires each to have
 //! been still running; then writes a
 //! file and makes a directory on the root (W7) and shuts down with Ctrl-D.
-//! The second boot `cat`s the file back, removes it and shuts down. Each
+//! The second boot `cat`s the file back, removes it, under `--smp` runs
+//! `touch-loop` three at once and requires its faults counted, and shuts
+//! down; its fault, lock, admission and commit-step lines are printed. Each
 //! boot must end with the kernel's power-off line on its COM1 log. That is the smoke check for development commits.
 //!
 //! `--icount` is a measurement mode: QEMU runs with `-icount shift=0`, so
@@ -66,7 +71,7 @@ use std::{
     io::{Read, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
+    process::{Child, ChildStdin, Command},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -75,6 +80,12 @@ use std::{
 use crate::{error::Failure, product, tasks};
 
 mod memory;
+mod qemu;
+mod shell;
+mod touch;
+
+use qemu::{boot_once, create_root_disk, kvm_access, qemu_arguments};
+use shell::{END_OF_INPUT, PROMPT, Shell, contains, spawn_job, strip_escapes, wait_until};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DevBoot {
@@ -102,12 +113,7 @@ pub(crate) enum Clock {
 /// The device KVM is opened through.
 const KVM_DEVICE: &str = "/dev/kvm";
 
-/// The same memory and CPU counts as the F matrix's default and SMP profiles.
-const MEMORY_MIB: u32 = 2048;
-const SMP_VCPUS: u32 = 4;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(180);
-const PROMPT: &[u8] = b"wyrmsh> ";
-const END_OF_INPUT: u8 = 0x04;
 const POWER_OFF: &[u8] = b"no process remains; powering off";
 /// The kernel's record that every CPU runs with SMEP and SMAP (Deepwyrm
 /// DW2 M2): the guest CPU has both, so the kernel must have turned them on.
@@ -257,6 +263,7 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
             unique,
             sdk.is_some(),
             boot.clock,
+            boot.smp,
         )
     } else {
         eprintln!(
@@ -274,133 +281,6 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
     }
 }
 
-/// Fails unless KVM's device at `device` opens read-write, as QEMU needs.
-fn kvm_access(device: &Path) -> Result<(), Failure> {
-    fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(device)
-        .map(drop)
-        .map_err(|error| {
-            Failure::task(format!(
-                "dev-boot --kvm: cannot open {} read-write ({error}); if you were \
-                 just added to group kvm, run the command through \
-                 `sg kvm -c '...'` or start a new login session",
-                device.display()
-            ))
-        })
-}
-
-/// A writable copy of the product's empty root disk at `path`.
-fn create_root_disk(product: &Path, path: &Path) -> Result<(), Failure> {
-    let failed = |what: String| {
-        Failure::task(format!(
-            "could not make the root disk {}: {what}",
-            path.display()
-        ))
-    };
-    let mut source = fs::File::open(product.join("artifacts").join(product::ROOT_DISK_NAME))
-        .map_err(|error| failed(error.to_string()))?;
-    let mut copy = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| failed(error.to_string()))?;
-    std::io::copy(&mut source, &mut copy).map_err(|error| failed(error.to_string()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| failed(error.to_string()))
-}
-
-fn qemu_arguments(
-    smp: bool,
-    clock: Clock,
-    product: &Path,
-    vars: &Path,
-    com1: &Path,
-    root_disk: &Path,
-) -> Vec<String> {
-    let vcpus = if smp { SMP_VCPUS } else { 1 };
-    let kvm = clock == Clock::Kvm;
-    let mut args: Vec<String> = Vec::new();
-    if kvm {
-        args.extend(["-accel".into(), "kvm".into()]);
-    }
-    args.extend([
-        "-machine".into(),
-        // Under KVM the emulated VT-d's interrupt remapping needs the
-        // split irqchip: QEMU refuses `intremap=on` with the in-kernel one.
-        if kvm {
-            "q35,kernel-irqchip=split".into()
-        } else {
-            "q35".into()
-        },
-        "-m".into(),
-        format!("{MEMORY_MIB}M"),
-        "-smp".into(),
-        vcpus.to_string(),
-        // The default TCG model lacks what large-memory support relies on:
-        // 1 GiB pages for the kernel's direct map, SMEP and SMAP
-        // (Deepwyrm DW2 M2). Under KVM the guest has the host's CPU,
-        // with its invariant TSC shown (QEMU shows it only to a guest
-        // marked not migratable), so the kernel can time steps by the TSC.
-        "-cpu".into(),
-        if kvm {
-            "host,migratable=no,+invtsc".into()
-        } else {
-            "qemu64,+pdpe1gb,+smep,+smap".into()
-        },
-        "-nodefaults".into(),
-        "-display".into(),
-        "none".into(),
-        // A monitor socket beside COM1, so a failed check can record where
-        // every CPU was before QEMU is killed.
-        "-monitor".into(),
-        format!("unix:{},server,nowait", monitor_socket(com1).display()),
-        "-no-reboot".into(),
-        "-drive".into(),
-        format!(
-            "if=pflash,format=raw,readonly=on,file={}",
-            product.join("artifacts/OVMF_CODE.fd").display()
-        ),
-        "-drive".into(),
-        format!("if=pflash,format=raw,file={}", vars.display()),
-        // VT-d, so the kernel can confine device DMA (root `STORAGE_PLAN.md`).
-        // Interrupt remapping too: without it the kernel admits no bus
-        // mastering, since a device could forge interrupts by DMA.
-        "-device".into(),
-        "intel-iommu,intremap=on".into(),
-        // A modern-only virtio disk whose DMA goes through the IOMMU.
-        "-drive".into(),
-        format!(
-            "if=none,id=esp,format=raw,readonly=on,file={}",
-            product.join("artifacts").join(product::ESP_NAME).display()
-        ),
-        "-device".into(),
-        format!(
-            "virtio-blk-pci,drive=esp,addr={:#x},disable-legacy=on,iommu_platform=on",
-            product::BOOT_DISK_PCI_ADDRESS >> 3
-        ),
-        // The writable data disk with the persistent root (W7).
-        "-drive".into(),
-        format!("if=none,id=root,format=raw,file={}", root_disk.display()),
-        "-device".into(),
-        format!(
-            "virtio-blk-pci,drive=root,addr={:#x},disable-legacy=on,iommu_platform=on",
-            product::DATA_DISK_PCI_ADDRESS >> 3
-        ),
-        "-serial".into(),
-        format!("file:{}", com1.display()),
-    ]);
-    // The second ISA serial port is COM2, where the product runs `wyrmsh`.
-    args.extend(["-serial".into(), "stdio".into()]);
-    if clock == Clock::Icount {
-        // One guest instruction is one nanosecond of guest time; `sleep`
-        // stays on, so an idle guest's clock follows real time.
-        args.extend(["-icount".into(), "shift=0".into()]);
-    }
-    args
-}
-
 /// Boots twice on the same disks: the first boot writes, the second reads.
 fn check(
     boots: &[(&Vec<String>, &PathBuf); 2],
@@ -408,6 +288,7 @@ fn check(
     unique: u128,
     sdk: bool,
     clock: Clock,
+    smp: bool,
 ) -> Result<String, Failure> {
     let started = Instant::now();
     let patience = Patience::new(clock);
@@ -469,14 +350,43 @@ fn check(
         ))
     })?;
     eprintln!("dev-boot: {finalize}");
+    // A first touch's time in the kernel (DW2 M8 §13.5): the faults the
+    // first boot's `touch-loop` took, and where their time went.
+    let first_touch =
+        touch::first_touch(&steps, Some(touch::TOUCH_LOOP_PAGES)).map_err(|reason| {
+            Failure::task(format!(
+                "dev-boot check: {reason}; see {}",
+                boots[0].1.display()
+            ))
+        })?;
+    if let Some(line) = first_touch {
+        eprintln!("dev-boot: {line}");
+    }
     let second = boot_once(
         boots[1].0,
         boots[1].1,
         &root.join("com2-reboot.log"),
         patience,
-        |shell| second_boot(shell, &token),
+        |shell| second_boot(shell, &token, smp),
     );
     second?;
+    // The second boot's faults and lock waits: under `--smp`, three
+    // `touch-loop` jobs at once; otherwise little.
+    let log = fs::read(boots[1].1).map_err(|error| Failure::task(format!("COM1 log: {error}")))?;
+    let lines = touch::report_lines(&log);
+    for line in touch::second_boot_lines(&lines) {
+        eprintln!("dev-boot: kernel steps (second boot) {line}");
+    }
+    let first_touch =
+        touch::first_touch(&lines, smp.then_some(touch::TOUCH_LOOP_PAGES)).map_err(|reason| {
+            Failure::task(format!(
+                "dev-boot check: second boot: {reason}; see {}",
+                boots[1].1.display()
+            ))
+        })?;
+    if let Some(line) = first_touch {
+        eprintln!("dev-boot: (second boot) {line}");
+    }
     Ok(pass_line(started.elapsed().as_secs(), root, clock))
 }
 
@@ -573,6 +483,8 @@ fn first_boot(
     // is owed yet: the shell waits on the job, so the BSP is idle unless
     // the job is on it.
     *spins = memory::close_spin(shell)?;
+    // A first touch timed with one job (DW2 M8 §13.5), still quiet.
+    touch::single(shell)?;
     // Two hogs hold their own FP registers and FS base and preempt each
     // other (and everything else) until they are terminated; a hog that saw
     // its state change, or did not start from the initial FP state, exits on
@@ -663,8 +575,10 @@ fn run_sdk(shell: &mut Shell<'_>, runs: &[(&str, &[u8])]) -> Result<(), Failure>
     Ok(())
 }
 
-/// The second boot reads the first boot's file back and removes it.
-fn second_boot(shell: &mut Shell<'_>, token: &str) -> Result<(), Failure> {
+/// The second boot reads the first boot's file back and removes it; under
+/// `--smp` it then times a first touch with three jobs at once (DW2 M8
+/// §13.5).
+fn second_boot(shell: &mut Shell<'_>, token: &str, smp: bool) -> Result<(), Failure> {
     let command = format!("cat {PERSISTED_PATH}");
     shell.retry(&command, "the file written before the reboot", |output| {
         contains(output, token.as_bytes())
@@ -674,250 +588,10 @@ fn second_boot(shell: &mut Shell<'_>, token: &str) -> Result<(), Failure> {
     if contains(&listing, b"persist.txt") || !contains(&listing, b"home/\r\n") {
         return Err(Failure::task("dev-boot check: rm or mkdir did not persist"));
     }
+    if smp {
+        touch::three_at_once(shell)?;
+    }
     Ok(())
-}
-
-/// The shell console of one boot.
-struct Shell<'a> {
-    input: &'a mut ChildStdin,
-    com2: &'a Arc<Mutex<Vec<u8>>>,
-    deadline: Instant,
-    patience: Patience,
-    /// Whether QEMU has exited, and how; every wait checks it.
-    exited: &'a mut dyn FnMut() -> Result<Option<ExitStatus>, Failure>,
-}
-
-impl Shell<'_> {
-    /// How many times a loop that polls the guest tries before it fails.
-    const fn attempts(&self) -> usize {
-        self.patience.attempts
-    }
-
-    fn length(&self) -> usize {
-        self.com2.lock().map(|com2| com2.len()).unwrap_or(0)
-    }
-
-    /// Sends `command` and returns everything up to the next prompt.
-    fn run(&mut self, command: &str) -> Result<Vec<u8>, Failure> {
-        let before = self.length();
-        self.input
-            .write_all(format!("{command}\r").as_bytes())
-            .map_err(|error| Failure::task(format!("could not send `{command}`: {error}")))?;
-        let echo = command.as_bytes().to_vec();
-        let com2 = Arc::clone(self.com2);
-        // The command's output and the next prompt may arrive in one read.
-        wait_until(
-            self.deadline,
-            &format!("the prompt after `{command}`"),
-            &mut *self.exited,
-            || {
-                Ok(com2
-                    .lock()
-                    .map(|com2| {
-                        com2.get(before..)
-                            .is_some_and(|tail| contains(tail, &echo) && ends_with_prompt(tail))
-                    })
-                    .unwrap_or(false))
-            },
-        )?;
-        Ok(self
-            .com2
-            .lock()
-            .map(|com2| com2.get(before..).unwrap_or_default().to_vec())
-            .unwrap_or_default())
-    }
-
-    /// Runs `command`, which must print `needle`.
-    fn expect(&mut self, command: &str, needle: &[u8]) -> Result<(), Failure> {
-        let output = self.run(command)?;
-        if contains(&output, needle) {
-            Ok(())
-        } else {
-            Err(Failure::task(format!(
-                "dev-boot check: `{command}` printed {:?}{}",
-                String::from_utf8_lossy(&output),
-                memory::said(&output)
-            )))
-        }
-    }
-
-    /// Runs `command`, which must print nothing but its echo and the prompt.
-    fn quiet(&mut self, command: &str) -> Result<(), Failure> {
-        let output = self.run(command)?;
-        let echo = command.as_bytes();
-        let rest = output
-            .windows(echo.len())
-            .position(|window| window == echo)
-            .map_or(&output[..], |at| &output[at + echo.len()..]);
-        let text = String::from_utf8_lossy(&strip_escapes(rest)).into_owned();
-        if text.split_whitespace().collect::<Vec<_>>() != ["wyrmsh>"] {
-            return Err(Failure::task(format!(
-                "dev-boot check: `{command}` printed {text:?}"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Runs `command` until `done` holds for its output.
-    fn retry(
-        &mut self,
-        command: &str,
-        what: &str,
-        done: impl Fn(&[u8]) -> bool,
-    ) -> Result<(), Failure> {
-        for _ in 0..self.attempts() {
-            if done(&self.run(command)?) {
-                return Ok(());
-            }
-            if Instant::now() >= self.deadline {
-                break;
-            }
-            thread::sleep(Duration::from_millis(500));
-        }
-        Err(Failure::task(format!(
-            "dev-boot check: `{command}` never showed {what}"
-        )))
-    }
-}
-
-/// One boot: waits for the prompt, runs `script`, shuts down with Ctrl-D and
-/// requires the power-off line on `com1`. The shell transcript is kept at
-/// `transcript`.
-fn boot_once(
-    args: &[String],
-    com1: &Path,
-    transcript: &Path,
-    patience: Patience,
-    script: impl FnOnce(&mut Shell<'_>) -> Result<(), Failure>,
-) -> Result<(), Failure> {
-    // QEMU's own complaints, kept beside COM1 for a failed check.
-    let stderr = com1.with_extension("qemu-stderr.log");
-    let mut child = Command::new("qemu-system-x86_64")
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(fs::File::create(&stderr).map_or_else(|_| Stdio::null(), Stdio::from))
-        .spawn()
-        .map_err(|error| Failure::task(format!("could not launch QEMU: {error}")))?;
-    let com2 = Arc::new(Mutex::new(Vec::new()));
-    // COM2's input is held apart from the child, so the waits can ask the
-    // child whether QEMU has exited while the shell writes to it; it stays
-    // open until QEMU has been stopped.
-    let mut input = child.stdin.take();
-    let mut result = match &mut input {
-        Some(input) => drive(&mut child, input, com1, &com2, patience, script),
-        None => Err(Failure::task("QEMU COM2 input is not piped")),
-    };
-    if let Err(failure) = &mut result {
-        let socket = monitor_socket(com1);
-        if !record_cpu_state(&socket, &com1.with_extension("cpu-state.txt")) {
-            eprintln!(
-                "dev-boot: CPU state not recorded: QEMU's monitor at {} was gone",
-                socket.display()
-            );
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        if let Some(tail) = fs::read(&stderr).ok().as_deref().and_then(stderr_tail) {
-            failure.message = format!(
-                "{}\nQEMU stderr ({}):\n{tail}",
-                failure.message,
-                stderr.display()
-            );
-        }
-    }
-    // Keep the shell transcript beside COM1 so a failed check can be read.
-    if let Ok(com2) = com2.lock() {
-        let _ = fs::write(transcript, &*com2);
-    }
-    result
-}
-
-/// The QEMU monitor socket of the boot whose COM1 log is `com1`.
-fn monitor_socket(com1: &Path) -> PathBuf {
-    com1.with_extension("monitor")
-}
-
-/// The end of QEMU's stderr for a failure message: at most the last
-/// [`STDERR_TAIL_LINES`] lines of its last [`STDERR_TAIL_BYTES`] bytes, or
-/// `None` when it said nothing.
-fn stderr_tail(bytes: &[u8]) -> Option<String> {
-    let mut start = bytes.len().saturating_sub(STDERR_TAIL_BYTES);
-    // Start on a character, not inside one.
-    while bytes.get(start).is_some_and(|byte| byte & 0xc0 == 0x80) {
-        start += 1;
-    }
-    let text = String::from_utf8_lossy(&bytes[start..]);
-    let text = text.trim_end();
-    if text.trim().is_empty() {
-        return None;
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    let keep = lines.len().saturating_sub(STDERR_TAIL_LINES);
-    Some(lines[keep..].join("\n"))
-}
-
-/// How much of QEMU's stderr a failure message shows.
-const STDERR_TAIL_LINES: usize = 10;
-const STDERR_TAIL_BYTES: usize = 2000;
-
-/// Stops the guest and writes, from QEMU's monitor at `socket`, every
-/// CPU's registers and the top of its stack, the interrupt controllers, and
-/// the shell UART's (COM2) registers to `output`. Best effort: a failed
-/// check is reported either way. Returns whether the monitor was reached.
-fn record_cpu_state(socket: &Path, output: &Path) -> bool {
-    let Ok(mut monitor) = std::os::unix::net::UnixStream::connect(socket) else {
-        return false;
-    };
-    let _ = monitor.set_read_timeout(Some(Duration::from_millis(500)));
-    let mut state = Vec::new();
-    let read_all = |monitor: &mut std::os::unix::net::UnixStream, state: &mut Vec<u8>| {
-        let mut buffer = [0_u8; 65536];
-        while let Ok(read) = monitor.read(&mut buffer) {
-            if read == 0 {
-                break;
-            }
-            state.extend_from_slice(&buffer[..read]);
-        }
-    };
-    let send =
-        |monitor: &mut std::os::unix::net::UnixStream, state: &mut Vec<u8>, command: &str| {
-            let sent = monitor.write_all(format!("{command}\n").as_bytes()).is_ok();
-            read_all(monitor, state);
-            sent
-        };
-    read_all(&mut monitor, &mut state);
-    for command in [
-        "stop",
-        "info status",
-        "info cpus",
-        "info registers -a",
-        "info pic",
-        "info lapic",
-        "info irq",
-        // COM2 at 0x2f8: IER, LSR, MSR, then IIR last, since reading IIR
-        // clears a pending transmit interrupt.
-        "i /b 0x2f9",
-        "i /b 0x2fd",
-        "i /b 0x2fe",
-        "i /b 0x2fa",
-    ] {
-        if !send(&mut monitor, &mut state, command) {
-            break;
-        }
-    }
-    let registers = String::from_utf8_lossy(&state).into_owned();
-    for (cpu, stack) in registers
-        .split("RSP=")
-        .skip(1)
-        .filter_map(|tail| tail.get(..16))
-        .enumerate()
-    {
-        let _ = send(&mut monitor, &mut state, &format!("cpu {cpu}"));
-        let _ = send(&mut monitor, &mut state, &format!("x /128gx 0x{stack}"));
-    }
-    let _ = fs::write(output, strip_escapes(&state));
-    true
 }
 
 fn drive(
@@ -1030,261 +704,9 @@ fn stack_marks_fit(log: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Polls `done` until it holds. Fails at `deadline`, or as soon as
-/// `exited` reports that QEMU has exited, since then nothing more will come.
-fn wait_until(
-    deadline: Instant,
-    what: &str,
-    mut exited: impl FnMut() -> Result<Option<ExitStatus>, Failure>,
-    mut done: impl FnMut() -> Result<bool, Failure>,
-) -> Result<(), Failure> {
-    while !done()? {
-        if let Some(status) = exited()? {
-            // Output QEMU wrote just before exiting may have landed since.
-            if done()? {
-                break;
-            }
-            return Err(Failure::task(format!(
-                "dev-boot check: QEMU exited ({}) while waiting for {what}",
-                exit_description(status)
-            )));
-        }
-        if Instant::now() >= deadline {
-            return Err(Failure::task(format!(
-                "dev-boot check timed out waiting for {what}"
-            )));
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Ok(())
-}
-
-/// `status 0`, or `signal 9` for a QEMU that was killed.
-fn exit_description(status: ExitStatus) -> String {
-    use std::os::unix::process::ExitStatusExt;
-    match (status.code(), status.signal()) {
-        (Some(code), _) => format!("status {code}"),
-        (None, Some(signal)) => format!("signal {signal}"),
-        (None, None) => status.to_string(),
-    }
-}
-
-/// `bytes` without ANSI control sequences (`ESC [` ... final byte).
-fn strip_escapes(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
-            index += 2;
-            while index < bytes.len() && !(0x40..=0x7e).contains(&bytes[index]) {
-                index += 1;
-            }
-            index += 1;
-        } else {
-            out.push(bytes[index]);
-            index += 1;
-        }
-    }
-    out
-}
-
-/// Whether `output` ends at a fresh prompt.
-fn ends_with_prompt(output: &[u8]) -> bool {
-    output.ends_with(PROMPT)
-}
-
-/// Spawns a background job and returns the id the shell printed.
-fn spawn_job(shell: &mut Shell<'_>, path: &str) -> Result<u64, Failure> {
-    let output = shell.run(&format!("spawn {path}"))?;
-    spawned_job_id(&output).ok_or_else(|| {
-        Failure::task(format!(
-            "dev-boot check: `spawn {path}` printed {:?}",
-            String::from_utf8_lossy(&output)
-        ))
-    })
-}
-
-fn spawned_job_id(output: &[u8]) -> Option<u64> {
-    const PREFIX: &[u8] = b"spawn job=";
-    let at = output
-        .windows(PREFIX.len())
-        .position(|window| window == PREFIX)?;
-    let digits: Vec<u8> = output[at + PREFIX.len()..]
-        .iter()
-        .copied()
-        .take_while(u8::is_ascii_digit)
-        .collect();
-    std::str::from_utf8(&digits).ok()?.parse().ok()
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn exit_status(code: i32) -> ExitStatus {
-        use std::os::unix::process::ExitStatusExt;
-        ExitStatus::from_raw(code << 8)
-    }
-
-    #[test]
-    fn a_wait_fails_at_once_when_qemu_has_exited() {
-        let started = Instant::now();
-        let failure = wait_until(
-            started + Duration::from_secs(60),
-            "the wyrmsh prompt on COM2",
-            || Ok(Some(exit_status(0))),
-            || Ok(false),
-        )
-        .unwrap_err();
-        assert_eq!(
-            failure.message,
-            "dev-boot check: QEMU exited (status 0) while waiting for the wyrmsh prompt on COM2"
-        );
-        assert!(started.elapsed() < Duration::from_secs(5));
-    }
-
-    #[test]
-    fn a_killed_qemu_is_reported_by_its_signal() {
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(exit_description(ExitStatus::from_raw(9)), "signal 9");
-        assert_eq!(exit_description(exit_status(1)), "status 1");
-    }
-
-    #[test]
-    fn a_wait_on_a_running_qemu_still_times_out() {
-        let failure = wait_until(
-            Instant::now() + Duration::from_millis(250),
-            "the prompt after `ls /`",
-            || Ok(None),
-            || Ok(false),
-        )
-        .unwrap_err();
-        assert_eq!(
-            failure.message,
-            "dev-boot check timed out waiting for the prompt after `ls /`"
-        );
-    }
-
-    #[test]
-    fn a_wait_that_completes_succeeds_whatever_qemu_does_after() {
-        // QEMU exits once the third poll has seen the prompt.
-        let polls = std::cell::Cell::new(0);
-        wait_until(
-            Instant::now() + Duration::from_secs(60),
-            "the wyrmsh prompt on COM2",
-            || Ok((polls.get() >= 3).then(|| exit_status(0))),
-            || {
-                polls.set(polls.get() + 1);
-                Ok(polls.get() >= 3)
-            },
-        )
-        .unwrap();
-        assert_eq!(polls.get(), 3);
-        // The output QEMU wrote just before exiting still counts.
-        let seen = std::cell::Cell::new(false);
-        wait_until(
-            Instant::now() + Duration::from_secs(60),
-            "QEMU's last line",
-            || {
-                seen.set(true);
-                Ok(Some(exit_status(0)))
-            },
-            || Ok(seen.get()),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn the_stderr_tail_is_empty_short_or_the_last_ten_lines() {
-        assert_eq!(stderr_tail(b""), None);
-        assert_eq!(stderr_tail(b"\n  \n"), None);
-        assert_eq!(
-            stderr_tail(b"qemu: terminating on signal 15\n").as_deref(),
-            Some("qemu: terminating on signal 15")
-        );
-        let long: String = (1..=25).map(|line| format!("line {line}\n")).collect();
-        let expected: Vec<String> = (16..=25).map(|line| format!("line {line}")).collect();
-        assert_eq!(stderr_tail(long.as_bytes()), Some(expected.join("\n")));
-        let wide = format!("{}\nlast\n", "x".repeat(5000));
-        let tail = stderr_tail(wide.as_bytes()).unwrap();
-        assert!(tail.len() <= STDERR_TAIL_BYTES);
-        assert!(tail.ends_with("\nlast"));
-        let multibyte = "é".repeat(1500);
-        let tail = stderr_tail(multibyte.as_bytes()).unwrap();
-        assert!(tail.len() <= STDERR_TAIL_BYTES && tail.chars().all(|c| c == 'é'));
-    }
-
-    #[test]
-    fn spawned_job_ids_are_read_from_the_shell_echo() {
-        assert_eq!(
-            spawned_job_id(b"spawn bin/cpu-hog\r\nspawn job=12\r\nwyrmsh> "),
-            Some(12)
-        );
-        assert_eq!(spawned_job_id(b"spawn job=\r\n"), None);
-        assert_eq!(spawned_job_id(b"spawn: capacity\r\n"), None);
-    }
-
-    #[test]
-    fn the_shell_console_is_the_second_serial_port_after_the_kernel_log() {
-        let args = qemu_arguments(
-            false,
-            Clock::Emulated,
-            Path::new("/p"),
-            Path::new("/v.fd"),
-            Path::new("/c1.log"),
-            Path::new("/r.img"),
-        );
-        let serials: Vec<&str> = args
-            .windows(2)
-            .filter(|pair| pair[0] == "-serial")
-            .map(|pair| pair[1].as_str())
-            .collect();
-        assert_eq!(serials, ["file:/c1.log", "stdio"]);
-        assert!(args.iter().any(|arg| arg.ends_with("/p/artifacts/esp.img")));
-        assert!(!args.iter().any(|arg| arg.contains("isa-debug-exit")));
-    }
-
-    #[test]
-    fn the_esp_is_a_modern_virtio_disk_behind_the_iommu() {
-        let args = qemu_arguments(
-            false,
-            Clock::Emulated,
-            Path::new("/p"),
-            Path::new("/v"),
-            Path::new("/c"),
-            Path::new("/r.img"),
-        );
-        let devices: Vec<&str> = args
-            .windows(2)
-            .filter(|pair| pair[0] == "-device")
-            .map(|pair| pair[1].as_str())
-            .collect();
-        assert_eq!(
-            devices,
-            [
-                "intel-iommu,intremap=on",
-                "virtio-blk-pci,drive=esp,addr=0x1,disable-legacy=on,iommu_platform=on",
-                "virtio-blk-pci,drive=root,addr=0x2,disable-legacy=on,iommu_platform=on"
-            ]
-        );
-        assert!(!args.iter().any(|arg| arg.starts_with("if=virtio")));
-        // The ESP is read-only; the root disk is not.
-        assert!(
-            args.iter()
-                .any(|arg| arg.starts_with("if=none,id=esp,format=raw,readonly=on,"))
-        );
-        assert!(
-            args.iter()
-                .any(|arg| arg == "if=none,id=root,format=raw,file=/r.img")
-        );
-    }
 
     #[test]
     fn stack_marks_must_all_be_logged_and_leave_a_quarter_spare() {
@@ -1319,65 +741,6 @@ mod tests {
                 .contains("ist")
         );
         assert!(stack_marks_fit(b"").is_err());
-    }
-
-    #[test]
-    fn escapes_are_stripped_from_the_transcript() {
-        assert_eq!(
-            strip_escapes(b"\r\n\x1b[2Kwyrmsh> "),
-            b"\r\nwyrmsh> ".to_vec()
-        );
-        assert_eq!(strip_escapes(b"a\x1b[1;31mb"), b"ab".to_vec());
-    }
-
-    #[test]
-    fn the_guest_cpu_has_gigabyte_pages_smep_and_smap() {
-        let args = qemu_arguments(
-            false,
-            Clock::Emulated,
-            Path::new("product"),
-            Path::new("vars"),
-            Path::new("com1"),
-            Path::new("root"),
-        );
-        let cpu = args
-            .windows(2)
-            .find(|pair| pair[0] == "-cpu")
-            .map(|pair| pair[1].clone())
-            .expect("a CPU model is chosen");
-        for feature in ["+pdpe1gb", "+smep", "+smap"] {
-            assert!(
-                cpu.split(',').any(|part| part == feature),
-                "{feature} in {cpu}"
-            );
-        }
-    }
-
-    #[test]
-    fn icount_adds_shift_zero_and_changes_nothing_else() {
-        for smp in [false, true] {
-            let arguments = |clock| {
-                qemu_arguments(
-                    smp,
-                    clock,
-                    Path::new("/p"),
-                    Path::new("/v"),
-                    Path::new("/c"),
-                    Path::new("/r.img"),
-                )
-            };
-            let (plain, counted) = (arguments(Clock::Emulated), arguments(Clock::Icount));
-            assert!(!plain.iter().any(|arg| arg == "-icount"));
-            let at = counted
-                .iter()
-                .position(|arg| arg == "-icount")
-                .expect("-icount is passed");
-            assert_eq!(counted.get(at + 1).map(String::as_str), Some("shift=0"));
-            assert_eq!(counted.iter().filter(|arg| *arg == "-icount").count(), 1);
-            let mut rest = counted.clone();
-            rest.drain(at..at + 2);
-            assert_eq!(rest, plain);
-        }
     }
 
     #[test]
@@ -1489,113 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn kvm_adds_the_accelerator_host_cpu_and_split_irqchip_and_changes_nothing_else() {
-        for smp in [false, true] {
-            let arguments = |clock| {
-                qemu_arguments(
-                    smp,
-                    clock,
-                    Path::new("/p"),
-                    Path::new("/v"),
-                    Path::new("/c"),
-                    Path::new("/r.img"),
-                )
-            };
-            let (plain, kvm) = (arguments(Clock::Emulated), arguments(Clock::Kvm));
-            // Without KVM the list is exactly today's.
-            let vcpus = if smp { "4" } else { "1" };
-            let expected: Vec<String> = [
-                "-machine",
-                "q35",
-                "-m",
-                "2048M",
-                "-smp",
-                vcpus,
-                "-cpu",
-                "qemu64,+pdpe1gb,+smep,+smap",
-                "-nodefaults",
-                "-display",
-                "none",
-                "-monitor",
-                "unix:/c.monitor,server,nowait",
-                "-no-reboot",
-                "-drive",
-                "if=pflash,format=raw,readonly=on,file=/p/artifacts/OVMF_CODE.fd",
-                "-drive",
-                "if=pflash,format=raw,file=/v",
-                "-device",
-                "intel-iommu,intremap=on",
-                "-drive",
-                "if=none,id=esp,format=raw,readonly=on,file=/p/artifacts/esp.img",
-                "-device",
-                "virtio-blk-pci,drive=esp,addr=0x1,disable-legacy=on,iommu_platform=on",
-                "-drive",
-                "if=none,id=root,format=raw,file=/r.img",
-                "-device",
-                "virtio-blk-pci,drive=root,addr=0x2,disable-legacy=on,iommu_platform=on",
-                "-serial",
-                "file:/c",
-                "-serial",
-                "stdio",
-            ]
-            .iter()
-            .map(|arg| (*arg).to_owned())
-            .collect();
-            assert_eq!(plain, expected);
-            // Under KVM: the accelerator first, the split irqchip, the host
-            // CPU in place of the TCG model, and nothing else changed.
-            let mut changed = expected.clone();
-            changed[1] = "q35,kernel-irqchip=split".into();
-            changed[7] = "host,migratable=no,+invtsc".into();
-            changed.splice(0..0, ["-accel".to_owned(), "kvm".to_owned()]);
-            assert_eq!(kvm, changed);
-            assert!(!kvm.iter().any(|arg| arg.starts_with("qemu64")));
-            assert!(!kvm.iter().any(|arg| arg == "-icount"));
-        }
-    }
-
-    #[test]
-    fn kvm_is_refused_unless_its_device_opens_read_write() {
-        let failure = kvm_access(Path::new("/nonexistent/kvm")).unwrap_err();
-        assert!(
-            failure.message.contains("/nonexistent/kvm"),
-            "{}",
-            failure.message
-        );
-        assert!(
-            failure.message.contains("read-write"),
-            "{}",
-            failure.message
-        );
-        assert!(failure.message.contains("sg kvm -c"), "{}", failure.message);
-        assert!(
-            failure.message.contains("new login session"),
-            "{}",
-            failure.message
-        );
-        // A device that opens read-write is accepted.
-        assert!(kvm_access(Path::new("/dev/null")).is_ok());
-    }
-
-    #[test]
     fn kvm_keeps_the_base_waits() {
         assert_eq!(Patience::new(Clock::Kvm), Patience::new(Clock::Emulated));
-    }
-
-    #[test]
-    fn smp_uses_the_f_matrix_cpu_count() {
-        let args = qemu_arguments(
-            true,
-            Clock::Emulated,
-            Path::new("/p"),
-            Path::new("/v"),
-            Path::new("/c"),
-            Path::new("/r.img"),
-        );
-        let smp = args
-            .windows(2)
-            .find(|pair| pair[0] == "-smp")
-            .map(|pair| pair[1].clone());
-        assert_eq!(smp.as_deref(), Some("4"));
     }
 }
