@@ -66,7 +66,7 @@ use std::{
     io::{Read, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -677,10 +677,12 @@ fn second_boot(shell: &mut Shell<'_>, token: &str) -> Result<(), Failure> {
 
 /// The shell console of one boot.
 struct Shell<'a> {
-    input: &'a mut std::process::ChildStdin,
+    input: &'a mut ChildStdin,
     com2: &'a Arc<Mutex<Vec<u8>>>,
     deadline: Instant,
     patience: Patience,
+    /// Whether QEMU has exited, and how; every wait checks it.
+    exited: &'a mut dyn FnMut() -> Result<Option<ExitStatus>, Failure>,
 }
 
 impl Shell<'_> {
@@ -705,6 +707,7 @@ impl Shell<'_> {
         wait_until(
             self.deadline,
             &format!("the prompt after `{command}`"),
+            &mut *self.exited,
             || {
                 Ok(com2
                     .lock()
@@ -784,19 +787,41 @@ fn boot_once(
     patience: Patience,
     script: impl FnOnce(&mut Shell<'_>) -> Result<(), Failure>,
 ) -> Result<(), Failure> {
+    // QEMU's own complaints, kept beside COM1 for a failed check.
+    let stderr = com1.with_extension("qemu-stderr.log");
     let mut child = Command::new("qemu-system-x86_64")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(fs::File::create(&stderr).map_or_else(|_| Stdio::null(), Stdio::from))
         .spawn()
         .map_err(|error| Failure::task(format!("could not launch QEMU: {error}")))?;
     let com2 = Arc::new(Mutex::new(Vec::new()));
-    let result = drive(&mut child, com1, &com2, patience, script);
-    if result.is_err() {
-        record_cpu_state(&monitor_socket(com1), &com1.with_extension("cpu-state.txt"));
+    // COM2's input is held apart from the child, so the waits can ask the
+    // child whether QEMU has exited while the shell writes to it; it stays
+    // open until QEMU has been stopped.
+    let mut input = child.stdin.take();
+    let mut result = match &mut input {
+        Some(input) => drive(&mut child, input, com1, &com2, patience, script),
+        None => Err(Failure::task("QEMU COM2 input is not piped")),
+    };
+    if let Err(failure) = &mut result {
+        let socket = monitor_socket(com1);
+        if !record_cpu_state(&socket, &com1.with_extension("cpu-state.txt")) {
+            eprintln!(
+                "dev-boot: CPU state not recorded: QEMU's monitor at {} was gone",
+                socket.display()
+            );
+        }
         let _ = child.kill();
         let _ = child.wait();
+        if let Some(tail) = fs::read(&stderr).ok().as_deref().and_then(stderr_tail) {
+            failure.message = format!(
+                "{}\nQEMU stderr ({}):\n{tail}",
+                failure.message,
+                stderr.display()
+            );
+        }
     }
     // Keep the shell transcript beside COM1 so a failed check can be read.
     if let Ok(com2) = com2.lock() {
@@ -810,13 +835,36 @@ fn monitor_socket(com1: &Path) -> PathBuf {
     com1.with_extension("monitor")
 }
 
+/// The end of QEMU's stderr for a failure message: at most the last
+/// [`STDERR_TAIL_LINES`] lines of its last [`STDERR_TAIL_BYTES`] bytes, or
+/// `None` when it said nothing.
+fn stderr_tail(bytes: &[u8]) -> Option<String> {
+    let mut start = bytes.len().saturating_sub(STDERR_TAIL_BYTES);
+    // Start on a character, not inside one.
+    while bytes.get(start).is_some_and(|byte| byte & 0xc0 == 0x80) {
+        start += 1;
+    }
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    let text = text.trim_end();
+    if text.trim().is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let keep = lines.len().saturating_sub(STDERR_TAIL_LINES);
+    Some(lines[keep..].join("\n"))
+}
+
+/// How much of QEMU's stderr a failure message shows.
+const STDERR_TAIL_LINES: usize = 10;
+const STDERR_TAIL_BYTES: usize = 2000;
+
 /// Stops the guest and writes, from QEMU's monitor at `socket`, every
 /// CPU's registers and the top of its stack, the interrupt controllers, and
 /// the shell UART's (COM2) registers to `output`. Best effort: a failed
-/// check is reported either way.
-fn record_cpu_state(socket: &Path, output: &Path) {
+/// check is reported either way. Returns whether the monitor was reached.
+fn record_cpu_state(socket: &Path, output: &Path) -> bool {
     let Ok(mut monitor) = std::os::unix::net::UnixStream::connect(socket) else {
-        return;
+        return false;
     };
     let _ = monitor.set_read_timeout(Some(Duration::from_millis(500)));
     let mut state = Vec::new();
@@ -866,10 +914,12 @@ fn record_cpu_state(socket: &Path, output: &Path) {
         let _ = send(&mut monitor, &mut state, &format!("x /128gx 0x{stack}"));
     }
     let _ = fs::write(output, strip_escapes(&state));
+    true
 }
 
 fn drive(
     child: &mut Child,
+    input: &mut ChildStdin,
     com1: &Path,
     com2: &Arc<Mutex<Vec<u8>>>,
     patience: Patience,
@@ -892,36 +942,35 @@ fn drive(
             }
         }
     });
+    let mut exited = || {
+        child
+            .try_wait()
+            .map_err(|error| Failure::task(format!("could not wait for QEMU: {error}")))
+    };
     let prompt = Arc::clone(com2);
-    wait_until(deadline, "the wyrmsh prompt on COM2", || {
+    wait_until(deadline, "the wyrmsh prompt on COM2", &mut exited, || {
         Ok(prompt
             .lock()
             .map(|com2| contains(&com2, PROMPT))
             .unwrap_or(false))
     })?;
-    let input = child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| Failure::task("QEMU COM2 input is not piped"))?;
     script(&mut Shell {
         input,
         com2,
         deadline,
         patience,
+        exited: &mut exited,
     })?;
-    let input = child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| Failure::task("QEMU COM2 input is not piped"))?;
     input
         .write_all(&[END_OF_INPUT])
         .map_err(|error| Failure::task(format!("could not send Ctrl-D: {error}")))?;
-    wait_until(deadline, "QEMU to exit after Ctrl-D", || {
-        child
-            .try_wait()
-            .map(|status| status.is_some())
-            .map_err(|error| Failure::task(format!("could not wait for QEMU: {error}")))
-    })?;
+    // Here QEMU is meant to exit, so its exit is what is waited for.
+    wait_until(
+        deadline,
+        "QEMU to exit after Ctrl-D",
+        || Ok(None),
+        || exited().map(|status| status.is_some()),
+    )?;
     let log = fs::read(com1).map_err(|error| Failure::task(format!("COM1 log: {error}")))?;
     if !contains(&log, POWER_OFF) {
         return Err(Failure::task(format!(
@@ -972,12 +1021,25 @@ fn stack_marks_fit(log: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Polls `done` until it holds. Fails at `deadline`, or as soon as
+/// `exited` reports that QEMU has exited, since then nothing more will come.
 fn wait_until(
     deadline: Instant,
     what: &str,
+    mut exited: impl FnMut() -> Result<Option<ExitStatus>, Failure>,
     mut done: impl FnMut() -> Result<bool, Failure>,
 ) -> Result<(), Failure> {
     while !done()? {
+        if let Some(status) = exited()? {
+            // Output QEMU wrote just before exiting may have landed since.
+            if done()? {
+                break;
+            }
+            return Err(Failure::task(format!(
+                "dev-boot check: QEMU exited ({}) while waiting for {what}",
+                exit_description(status)
+            )));
+        }
         if Instant::now() >= deadline {
             return Err(Failure::task(format!(
                 "dev-boot check timed out waiting for {what}"
@@ -986,6 +1048,16 @@ fn wait_until(
         thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+/// `status 0`, or `signal 9` for a QEMU that was killed.
+fn exit_description(status: ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("status {code}"),
+        (None, Some(signal)) => format!("signal {signal}"),
+        (None, None) => status.to_string(),
+    }
 }
 
 /// `bytes` without ANSI control sequences (`ESC [` ... final byte).
@@ -1046,6 +1118,99 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn a_wait_fails_at_once_when_qemu_has_exited() {
+        let started = Instant::now();
+        let failure = wait_until(
+            started + Duration::from_secs(60),
+            "the wyrmsh prompt on COM2",
+            || Ok(Some(exit_status(0))),
+            || Ok(false),
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.message,
+            "dev-boot check: QEMU exited (status 0) while waiting for the wyrmsh prompt on COM2"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_killed_qemu_is_reported_by_its_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(exit_description(ExitStatus::from_raw(9)), "signal 9");
+        assert_eq!(exit_description(exit_status(1)), "status 1");
+    }
+
+    #[test]
+    fn a_wait_on_a_running_qemu_still_times_out() {
+        let failure = wait_until(
+            Instant::now() + Duration::from_millis(250),
+            "the prompt after `ls /`",
+            || Ok(None),
+            || Ok(false),
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.message,
+            "dev-boot check timed out waiting for the prompt after `ls /`"
+        );
+    }
+
+    #[test]
+    fn a_wait_that_completes_succeeds_whatever_qemu_does_after() {
+        // QEMU exits once the third poll has seen the prompt.
+        let polls = std::cell::Cell::new(0);
+        wait_until(
+            Instant::now() + Duration::from_secs(60),
+            "the wyrmsh prompt on COM2",
+            || Ok((polls.get() >= 3).then(|| exit_status(0))),
+            || {
+                polls.set(polls.get() + 1);
+                Ok(polls.get() >= 3)
+            },
+        )
+        .unwrap();
+        assert_eq!(polls.get(), 3);
+        // The output QEMU wrote just before exiting still counts.
+        let seen = std::cell::Cell::new(false);
+        wait_until(
+            Instant::now() + Duration::from_secs(60),
+            "QEMU's last line",
+            || {
+                seen.set(true);
+                Ok(Some(exit_status(0)))
+            },
+            || Ok(seen.get()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_stderr_tail_is_empty_short_or_the_last_ten_lines() {
+        assert_eq!(stderr_tail(b""), None);
+        assert_eq!(stderr_tail(b"\n  \n"), None);
+        assert_eq!(
+            stderr_tail(b"qemu: terminating on signal 15\n").as_deref(),
+            Some("qemu: terminating on signal 15")
+        );
+        let long: String = (1..=25).map(|line| format!("line {line}\n")).collect();
+        let expected: Vec<String> = (16..=25).map(|line| format!("line {line}")).collect();
+        assert_eq!(stderr_tail(long.as_bytes()), Some(expected.join("\n")));
+        let wide = format!("{}\nlast\n", "x".repeat(5000));
+        let tail = stderr_tail(wide.as_bytes()).unwrap();
+        assert!(tail.len() <= STDERR_TAIL_BYTES);
+        assert!(tail.ends_with("\nlast"));
+        let multibyte = "é".repeat(1500);
+        let tail = stderr_tail(multibyte.as_bytes()).unwrap();
+        assert!(tail.len() <= STDERR_TAIL_BYTES && tail.chars().all(|c| c == 'é'));
+    }
 
     #[test]
     fn spawned_job_ids_are_read_from_the_shell_echo() {
