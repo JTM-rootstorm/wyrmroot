@@ -1,7 +1,8 @@
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_WAIT,
-    DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_STATUS_BAD_HANDLE,
-    DW_STATUS_NO_RESOURCES, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwSignals,
+    DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE,
+    DW_STATUS_BAD_HANDLE, DW_STATUS_NO_RESOURCES, DW_STATUS_WOULD_BLOCK, DwHandle, DwObjectType,
+    DwReceivedHandleInfoV1, DwRights, DwSignals,
 };
 use wyrmroot_hello::{
     HelloError, HelloNativeOperation, HelloSystem, JobHelloSystem, run_hello, run_job_hello,
@@ -12,7 +13,7 @@ use wyrmroot_loader::launch::{
 };
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, NativeError,
-    ReceiveCounts, StreamSystem,
+    OUTPUT_WAIT_SIGNALS, ReceiveCounts, StreamSystem,
 };
 
 const CHANNEL: DwHandle = DwHandle(11);
@@ -217,6 +218,14 @@ struct StreamFixture {
     sent: Vec<Vec<u8>>,
     closed: Vec<DwHandle>,
     events: Vec<&'static str>,
+    /// When set, stdout is a kernel queue this many records deep: a send
+    /// into a full queue is refused with WOULD_BLOCK, and a wait on stdout
+    /// lets the reader take everything queued (or, once `reader_gone`,
+    /// reports the peer closed).
+    stdout_depth: Option<usize>,
+    stdout_queued: usize,
+    reader_gone: bool,
+    stdout_waits: Vec<(DwHandle, DwSignals)>,
 }
 impl StreamFixture {
     fn new() -> Self {
@@ -245,6 +254,10 @@ impl StreamFixture {
             sent: vec![],
             closed: vec![],
             events: vec![],
+            stdout_depth: None,
+            stdout_queued: 0,
+            reader_gone: false,
+            stdout_waits: vec![],
         }
     }
 }
@@ -314,6 +327,13 @@ impl StreamSystem for StreamFixture {
         unreachable!()
     }
     fn send(&mut self, _: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+        if let Some(depth) = self.stdout_depth {
+            if self.stdout_queued == depth {
+                self.events.push("stdout-full");
+                return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
+            }
+            self.stdout_queued += 1;
+        }
         self.events.push("stdout-data");
         self.sent.push(bytes.to_vec());
         Ok(())
@@ -322,8 +342,14 @@ impl StreamSystem for StreamFixture {
         self.closed.push(handle);
         Ok(())
     }
-    fn wait(&mut self, _: DwHandle, _: DwSignals) -> Result<DwSignals, NativeError> {
-        Ok(DW_SIGNAL_PEER_CLOSED)
+    fn wait(&mut self, channel: DwHandle, signals: DwSignals) -> Result<DwSignals, NativeError> {
+        self.stdout_waits.push((channel, signals));
+        if self.stdout_depth.is_none() || self.reader_gone {
+            return Ok(DW_SIGNAL_PEER_CLOSED);
+        }
+        self.events.push("reader-drains");
+        self.stdout_queued = 0;
+        Ok(DW_SIGNAL_WRITABLE)
     }
 }
 
@@ -406,6 +432,80 @@ fn stream_hello_runs_its_probe_after_ready_with_the_self_root_and_stdout() {
             "close-stream",
         ]
     );
+}
+
+/// DW2 M8 entry: the reader's queue is two records deep. With the greeting
+/// still unread, a probe's second line meets a full queue; the job waits on
+/// stdout for the reader instead of dropping the line, so every line arrives
+/// in order and each write reports success.
+#[test]
+fn a_probe_line_waits_out_a_full_stdout_queue() {
+    let mut fixture = StreamFixture::new();
+    fixture.stdout_depth = Some(2);
+    let mut written = vec![];
+    let mut probe = |_: DwHandle, _: u64, write: &mut dyn FnMut(&[u8]) -> bool| {
+        written.push(write(b"probe one\n"));
+        written.push(write(b"probe two\n"));
+        written.push(write(b"probe three\n"));
+        0
+    };
+    assert_eq!(
+        run_stream_hello_with(&mut fixture, CHANNEL, Some(&mut probe)),
+        Ok(0)
+    );
+    assert_eq!(written, [true, true, true]);
+    let payloads: Vec<_> = fixture
+        .sent
+        .iter()
+        .filter_map(|record| wyrmroot_stream_proto::decode_data(record).ok())
+        .map(|data| data.payload().to_vec())
+        .collect();
+    assert_eq!(
+        payloads,
+        [
+            b"hello from native stdout\n".to_vec(),
+            b"probe one\n".to_vec(),
+            b"probe two\n".to_vec(),
+            b"probe three\n".to_vec(),
+        ]
+    );
+    // It waited once, on stdout, for writability or a closed reader.
+    assert_eq!(fixture.stdout_waits, [(DwHandle(22), OUTPUT_WAIT_SIGNALS)]);
+    assert_eq!(
+        fixture.events,
+        [
+            "stdout-data",
+            "ready",
+            "wait-release",
+            "close-bootstrap",
+            "stdout-data",
+            "stdout-full",
+            "reader-drains",
+            "stdout-data",
+            "stdout-data",
+            "close-root",
+            "close-stream",
+            "close-stream",
+            "close-stream",
+        ]
+    );
+
+    // A reader that has gone away is a failed write, not a wait forever.
+    let mut gone = StreamFixture::new();
+    gone.stdout_depth = Some(2);
+    gone.reader_gone = true;
+    let mut written = vec![];
+    let mut probe = |_: DwHandle, _: u64, write: &mut dyn FnMut(&[u8]) -> bool| {
+        written.push(write(b"probe one\n"));
+        written.push(write(b"probe two\n"));
+        5
+    };
+    assert_eq!(
+        run_stream_hello_with(&mut gone, CHANNEL, Some(&mut probe)),
+        Ok(5)
+    );
+    assert_eq!(written, [true, false]);
+    assert_eq!(gone.stdout_waits, [(DwHandle(22), OUTPUT_WAIT_SIGNALS)]);
 }
 
 /// `spawn bin/hello <mode>`: a spawned job has no streams (JobV2), so the
