@@ -13,8 +13,8 @@
 //! `0x4D` top byte.
 
 use deepwyrm_syscall::{
-    DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND, DW_STATUS_SUCCESS, DwHandle, DwMemoryObjectCreateFlags,
-    DwStatus,
+    DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND, DW_STATUS_NO_RESOURCES, DW_STATUS_SUCCESS, DwHandle,
+    DwMemoryObjectCreateFlags, DwStatus,
 };
 
 /// The top byte of every probe failure status.
@@ -145,11 +145,22 @@ pub enum ProbeSite {
     WaitEnded = 54,
     /// An unknown mode (code 0).
     UnknownMode = 55,
+    /// `churn-create`, `churn-commit`: `channel_create` for the pause
+    /// between refused creates, made once before the loop.
+    ChurnSleeper = 56,
+    /// `churn-create`: `memory_object_create` still refused with
+    /// `NO_RESOURCES` after [`CHURN_REFUSALS_MAX`] pauses in a row (code
+    /// 13).
+    ChurnCreateStillRefused = 57,
+    /// `churn-commit`: `memory_object_create` still refused with
+    /// `NO_RESOURCES` after [`CHURN_REFUSALS_MAX`] pauses in a row (code
+    /// 13).
+    ChurnCommitStillRefused = 58,
 }
 
 impl ProbeSite {
     /// Every site, for tests and decoders.
-    pub const ALL: [Self; 55] = [
+    pub const ALL: [Self; 58] = [
         Self::OnDemandCreate,
         Self::OnDemandInfo,
         Self::OnDemandMap,
@@ -205,6 +216,9 @@ impl ProbeSite {
         Self::FragmentFinalCreate,
         Self::WaitEnded,
         Self::UnknownMode,
+        Self::ChurnSleeper,
+        Self::ChurnCreateStillRefused,
+        Self::ChurnCommitStillRefused,
     ];
 
     /// This site's failure with the kernel status of its call.
@@ -288,7 +302,18 @@ pub trait ChurnCalls {
     fn unmap(&mut self, at: u64, size: u64) -> Result<(), DwStatus>;
     /// `handle_close`.
     fn close(&mut self, handle: DwHandle) -> DwStatus;
+    /// Waits about [`CHURN_PAUSE_US`] doing nothing, after a create refused
+    /// with `NO_RESOURCES`.
+    fn pause(&mut self);
 }
+
+/// How long a churn probe waits after a create refused with
+/// `NO_RESOURCES` before it tries again: a closed object counts against
+/// the job's 64 until the kernel has finished its owed finalization.
+pub const CHURN_PAUSE_US: u64 = 10_000;
+/// How many pauses in a row (about five seconds) a churn probe waits out
+/// before a create still refused with `NO_RESOURCES` fails the job.
+pub const CHURN_REFUSALS_MAX: u32 = 500;
 
 /// An on-demand object of `size` created, committed whole and closed; the
 /// commit's and the close's statuses are not looked at. The create's
@@ -300,31 +325,61 @@ pub fn commit_once(calls: &mut impl ChurnCalls, size: u64) -> Result<(), DwStatu
     Ok(())
 }
 
-/// `churn-create`: a [`CHURN`] eager object created and closed, forever;
-/// returns only when a create is refused, with the rounds completed before
-/// it.
+/// `churn-create`: a [`CHURN`] eager object created and closed, forever
+/// (see [`churn`] for a refused create).
 pub fn churn_create(calls: &mut impl ChurnCalls) -> u32 {
-    let mut rounds: u32 = 0;
-    loop {
-        match calls.create(CHURN, DwMemoryObjectCreateFlags(0)) {
-            Ok(object) => {
-                calls.close(object);
-                rounds = rounds.saturating_add(1);
-            }
-            Err(status) => return ProbeSite::ChurnCreate.after(status, rounds),
-        }
-    }
+    churn(
+        calls,
+        ProbeSite::ChurnCreate,
+        ProbeSite::ChurnCreateStillRefused,
+        |calls| {
+            let object = calls.create(CHURN, DwMemoryObjectCreateFlags(0))?;
+            calls.close(object);
+            Ok(())
+        },
+    )
 }
 
-/// `churn-commit`: [`commit_once`] of [`CHURN`], forever; returns only
-/// when a create is refused, with the rounds completed before it.
+/// `churn-commit`: [`commit_once`] of [`CHURN`], forever (see [`churn`]
+/// for a refused create).
 pub fn churn_commit(calls: &mut impl ChurnCalls) -> u32 {
+    churn(
+        calls,
+        ProbeSite::ChurnCommitCreate,
+        ProbeSite::ChurnCommitStillRefused,
+        |calls| commit_once(calls, CHURN),
+    )
+}
+
+/// Runs `round` forever. A round whose create is refused with
+/// `NO_RESOURCES` is retried after a [`ChurnCalls::pause`]; once
+/// [`CHURN_REFUSALS_MAX`] pauses in a row have not helped, the next such
+/// refusal fails the job at `still`. Any other refusal fails it at once at
+/// `refused`. Either failure carries the rounds completed before it; a
+/// round that succeeds resets the pauses and makes no extra call.
+fn churn<C: ChurnCalls>(
+    calls: &mut C,
+    refused: ProbeSite,
+    still: ProbeSite,
+    round: impl Fn(&mut C) -> Result<(), DwStatus>,
+) -> u32 {
     let mut rounds: u32 = 0;
+    let mut pauses: u32 = 0;
     loop {
-        if let Err(status) = commit_once(calls, CHURN) {
-            return ProbeSite::ChurnCommitCreate.after(status, rounds);
+        match round(calls) {
+            Ok(()) => {
+                rounds = rounds.saturating_add(1);
+                pauses = 0;
+            }
+            Err(status) if status != DW_STATUS_NO_RESOURCES => {
+                return refused.after(status, rounds);
+            }
+            Err(status) if pauses >= CHURN_REFUSALS_MAX => return still.after(status, rounds),
+            Err(_) => {
+                calls.pause();
+                pauses += 1;
+            }
         }
-        rounds = rounds.saturating_add(1);
     }
 }
 

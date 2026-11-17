@@ -1,13 +1,13 @@
 //! The memory probes' failure statuses (Deepwyrm DW2 M8 §13.4 item 2), and
 //! the churn probes driven against a recording system.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use deepwyrm_syscall::{
     DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND, DW_STATUS_NO_MEMORY, DW_STATUS_NO_RESOURCES,
     DW_STATUS_SUCCESS, DwHandle, DwMemoryObjectCreateFlags, DwStatus,
 };
-use wyrmroot_hello::probe::{CHURN, churn_commit, churn_create, churn_map};
+use wyrmroot_hello::probe::{CHURN, CHURN_REFUSALS_MAX, churn_commit, churn_create, churn_map};
 use wyrmroot_hello::{
     ChurnCalls, MAX_ROUNDS, PROBE_FAILURE_PREFIX, ProbeSite, decode_probe_failure, probe_failure,
     probe_failure_after,
@@ -88,12 +88,16 @@ enum Call {
     Map(DwHandle, u64),
     Unmap(u64, u64),
     Close(DwHandle),
+    Pause,
 }
 
 /// A recording system whose creates and maps succeed until a planned
 /// refusal.
 struct Recorder {
     calls: Vec<Call>,
+    /// Creates answered first, in order: refused with the status, or
+    /// accepted.
+    script: VecDeque<Option<DwStatus>>,
     creates_left: usize,
     create_refusal: DwStatus,
     maps_left: usize,
@@ -105,6 +109,7 @@ impl Recorder {
     fn new(creates: usize, create_refusal: DwStatus) -> Self {
         Self {
             calls: Vec::new(),
+            script: VecDeque::new(),
             creates_left: creates,
             create_refusal,
             maps_left: usize::MAX,
@@ -121,6 +126,14 @@ impl ChurnCalls for Recorder {
         flags: DwMemoryObjectCreateFlags,
     ) -> Result<DwHandle, DwStatus> {
         self.calls.push(Call::Create(size, flags.0));
+        match self.script.pop_front() {
+            Some(Some(refusal)) => return Err(refusal),
+            Some(None) => {
+                self.next += 1;
+                return Ok(DwHandle(self.next));
+            }
+            None => {}
+        }
         if self.creates_left == 0 {
             return Err(self.create_refusal);
         }
@@ -154,18 +167,29 @@ impl ChurnCalls for Recorder {
         self.calls.push(Call::Close(handle));
         DW_STATUS_SUCCESS
     }
+
+    fn pause(&mut self) {
+        self.calls.push(Call::Pause);
+    }
+}
+
+impl Recorder {
+    fn pauses(&self) -> usize {
+        self.calls
+            .iter()
+            .filter(|call| **call == Call::Pause)
+            .count()
+    }
 }
 
 #[test]
 fn a_refused_create_ends_churn_create_with_its_site_and_status() {
-    let mut recorder = Recorder::new(3, DW_STATUS_NO_RESOURCES);
+    // NO_MEMORY: not waited out.
+    let mut recorder = Recorder::new(3, DW_STATUS_NO_MEMORY);
     let status = churn_create(&mut recorder);
     // Refused after three completed rounds: round 3.
-    assert_eq!(
-        status,
-        ProbeSite::ChurnCreate.after(DW_STATUS_NO_RESOURCES, 3)
-    );
-    assert_eq!(decode_probe_failure(status), Some((38, 13, 3)));
+    assert_eq!(status, ProbeSite::ChurnCreate.after(DW_STATUS_NO_MEMORY, 3));
+    assert_eq!(decode_probe_failure(status), Some((38, 12, 3)));
     // Three rounds of create and close, then the refused create: nothing
     // else was called.
     let round = |handle| [Call::Create(CHURN, 0), Call::Close(DwHandle(handle))];
@@ -229,15 +253,15 @@ fn churn_map_fails_at_its_create_or_a_first_refused_map() {
 
 #[test]
 fn a_create_refused_on_the_first_round_says_round_0() {
-    let mut recorder = Recorder::new(0, DW_STATUS_NO_RESOURCES);
+    let mut recorder = Recorder::new(0, DW_STATUS_NO_MEMORY);
     assert_eq!(
         decode_probe_failure(churn_create(&mut recorder)),
-        Some((38, 13, 0))
+        Some((38, 12, 0))
     );
-    let mut recorder = Recorder::new(0, DW_STATUS_NO_RESOURCES);
+    let mut recorder = Recorder::new(0, DW_STATUS_NO_MEMORY);
     assert_eq!(
         decode_probe_failure(churn_commit(&mut recorder)),
-        Some((39, 13, 0))
+        Some((39, 12, 0))
     );
     // churn-map's own create says round 0 too.
     let mut recorder = Recorder::new(0, DW_STATUS_NO_RESOURCES);
@@ -249,15 +273,15 @@ fn a_create_refused_on_the_first_round_says_round_0() {
 
 #[test]
 fn three_hundred_rounds_say_255() {
-    let mut recorder = Recorder::new(300, DW_STATUS_NO_RESOURCES);
+    let mut recorder = Recorder::new(300, DW_STATUS_NO_MEMORY);
     assert_eq!(
         decode_probe_failure(churn_create(&mut recorder)),
-        Some((38, 13, 255))
+        Some((38, 12, 255))
     );
-    let mut recorder = Recorder::new(300, DW_STATUS_NO_RESOURCES);
+    let mut recorder = Recorder::new(300, DW_STATUS_NO_MEMORY);
     assert_eq!(
         decode_probe_failure(churn_commit(&mut recorder)),
-        Some((39, 13, 255))
+        Some((39, 12, 255))
     );
     // 300 maps: 64 kept, the rest unmapped at once, then a refusal unmaps
     // the 64 and the next refusal, with none kept, ends the job.
@@ -274,4 +298,62 @@ fn three_hundred_rounds_say_255() {
         .filter(|call| matches!(call, Call::Map(..)))
         .count();
     assert_eq!(maps, 302);
+}
+
+type Churn = fn(&mut Recorder) -> u32;
+/// Each pausing churn probe with its refused and still-refused sites.
+const PAUSING: [(Churn, u8, u8); 2] = [(churn_create, 38, 57), (churn_commit, 39, 58)];
+
+#[test]
+fn a_create_refused_for_no_resources_pauses_and_goes_on() {
+    for (churn, refused, _) in PAUSING {
+        // Two refusals, then two more rounds, then NO_MEMORY ends it.
+        let mut recorder = Recorder::new(2, DW_STATUS_NO_MEMORY);
+        recorder.script = [Some(DW_STATUS_NO_RESOURCES); 2].into_iter().collect();
+        let status = churn(&mut recorder);
+        assert_eq!(recorder.pauses(), 2);
+        // The refused round was retried, not counted.
+        assert_eq!(decode_probe_failure(status), Some((refused, 12, 2)));
+        // Each pause follows its refused create.
+        assert_eq!(recorder.calls[1], Call::Pause);
+        assert_eq!(recorder.calls[3], Call::Pause);
+    }
+}
+
+#[test]
+fn a_create_still_refused_after_500_pauses_ends_the_job() {
+    assert_eq!(CHURN_REFUSALS_MAX, 500);
+    for (churn, _, still) in PAUSING {
+        let mut recorder = Recorder::new(3, DW_STATUS_NO_RESOURCES);
+        let status = churn(&mut recorder);
+        assert_eq!(decode_probe_failure(status), Some((still, 13, 3)));
+        assert_eq!(recorder.pauses(), 500);
+        // Nothing was called after the last refused create.
+        assert!(matches!(recorder.calls.last(), Some(Call::Create(..))));
+    }
+}
+
+#[test]
+fn a_create_refused_otherwise_ends_the_job_without_a_pause() {
+    for (churn, refused, _) in PAUSING {
+        let mut recorder = Recorder::new(1, DwStatus(-12));
+        let status = churn(&mut recorder);
+        assert_eq!(decode_probe_failure(status), Some((refused, 12, 1)));
+        assert_eq!(recorder.pauses(), 0);
+    }
+}
+
+#[test]
+fn an_accepted_create_resets_the_refusals() {
+    for (churn, refused, _) in PAUSING {
+        // 499 refusals, a round, 499 more: still running, until NO_MEMORY.
+        let mut recorder = Recorder::new(0, DW_STATUS_NO_MEMORY);
+        recorder.script = std::iter::repeat_n(Some(DW_STATUS_NO_RESOURCES), 499)
+            .chain([None])
+            .chain(std::iter::repeat_n(Some(DW_STATUS_NO_RESOURCES), 499))
+            .collect();
+        let status = churn(&mut recorder);
+        assert_eq!(recorder.pauses(), 998);
+        assert_eq!(decode_probe_failure(status), Some((refused, 12, 1)));
+    }
 }
