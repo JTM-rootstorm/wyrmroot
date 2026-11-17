@@ -119,7 +119,7 @@ pub(super) fn check_plan(memory: &Memory) -> Result<(), String> {
     }
 }
 
-fn read(shell: &mut Shell<'_>) -> Result<Memory, Failure> {
+pub(super) fn read(shell: &mut Shell<'_>) -> Result<Memory, Failure> {
     let output = shell.run("memory")?;
     parse(&output).ok_or_else(|| {
         Failure::task(format!(
@@ -131,7 +131,7 @@ fn read(shell: &mut Shell<'_>) -> Result<Memory, Failure> {
 
 /// Reads `memory` until `done` holds for two reads in a row with the same
 /// usage, so the reading is settled rather than caught mid-change.
-fn settle(
+pub(super) fn settle(
     shell: &mut Shell<'_>,
     what: &str,
     done: impl Fn(&Memory) -> bool,
@@ -156,7 +156,7 @@ fn settle(
 }
 
 /// Usage and the free count are back to `base` once a job has gone.
-fn back_to(shell: &mut Shell<'_>, base: &Memory, after: &str) -> Result<(), Failure> {
+pub(super) fn back_to(shell: &mut Shell<'_>, base: &Memory, after: &str) -> Result<(), Failure> {
     settle(
         shell,
         &format!(
@@ -171,7 +171,11 @@ fn back_to(shell: &mut Shell<'_>, base: &Memory, after: &str) -> Result<(), Fail
 /// `result`, or if it failed, the failure with job `job`'s result if the
 /// job has already ended (so `wait` cannot block), and what a `hello` probe
 /// said by it (see [`hello_failure`]).
-fn explain<T>(shell: &mut Shell<'_>, job: u64, result: Result<T, Failure>) -> Result<T, Failure> {
+pub(super) fn explain<T>(
+    shell: &mut Shell<'_>,
+    job: u64,
+    result: Result<T, Failure>,
+) -> Result<T, Failure> {
     let Err(failure) = result else {
         return result;
     };
@@ -189,7 +193,7 @@ fn explain<T>(shell: &mut Shell<'_>, job: u64, result: Result<T, Failure>) -> Re
 }
 
 /// Ends a spawned job and requires that it was ended from outside.
-fn end(shell: &mut Shell<'_>, job: u64) -> Result<(), Failure> {
+pub(super) fn end(shell: &mut Shell<'_>, job: u64) -> Result<(), Failure> {
     shell.run(&format!("terminate {job}"))?;
     let output = shell.run(&format!("wait {job}"))?;
     let prefix = format!("job result job={job} classification=");
@@ -248,7 +252,7 @@ pub(super) fn said(output: &[u8]) -> String {
 }
 
 /// The value after `name=` on the line containing it.
-fn line_field(output: &[u8], name: &str) -> Option<u64> {
+pub(super) fn line_field(output: &[u8], name: &str) -> Option<u64> {
     let text = String::from_utf8_lossy(output);
     let needle = format!("{name}=");
     text.split(|c: char| c.is_whitespace())

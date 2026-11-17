@@ -1,14 +1,16 @@
 //! How `hello`'s memory probes report a failure (Deepwyrm DW2 M8 §13.4
-//! item 2), and the three churn probes, which run against [`ChurnCalls`] so
-//! a host test can drive them.
+//! item 2), the three churn probes, which run against [`ChurnCalls`] so a
+//! host test can drive them, and `touch-loop` (DW2 M8 §13.5), which runs
+//! against [`TouchCalls`].
 //!
 //! A probe that fails ends its job with [`probe_failure_after`]'s status:
 //! `0x4D00_0000 | (round << 16) | (site << 8) | code`, where `site` is the
 //! [`ProbeSite`] that failed and `code` is the low byte of the negated kernel
 //! status of the call that failed (`DW_STATUS_NO_RESOURCES`, −13, gives 13),
 //! or 0 when the failure was not a kernel status (a data check, a bad
-//! argument, an unknown mode). `round` is how far a churn probe got (see
-//! each churn function), saturating at 255, and 0 for every other site. A spawned job has no streams, so this status is all it can say.
+//! argument, an unknown mode). `round` is how far a churn probe or
+//! `touch-loop` got (see each function), saturating at 255, and 0 for
+//! every other site. A spawned job has no streams, so this status is all it can say.
 //! A probe's own success (0) and its deliberate ends (1) never carry the
 //! `0x4D` top byte.
 
@@ -156,11 +158,34 @@ pub enum ProbeSite {
     /// `NO_RESOURCES` after [`CHURN_REFUSALS_MAX`] pauses in a row (code
     /// 13).
     ChurnCommitStillRefused = 58,
+    /// `touch-loop`: the size or the rounds argument is missing or out of
+    /// range (code 0).
+    TouchLoopArgument = 59,
+    /// `touch-loop`: `channel_create` for the pause between refused
+    /// creates, made once before the loop.
+    TouchLoopSleeper = 60,
+    /// `touch-loop`: `memory_object_create` refused other than with
+    /// `NO_RESOURCES`.
+    TouchLoopCreate = 61,
+    /// `touch-loop`: `memory_object_create` still refused with
+    /// `NO_RESOURCES` after [`CHURN_REFUSALS_MAX`] pauses in a row (code
+    /// 13).
+    TouchLoopCreateStillRefused = 62,
+    /// `touch-loop`: `address_region_map` of the object.
+    TouchLoopMap = 63,
+    /// `touch-loop`: `handle_close` of the object once it is mapped.
+    TouchLoopClose = 64,
+    /// `touch-loop`: `clock_get` before or after the touch pass.
+    TouchLoopClock = 65,
+    /// `touch-loop`: `address_region_unmap` of all but the last page.
+    TouchLoopUnmapMost = 66,
+    /// `touch-loop`: `address_region_unmap` of the last page.
+    TouchLoopUnmapLast = 67,
 }
 
 impl ProbeSite {
     /// Every site, for tests and decoders.
-    pub const ALL: [Self; 58] = [
+    pub const ALL: [Self; 67] = [
         Self::OnDemandCreate,
         Self::OnDemandInfo,
         Self::OnDemandMap,
@@ -219,6 +244,15 @@ impl ProbeSite {
         Self::ChurnSleeper,
         Self::ChurnCreateStillRefused,
         Self::ChurnCommitStillRefused,
+        Self::TouchLoopArgument,
+        Self::TouchLoopSleeper,
+        Self::TouchLoopCreate,
+        Self::TouchLoopCreateStillRefused,
+        Self::TouchLoopMap,
+        Self::TouchLoopClose,
+        Self::TouchLoopClock,
+        Self::TouchLoopUnmapMost,
+        Self::TouchLoopUnmapLast,
     ];
 
     /// This site's failure with the kernel status of its call.
@@ -424,4 +458,240 @@ pub fn churn_map(calls: &mut impl ChurnCalls) -> u32 {
             Err(status) => return ProbeSite::ChurnMapRefused.after(status, maps),
         }
     }
+}
+
+/// The page `touch-loop` touches one word of.
+pub const PAGE: u64 = 4096;
+/// The largest object `touch-loop` takes, in MiB.
+pub const TOUCH_MIB_MAX: u64 = 256;
+/// The most rounds `touch-loop` runs: its figures are kept on the stack.
+pub const TOUCH_ROUNDS_MAX: u32 = 64;
+
+/// The calls `touch-loop` makes besides the churn probes': the monotonic
+/// clock and the touch pass. The guest's implementation makes the raw
+/// syscall and the writes and nothing else.
+pub trait TouchCalls: ChurnCalls {
+    /// `clock_get` of the monotonic active clock, in nanoseconds.
+    fn now_ns(&mut self) -> Result<u64, DwStatus>;
+    /// Writes one word to every page of `[base, base + size)`, with no
+    /// read first, so every write is a first touch.
+    fn touch(&mut self, base: u64, size: u64);
+}
+
+/// `touch-loop <MiB> <rounds>`'s arguments: the object's size in MiB
+/// (1..=[`TOUCH_MIB_MAX`]) and the rounds (1..=[`TOUCH_ROUNDS_MAX`]), each
+/// in decimal digits alone. A missing or bad one is the job status
+/// [`ProbeSite::TouchLoopArgument`] with code 0.
+pub fn touch_loop_arguments(size: Option<&str>, rounds: Option<&str>) -> Result<(u64, u32), u32> {
+    let bad = ProbeSite::TouchLoopArgument.alone();
+    let size = size.and_then(decimal).ok_or(bad)?;
+    let rounds = rounds.and_then(decimal).ok_or(bad)?;
+    if !(1..=TOUCH_MIB_MAX).contains(&size) || !(1..=u64::from(TOUCH_ROUNDS_MAX)).contains(&rounds)
+    {
+        return Err(bad);
+    }
+    // In range, so it fits.
+    Ok((size, rounds as u32))
+}
+
+/// A short decimal number: one to six digits and nothing else.
+fn decimal(text: &str) -> Option<u64> {
+    if text.is_empty() || text.len() > 6 {
+        return None;
+    }
+    text.bytes().try_fold(0_u64, |value, digit| {
+        digit
+            .is_ascii_digit()
+            .then(|| value * 10 + u64::from(digit - b'0'))
+    })
+}
+
+/// What `touch-loop` found: the least, the median (the lower middle of an
+/// even count) and the greatest of its rounds' nanoseconds a page, with
+/// the pauses its refused creates waited out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TouchSummary {
+    pub size_mib: u64,
+    pub rounds: u32,
+    pub pauses: u32,
+    pub min: u64,
+    pub median: u64,
+    pub max: u64,
+}
+
+impl TouchSummary {
+    /// `touch-loop size-mib=<n> rounds=<n> pauses=<n> min-ns-per-page=<n>
+    /// median-ns-per-page=<n> max-ns-per-page=<n>` and a newline.
+    #[must_use]
+    pub fn line(&self) -> TouchLine {
+        let mut line = TouchLine {
+            bytes: [0; TOUCH_LINE_BYTES],
+            len: 0,
+        };
+        for (name, value) in [
+            ("touch-loop size-mib=", self.size_mib),
+            (" rounds=", u64::from(self.rounds)),
+            (" pauses=", u64::from(self.pauses)),
+            (" min-ns-per-page=", self.min),
+            (" median-ns-per-page=", self.median),
+            (" max-ns-per-page=", self.max),
+        ] {
+            line.text(name);
+            line.number(value);
+        }
+        line.text("\n");
+        line
+    }
+}
+
+/// The longest [`TouchSummary::line`]: its names and six numbers of up to
+/// twenty digits each.
+const TOUCH_LINE_BYTES: usize = 224;
+
+/// A [`TouchSummary`]'s line, built without allocation.
+pub struct TouchLine {
+    bytes: [u8; TOUCH_LINE_BYTES],
+    len: usize,
+}
+
+impl TouchLine {
+    fn text(&mut self, text: &str) {
+        for &byte in text.as_bytes() {
+            self.bytes[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    fn number(&mut self, mut value: u64) {
+        let mut digits = [0_u8; 20];
+        let mut count = 0;
+        loop {
+            digits[count] = b'0' + (value % 10) as u8;
+            count += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        for &digit in digits[..count].iter().rev() {
+            self.bytes[self.len] = digit;
+            self.len += 1;
+        }
+    }
+
+    /// The line's bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+/// The least, the median (the lower middle of an even count) and the
+/// greatest of `times`; `None` for none or more than
+/// [`TOUCH_ROUNDS_MAX`]. Sorts a copy on the stack.
+#[must_use]
+pub fn spread(times: &[u64]) -> Option<(u64, u64, u64)> {
+    if times.is_empty() || times.len() > TOUCH_ROUNDS_MAX as usize {
+        return None;
+    }
+    let mut sorted = [0_u64; TOUCH_ROUNDS_MAX as usize];
+    let sorted = &mut sorted[..times.len()];
+    sorted.copy_from_slice(times);
+    sorted.sort_unstable();
+    Some((
+        sorted[0],
+        sorted[(sorted.len() - 1) / 2],
+        sorted[sorted.len() - 1],
+    ))
+}
+
+/// `touch-loop <MiB> <rounds>` (Deepwyrm DW2 M8 §13.5): each round creates
+/// an on-demand object of `size_mib`, maps it whole read-write, closes its
+/// handle so only the mapping holds it, times one write to every page (each
+/// a first touch) with the monotonic clock, and unmaps all but the last page
+/// and then the last page. With no handle left, the first unmap's steps
+/// return the pages they remove, and the object's own finalization, owed
+/// after the second, has one page left. A round's figure is the touch
+/// pass's nanoseconds divided by its pages.
+///
+/// A create refused with `NO_RESOURCES` (closed objects count against the
+/// job until their owed finalization is done) is retried after a
+/// [`ChurnCalls::pause`], each pause counted; once [`CHURN_REFUSALS_MAX`]
+/// pauses in a row have not helped, the next such refusal fails the job
+/// at [`ProbeSite::TouchLoopCreateStillRefused`]. Any other failed call
+/// ends the job at its own site with its kernel status, its round being
+/// the rounds completed. At the end `write` gets the summary's line
+/// ([`TouchSummary::line`]) and the job status is 0. Sizes and rounds
+/// outside [`touch_loop_arguments`]'s ranges fail at
+/// [`ProbeSite::TouchLoopArgument`] before any call.
+pub fn touch_loop(
+    calls: &mut impl TouchCalls,
+    size_mib: u64,
+    rounds: u32,
+    write: &mut dyn FnMut(&[u8]) -> bool,
+) -> u32 {
+    if !(1..=TOUCH_MIB_MAX).contains(&size_mib) || !(1..=TOUCH_ROUNDS_MAX).contains(&rounds) {
+        return ProbeSite::TouchLoopArgument.alone();
+    }
+    let size = size_mib * MIB;
+    let pages = size / PAGE;
+    let mut figures = [0_u64; TOUCH_ROUNDS_MAX as usize];
+    let mut done: u32 = 0;
+    let mut pauses: u32 = 0;
+    while done < rounds {
+        let mut refused: u32 = 0;
+        let object = loop {
+            match calls.create(size, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND) {
+                Ok(object) => break object,
+                Err(status) if status != DW_STATUS_NO_RESOURCES => {
+                    return ProbeSite::TouchLoopCreate.after(status, done);
+                }
+                Err(status) if refused >= CHURN_REFUSALS_MAX => {
+                    return ProbeSite::TouchLoopCreateStillRefused.after(status, done);
+                }
+                Err(_) => {
+                    calls.pause();
+                    refused += 1;
+                    pauses = pauses.saturating_add(1);
+                }
+            }
+        };
+        let base = match calls.map(object, size) {
+            Ok(base) => base,
+            Err(status) => return ProbeSite::TouchLoopMap.after(status, done),
+        };
+        let status = calls.close(object);
+        if status != DW_STATUS_SUCCESS {
+            return ProbeSite::TouchLoopClose.after(status, done);
+        }
+        let start = match calls.now_ns() {
+            Ok(now) => now,
+            Err(status) => return ProbeSite::TouchLoopClock.after(status, done),
+        };
+        calls.touch(base, size);
+        let end = match calls.now_ns() {
+            Ok(now) => now,
+            Err(status) => return ProbeSite::TouchLoopClock.after(status, done),
+        };
+        if let Err(status) = calls.unmap(base, size - PAGE) {
+            return ProbeSite::TouchLoopUnmapMost.after(status, done);
+        }
+        if let Err(status) = calls.unmap(base + size - PAGE, PAGE) {
+            return ProbeSite::TouchLoopUnmapLast.after(status, done);
+        }
+        figures[done as usize] = end.saturating_sub(start) / pages;
+        done += 1;
+    }
+    // `rounds` is 1..=64, so the spread is there.
+    let (min, median, max) = spread(&figures[..rounds as usize]).unwrap_or((0, 0, 0));
+    let summary = TouchSummary {
+        size_mib,
+        rounds,
+        pauses,
+        min,
+        median,
+        max,
+    };
+    write(summary.line().as_bytes());
+    0
 }

@@ -17,7 +17,10 @@
 //! `bin/hello close-spin` three times while the system is quiet, after
 //! which the first boot's report must show an owed-work wake for each run
 //! that spun on an AP, and its longest finalize gap is reported (Deepwyrm
-//! DW2 §10.19, `memory.rs`); spawns two `bin/cpu-hog` jobs,
+//! DW2 §10.19, `memory.rs`); runs `bin/hello touch-loop 64 20`, which
+//! times a first touch of an on-demand page, and requires the kernel's
+//! `faults` line to count its pages (DW2 M8 §13.5, `touch.rs`); spawns two
+//! `bin/cpu-hog` jobs,
 //! which hold their own FP registers and FS base while they preempt each
 //! other; runs `bin/hello` with its on-demand MemoryObject probe, which must
 //! pass and then end in `resource-policy` once its page quota is spent
@@ -28,7 +31,9 @@
 //! also the SDK's programs); terminates the hogs and requires each to have
 //! been still running; then writes a
 //! file and makes a directory on the root (W7) and shuts down with Ctrl-D.
-//! The second boot `cat`s the file back, removes it and shuts down. Each
+//! The second boot `cat`s the file back, removes it, under `--smp` runs
+//! `touch-loop` three at once and requires its faults counted, and shuts
+//! down; its fault, lock, admission and commit-step lines are printed. Each
 //! boot must end with the kernel's power-off line on its COM1 log. That is the smoke check for development commits.
 //!
 //! `--icount` is a measurement mode: QEMU runs with `-icount shift=0`, so
@@ -75,6 +80,7 @@ use std::{
 use crate::{error::Failure, product, tasks};
 
 mod memory;
+mod touch;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DevBoot {
@@ -257,6 +263,7 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
             unique,
             sdk.is_some(),
             boot.clock,
+            boot.smp,
         )
     } else {
         eprintln!(
@@ -408,6 +415,7 @@ fn check(
     unique: u128,
     sdk: bool,
     clock: Clock,
+    smp: bool,
 ) -> Result<String, Failure> {
     let started = Instant::now();
     let patience = Patience::new(clock);
@@ -469,14 +477,43 @@ fn check(
         ))
     })?;
     eprintln!("dev-boot: {finalize}");
+    // A first touch's time in the kernel (DW2 M8 §13.5): the faults the
+    // first boot's `touch-loop` took, and where their time went.
+    let first_touch =
+        touch::first_touch(&steps, Some(touch::TOUCH_LOOP_PAGES)).map_err(|reason| {
+            Failure::task(format!(
+                "dev-boot check: {reason}; see {}",
+                boots[0].1.display()
+            ))
+        })?;
+    if let Some(line) = first_touch {
+        eprintln!("dev-boot: {line}");
+    }
     let second = boot_once(
         boots[1].0,
         boots[1].1,
         &root.join("com2-reboot.log"),
         patience,
-        |shell| second_boot(shell, &token),
+        |shell| second_boot(shell, &token, smp),
     );
     second?;
+    // The second boot's faults and lock waits: under `--smp`, three
+    // `touch-loop` jobs at once; otherwise little.
+    let log = fs::read(boots[1].1).map_err(|error| Failure::task(format!("COM1 log: {error}")))?;
+    let lines = touch::report_lines(&log);
+    for line in touch::second_boot_lines(&lines) {
+        eprintln!("dev-boot: kernel steps (second boot) {line}");
+    }
+    let first_touch =
+        touch::first_touch(&lines, smp.then_some(touch::TOUCH_LOOP_PAGES)).map_err(|reason| {
+            Failure::task(format!(
+                "dev-boot check: second boot: {reason}; see {}",
+                boots[1].1.display()
+            ))
+        })?;
+    if let Some(line) = first_touch {
+        eprintln!("dev-boot: (second boot) {line}");
+    }
     Ok(pass_line(started.elapsed().as_secs(), root, clock))
 }
 
@@ -573,6 +610,8 @@ fn first_boot(
     // is owed yet: the shell waits on the job, so the BSP is idle unless
     // the job is on it.
     *spins = memory::close_spin(shell)?;
+    // A first touch timed with one job (DW2 M8 §13.5), still quiet.
+    touch::single(shell)?;
     // Two hogs hold their own FP registers and FS base and preempt each
     // other (and everything else) until they are terminated; a hog that saw
     // its state change, or did not start from the initial FP state, exits on
@@ -663,8 +702,10 @@ fn run_sdk(shell: &mut Shell<'_>, runs: &[(&str, &[u8])]) -> Result<(), Failure>
     Ok(())
 }
 
-/// The second boot reads the first boot's file back and removes it.
-fn second_boot(shell: &mut Shell<'_>, token: &str) -> Result<(), Failure> {
+/// The second boot reads the first boot's file back and removes it; under
+/// `--smp` it then times a first touch with three jobs at once (DW2 M8
+/// §13.5).
+fn second_boot(shell: &mut Shell<'_>, token: &str, smp: bool) -> Result<(), Failure> {
     let command = format!("cat {PERSISTED_PATH}");
     shell.retry(&command, "the file written before the reboot", |output| {
         contains(output, token.as_bytes())
@@ -673,6 +714,9 @@ fn second_boot(shell: &mut Shell<'_>, token: &str) -> Result<(), Failure> {
     let listing = shell.run("ls /")?;
     if contains(&listing, b"persist.txt") || !contains(&listing, b"home/\r\n") {
         return Err(Failure::task("dev-boot check: rm or mkdir did not persist"));
+    }
+    if smp {
+        touch::three_at_once(shell)?;
     }
     Ok(())
 }

@@ -77,12 +77,14 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
         // Never answers INIT: init's READY timeout ends it mid-commit.
         memory::slow_ready();
     }
-    let size_mib = (startup.argc() >= 3)
-        .then(|| startup.arg(2).map(|argument| argument.as_str()))
-        .flatten()
-        .and_then(memory::parse_mib);
+    let argument = |index: usize| {
+        (startup.argc() > index)
+            .then(|| startup.arg(index).map(|argument| argument.as_str()))
+            .flatten()
+    };
+    let arguments = [argument(2), argument(3)];
     let mut run = |region: DwHandle, budget: u64, write: &mut dyn FnMut(&[u8]) -> bool| {
-        memory::run(mode.unwrap_or(""), size_mib, region, budget, write)
+        memory::run(mode.unwrap_or(""), arguments, region, budget, write)
     };
     let probe: Option<Probe<'_>> = mode.filter(|mode| memory::is_mode(mode)).map(|_| {
         let run: Probe<'_> = &mut run;
@@ -114,6 +116,10 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
 ///   objects count until their owed finalization is done; DW2 M8 §13.4
 ///   item 2).
 /// - `slow-ready`: commits forever before READY (see `hello_main`).
+/// - `touch-loop <MiB> <rounds>`: times a first touch of every page of a
+///   fresh on-demand mapping, round after round, and prints the least,
+///   median and greatest nanoseconds a page (DW2 M8 §13.5; the loop is
+///   `wyrmroot_hello::probe::touch_loop`).
 ///
 /// A mode that fails ends its job with a `ProbeSite` status naming the
 /// place and the kernel status (`wyrmroot_hello::probe`, DW2 M8 §13.4
@@ -137,7 +143,7 @@ mod memory {
         DwMemoryObjectCreateFlags, DwMemoryProtection, DwOffset, DwRights, DwSize, DwStatus,
         DwUserAddress, DwWaitResultV1,
     };
-    use wyrmroot_hello::{ChurnCalls, ProbeSite, probe};
+    use wyrmroot_hello::{ChurnCalls, ProbeSite, TouchCalls, probe};
 
     const MIB: u64 = 1 << 20;
     const PAGE: u64 = 4096;
@@ -177,16 +183,20 @@ mod memory {
                 | "fragment"
                 | "fragmented"
                 | "unfragmented"
+                | "touch-loop"
         )
     }
 
+    /// Runs `mode`; `arguments` are the job's two arguments after the mode,
+    /// where given.
     pub(super) fn run(
         mode: &str,
-        size_mib: Option<u64>,
+        arguments: [Option<&str>; 2],
         region: DwHandle,
         budget: u64,
         write: &mut dyn FnMut(&[u8]) -> bool,
     ) -> u32 {
+        let size_mib = arguments[0].and_then(parse_mib);
         let mut line = Line::new();
         line.text("job budget-kib=")
             .number(budget / 1024)
@@ -233,6 +243,23 @@ mod memory {
                 }
             }
             "close-spin" => close_spin(write),
+            "touch-loop" => {
+                let (size_mib, rounds) =
+                    match probe::touch_loop_arguments(arguments[0], arguments[1]) {
+                        Ok(parsed) => parsed,
+                        Err(status) => return status,
+                    };
+                // The pause between refused creates, made once.
+                let sleeper = match Sleeper::new() {
+                    Ok(sleeper) => sleeper,
+                    Err(status) => return ProbeSite::TouchLoopSleeper.with(status),
+                };
+                let mut calls = Calls {
+                    region,
+                    sleeper: Some(sleeper),
+                };
+                probe::touch_loop(&mut calls, size_mib, rounds, write)
+            }
             "fragment" => match size_mib {
                 Some(filler) => fragment(budget, filler * MIB),
                 None => ProbeSite::FragmentArgument.alone(),
@@ -256,12 +283,12 @@ mod memory {
         }
     }
 
-    /// The churn probes' kernel calls in `region`: the raw syscalls and
-    /// nothing else.
+    /// The churn probes' and `touch-loop`'s kernel calls in `region`: the
+    /// raw syscalls and the touch pass's writes, and nothing else.
     struct Calls {
         region: DwHandle,
-        /// The pause's channel: only `churn-create` and `churn-commit`,
-        /// which pause, have one.
+        /// The pause's channel: only `churn-create`, `churn-commit` and
+        /// `touch-loop`, which pause, have one.
         sleeper: Option<Sleeper>,
     }
 
@@ -293,6 +320,25 @@ mod memory {
         fn pause(&mut self) {
             if let Some(sleeper) = &self.sleeper {
                 sleeper.sleep(probe::CHURN_PAUSE_US);
+            }
+        }
+    }
+
+    impl TouchCalls for Calls {
+        fn now_ns(&mut self) -> Result<u64, DwStatus> {
+            let mut nanoseconds = 0;
+            checked(deepwyrm_syscall::clock_get(
+                DW_CLOCK_MONOTONIC_ACTIVE.0,
+                &mut nanoseconds,
+            ))
+            .map(|()| nanoseconds)
+        }
+
+        fn touch(&mut self, base: u64, size: u64) {
+            let mut page = base;
+            while page < base + size {
+                write_word(page, page);
+                page += PAGE;
             }
         }
     }
@@ -553,7 +599,7 @@ mod memory {
     }
 
     /// A decimal argument of whole MiB.
-    pub(super) fn parse_mib(text: &str) -> Option<u64> {
+    fn parse_mib(text: &str) -> Option<u64> {
         if text.is_empty() || text.len() > 6 {
             return None;
         }
