@@ -170,8 +170,9 @@ pub fn run_stream_hello<System: StreamHelloSystem>(
 
 /// A probe mode's work (`run bin/hello <mode>`, Deepwyrm DW2 M6 and M5):
 /// given the job's own AddressRegion, its memory budget in bytes (from its
-/// INIT) and a writer for stdout lines (which returns whether the whole line
-/// was written), it returns the job's exit status.
+/// INIT) and a writer for stdout lines (which waits while the reader's queue
+/// is full and returns whether the whole line was written), it returns the
+/// job's exit status.
 pub type Probe<'a> = &'a mut dyn FnMut(DwHandle, u64, &mut dyn FnMut(&[u8]) -> bool) -> u32;
 
 /// [`run_stream_hello`], and when `probe` is given, runs it once the job is
@@ -263,8 +264,15 @@ pub fn run_stream_hello_with<System: StreamHelloSystem>(
     send_ready(system, bootstrap_channel, streams.profile, transaction)?;
     wait_for_release(system, bootstrap_channel)?;
     close_bootstrap(system, bootstrap_channel)?;
+    // The reader's queue is only two records deep and a probe can outrun
+    // it, so each line waits out a full queue; only a broken stream or
+    // another failure reports `false`.
     let status = {
-        let mut write = |line: &[u8]| stdout.write(system, line).is_ok_and(|n| n == line.len());
+        let mut write = |line: &[u8]| {
+            stdout
+                .write_wait(system, line)
+                .is_ok_and(|n| n == line.len())
+        };
         probe(streams.self_root, streams.memory_budget_bytes, &mut write)
     };
     for handle in [
