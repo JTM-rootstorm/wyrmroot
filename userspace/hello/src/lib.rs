@@ -24,7 +24,10 @@ use wyrmroot_runtime::{
 use wyrmroot_stream_proto as _;
 
 pub mod probe;
-pub use probe::{ChurnCalls, PROBE_FAILURE_PREFIX, ProbeSite, decode_probe_failure, probe_failure};
+pub use probe::{
+    ChurnCalls, MAX_ROUNDS, PROBE_FAILURE_PREFIX, ProbeSite, decode_probe_failure, probe_failure,
+    probe_failure_after,
+};
 
 /// Native operations used by the WYR0-G `hello` parent-channel exchange.
 pub trait HelloSystem {

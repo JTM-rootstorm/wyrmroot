@@ -2,12 +2,13 @@
 //! item 2), and the three churn probes, which run against [`ChurnCalls`] so
 //! a host test can drive them.
 //!
-//! A probe that fails ends its job with [`probe_failure`]'s status:
-//! `0x4D00_0000 | (site << 8) | code`, where `site` is the [`ProbeSite`] that
-//! failed and `code` is the low byte of the negated kernel status of the
-//! call that failed (`DW_STATUS_NO_RESOURCES`, −13, gives 13), or 0 when the
-//! failure was not a kernel status (a data check, a bad argument, an unknown
-//! mode). A spawned job has no streams, so this status is all it can say.
+//! A probe that fails ends its job with [`probe_failure_after`]'s status:
+//! `0x4D00_0000 | (round << 16) | (site << 8) | code`, where `site` is the
+//! [`ProbeSite`] that failed and `code` is the low byte of the negated kernel
+//! status of the call that failed (`DW_STATUS_NO_RESOURCES`, −13, gives 13),
+//! or 0 when the failure was not a kernel status (a data check, a bad
+//! argument, an unknown mode). `round` is how far a churn probe got (see
+//! each churn function), saturating at 255, and 0 for every other site. A spawned job has no streams, so this status is all it can say.
 //! A probe's own success (0) and its deliberate ends (1) never carry the
 //! `0x4D` top byte.
 
@@ -212,6 +213,13 @@ impl ProbeSite {
         probe_failure(self, status)
     }
 
+    /// This site's failure with the kernel status of its call, after
+    /// `rounds` rounds of a churn probe.
+    #[must_use]
+    pub const fn after(self, status: DwStatus, rounds: u32) -> u32 {
+        probe_failure_after(self, status, rounds)
+    }
+
     /// This site's failure with no kernel status (code 0).
     #[must_use]
     pub const fn alone(self) -> u32 {
@@ -219,23 +227,42 @@ impl ProbeSite {
     }
 }
 
+/// The most rounds a status can say; more are reported as this many.
+pub const MAX_ROUNDS: u32 = 255;
+
 /// The job status of a probe that failed at `site` with the kernel's
-/// `status` (`DW_STATUS_SUCCESS` when the failure was not a kernel status):
-/// `0x4D00_0000 | (site << 8) | code`, `code` being the low byte of the
-/// negated status.
+/// `status` (`DW_STATUS_SUCCESS` when the failure was not a kernel status)
+/// after `rounds` rounds of a churn probe: `0x4D00_0000 | (round << 16) |
+/// (site << 8) | code`, `round` being `rounds` saturated at [`MAX_ROUNDS`]
+/// and `code` the low byte of the negated status.
 #[must_use]
-pub const fn probe_failure(site: ProbeSite, status: DwStatus) -> u32 {
-    PROBE_FAILURE_PREFIX | ((site as u32) << 8) | ((status.0.wrapping_neg() as u32) & 0xff)
+pub const fn probe_failure_after(site: ProbeSite, status: DwStatus, rounds: u32) -> u32 {
+    let round = if rounds > MAX_ROUNDS {
+        MAX_ROUNDS
+    } else {
+        rounds
+    };
+    PROBE_FAILURE_PREFIX
+        | (round << 16)
+        | ((site as u32) << 8)
+        | ((status.0.wrapping_neg() as u32) & 0xff)
 }
 
-/// The site number and code of a probe failure status; `None` for any
-/// status without the `0x4D` top byte.
+/// [`probe_failure_after`] with round 0, for every site but the churn
+/// probes'.
 #[must_use]
-pub const fn decode_probe_failure(status: u32) -> Option<(u8, u8)> {
+pub const fn probe_failure(site: ProbeSite, status: DwStatus) -> u32 {
+    probe_failure_after(site, status, 0)
+}
+
+/// The site number, code and round of a probe failure status; `None` for
+/// any status without the `0x4D` top byte.
+#[must_use]
+pub const fn decode_probe_failure(status: u32) -> Option<(u8, u8, u8)> {
     if status & 0xff00_0000 != PROBE_FAILURE_PREFIX {
         return None;
     }
-    Some(((status >> 8) as u8, status as u8))
+    Some(((status >> 8) as u8, status as u8, (status >> 16) as u8))
 }
 
 const MIB: u64 = 1 << 20;
@@ -274,30 +301,36 @@ pub fn commit_once(calls: &mut impl ChurnCalls, size: u64) -> Result<(), DwStatu
 }
 
 /// `churn-create`: a [`CHURN`] eager object created and closed, forever;
-/// returns only when a create is refused.
+/// returns only when a create is refused, with the rounds completed before
+/// it.
 pub fn churn_create(calls: &mut impl ChurnCalls) -> u32 {
+    let mut rounds: u32 = 0;
     loop {
         match calls.create(CHURN, DwMemoryObjectCreateFlags(0)) {
             Ok(object) => {
                 calls.close(object);
+                rounds = rounds.saturating_add(1);
             }
-            Err(status) => return ProbeSite::ChurnCreate.with(status),
+            Err(status) => return ProbeSite::ChurnCreate.after(status, rounds),
         }
     }
 }
 
 /// `churn-commit`: [`commit_once`] of [`CHURN`], forever; returns only
-/// when a create is refused.
+/// when a create is refused, with the rounds completed before it.
 pub fn churn_commit(calls: &mut impl ChurnCalls) -> u32 {
+    let mut rounds: u32 = 0;
     loop {
         if let Err(status) = commit_once(calls, CHURN) {
-            return ProbeSite::ChurnCommitCreate.with(status);
+            return ProbeSite::ChurnCommitCreate.after(status, rounds);
         }
+        rounds = rounds.saturating_add(1);
     }
 }
 
 /// `churn-map`: one [`CHURN`] eager object mapped again and again at new
-/// addresses, forever.
+/// addresses, forever. A failure after the create carries the number of
+/// maps that succeeded since the job started.
 pub fn churn_map(calls: &mut impl ChurnCalls) -> u32 {
     let object = match calls.create(CHURN, DwMemoryObjectCreateFlags(0)) {
         Ok(object) => object,
@@ -309,26 +342,31 @@ pub fn churn_map(calls: &mut impl ChurnCalls) -> u32 {
     // room or page-table quota) are they all unmapped.
     let mut bases = [0_u64; CHURN_MAPS_KEPT];
     let mut count = 0;
+    let mut maps: u32 = 0;
     loop {
-        match calls.map(object, CHURN) {
+        let mapped = calls.map(object, CHURN);
+        if mapped.is_ok() {
+            maps = maps.saturating_add(1);
+        }
+        match mapped {
             Ok(base) if count < bases.len() => {
                 bases[count] = base;
                 count += 1;
             }
             Ok(base) => {
                 if let Err(status) = calls.unmap(base, CHURN) {
-                    return ProbeSite::ChurnMapUnmapExtra.with(status);
+                    return ProbeSite::ChurnMapUnmapExtra.after(status, maps);
                 }
             }
             Err(_) if count > 0 => {
                 for &base in &bases[..count] {
                     if let Err(status) = calls.unmap(base, CHURN) {
-                        return ProbeSite::ChurnMapUnmapAll.with(status);
+                        return ProbeSite::ChurnMapUnmapAll.after(status, maps);
                     }
                 }
                 count = 0;
             }
-            Err(status) => return ProbeSite::ChurnMapRefused.with(status),
+            Err(status) => return ProbeSite::ChurnMapRefused.after(status, maps),
         }
     }
 }

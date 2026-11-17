@@ -209,14 +209,17 @@ fn end(shell: &mut Shell<'_>, job: u64) -> Result<(), Failure> {
 
 /// The top byte of a `hello` memory probe's failure status (`hello`'s
 /// `PROBE_FAILURE_PREFIX`, Deepwyrm DW2 M8 §13.4 item 2): the status is
-/// `0x4D00_0000 | (site << 8) | code`, `code` being the low byte of the
-/// negated kernel status of the call that failed, or 0 for none.
+/// `0x4D00_0000 | (round << 16) | (site << 8) | code`, `code` being the low
+/// byte of the negated kernel status of the call that failed, or 0 for
+/// none, and `round` how far a churn probe got, saturating at 255 (0 for
+/// every other site).
 const PROBE_FAILURE_PREFIX: u64 = 0x4D00_0000;
 
 /// What a `hello` memory probe's status says, from the first `job result`
 /// line in `output` (as `wyrmsh` prints it, `application=` in decimal):
 /// `hello failed at site S with kernel status -C`, or `... with no kernel
-/// status`. `None` without such a line or when the status is not a probe
+/// status`, then ` after N rounds` for a nonzero round (` after 255 or more
+/// rounds` at the saturated 255). `None` without such a line or when the status is not a probe
 /// failure.
 pub(super) fn hello_failure(output: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(output);
@@ -225,11 +228,16 @@ pub(super) fn hello_failure(output: &[u8]) -> Option<String> {
     if status >> 24 != PROBE_FAILURE_PREFIX >> 24 {
         return None;
     }
-    let (site, code) = ((status >> 8) & 0xff, status & 0xff);
-    Some(if code == 0 {
+    let (site, code, round) = ((status >> 8) & 0xff, status & 0xff, (status >> 16) & 0xff);
+    let failed = if code == 0 {
         format!("hello failed at site {site} with no kernel status")
     } else {
         format!("hello failed at site {site} with kernel status -{code}")
+    };
+    Some(match round {
+        0 => failed,
+        255 => format!("{failed} after 255 or more rounds"),
+        _ => format!("{failed} after {round} rounds"),
     })
 }
 
@@ -1129,6 +1137,25 @@ mod tests {
         assert_eq!(
             hello_failure(none).as_deref(),
             Some("hello failed at site 55 with no kernel status")
+        );
+        // A churn probe's round: `churn-create` refused NO_RESOURCES after
+        // 37 rounds (0x4D25_260D), and one past 255 rounds (0x4DFF_260D).
+        let rounds = |application: u64| {
+            hello_failure(
+                format!(
+                    "job result job=9 classification=normal application={application} \
+                     exception-class=0 exception-detail=0 exception-address=0 cleanup=0\r\n"
+                )
+                .as_bytes(),
+            )
+        };
+        assert_eq!(
+            rounds(1_294_280_205).as_deref(),
+            Some("hello failed at site 38 with kernel status -13 after 37 rounds")
+        );
+        assert_eq!(
+            rounds(1_308_567_053).as_deref(),
+            Some("hello failed at site 38 with kernel status -13 after 255 or more rounds")
         );
     }
 
