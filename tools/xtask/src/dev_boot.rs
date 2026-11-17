@@ -42,11 +42,13 @@
 //! microseconds, or under `--icount` in thousands of guest instructions.
 //!
 //! `--kvm` is the timing mode: QEMU runs the guest under KVM (`-accel kvm`,
-//! `-cpu host`), so the kernel's step times are real time on the host CPU,
-//! under virtualization. The emulated VT-d's interrupt remapping needs the
-//! split irqchip there (`-machine q35,kernel-irqchip=split`). The check
-//! refuses to start unless `/dev/kvm` opens read-write, keeps the base waits,
-//! prints the step means in nanoseconds and ends its pass line in `kvm=1`.
+//! `-cpu host,migratable=no,+invtsc`), so the kernel's step times are real
+//! time on the host CPU, under virtualization; the guest sees the host's
+//! invariant TSC, which QEMU exposes only to a non-migratable guest. The
+//! emulated VT-d's interrupt remapping needs the split irqchip there
+//! (`-machine q35,kernel-irqchip=split`). The check refuses to start unless
+//! `/dev/kvm` opens read-write, keeps the base waits, prints the step means
+//! in nanoseconds and ends its pass line in `kvm=1`.
 //! The kernel reports totals in whole microseconds, so a nanosecond mean
 //! (`call-total-us * 1000 / call-steps`) is exact only to that.
 //!
@@ -338,10 +340,12 @@ fn qemu_arguments(
         vcpus.to_string(),
         // The default TCG model lacks what large-memory support relies on:
         // 1 GiB pages for the kernel's direct map, SMEP and SMAP
-        // (Deepwyrm DW2 M2). Under KVM the guest has the host's CPU.
+        // (Deepwyrm DW2 M2). Under KVM the guest has the host's CPU,
+        // with its invariant TSC shown (QEMU shows it only to a guest
+        // marked not migratable), so the kernel can time steps by the TSC.
         "-cpu".into(),
         if kvm {
-            "host".into()
+            "host,migratable=no,+invtsc".into()
         } else {
             "qemu64,+pdpe1gb,+smep,+smap".into()
         },
@@ -1368,7 +1372,7 @@ mod tests {
             // CPU in place of the TCG model, and nothing else changed.
             let mut changed = expected.clone();
             changed[1] = "q35,kernel-irqchip=split".into();
-            changed[7] = "host".into();
+            changed[7] = "host,migratable=no,+invtsc".into();
             changed.splice(0..0, ["-accel".to_owned(), "kvm".to_owned()]);
             assert_eq!(kvm, changed);
             assert!(!kvm.iter().any(|arg| arg.starts_with("qemu64")));
