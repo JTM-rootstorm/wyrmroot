@@ -23,6 +23,9 @@ use wyrmroot_runtime::{
 #[cfg(test)]
 use wyrmroot_stream_proto as _;
 
+pub mod probe;
+pub use probe::{ChurnCalls, PROBE_FAILURE_PREFIX, ProbeSite, decode_probe_failure, probe_failure};
+
 /// Native operations used by the WYR0-G `hello` parent-channel exchange.
 pub trait HelloSystem {
     /// Queries current object metadata for a locally held capability.

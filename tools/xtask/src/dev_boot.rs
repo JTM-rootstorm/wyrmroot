@@ -630,8 +630,9 @@ fn first_boot(
             });
         if !ended {
             return Err(Failure::task(format!(
-                "dev-boot check: hog job {job} was not still running: {:?}",
-                String::from_utf8_lossy(&output)
+                "dev-boot check: hog job {job} was not still running: {:?}{}",
+                String::from_utf8_lossy(&output),
+                memory::said(&output)
             )));
         }
     }
@@ -653,8 +654,9 @@ fn run_sdk(shell: &mut Shell<'_>, runs: &[(&str, &[u8])]) -> Result<(), Failure>
             || !contains(&output, b"classification=normal application=0 ")
         {
             return Err(Failure::task(format!(
-                "dev-boot check: `{command}` printed {:?}",
-                String::from_utf8_lossy(&output)
+                "dev-boot check: `{command}` printed {:?}{}",
+                String::from_utf8_lossy(&output),
+                memory::said(&output)
             )));
         }
     }
@@ -732,8 +734,9 @@ impl Shell<'_> {
             Ok(())
         } else {
             Err(Failure::task(format!(
-                "dev-boot check: `{command}` printed {:?}",
-                String::from_utf8_lossy(&output)
+                "dev-boot check: `{command}` printed {:?}{}",
+                String::from_utf8_lossy(&output),
+                memory::said(&output)
             )))
         }
     }
@@ -985,6 +988,12 @@ fn drive(
         )));
     }
     stack_marks_fit(&log).map_err(|reason| {
+        Failure::task(format!("dev-boot check: {reason}; see {}", com1.display()))
+    })?;
+    // No kernel record was lost to a contended writer (DW2 M8 §13.4 item
+    // 4). Both boots power off through the kernel's step report, the
+    // second with all-zero counts, so both carry the line.
+    memory::records_dropped(&log).map_err(|reason| {
         Failure::task(format!("dev-boot check: {reason}; see {}", com1.display()))
     })?;
     Ok(())
