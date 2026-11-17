@@ -43,13 +43,13 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         Action::DevBoot {
             check,
             smp,
-            icount,
+            clock,
             deep_repository,
             sdk,
         } => dev_boot::run(&dev_boot::DevBoot {
             check,
             smp,
-            icount,
+            clock,
             deep_repository,
             sdk,
         })

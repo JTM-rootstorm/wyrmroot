@@ -41,6 +41,17 @@
 //! report's `call-total-us` and `call-steps` lines ([`step_means`]), in
 //! microseconds, or under `--icount` in thousands of guest instructions.
 //!
+//! `--kvm` is the timing mode: QEMU runs the guest under KVM (`-accel kvm`,
+//! `-cpu host,migratable=no,+invtsc`), so the kernel's step times are real
+//! time on the host CPU, under virtualization; the guest sees the host's
+//! invariant TSC, which QEMU exposes only to a non-migratable guest. The
+//! emulated VT-d's interrupt remapping needs the split irqchip there
+//! (`-machine q35,kernel-irqchip=split`). The check refuses to start unless
+//! `/dev/kvm` opens read-write, keeps the base waits, prints the step means
+//! in nanoseconds and ends its pass line in `kvm=1`.
+//! The kernel reports totals in whole microseconds, so a nanosecond mean
+//! (`call-total-us * 1000 / call-steps`) is exact only to that.
+//!
 //! The persistent root is a second, writable virtio disk at 00:02.0: a copy
 //! of the product's empty ext4 `root.img`. `--check` makes a fresh copy per
 //! run; an interactive run keeps one at `OS-Project/.tmp/dev-boot/root.img`
@@ -69,13 +80,27 @@ mod memory;
 pub(crate) struct DevBoot {
     pub(crate) check: bool,
     pub(crate) smp: bool,
-    /// QEMU's `-icount shift=0`: guest time counts guest instructions.
-    pub(crate) icount: bool,
+    pub(crate) clock: Clock,
     pub(crate) deep_repository: Option<String>,
     /// A built Wyrmroot SDK (`wyrmroot-sdk/out`) whose test programs go on
     /// the ESP and, under `--check`, run (root `TOOLCHAIN_PLAN.md` step 2).
     pub(crate) sdk: Option<String>,
 }
+
+/// What the guest's clock measures, which QEMU's accelerator decides.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum Clock {
+    /// QEMU's emulator (TCG): guest time follows the host loosely.
+    #[default]
+    Emulated,
+    /// QEMU's `-icount shift=0`: guest time counts guest instructions.
+    Icount,
+    /// KVM: the guest runs on the host CPU, so its time is real time.
+    Kvm,
+}
+
+/// The device KVM is opened through.
+const KVM_DEVICE: &str = "/dev/kvm";
 
 /// The same memory and CPU counts as the F matrix's default and SMP profiles.
 const MEMORY_MIB: u32 = 2048;
@@ -162,8 +187,13 @@ struct Patience {
 
 impl Patience {
     /// The base waits, or under `--icount` [`ICOUNT_PATIENCE`] times them.
-    fn new(icount: bool) -> Self {
-        let factor = if icount { ICOUNT_PATIENCE } else { 1 };
+    /// KVM is faster than the emulator, so it keeps the base waits.
+    fn new(clock: Clock) -> Self {
+        let factor = if clock == Clock::Icount {
+            ICOUNT_PATIENCE
+        } else {
+            1
+        };
         Self {
             timeout: CHECK_TIMEOUT * factor,
             attempts: ATTEMPTS * factor as usize,
@@ -175,6 +205,9 @@ impl Patience {
 const PERSISTED_PATH: &str = "/persist.txt";
 
 pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
+    if boot.clock == Clock::Kvm {
+        kvm_access(Path::new(KVM_DEVICE))?;
+    }
     let repository = tasks::repository_root()?;
     let project = tasks::canonical_project_root(&repository)?;
     let deep = boot
@@ -213,17 +246,17 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
     if !root_disk.exists() {
         create_root_disk(&product, &root_disk)?;
     }
-    let args = qemu_arguments(boot.smp, boot.icount, &product, &vars, &com1, &root_disk);
+    let args = qemu_arguments(boot.smp, boot.clock, &product, &vars, &com1, &root_disk);
 
     if boot.check {
         let reboot = root.join("com1-reboot.log");
-        let second = qemu_arguments(boot.smp, boot.icount, &product, &vars, &reboot, &root_disk);
+        let second = qemu_arguments(boot.smp, boot.clock, &product, &vars, &reboot, &root_disk);
         check(
             &[(&args, &com1), (&second, &reboot)],
             &root,
             unique,
             sdk.is_some(),
-            boot.icount,
+            boot.clock,
         )
     } else {
         eprintln!(
@@ -239,6 +272,23 @@ pub(crate) fn run(boot: &DevBoot) -> Result<String, Failure> {
             com1.display()
         ))
     }
+}
+
+/// Fails unless KVM's device at `device` opens read-write, as QEMU needs.
+fn kvm_access(device: &Path) -> Result<(), Failure> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(device)
+        .map(drop)
+        .map_err(|error| {
+            Failure::task(format!(
+                "dev-boot --kvm: cannot open {} read-write ({error}); if you were \
+                 just added to group kvm, run the command through \
+                 `sg kvm -c '...'` or start a new login session",
+                device.display()
+            ))
+        })
 }
 
 /// A writable copy of the product's empty root disk at `path`.
@@ -263,25 +313,42 @@ fn create_root_disk(product: &Path, path: &Path) -> Result<(), Failure> {
 
 fn qemu_arguments(
     smp: bool,
-    icount: bool,
+    clock: Clock,
     product: &Path,
     vars: &Path,
     com1: &Path,
     root_disk: &Path,
 ) -> Vec<String> {
     let vcpus = if smp { SMP_VCPUS } else { 1 };
-    let mut args: Vec<String> = vec![
+    let kvm = clock == Clock::Kvm;
+    let mut args: Vec<String> = Vec::new();
+    if kvm {
+        args.extend(["-accel".into(), "kvm".into()]);
+    }
+    args.extend([
         "-machine".into(),
-        "q35".into(),
+        // Under KVM the emulated VT-d's interrupt remapping needs the
+        // split irqchip: QEMU refuses `intremap=on` with the in-kernel one.
+        if kvm {
+            "q35,kernel-irqchip=split".into()
+        } else {
+            "q35".into()
+        },
         "-m".into(),
         format!("{MEMORY_MIB}M"),
         "-smp".into(),
         vcpus.to_string(),
         // The default TCG model lacks what large-memory support relies on:
         // 1 GiB pages for the kernel's direct map, SMEP and SMAP
-        // (Deepwyrm DW2 M2).
+        // (Deepwyrm DW2 M2). Under KVM the guest has the host's CPU,
+        // with its invariant TSC shown (QEMU shows it only to a guest
+        // marked not migratable), so the kernel can time steps by the TSC.
         "-cpu".into(),
-        "qemu64,+pdpe1gb,+smep,+smap".into(),
+        if kvm {
+            "host,migratable=no,+invtsc".into()
+        } else {
+            "qemu64,+pdpe1gb,+smep,+smap".into()
+        },
         "-nodefaults".into(),
         "-display".into(),
         "none".into(),
@@ -323,10 +390,10 @@ fn qemu_arguments(
         ),
         "-serial".into(),
         format!("file:{}", com1.display()),
-    ];
+    ]);
     // The second ISA serial port is COM2, where the product runs `wyrmsh`.
     args.extend(["-serial".into(), "stdio".into()]);
-    if icount {
+    if clock == Clock::Icount {
         // One guest instruction is one nanosecond of guest time; `sleep`
         // stays on, so an idle guest's clock follows real time.
         args.extend(["-icount".into(), "shift=0".into()]);
@@ -340,10 +407,10 @@ fn check(
     root: &Path,
     unique: u128,
     sdk: bool,
-    icount: bool,
+    clock: Clock,
 ) -> Result<String, Failure> {
     let started = Instant::now();
-    let patience = Patience::new(icount);
+    let patience = Patience::new(clock);
     let token = format!("dev-boot persisted {unique}");
     let mut spins = Vec::new();
     let first = boot_once(
@@ -365,7 +432,7 @@ fn check(
     for line in &steps {
         eprintln!("dev-boot: kernel steps {line}");
     }
-    for line in step_means(&steps, icount) {
+    for line in step_means(&steps, clock) {
         eprintln!("dev-boot: {line}");
     }
     // The idle-BSP probe: each run that spun on an AP had the kernel wake
@@ -410,25 +477,32 @@ fn check(
         |shell| second_boot(shell, &token),
     );
     second?;
-    Ok(pass_line(started.elapsed().as_secs(), root, icount))
+    Ok(pass_line(started.elapsed().as_secs(), root, clock))
 }
 
-/// The check's result line; under `--icount` it says so, so the result
-/// cannot be taken for a wall-time one.
-fn pass_line(seconds: u64, root: &Path, icount: bool) -> String {
+/// The check's result line; under `--icount` or `--kvm` it says so, so the
+/// result cannot be taken for one of the emulator's.
+fn pass_line(seconds: u64, root: &Path, clock: Clock) -> String {
     format!(
         "DEV_BOOT_CHECK_PASS seconds={seconds} root={}{}\n",
         root.display(),
-        if icount { " icount=1" } else { "" }
+        match clock {
+            Clock::Emulated => "",
+            Clock::Icount => " icount=1",
+            Clock::Kvm => " kvm=1",
+        }
     )
 }
 
 /// Each timed call's mean step from the kernel's step report (`lines`, as
 /// [`memory::steps_report`] returns them): `call-total-us / call-steps`.
 /// Under `--icount` a guest microsecond is a thousand guest instructions, so
-/// the unit is `kinstr` and a line before says so. A call with no steps is
-/// left out; without both source lines there is nothing to print.
-fn step_means(lines: &[String], icount: bool) -> Vec<String> {
+/// the unit is `kinstr` and a line before says so. Under `--kvm` steps are
+/// short real time, so the unit is `ns` (`call-total-us * 1000 /
+/// call-steps`, exact only to the kernel's whole-microsecond totals) and a
+/// line before says so. A call with no steps is left out; without both
+/// source lines there is nothing to print.
+fn step_means(lines: &[String], clock: Clock) -> Vec<String> {
     let source = |prefix: &str| lines.iter().find_map(|line| line.strip_prefix(prefix));
     let (Some(steps), Some(totals)) = (source("call-steps "), source("call-total-us ")) else {
         return Vec::new();
@@ -438,22 +512,34 @@ fn step_means(lines: &[String], icount: bool) -> Vec<String> {
             .find_map(|part| part.strip_prefix(call)?.strip_prefix('='))
             .and_then(|value| value.parse::<u64>().ok())
     };
+    let scale: u128 = if clock == Clock::Kvm { 1000 } else { 1 };
     let means: Vec<String> = STEP_CALLS
         .iter()
         .filter_map(|call| {
             let count = field(steps, call).filter(|&count| count != 0)?;
-            Some(format!("{call}={}", field(totals, call)? / count))
+            let total = field(totals, call)?;
+            Some(format!(
+                "{call}={}",
+                u128::from(total) * scale / u128::from(count)
+            ))
         })
         .collect();
     let mut out = Vec::with_capacity(2);
-    if icount {
-        out.push(
+    match clock {
+        Clock::Emulated => {}
+        Clock::Icount => out.push(
             "icount: guest time counts instructions (1 ns each); \
              step times are thousands of guest instructions"
                 .to_owned(),
-        );
+        ),
+        Clock::Kvm => out
+            .push("kvm: step times are real time on the host CPU, under virtualization".to_owned()),
     }
-    let unit = if icount { "kinstr" } else { "us" };
+    let unit = match clock {
+        Clock::Emulated => "us",
+        Clock::Icount => "kinstr",
+        Clock::Kvm => "ns",
+    };
     out.push(format!("step means {unit} {}", means.join(" ")));
     out
 }
@@ -975,7 +1061,7 @@ mod tests {
     fn the_shell_console_is_the_second_serial_port_after_the_kernel_log() {
         let args = qemu_arguments(
             false,
-            false,
+            Clock::Emulated,
             Path::new("/p"),
             Path::new("/v.fd"),
             Path::new("/c1.log"),
@@ -995,7 +1081,7 @@ mod tests {
     fn the_esp_is_a_modern_virtio_disk_behind_the_iommu() {
         let args = qemu_arguments(
             false,
-            false,
+            Clock::Emulated,
             Path::new("/p"),
             Path::new("/v"),
             Path::new("/c"),
@@ -1074,7 +1160,7 @@ mod tests {
     fn the_guest_cpu_has_gigabyte_pages_smep_and_smap() {
         let args = qemu_arguments(
             false,
-            false,
+            Clock::Emulated,
             Path::new("product"),
             Path::new("vars"),
             Path::new("com1"),
@@ -1096,17 +1182,17 @@ mod tests {
     #[test]
     fn icount_adds_shift_zero_and_changes_nothing_else() {
         for smp in [false, true] {
-            let arguments = |icount| {
+            let arguments = |clock| {
                 qemu_arguments(
                     smp,
-                    icount,
+                    clock,
                     Path::new("/p"),
                     Path::new("/v"),
                     Path::new("/c"),
                     Path::new("/r.img"),
                 )
             };
-            let (plain, counted) = (arguments(false), arguments(true));
+            let (plain, counted) = (arguments(Clock::Emulated), arguments(Clock::Icount));
             assert!(!plain.iter().any(|arg| arg == "-icount"));
             let at = counted
                 .iter()
@@ -1123,14 +1209,14 @@ mod tests {
     #[test]
     fn patience_is_the_base_waits_or_four_times_them_under_icount() {
         assert_eq!(
-            Patience::new(false),
+            Patience::new(Clock::Emulated),
             Patience {
                 timeout: Duration::from_secs(180),
                 attempts: 20
             }
         );
         assert_eq!(
-            Patience::new(true),
+            Patience::new(Clock::Icount),
             Patience {
                 timeout: Duration::from_secs(720),
                 attempts: 80
@@ -1153,7 +1239,7 @@ mod tests {
     #[test]
     fn step_means_divide_each_total_by_its_steps_and_leave_out_idle_calls() {
         assert_eq!(
-            step_means(&step_lines(), false),
+            step_means(&step_lines(), Clock::Emulated),
             [
                 "step means us map=2076524 unmap=394180 fill=16 commit=754512 create=1923 \
               teardown=95 release=2 finalize=626"
@@ -1164,7 +1250,7 @@ mod tests {
     #[test]
     fn under_icount_step_means_are_thousands_of_instructions() {
         assert_eq!(
-            step_means(&step_lines(), true),
+            step_means(&step_lines(), Clock::Icount),
             [
                 "icount: guest time counts instructions (1 ns each); \
                  step times are thousands of guest instructions",
@@ -1181,30 +1267,152 @@ mod tests {
                 .into_iter()
                 .filter(|line| !line.starts_with(missing))
                 .collect();
-            assert!(step_means(&lines, false).is_empty(), "{missing}");
-            assert!(step_means(&lines, true).is_empty(), "{missing}");
+            for clock in [Clock::Emulated, Clock::Icount, Clock::Kvm] {
+                assert!(step_means(&lines, clock).is_empty(), "{missing}");
+            }
         }
-        assert!(step_means(&[], true).is_empty());
+        assert!(step_means(&[], Clock::Icount).is_empty());
+        assert!(step_means(&[], Clock::Kvm).is_empty());
     }
 
     #[test]
-    fn the_pass_line_marks_an_icount_result() {
+    fn under_kvm_step_means_are_nanoseconds_of_real_time() {
+        assert_eq!(
+            step_means(&step_lines(), Clock::Kvm),
+            [
+                "kvm: step times are real time on the host CPU, under virtualization",
+                "step means ns map=2076524750 unmap=394180666 fill=16053 commit=754512285 \
+                 create=1923706 teardown=95948 release=2321 finalize=626386"
+            ]
+        );
+        // A total far past any microsecond count still scales without
+        // overflowing.
+        let huge = [
+            "call-steps fill=1".to_owned(),
+            format!("call-total-us fill={}", u64::MAX),
+        ];
+        assert_eq!(
+            step_means(&huge, Clock::Kvm)[1],
+            format!("step means ns fill={}", u128::from(u64::MAX) * 1000)
+        );
+    }
+
+    #[test]
+    fn the_pass_line_marks_an_icount_or_kvm_result() {
         let root = Path::new("/t/run");
         assert_eq!(
-            pass_line(42, root, false),
+            pass_line(42, root, Clock::Emulated),
             "DEV_BOOT_CHECK_PASS seconds=42 root=/t/run\n"
         );
         assert_eq!(
-            pass_line(42, root, true),
+            pass_line(42, root, Clock::Icount),
             "DEV_BOOT_CHECK_PASS seconds=42 root=/t/run icount=1\n"
         );
+        assert_eq!(
+            pass_line(42, root, Clock::Kvm),
+            "DEV_BOOT_CHECK_PASS seconds=42 root=/t/run kvm=1\n"
+        );
+    }
+
+    #[test]
+    fn kvm_adds_the_accelerator_host_cpu_and_split_irqchip_and_changes_nothing_else() {
+        for smp in [false, true] {
+            let arguments = |clock| {
+                qemu_arguments(
+                    smp,
+                    clock,
+                    Path::new("/p"),
+                    Path::new("/v"),
+                    Path::new("/c"),
+                    Path::new("/r.img"),
+                )
+            };
+            let (plain, kvm) = (arguments(Clock::Emulated), arguments(Clock::Kvm));
+            // Without KVM the list is exactly today's.
+            let vcpus = if smp { "4" } else { "1" };
+            let expected: Vec<String> = [
+                "-machine",
+                "q35",
+                "-m",
+                "2048M",
+                "-smp",
+                vcpus,
+                "-cpu",
+                "qemu64,+pdpe1gb,+smep,+smap",
+                "-nodefaults",
+                "-display",
+                "none",
+                "-monitor",
+                "unix:/c.monitor,server,nowait",
+                "-no-reboot",
+                "-drive",
+                "if=pflash,format=raw,readonly=on,file=/p/artifacts/OVMF_CODE.fd",
+                "-drive",
+                "if=pflash,format=raw,file=/v",
+                "-device",
+                "intel-iommu,intremap=on",
+                "-drive",
+                "if=none,id=esp,format=raw,readonly=on,file=/p/artifacts/esp.img",
+                "-device",
+                "virtio-blk-pci,drive=esp,addr=0x1,disable-legacy=on,iommu_platform=on",
+                "-drive",
+                "if=none,id=root,format=raw,file=/r.img",
+                "-device",
+                "virtio-blk-pci,drive=root,addr=0x2,disable-legacy=on,iommu_platform=on",
+                "-serial",
+                "file:/c",
+                "-serial",
+                "stdio",
+            ]
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect();
+            assert_eq!(plain, expected);
+            // Under KVM: the accelerator first, the split irqchip, the host
+            // CPU in place of the TCG model, and nothing else changed.
+            let mut changed = expected.clone();
+            changed[1] = "q35,kernel-irqchip=split".into();
+            changed[7] = "host,migratable=no,+invtsc".into();
+            changed.splice(0..0, ["-accel".to_owned(), "kvm".to_owned()]);
+            assert_eq!(kvm, changed);
+            assert!(!kvm.iter().any(|arg| arg.starts_with("qemu64")));
+            assert!(!kvm.iter().any(|arg| arg == "-icount"));
+        }
+    }
+
+    #[test]
+    fn kvm_is_refused_unless_its_device_opens_read_write() {
+        let failure = kvm_access(Path::new("/nonexistent/kvm")).unwrap_err();
+        assert!(
+            failure.message.contains("/nonexistent/kvm"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("read-write"),
+            "{}",
+            failure.message
+        );
+        assert!(failure.message.contains("sg kvm -c"), "{}", failure.message);
+        assert!(
+            failure.message.contains("new login session"),
+            "{}",
+            failure.message
+        );
+        // A device that opens read-write is accepted.
+        assert!(kvm_access(Path::new("/dev/null")).is_ok());
+    }
+
+    #[test]
+    fn kvm_keeps_the_base_waits() {
+        assert_eq!(Patience::new(Clock::Kvm), Patience::new(Clock::Emulated));
     }
 
     #[test]
     fn smp_uses_the_f_matrix_cpu_count() {
         let args = qemu_arguments(
             true,
-            false,
+            Clock::Emulated,
             Path::new("/p"),
             Path::new("/v"),
             Path::new("/c"),
