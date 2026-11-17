@@ -16,7 +16,10 @@
 
 use std::{thread, time::Duration};
 
-use super::{Shell, contains, memory, spawn_job};
+use super::{
+    memory,
+    shell::{Shell, contains, spawn_job},
+};
 use crate::error::Failure;
 
 /// The foreground run, in both boots.

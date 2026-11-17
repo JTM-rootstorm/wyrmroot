@@ -36,7 +36,7 @@
 
 use std::{thread, time::Duration};
 
-use super::{Shell, contains, spawn_job};
+use super::shell::{Shell, contains, spawn_job};
 use crate::error::Failure;
 
 const MIB_KIB: u64 = 1024;
