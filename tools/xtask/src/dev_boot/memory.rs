@@ -169,12 +169,9 @@ fn back_to(shell: &mut Shell<'_>, base: &Memory, after: &str) -> Result<(), Fail
 }
 
 /// `result`, or if it failed, the failure with job `job`'s result if the
-/// job has already ended (so `wait` cannot block).
-fn explain(
-    shell: &mut Shell<'_>,
-    job: u64,
-    result: Result<Memory, Failure>,
-) -> Result<Memory, Failure> {
+/// job has already ended (so `wait` cannot block), and what a `hello` probe
+/// said by it (see [`hello_failure`]).
+fn explain<T>(shell: &mut Shell<'_>, job: u64, result: Result<T, Failure>) -> Result<T, Failure> {
     let Err(failure) = result else {
         return result;
     };
@@ -184,9 +181,10 @@ fn explain(
     }
     let ended = shell.run(&format!("wait {job}"))?;
     Err(Failure::task(format!(
-        "{}; job {job} had ended: {:?}",
+        "{}; job {job} had ended: {:?}{}",
         failure.message,
-        String::from_utf8_lossy(&super::strip_escapes(&ended))
+        String::from_utf8_lossy(&super::strip_escapes(&ended)),
+        said(&ended)
     )))
 }
 
@@ -202,10 +200,51 @@ fn end(shell: &mut Shell<'_>, job: u64) -> Result<(), Failure> {
         Ok(())
     } else {
         Err(Failure::task(format!(
-            "dev-boot check: job {job} was not still running: {:?}",
-            String::from_utf8_lossy(&output)
+            "dev-boot check: job {job} was not still running: {:?}{}",
+            String::from_utf8_lossy(&output),
+            said(&output)
         )))
     }
+}
+
+/// The top byte of a `hello` memory probe's failure status (`hello`'s
+/// `PROBE_FAILURE_PREFIX`, Deepwyrm DW2 M8 §13.4 item 2): the status is
+/// `0x4D00_0000 | (round << 16) | (site << 8) | code`, `code` being the low
+/// byte of the negated kernel status of the call that failed, or 0 for
+/// none, and `round` how far a churn probe got, saturating at 255 (0 for
+/// every other site).
+const PROBE_FAILURE_PREFIX: u64 = 0x4D00_0000;
+
+/// What a `hello` memory probe's status says, from the first `job result`
+/// line in `output` (as `wyrmsh` prints it, `application=` in decimal):
+/// `hello failed at site S with kernel status -C`, or `... with no kernel
+/// status`, then ` after N rounds` for a nonzero round (` after 255 or more
+/// rounds` at the saturated 255). `None` without such a line or when the status is not a probe
+/// failure.
+pub(super) fn hello_failure(output: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    let line = text.lines().find(|line| line.contains("job result job="))?;
+    let status = line_field(line.as_bytes(), "application")?;
+    if status >> 24 != PROBE_FAILURE_PREFIX >> 24 {
+        return None;
+    }
+    let (site, code, round) = ((status >> 8) & 0xff, status & 0xff, (status >> 16) & 0xff);
+    let failed = if code == 0 {
+        format!("hello failed at site {site} with no kernel status")
+    } else {
+        format!("hello failed at site {site} with kernel status -{code}")
+    };
+    Some(match round {
+        0 => failed,
+        255 => format!("{failed} after 255 or more rounds"),
+        _ => format!("{failed} after {round} rounds"),
+    })
+}
+
+/// [`hello_failure`] as a suffix for a failure message: `; <text>`, or
+/// nothing.
+pub(super) fn said(output: &[u8]) -> String {
+    hello_failure(output).map_or_else(String::new, |text| format!("; {text}"))
 }
 
 /// The value after `name=` on the line containing it.
@@ -231,9 +270,10 @@ pub(super) fn probes(shell: &mut Shell<'_>) -> Result<(), Failure> {
         || !contains(&output, b"classification=normal application=0 ")
     {
         return Err(Failure::task(format!(
-            "dev-boot check: `run bin/hello eager` (budget {} KiB planned) printed {:?}",
+            "dev-boot check: `run bin/hello eager` (budget {} KiB planned) printed {:?}{}",
             base.budget,
-            String::from_utf8_lossy(&output)
+            String::from_utf8_lossy(&output),
+            said(&output)
         )));
     }
     for line in String::from_utf8_lossy(&output)
@@ -283,9 +323,15 @@ pub(super) fn probes(shell: &mut Shell<'_>) -> Result<(), Failure> {
             thread::sleep(Duration::from_millis(200));
         }
         if churning.is_none() {
-            return Err(Failure::task(format!(
-                "dev-boot check: `hello {mode}` never reached its loop"
-            )));
+            // With the job's result if it has already ended, and what it
+            // said by it.
+            return explain(
+                shell,
+                job,
+                Err(Failure::task(format!(
+                    "dev-boot check: `hello {mode}` never reached its loop"
+                ))),
+            );
         }
         end(shell, job)?;
         back_to(shell, &base, &format!("`hello {mode}`"))?;
@@ -342,8 +388,9 @@ pub(super) fn close_spin(shell: &mut Shell<'_>) -> Result<Vec<Spin>, Failure> {
             .filter(|_| contains(&output, b"classification=normal application=0 "));
         let Some(spin) = spin else {
             return Err(Failure::task(format!(
-                "dev-boot check: `run bin/hello close-spin` printed {:?}",
-                String::from_utf8_lossy(&output)
+                "dev-boot check: `run bin/hello close-spin` printed {:?}{}",
+                String::from_utf8_lossy(&output),
+                said(&output)
             )));
         };
         for line in String::from_utf8_lossy(&output)
@@ -513,8 +560,9 @@ fn measured(output: &[u8], command: &str, name: &str, base: &Memory) -> Result<(
         || !contains(output, b"classification=normal application=0 ")
     {
         return Err(Failure::task(format!(
-            "dev-boot check: `{command}` printed {:?}",
-            String::from_utf8_lossy(output)
+            "dev-boot check: `{command}` printed {:?}{}",
+            String::from_utf8_lossy(output),
+            said(output)
         )));
     }
     let prefix = format!("{name} size-mib=");
@@ -765,6 +813,33 @@ pub(super) fn steps_report(log: &[u8]) -> Result<Vec<String>, String> {
         return Err(format!("no Stop landed inside a map in steps: {lines:?}"));
     }
     Ok(lines)
+}
+
+/// The kernel's `records-dropped=<n>` line, the last of its step report
+/// (Deepwyrm DW2 M8 §13.4 item 4): it must be there and `n` must be 0, or
+/// a kernel record was lost to a contended writer. Read from the raw COM1
+/// log, not through [`steps_report`], so it applies to a boot that ran no
+/// probe. Returns the line.
+pub(super) fn records_dropped(log: &[u8]) -> Result<String, String> {
+    let text = String::from_utf8_lossy(log);
+    let Some(line) = text
+        .lines()
+        .filter_map(|line| line.split_once("[steps] ").map(|(_, rest)| rest.trim_end()))
+        .find(|line| line.starts_with("records-dropped="))
+    else {
+        return Err(
+            "the kernel's step report has no `records-dropped` line (DW2 M8 §13.4 item 4)".into(),
+        );
+    };
+    match line_field(line.as_bytes(), "records-dropped") {
+        Some(0) => Ok(line.to_owned()),
+        Some(dropped) => Err(format!(
+            "the kernel dropped {dropped} records under contention: {line:?}"
+        )),
+        None => Err(format!(
+            "the kernel's records-dropped line does not parse: {line:?}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1039,6 +1114,87 @@ mod tests {
         assert!(finalize_hold(&line("0")).is_err());
         assert!(finalize_hold(&line("one")).is_err());
         assert!(finalize_hold(&report("")).is_err());
+    }
+
+    #[test]
+    fn a_probe_failure_in_a_job_result_is_decoded() {
+        // `wait 7` after `hello churn-commit` ended at site 39 with
+        // NO_RESOURCES (0x4D00_270D), as wyrmsh prints it.
+        let output = b"wait 7\r\njob result job=7 classification=normal \
+            application=1291855629 exception-class=0 exception-detail=0 \
+            exception-address=0 cleanup=0\r\nwyrmsh> ";
+        assert_eq!(
+            hello_failure(output).as_deref(),
+            Some("hello failed at site 39 with kernel status -13")
+        );
+        assert_eq!(
+            said(output),
+            "; hello failed at site 39 with kernel status -13"
+        );
+        // Code 0: a data check or an unknown mode (0x4D00_3700, site 55).
+        let none = b"job result job=3 classification=normal application=1291859712 \
+            exception-class=0 exception-detail=0 exception-address=0 cleanup=0\r\n";
+        assert_eq!(
+            hello_failure(none).as_deref(),
+            Some("hello failed at site 55 with no kernel status")
+        );
+        // A churn probe's round: `churn-create` refused NO_RESOURCES after
+        // 37 rounds (0x4D25_260D), and one past 255 rounds (0x4DFF_260D).
+        let rounds = |application: u64| {
+            hello_failure(
+                format!(
+                    "job result job=9 classification=normal application={application} \
+                     exception-class=0 exception-detail=0 exception-address=0 cleanup=0\r\n"
+                )
+                .as_bytes(),
+            )
+        };
+        assert_eq!(
+            rounds(1_294_280_205).as_deref(),
+            Some("hello failed at site 38 with kernel status -13 after 37 rounds")
+        );
+        assert_eq!(
+            rounds(1_308_567_053).as_deref(),
+            Some("hello failed at site 38 with kernel status -13 after 255 or more rounds")
+        );
+    }
+
+    #[test]
+    fn a_status_that_is_not_a_probe_failure_says_nothing() {
+        for application in ["0", "1", "2", "1207959565", "4278190080"] {
+            let output = format!(
+                "job result job=4 classification=authorized application={application} \
+                 exception-class=0 exception-detail=0 exception-address=0 cleanup=0\r\n"
+            );
+            assert_eq!(hello_failure(output.as_bytes()), None, "{application}");
+            assert_eq!(said(output.as_bytes()), "");
+        }
+        // No job result line at all.
+        assert_eq!(hello_failure(b"wyrmsh> wait 4\r\nwyrmsh> "), None);
+    }
+
+    #[test]
+    fn the_step_report_must_drop_no_record() {
+        let log = |line: &str| {
+            format!(
+                "[DW0][INFO][steps] timer-arm retries=0 deferred=0\n\
+                 {line}[DW0][INFO] no process remains; powering off\n"
+            )
+        };
+        assert_eq!(
+            records_dropped(log("[DW0][INFO][steps] records-dropped=0\n").as_bytes()),
+            Ok("records-dropped=0".into())
+        );
+        assert_eq!(
+            records_dropped(log("[DW0][INFO][steps] records-dropped=3\r\n").as_bytes()),
+            Err("the kernel dropped 3 records under contention: \"records-dropped=3\"".into())
+        );
+        assert!(records_dropped(log("").as_bytes()).is_err());
+        assert!(
+            records_dropped(log("[DW0][INFO][steps] records-dropped=many\n").as_bytes()).is_err()
+        );
+        // The line outside the step report does not count.
+        assert!(records_dropped(log("records-dropped=0\n").as_bytes()).is_err());
     }
 
     #[test]

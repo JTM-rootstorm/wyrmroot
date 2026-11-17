@@ -110,7 +110,14 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
 /// - `churn-map`, `churn-create`, `churn-commit`: repeat a 256 MiB map
 ///   (keeping the mappings until a map is refused), eager create, or
 ///   on-demand commit forever, for the check to stop mid-call (probe 15).
+///   The last two wait out a create refused with `NO_RESOURCES` (closed
+///   objects count until their owed finalization is done; DW2 M8 §13.4
+///   item 2).
 /// - `slow-ready`: commits forever before READY (see `hello_main`).
+///
+/// A mode that fails ends its job with a `ProbeSite` status naming the
+/// place and the kernel status (`wyrmroot_hello::probe`, DW2 M8 §13.4
+/// item 2); the churn probes themselves are in that module.
 /// - `close-spin`: commits a 512 MiB on-demand object, closes it (its
 ///   finalization is then owed) and spins half a second in user mode with
 ///   no syscall and no fault, then prints `close-spin spin-us=` with the
@@ -127,13 +134,13 @@ mod memory {
         DW_MEMORY_PROTECTION_READ, DW_MEMORY_PROTECTION_WRITE, DW_RIGHT_MAP, DW_RIGHT_READ,
         DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_READABLE, DW_STATUS_NO_RESOURCES,
         DW_STATUS_SUCCESS, DwAddressRegionMapArgsV1, DwDeadline, DwHandle,
-        DwMemoryObjectCreateFlags, DwMemoryProtection, DwOffset, DwRights, DwSize, DwUserAddress,
-        DwWaitResultV1,
+        DwMemoryObjectCreateFlags, DwMemoryProtection, DwOffset, DwRights, DwSize, DwStatus,
+        DwUserAddress, DwWaitResultV1,
     };
+    use wyrmroot_hello::{ChurnCalls, ProbeSite, probe};
 
     const MIB: u64 = 1 << 20;
     const PAGE: u64 = 4096;
-    const CHURN: u64 = 256 * MIB;
     const HOLD: u64 = 64 * MIB;
     /// `close-spin`'s object: about 256 finalize steps of 512 entries.
     const SPIN_OBJECT: u64 = 512 * MIB;
@@ -197,50 +204,106 @@ mod memory {
                         write(b"on-demand quota next\n");
                         super::on_demand::exhaust(base, budget)
                     }
-                    Err(failure) => {
+                    Err((failure, status)) => {
                         write(failure);
-                        2
+                        status
                     }
                 }
             }
             "eager" => eager(region, write),
             "hold-touched" | "hold-released" => hold(region, mode == "hold-released"),
-            "churn-map" => churn_map(region),
-            "churn-create" => loop {
-                let Ok(object) = create(CHURN, DwMemoryObjectCreateFlags(0)) else {
-                    return 2;
+            "churn-map" => probe::churn_map(&mut Calls {
+                region,
+                sleeper: None,
+            }),
+            "churn-create" | "churn-commit" => {
+                // The pause between refused creates, made once.
+                let sleeper = match Sleeper::new() {
+                    Ok(sleeper) => sleeper,
+                    Err(status) => return ProbeSite::ChurnSleeper.with(status),
                 };
-                deepwyrm_syscall::handle_close(object);
-            },
-            "churn-commit" => loop {
-                if commit_once(CHURN).is_err() {
-                    return 2;
+                let mut calls = Calls {
+                    region,
+                    sleeper: Some(sleeper),
+                };
+                if mode == "churn-create" {
+                    probe::churn_create(&mut calls)
+                } else {
+                    probe::churn_commit(&mut calls)
                 }
-            },
+            }
             "close-spin" => close_spin(write),
             "fragment" => match size_mib {
                 Some(filler) => fragment(budget, filler * MIB),
-                None => 2,
+                None => ProbeSite::FragmentArgument.alone(),
             },
             "fragmented" | "unfragmented" => {
                 measure(mode, region, size_mib.unwrap_or(0) * MIB, write)
             }
-            _ => 2,
+            _ => ProbeSite::UnknownMode.alone(),
         }
     }
 
     /// `slow-ready`: commits 512 MiB objects, one after another, forever.
     pub(super) fn slow_ready() -> ! {
+        // `slow-ready` maps nothing; the region is never used.
+        let mut calls = Calls {
+            region: DwHandle(0),
+            sleeper: None,
+        };
         loop {
-            let _ = commit_once(512 * MIB);
+            let _ = probe::commit_once(&mut calls, 512 * MIB);
         }
     }
 
-    fn commit_once(size: u64) -> Result<(), ()> {
-        let object = create(size, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND)?;
-        let _ = deepwyrm_syscall::memory_object_commit(object, DwOffset(0), DwSize(size));
-        deepwyrm_syscall::handle_close(object);
-        Ok(())
+    /// The churn probes' kernel calls in `region`: the raw syscalls and
+    /// nothing else.
+    struct Calls {
+        region: DwHandle,
+        /// The pause's channel: only `churn-create` and `churn-commit`,
+        /// which pause, have one.
+        sleeper: Option<Sleeper>,
+    }
+
+    impl ChurnCalls for Calls {
+        fn create(
+            &mut self,
+            size: u64,
+            flags: DwMemoryObjectCreateFlags,
+        ) -> Result<DwHandle, DwStatus> {
+            create(size, flags)
+        }
+
+        fn commit(&mut self, object: DwHandle, size: u64) -> DwStatus {
+            deepwyrm_syscall::memory_object_commit(object, DwOffset(0), DwSize(size))
+        }
+
+        fn map(&mut self, object: DwHandle, size: u64) -> Result<u64, DwStatus> {
+            map(self.region, object, size)
+        }
+
+        fn unmap(&mut self, at: u64, size: u64) -> Result<(), DwStatus> {
+            unmap(self.region, at, size)
+        }
+
+        fn close(&mut self, handle: DwHandle) -> DwStatus {
+            deepwyrm_syscall::handle_close(handle)
+        }
+
+        fn pause(&mut self) {
+            if let Some(sleeper) = &self.sleeper {
+                sleeper.sleep(probe::CHURN_PAUSE_US);
+            }
+        }
+    }
+
+    /// The kernel status as an error, `Ok` on success.
+    fn checked(status: DwStatus) -> Result<(), DwStatus> {
+        if status == DW_STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(status)
+        }
     }
 
     fn now_us() -> u64 {
@@ -249,16 +312,19 @@ mod memory {
         nanoseconds / 1000
     }
 
-    fn create(size: u64, flags: DwMemoryObjectCreateFlags) -> Result<DwHandle, ()> {
+    fn create(size: u64, flags: DwMemoryObjectCreateFlags) -> Result<DwHandle, DwStatus> {
         let mut object = DwHandle(0);
         let rights = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0);
-        (deepwyrm_syscall::memory_object_create(DwSize(size), flags, rights, &mut object)
-            == DW_STATUS_SUCCESS)
-            .then_some(object)
-            .ok_or(())
+        checked(deepwyrm_syscall::memory_object_create(
+            DwSize(size),
+            flags,
+            rights,
+            &mut object,
+        ))
+        .map(|()| object)
     }
 
-    fn map(region: DwHandle, object: DwHandle, size: u64) -> Result<u64, ()> {
+    fn map(region: DwHandle, object: DwHandle, size: u64) -> Result<u64, DwStatus> {
         let args = DwAddressRegionMapArgsV1 {
             size: DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE,
             version: DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
@@ -268,16 +334,18 @@ mod memory {
             ..DwAddressRegionMapArgsV1::default()
         };
         let mut at = DwUserAddress(0);
-        (deepwyrm_syscall::address_region_map(region, object, &args, &mut at) == DW_STATUS_SUCCESS)
-            .then_some(at.0)
-            .ok_or(())
+        checked(deepwyrm_syscall::address_region_map(
+            region, object, &args, &mut at,
+        ))
+        .map(|()| at.0)
     }
 
-    fn unmap(region: DwHandle, at: u64, size: u64) -> Result<(), ()> {
-        (deepwyrm_syscall::address_region_unmap(region, DwUserAddress(at), DwSize(size))
-            == DW_STATUS_SUCCESS)
-            .then_some(())
-            .ok_or(())
+    fn unmap(region: DwHandle, at: u64, size: u64) -> Result<(), DwStatus> {
+        checked(deepwyrm_syscall::address_region_unmap(
+            region,
+            DwUserAddress(at),
+            DwSize(size),
+        ))
     }
 
     fn read(address: u64) -> u64 {
@@ -310,11 +378,11 @@ mod memory {
                 Ok(times) => {
                     write(timed_line("eager", size_mib, times).bytes());
                 }
-                Err(step) => {
+                Err((step, status)) => {
                     let mut line = Line::new();
                     line.text("eager failed: ").text(step).text("\n");
                     write(line.bytes());
-                    return 2;
+                    return status;
                 }
             }
         }
@@ -342,34 +410,39 @@ mod memory {
     }
 
     /// One eager object of `size`: create, map, touch, protect read-only,
-    /// unmap, close; the microseconds each took.
-    fn eager_once(region: DwHandle, size: u64) -> Result<[u64; 6], &'static str> {
+    /// unmap, close; the microseconds each took, or the step that failed
+    /// and the job status that says so.
+    fn eager_once(region: DwHandle, size: u64) -> Result<[u64; 6], (&'static str, u32)> {
         let start = now_us();
-        let object = create(size, DwMemoryObjectCreateFlags(0)).map_err(|()| "create")?;
+        let object = create(size, DwMemoryObjectCreateFlags(0))
+            .map_err(|status| ("create", ProbeSite::EagerCreate.with(status)))?;
         let created = now_us();
-        let base = map(region, object, size).map_err(|()| "map")?;
+        let base = map(region, object, size)
+            .map_err(|status| ("map", ProbeSite::EagerMap.with(status)))?;
         let mapped = now_us();
         if !touch_all(base, size) {
-            return Err("touch");
+            return Err(("touch", ProbeSite::EagerTouch.alone()));
         }
         let touched = now_us();
-        if deepwyrm_syscall::address_region_protect(
+        let status = deepwyrm_syscall::address_region_protect(
             region,
             DwUserAddress(base),
             DwSize(size),
             DW_MEMORY_PROTECTION_READ,
-        ) != DW_STATUS_SUCCESS
-        {
-            return Err("protect");
+        );
+        if status != DW_STATUS_SUCCESS {
+            return Err(("protect", ProbeSite::EagerProtect.with(status)));
         }
         let protected = now_us();
         if read(base + size - PAGE) != base + size - PAGE || read(base) != base {
-            return Err("read back");
+            return Err(("read back", ProbeSite::EagerReadBack.alone()));
         }
-        unmap(region, base, size).map_err(|()| "unmap")?;
+        unmap(region, base, size)
+            .map_err(|status| ("unmap", ProbeSite::EagerUnmap.with(status)))?;
         let unmapped = now_us();
-        if deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS {
-            return Err("close");
+        let status = deepwyrm_syscall::handle_close(object);
+        if status != DW_STATUS_SUCCESS {
+            return Err(("close", ProbeSite::EagerClose.with(status)));
         }
         let closed = now_us();
         Ok([
@@ -385,54 +458,26 @@ mod memory {
     /// Maps [`HOLD`] on demand, lets the object's handle go, touches every
     /// page, unmaps the top half if `release`, then waits forever.
     fn hold(region: DwHandle, release: bool) -> u32 {
-        let Ok(object) = create(HOLD, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND) else {
-            return 2;
+        let object = match create(HOLD, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND) {
+            Ok(object) => object,
+            Err(status) => return ProbeSite::HoldCreate.with(status),
         };
-        let Ok(base) = map(region, object, HOLD) else {
-            return 2;
+        let base = match map(region, object, HOLD) {
+            Ok(base) => base,
+            Err(status) => return ProbeSite::HoldMap.with(status),
         };
         // Only the mapping holds the object now, so an unmap returns pages.
-        if deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS || !touch_all(base, HOLD) {
-            return 2;
+        let status = deepwyrm_syscall::handle_close(object);
+        if status != DW_STATUS_SUCCESS {
+            return ProbeSite::HoldClose.with(status);
         }
-        if release && unmap(region, base + HOLD / 2, HOLD / 2).is_err() {
-            return 2;
+        if !touch_all(base, HOLD) {
+            return ProbeSite::HoldTouch.alone();
+        }
+        if release && let Err(status) = unmap(region, base + HOLD / 2, HOLD / 2) {
+            return ProbeSite::HoldUnmap.with(status);
         }
         wait_forever()
-    }
-
-    fn churn_map(region: DwHandle) -> u32 {
-        let Ok(object) = create(CHURN, DwMemoryObjectCreateFlags(0)) else {
-            return 2;
-        };
-        // The object is mapped again and again at new addresses and the
-        // mappings are kept, so the job is almost always inside a map's
-        // steps when it is stopped (probe 15). Only when a map is refused
-        // (slots, room or page-table quota) are they all unmapped.
-        let mut bases = [0_u64; 64];
-        let mut count = 0;
-        loop {
-            match map(region, object, CHURN) {
-                Ok(base) if count < bases.len() => {
-                    bases[count] = base;
-                    count += 1;
-                }
-                Ok(base) => {
-                    if unmap(region, base, CHURN).is_err() {
-                        return 2;
-                    }
-                }
-                Err(_) if count > 0 => {
-                    for &base in &bases[..count] {
-                        if unmap(region, base, CHURN).is_err() {
-                            return 2;
-                        }
-                    }
-                    count = 0;
-                }
-                Err(_) => return 2,
-            }
-        }
     }
 
     /// `close-spin`: a committed on-demand object closed, then a spin of
@@ -440,13 +485,14 @@ mod memory {
     /// clock read after it. The object fills the job's budget, so its
     /// commit may stop at the quota; what was committed is kept.
     fn close_spin(write: &mut dyn FnMut(&[u8]) -> bool) -> u32 {
-        let Ok(object) = create(SPIN_OBJECT, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND) else {
-            return 2;
+        let object = match create(SPIN_OBJECT, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND) {
+            Ok(object) => object,
+            Err(status) => return ProbeSite::CloseSpinCreate.with(status),
         };
         let committed =
             deepwyrm_syscall::memory_object_commit(object, DwOffset(0), DwSize(SPIN_OBJECT));
         if committed != DW_STATUS_SUCCESS && committed != DW_STATUS_NO_RESOURCES {
-            return 2;
+            return ProbeSite::CloseSpinCommit.with(committed);
         }
         // Calibrated before the close, with the same function, so its code
         // and stack are already touched when it runs after the close.
@@ -464,8 +510,9 @@ mod memory {
             u64::try_from(u128::from(iterations) * u128::from(SPIN_US) / u128::from(elapsed))
                 .unwrap_or(u64::MAX);
         let start = now_us();
-        if deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS {
-            return 2;
+        let status = deepwyrm_syscall::handle_close(object);
+        if status != DW_STATUS_SUCCESS {
+            return ProbeSite::CloseSpinClose.with(status);
         }
         let cpu_before = cpu();
         spin(target);
@@ -537,48 +584,57 @@ mod memory {
         let filled = if filler == 0 {
             None
         } else {
-            let Ok(object) = create(filler, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND) else {
-                return 2;
+            let object = match create(filler, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND) {
+                Ok(object) => object,
+                Err(status) => return ProbeSite::FragmentFillerCreate.with(status),
             };
-            if deepwyrm_syscall::memory_object_commit(object, DwOffset(0), DwSize(filler))
-                != DW_STATUS_SUCCESS
-            {
-                return 2;
+            let status =
+                deepwyrm_syscall::memory_object_commit(object, DwOffset(0), DwSize(filler));
+            if status != DW_STATUS_SUCCESS {
+                return ProbeSite::FragmentFillerCommit.with(status);
             }
             Some(object)
         };
-        let (Ok(pins), Ok(holes)) = (
+        let (pins, holes) = match (
             create(groups * PAGE, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND),
             create(
                 groups * PAGE * HOLE_PAGES,
                 DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND,
             ),
-        ) else {
-            return 2;
+        ) {
+            (Ok(pins), Ok(holes)) => (pins, holes),
+            (Err(status), _) => return ProbeSite::FragmentPinsCreate.with(status),
+            (_, Err(status)) => return ProbeSite::FragmentHolesCreate.with(status),
         };
         for index in 0..groups {
             let hole_size = PAGE * HOLE_PAGES;
-            if deepwyrm_syscall::memory_object_commit(pins, DwOffset(index * PAGE), DwSize(PAGE))
-                != DW_STATUS_SUCCESS
-                || deepwyrm_syscall::memory_object_commit(
-                    holes,
-                    DwOffset(index * hole_size),
-                    DwSize(hole_size),
-                ) != DW_STATUS_SUCCESS
-            {
-                return 2;
+            let status =
+                deepwyrm_syscall::memory_object_commit(pins, DwOffset(index * PAGE), DwSize(PAGE));
+            if status != DW_STATUS_SUCCESS {
+                return ProbeSite::FragmentPinCommit.with(status);
+            }
+            let status = deepwyrm_syscall::memory_object_commit(
+                holes,
+                DwOffset(index * hole_size),
+                DwSize(hole_size),
+            );
+            if status != DW_STATUS_SUCCESS {
+                return ProbeSite::FragmentHoleCommit.with(status);
             }
         }
-        if let Some(object) = filled
-            && deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS
-        {
-            return 2;
+        if let Some(object) = filled {
+            let status = deepwyrm_syscall::handle_close(object);
+            if status != DW_STATUS_SUCCESS {
+                return ProbeSite::FragmentFillerClose.with(status);
+            }
         }
-        if deepwyrm_syscall::handle_close(holes) != DW_STATUS_SUCCESS {
-            return 2;
+        let status = deepwyrm_syscall::handle_close(holes);
+        if status != DW_STATUS_SUCCESS {
+            return ProbeSite::FragmentHolesClose.with(status);
         }
-        let Ok(sleeper) = Sleeper::new() else {
-            return 2;
+        let sleeper = match Sleeper::new() {
+            Ok(sleeper) => sleeper,
+            Err(status) => return ProbeSite::FragmentSleeper.with(status),
         };
         let last = budget.saturating_sub(FINAL_SPARE + groups * PAGE);
         loop {
@@ -593,7 +649,7 @@ mod memory {
                 break;
             }
             if status != DW_STATUS_NO_RESOURCES {
-                return 2;
+                return ProbeSite::FragmentFinalCreate.with(status);
             }
             sleeper.sleep(RETRY_US);
         }
@@ -612,18 +668,20 @@ mod memory {
         top_up: u64,
         write: &mut dyn FnMut(&[u8]) -> bool,
     ) -> u32 {
-        let failed = |write: &mut dyn FnMut(&[u8]) -> bool, step: &str| {
+        let failed = |write: &mut dyn FnMut(&[u8]) -> bool, step: &str, status: u32| {
             let mut line = Line::new();
             line.text(name).text(" failed: ").text(step).text("\n");
             write(line.bytes());
-            2
+            status
         };
         let held = if top_up == 0 {
             None
         } else {
             match create(top_up, DwMemoryObjectCreateFlags(0)) {
                 Ok(object) => Some(object),
-                Err(()) => return failed(write, "top-up"),
+                Err(status) => {
+                    return failed(write, "top-up", ProbeSite::MeasureTopUp.with(status));
+                }
             }
         };
         let status = match eager_once(region, MEASURED_MIB * MIB) {
@@ -631,12 +689,17 @@ mod memory {
                 write(timed_line(name, MEASURED_MIB, times).bytes());
                 0
             }
-            Err(step) => failed(write, step),
+            Err((step, status)) => failed(write, step, status),
         };
-        if let Some(object) = held
-            && deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS
-        {
-            return failed(write, "top-up close");
+        if let Some(object) = held {
+            let closed = deepwyrm_syscall::handle_close(object);
+            if closed != DW_STATUS_SUCCESS {
+                return failed(
+                    write,
+                    "top-up close",
+                    ProbeSite::MeasureTopUpClose.with(closed),
+                );
+            }
         }
         if status == 0 {
             let mut line = Line::new();
@@ -652,16 +715,15 @@ mod memory {
     }
 
     impl Sleeper {
-        fn new() -> Result<Self, ()> {
+        fn new() -> Result<Self, DwStatus> {
             let (mut sender, mut receiver) = (DwHandle(0), DwHandle(0));
             // The sender stays open, so the receiver never becomes readable.
-            (deepwyrm_syscall::channel_create(
+            checked(deepwyrm_syscall::channel_create(
                 DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0),
                 &mut sender,
                 &mut receiver,
-            ) == DW_STATUS_SUCCESS)
-                .then_some(Self { receiver })
-                .ok_or(())
+            ))
+            .map(|()| Self { receiver })
         }
 
         /// Waits about `us` microseconds of active time.
@@ -677,20 +739,26 @@ mod memory {
             );
         }
 
+        /// Waits forever; if the wait ever returns, the job status that
+        /// says so, with the wait's status.
         fn forever(&self) -> u32 {
             let mut result = DwWaitResultV1::default();
-            deepwyrm_syscall::wait_one(
+            let status = deepwyrm_syscall::wait_one(
                 self.receiver,
                 DW_SIGNAL_READABLE,
                 DW_DEADLINE_INFINITE,
                 &mut result,
             );
-            2
+            ProbeSite::WaitEnded.with(status)
         }
     }
 
+    /// `hold-*`'s wait that never ends.
     fn wait_forever() -> u32 {
-        Sleeper::new().map_or(2, |sleeper| sleeper.forever())
+        Sleeper::new().map_or_else(
+            |status| ProbeSite::HoldSleeper.with(status),
+            |sleeper| sleeper.forever(),
+        )
     }
 
     /// A line built without allocation; text past its size is dropped.
@@ -765,6 +833,7 @@ mod on_demand {
         DwAddressRegionMapArgsV1, DwChannelReceiveResultV1, DwHandle, DwMemoryObjectInfoV1,
         DwMemoryProtection, DwOffset, DwRights, DwSize, DwUserAddress,
     };
+    use wyrmroot_hello::ProbeSite;
 
     const MIB: u64 = 1 << 20;
     /// The mapped object's size, which the fixed offsets below fit in.
@@ -788,53 +857,64 @@ mod on_demand {
 
     /// Commits a new object four times the job's budget, so the commit stops
     /// at the quota with `NO_RESOURCES`; then touches an untouched page of
-    /// the probe's mapping at `base`, which ends the job. Exit status 2 if
-    /// the object could not be made or the commit was not refused.
+    /// the probe's mapping at `base`, which ends the job. A [`ProbeSite`]
+    /// failure if the object could not be made or the commit was not
+    /// refused.
     pub(super) fn exhaust(base: u64, budget: u64) -> u32 {
         let Some(size) = budget.checked_mul(4) else {
-            return 2;
+            return ProbeSite::ExhaustSize.alone();
         };
         let mut object = DwHandle(0);
-        if deepwyrm_syscall::memory_object_create(
+        let status = deepwyrm_syscall::memory_object_create(
             DwSize(size),
             DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND,
             // Commit needs MAP.
             DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0),
             &mut object,
-        ) != DW_STATUS_SUCCESS
-            || deepwyrm_syscall::memory_object_commit(object, DwOffset(0), DwSize(size))
-                != DW_STATUS_NO_RESOURCES
-        {
-            return 2;
+        );
+        if status != DW_STATUS_SUCCESS {
+            return ProbeSite::ExhaustCreate.with(status);
+        }
+        let status = deepwyrm_syscall::memory_object_commit(object, DwOffset(0), DwSize(size));
+        if status != DW_STATUS_NO_RESOURCES {
+            return ProbeSite::ExhaustCommit.with(status);
         }
         touch(base + 50 * MIB);
         1
     }
 
     /// The probe; with `keep`, the mapping is left for [`exhaust`]. Its
-    /// base, or the line naming the step that failed.
-    pub(super) fn probe(region: DwHandle, keep: bool) -> Result<u64, &'static [u8]> {
+    /// base, or the line naming the step that failed and the job status
+    /// that says so.
+    pub(super) fn probe(region: DwHandle, keep: bool) -> Result<u64, (&'static [u8], u32)> {
         let size = SIZE;
         let mut object = DwHandle(0);
         let rights =
             DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0);
-        if deepwyrm_syscall::memory_object_create(
+        let status = deepwyrm_syscall::memory_object_create(
             DwSize(size),
             DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND,
             rights,
             &mut object,
-        ) != DW_STATUS_SUCCESS
-        {
-            return Err(b"on-demand failed: create\n");
+        );
+        if status != DW_STATUS_SUCCESS {
+            return Err((
+                b"on-demand failed: create\n",
+                ProbeSite::OnDemandCreate.with(status),
+            ));
         }
         let mut info = DwMemoryObjectInfoV1::default();
         let mut required = 0;
-        if deepwyrm_syscall::object_get_memory_object_info_v1(object, &mut info, &mut required)
-            != DW_STATUS_SUCCESS
+        let status =
+            deepwyrm_syscall::object_get_memory_object_info_v1(object, &mut info, &mut required);
+        if status != DW_STATUS_SUCCESS
             || info.flags != DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND
             || info.byte_size != size
         {
-            return Err(b"on-demand failed: info\n");
+            return Err((
+                b"on-demand failed: info\n",
+                ProbeSite::OnDemandInfo.with(status),
+            ));
         }
         let args = DwAddressRegionMapArgsV1 {
             size: DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE,
@@ -847,14 +927,20 @@ mod on_demand {
             ..DwAddressRegionMapArgsV1::default()
         };
         let mut at = DwUserAddress(0);
-        if deepwyrm_syscall::address_region_map(region, object, &args, &mut at) != DW_STATUS_SUCCESS
-        {
-            return Err(b"on-demand failed: map\n");
+        let status = deepwyrm_syscall::address_region_map(region, object, &args, &mut at);
+        if status != DW_STATUS_SUCCESS {
+            return Err((
+                b"on-demand failed: map\n",
+                ProbeSite::OnDemandMap.with(status),
+            ));
         }
         let base = at.0;
         // A read fault, then writes past the first 16 MiB and at the end.
         if read(base) != 0 {
-            return Err(b"on-demand failed: first read\n");
+            return Err((
+                b"on-demand failed: first read\n",
+                ProbeSite::OnDemandFirstRead.alone(),
+            ));
         }
         write(base + 40 * MIB + 8, MARK);
         write(base + size - 8, !MARK);
@@ -863,35 +949,44 @@ mod on_demand {
             || read(base + 40 * MIB + 4096) != 0
             || read(base + 8) != 0
         {
-            return Err(b"on-demand failed: touch\n");
+            return Err((
+                b"on-demand failed: touch\n",
+                ProbeSite::OnDemandTouch.alone(),
+            ));
         }
         // A syscall writes into a page nothing has touched.
         let out = base + 20 * MIB;
         // SAFETY: an aligned word of the probe's own read-write mapping.
         let nanoseconds = unsafe { &mut *(out as *mut u64) };
-        if deepwyrm_syscall::clock_get(DW_CLOCK_MONOTONIC_ACTIVE.0, nanoseconds)
-            != DW_STATUS_SUCCESS
-            || read(out) == 0
-        {
-            return Err(b"on-demand failed: fill-in\n");
+        let status = deepwyrm_syscall::clock_get(DW_CLOCK_MONOTONIC_ACTIVE.0, nanoseconds);
+        if status != DW_STATUS_SUCCESS || read(out) == 0 {
+            return Err((
+                b"on-demand failed: fill-in\n",
+                ProbeSite::OnDemandFillIn.with(status),
+            ));
         }
-        if deepwyrm_syscall::memory_object_commit(object, DwOffset(30 * MIB), DwSize(4096))
-            != DW_STATUS_SUCCESS
-            || read(base + 30 * MIB) != 0
-        {
-            return Err(b"on-demand failed: commit\n");
+        let status =
+            deepwyrm_syscall::memory_object_commit(object, DwOffset(30 * MIB), DwSize(4096));
+        if status != DW_STATUS_SUCCESS || read(base + 30 * MIB) != 0 {
+            return Err((
+                b"on-demand failed: commit\n",
+                ProbeSite::OnDemandCommit.with(status),
+            ));
         }
         // A syscall reads from a page nothing has touched: the kernel fills
         // it in for the read, and what it reads is zeros.
         let input = base + 25 * MIB;
         let (mut sender, mut receiver) = (DwHandle(0), DwHandle(0));
-        if deepwyrm_syscall::channel_create(
+        let status = deepwyrm_syscall::channel_create(
             DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0),
             &mut sender,
             &mut receiver,
-        ) != DW_STATUS_SUCCESS
-        {
-            return Err(b"on-demand failed: channel\n");
+        );
+        if status != DW_STATUS_SUCCESS {
+            return Err((
+                b"on-demand failed: channel\n",
+                ProbeSite::OnDemandChannel.with(status),
+            ));
         }
         // SAFETY: 64 bytes of the probe's own mapping, never written.
         let untouched = unsafe { core::slice::from_raw_parts(input as *const u8, 64) };
@@ -899,23 +994,43 @@ mod on_demand {
         let mut result = DwChannelReceiveResultV1::default();
         let sent = deepwyrm_syscall::channel_send(sender, untouched, &[], 0);
         let got = deepwyrm_syscall::channel_receive(receiver, &mut received, &mut [], &mut result);
-        let closed = deepwyrm_syscall::handle_close(sender) == DW_STATUS_SUCCESS
-            && deepwyrm_syscall::handle_close(receiver) == DW_STATUS_SUCCESS;
-        if sent != DW_STATUS_SUCCESS
-            || got != DW_STATUS_SUCCESS
-            || !closed
-            || received.iter().any(|byte| *byte != 0)
-            || read(input) != 0
-        {
-            return Err(b"on-demand failed: read fill-in\n");
+        // The receiver is closed only if the sender was, as before.
+        let closed_sender = deepwyrm_syscall::handle_close(sender);
+        let closed_receiver = if closed_sender == DW_STATUS_SUCCESS {
+            deepwyrm_syscall::handle_close(receiver)
+        } else {
+            DW_STATUS_SUCCESS
+        };
+        let read_fill_in = b"on-demand failed: read fill-in\n";
+        for (status, site) in [
+            (sent, ProbeSite::OnDemandSend),
+            (got, ProbeSite::OnDemandReceive),
+            (closed_sender, ProbeSite::OnDemandCloseSender),
+            (closed_receiver, ProbeSite::OnDemandCloseReceiver),
+        ] {
+            if status != DW_STATUS_SUCCESS {
+                return Err((read_fill_in, site.with(status)));
+            }
+        }
+        if received.iter().any(|byte| *byte != 0) || read(input) != 0 {
+            return Err((read_fill_in, ProbeSite::OnDemandReadFillIn.alone()));
         }
         if keep {
             return Ok(base);
         }
-        if deepwyrm_syscall::address_region_unmap(region, at, DwSize(size)) != DW_STATUS_SUCCESS
-            || deepwyrm_syscall::handle_close(object) != DW_STATUS_SUCCESS
-        {
-            return Err(b"on-demand failed: teardown\n");
+        let status = deepwyrm_syscall::address_region_unmap(region, at, DwSize(size));
+        if status != DW_STATUS_SUCCESS {
+            return Err((
+                b"on-demand failed: teardown\n",
+                ProbeSite::OnDemandUnmap.with(status),
+            ));
+        }
+        let status = deepwyrm_syscall::handle_close(object);
+        if status != DW_STATUS_SUCCESS {
+            return Err((
+                b"on-demand failed: teardown\n",
+                ProbeSite::OnDemandClose.with(status),
+            ));
         }
         Ok(base)
     }
