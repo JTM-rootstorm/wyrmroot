@@ -13,18 +13,26 @@
 //! every other site. A spawned job has no streams, so this status is all it can say.
 //! A probe's own success (0) and its deliberate ends (1) never carry the
 //! `0x4D` top byte.
+//!
+//! No probe waits out a refused call. The kernel refuses a create or a
+//! commit only when no owed work could admit it, and waits for that work
+//! inside the call itself (DW2 M8 §13.12 part b), so a refused create ends
+//! `churn-create`, `churn-commit` and `touch-loop` like any other failed
+//! call: they are the regression test of that wait.
 
 use deepwyrm_syscall::{
-    DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND, DW_STATUS_NO_RESOURCES, DW_STATUS_SUCCESS, DwHandle,
-    DwMemoryObjectCreateFlags, DwStatus,
+    DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND, DW_STATUS_SUCCESS, DwHandle, DwMemoryObjectCreateFlags,
+    DwStatus,
 };
 
 /// The top byte of every probe failure status.
 pub const PROBE_FAILURE_PREFIX: u32 = 0x4D00_0000;
 
 /// Where a memory probe failed. The numbers are fixed so a status read
-/// from an old log names the same place. Unless a variant says otherwise,
-/// the code is the named call's kernel status.
+/// from an old log names the same place; a retired site's number (56, 57,
+/// 58, 60 and 62, which the waits for a refused create used) is never
+/// reused. Unless a variant says otherwise, the code is the named call's
+/// kernel status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ProbeSite {
@@ -147,30 +155,11 @@ pub enum ProbeSite {
     WaitEnded = 54,
     /// An unknown mode (code 0).
     UnknownMode = 55,
-    /// `churn-create`, `churn-commit`: `channel_create` for the pause
-    /// between refused creates, made once before the loop.
-    ChurnSleeper = 56,
-    /// `churn-create`: `memory_object_create` still refused with
-    /// `NO_RESOURCES` after [`CHURN_REFUSALS_MAX`] pauses in a row (code
-    /// 13).
-    ChurnCreateStillRefused = 57,
-    /// `churn-commit`: `memory_object_create` still refused with
-    /// `NO_RESOURCES` after [`CHURN_REFUSALS_MAX`] pauses in a row (code
-    /// 13).
-    ChurnCommitStillRefused = 58,
     /// `touch-loop`: the size or the rounds argument is missing or out of
     /// range (code 0).
     TouchLoopArgument = 59,
-    /// `touch-loop`: `channel_create` for the pause between refused
-    /// creates, made once before the loop.
-    TouchLoopSleeper = 60,
-    /// `touch-loop`: `memory_object_create` refused other than with
-    /// `NO_RESOURCES`.
+    /// `touch-loop`: `memory_object_create` of the object.
     TouchLoopCreate = 61,
-    /// `touch-loop`: `memory_object_create` still refused with
-    /// `NO_RESOURCES` after [`CHURN_REFUSALS_MAX`] pauses in a row (code
-    /// 13).
-    TouchLoopCreateStillRefused = 62,
     /// `touch-loop`: `address_region_map` of the object.
     TouchLoopMap = 63,
     /// `touch-loop`: `handle_close` of the object once it is mapped.
@@ -185,7 +174,7 @@ pub enum ProbeSite {
 
 impl ProbeSite {
     /// Every site, for tests and decoders.
-    pub const ALL: [Self; 67] = [
+    pub const ALL: [Self; 62] = [
         Self::OnDemandCreate,
         Self::OnDemandInfo,
         Self::OnDemandMap,
@@ -241,13 +230,8 @@ impl ProbeSite {
         Self::FragmentFinalCreate,
         Self::WaitEnded,
         Self::UnknownMode,
-        Self::ChurnSleeper,
-        Self::ChurnCreateStillRefused,
-        Self::ChurnCommitStillRefused,
         Self::TouchLoopArgument,
-        Self::TouchLoopSleeper,
         Self::TouchLoopCreate,
-        Self::TouchLoopCreateStillRefused,
         Self::TouchLoopMap,
         Self::TouchLoopClose,
         Self::TouchLoopClock,
@@ -336,18 +320,7 @@ pub trait ChurnCalls {
     fn unmap(&mut self, at: u64, size: u64) -> Result<(), DwStatus>;
     /// `handle_close`.
     fn close(&mut self, handle: DwHandle) -> DwStatus;
-    /// Waits about [`CHURN_PAUSE_US`] doing nothing, after a create refused
-    /// with `NO_RESOURCES`.
-    fn pause(&mut self);
 }
-
-/// How long a churn probe waits after a create refused with
-/// `NO_RESOURCES` before it tries again: a closed object counts against
-/// the job's 64 until the kernel has finished its owed finalization.
-pub const CHURN_PAUSE_US: u64 = 10_000;
-/// How many pauses in a row (about five seconds) a churn probe waits out
-/// before a create still refused with `NO_RESOURCES` fails the job.
-pub const CHURN_REFUSALS_MAX: u32 = 500;
 
 /// An on-demand object of `size` created, committed whole and closed; the
 /// commit's and the close's statuses are not looked at. The create's
@@ -362,58 +335,35 @@ pub fn commit_once(calls: &mut impl ChurnCalls, size: u64) -> Result<(), DwStatu
 /// `churn-create`: a [`CHURN`] eager object created and closed, forever
 /// (see [`churn`] for a refused create).
 pub fn churn_create(calls: &mut impl ChurnCalls) -> u32 {
-    churn(
-        calls,
-        ProbeSite::ChurnCreate,
-        ProbeSite::ChurnCreateStillRefused,
-        |calls| {
-            let object = calls.create(CHURN, DwMemoryObjectCreateFlags(0))?;
-            calls.close(object);
-            Ok(())
-        },
-    )
+    churn(calls, ProbeSite::ChurnCreate, |calls| {
+        let object = calls.create(CHURN, DwMemoryObjectCreateFlags(0))?;
+        calls.close(object);
+        Ok(())
+    })
 }
 
 /// `churn-commit`: [`commit_once`] of [`CHURN`], forever (see [`churn`]
 /// for a refused create).
 pub fn churn_commit(calls: &mut impl ChurnCalls) -> u32 {
-    churn(
-        calls,
-        ProbeSite::ChurnCommitCreate,
-        ProbeSite::ChurnCommitStillRefused,
-        |calls| commit_once(calls, CHURN),
-    )
+    churn(calls, ProbeSite::ChurnCommitCreate, |calls| {
+        commit_once(calls, CHURN)
+    })
 }
 
-/// Runs `round` forever. A round whose create is refused with
-/// `NO_RESOURCES` is retried after a [`ChurnCalls::pause`]; once
-/// [`CHURN_REFUSALS_MAX`] pauses in a row have not helped, the next such
-/// refusal fails the job at `still`. Any other refusal fails it at once at
-/// `refused`. Either failure carries the rounds completed before it; a
-/// round that succeeds resets the pauses and makes no extra call.
+/// Runs `round` forever. The first round whose create is refused, with
+/// any status, ends the job at `refused` with that status and the rounds
+/// completed before it; nothing is retried.
 fn churn<C: ChurnCalls>(
     calls: &mut C,
     refused: ProbeSite,
-    still: ProbeSite,
     round: impl Fn(&mut C) -> Result<(), DwStatus>,
 ) -> u32 {
     let mut rounds: u32 = 0;
-    let mut pauses: u32 = 0;
     loop {
-        match round(calls) {
-            Ok(()) => {
-                rounds = rounds.saturating_add(1);
-                pauses = 0;
-            }
-            Err(status) if status != DW_STATUS_NO_RESOURCES => {
-                return refused.after(status, rounds);
-            }
-            Err(status) if pauses >= CHURN_REFUSALS_MAX => return still.after(status, rounds),
-            Err(_) => {
-                calls.pause();
-                pauses += 1;
-            }
+        if let Err(status) = round(calls) {
+            return refused.after(status, rounds);
         }
+        rounds = rounds.saturating_add(1);
     }
 }
 
@@ -507,20 +457,18 @@ fn decimal(text: &str) -> Option<u64> {
 }
 
 /// What `touch-loop` found: the least, the median (the lower middle of an
-/// even count) and the greatest of its rounds' nanoseconds a page, with
-/// the pauses its refused creates waited out.
+/// even count) and the greatest of its rounds' nanoseconds a page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TouchSummary {
     pub size_mib: u64,
     pub rounds: u32,
-    pub pauses: u32,
     pub min: u64,
     pub median: u64,
     pub max: u64,
 }
 
 impl TouchSummary {
-    /// `touch-loop size-mib=<n> rounds=<n> pauses=<n> min-ns-per-page=<n>
+    /// `touch-loop size-mib=<n> rounds=<n> min-ns-per-page=<n>
     /// median-ns-per-page=<n> max-ns-per-page=<n>` and a newline.
     #[must_use]
     pub fn line(&self) -> TouchLine {
@@ -531,7 +479,6 @@ impl TouchSummary {
         for (name, value) in [
             ("touch-loop size-mib=", self.size_mib),
             (" rounds=", u64::from(self.rounds)),
-            (" pauses=", u64::from(self.pauses)),
             (" min-ns-per-page=", self.min),
             (" median-ns-per-page=", self.median),
             (" max-ns-per-page=", self.max),
@@ -544,7 +491,7 @@ impl TouchSummary {
     }
 }
 
-/// The longest [`TouchSummary::line`]: its names and six numbers of up to
+/// The longest [`TouchSummary::line`]: its names and five numbers of up to
 /// twenty digits each.
 const TOUCH_LINE_BYTES: usize = 224;
 
@@ -614,13 +561,9 @@ pub fn spread(times: &[u64]) -> Option<(u64, u64, u64)> {
 /// after the second, has one page left. A round's figure is the touch
 /// pass's nanoseconds divided by its pages.
 ///
-/// A create refused with `NO_RESOURCES` (closed objects count against the
-/// job until their owed finalization is done) is retried after a
-/// [`ChurnCalls::pause`], each pause counted; once [`CHURN_REFUSALS_MAX`]
-/// pauses in a row have not helped, the next such refusal fails the job
-/// at [`ProbeSite::TouchLoopCreateStillRefused`]. Any other failed call
-/// ends the job at its own site with its kernel status, its round being
-/// the rounds completed. At the end `write` gets the summary's line
+/// Any failed call, a refused create included, ends the job at its own
+/// site with its kernel status, its round being the rounds completed;
+/// nothing is retried. At the end `write` gets the summary's line
 /// ([`TouchSummary::line`]) and the job status is 0. Sizes and rounds
 /// outside [`touch_loop_arguments`]'s ranges fail at
 /// [`ProbeSite::TouchLoopArgument`] before any call.
@@ -637,24 +580,10 @@ pub fn touch_loop(
     let pages = size / PAGE;
     let mut figures = [0_u64; TOUCH_ROUNDS_MAX as usize];
     let mut done: u32 = 0;
-    let mut pauses: u32 = 0;
     while done < rounds {
-        let mut refused: u32 = 0;
-        let object = loop {
-            match calls.create(size, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND) {
-                Ok(object) => break object,
-                Err(status) if status != DW_STATUS_NO_RESOURCES => {
-                    return ProbeSite::TouchLoopCreate.after(status, done);
-                }
-                Err(status) if refused >= CHURN_REFUSALS_MAX => {
-                    return ProbeSite::TouchLoopCreateStillRefused.after(status, done);
-                }
-                Err(_) => {
-                    calls.pause();
-                    refused += 1;
-                    pauses = pauses.saturating_add(1);
-                }
-            }
+        let object = match calls.create(size, DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND) {
+            Ok(object) => object,
+            Err(status) => return ProbeSite::TouchLoopCreate.after(status, done),
         };
         let base = match calls.map(object, size) {
             Ok(base) => base,
@@ -687,7 +616,6 @@ pub fn touch_loop(
     let summary = TouchSummary {
         size_mib,
         rounds,
-        pauses,
         min,
         median,
         max,

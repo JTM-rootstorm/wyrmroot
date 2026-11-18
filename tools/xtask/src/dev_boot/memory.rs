@@ -872,8 +872,8 @@ pub(super) fn usage_check(log: &[u8]) -> Result<String, String> {
         )),
         (Some(_), Some(0)) => Ok(line.to_owned()),
         (Some(_), Some(mismatches)) => Err(format!(
-            "the kernel's usage check found {mismatches} TaskGroups whose kept usage differs \
-             from a scan (DW2 M8 §13.12 part a): {line:?}"
+            "the kernel's usage check found {mismatches} kept usage figures that differ from a \
+             scan (DW2 M8 §13.12 part a): {line:?}"
         )),
         _ => Err(format!(
             "the kernel's usage-check line does not parse (DW2 M8 §13.12 part a): {line:?}"
@@ -1258,8 +1258,8 @@ mod tests {
         assert_eq!(
             check("[DW0][INFO][steps] usage-check groups=4 mismatches=3\n"),
             Err(
-                "the kernel's usage check found 3 TaskGroups whose kept usage differs \
-                 from a scan (DW2 M8 §13.12 part a): \"usage-check groups=4 mismatches=3\""
+                "the kernel's usage check found 3 kept usage figures that differ from a \
+                 scan (DW2 M8 §13.12 part a): \"usage-check groups=4 mismatches=3\""
                     .into()
             )
         );

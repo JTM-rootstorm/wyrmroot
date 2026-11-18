@@ -1,7 +1,8 @@
 //! The first-touch measurement of `dev-boot --check` (Deepwyrm DW2 M8
 //! §13.5): `hello touch-loop`, which times a first touch of every page of a
 //! fresh on-demand mapping, and the kernel's step report lines on faults,
-//! the wait for the runtime lock, the usage check and commit steps.
+//! the wait for the runtime lock, the usage check, commit steps and
+//! admission waits.
 //! - The first boot runs `touch-loop 64 20` alone, in the quiet part with
 //!   `close-spin`, before the CPU hogs start.
 //! - The second boot, under `--smp` only, spawns two `touch-loop 64 64`
@@ -13,6 +14,14 @@
 //! Each boot's `faults` line must count at least the pages the foreground
 //! run touched where it ran ([`TOUCH_LOOP_PAGES`]); the check prints the
 //! mean a fault took in the kernel and its parts.
+//!
+//! `touch-loop` no longer waits out a refused create: the kernel waits for
+//! owed work inside the call (DW2 M8 §13.12 part b), so a refusal ends the
+//! job at its site. Each boot's step report must carry the kernel's
+//! `admission-waits create=<n> commit=<n> fault=<n>` line
+//! ([`admission_waits`]), printed once with each boot's other step-report
+//! lines; it requires no particular counts, since whether a call waits
+//! depends on timing.
 
 use std::{thread, time::Duration};
 
@@ -32,20 +41,20 @@ pub(super) const TOUCH_LOOP_PAGES: u64 = 64 * 256 * 20;
 /// The background jobs are touching once usage is this far above the base.
 const TOUCHING_KIB: u64 = 32 * 1024;
 /// The step report lines the check prints from the second boot.
-const SECOND_BOOT_PREFIXES: [&str; 5] = [
+const SECOND_BOOT_PREFIXES: [&str; 6] = [
     "faults ",
     "fault-passes ",
     "t-lock ",
     "usage-check ",
     "commit-steps ",
+    "admission-waits ",
 ];
 
 /// The `touch-loop` line in a job's output, without its line ending.
 fn touch_line(output: &[u8]) -> Option<String> {
-    const FIELDS: [&str; 6] = [
+    const FIELDS: [&str; 5] = [
         "size-mib",
         "rounds",
-        "pauses",
         "min-ns-per-page",
         "median-ns-per-page",
         "max-ns-per-page",
@@ -132,7 +141,8 @@ pub(super) fn report_lines(log: &[u8]) -> Vec<String> {
 }
 
 /// The second boot's lines the check prints: `faults`, `fault-passes`,
-/// `t-lock` (one a CPU), `usage-check` and `commit-steps`.
+/// `t-lock` (one a CPU), `usage-check`, `commit-steps` and
+/// `admission-waits`.
 pub(super) fn second_boot_lines(lines: &[String]) -> Vec<&String> {
     lines
         .iter()
@@ -142,6 +152,21 @@ pub(super) fn second_boot_lines(lines: &[String]) -> Vec<&String> {
                 .any(|prefix| line.starts_with(prefix))
         })
         .collect()
+}
+
+/// The kernel's `admission-waits create=<n> commit=<n> fault=<n>` line in a
+/// boot's step report `lines`, without its line ending: the creates,
+/// commits and faults the kernel held inside the call until owed work could
+/// admit them (DW2 M8 §13.12 part b). It must be there; its counts are not
+/// checked, since whether a call waits depends on timing.
+pub(super) fn admission_waits(lines: &[String]) -> Result<String, String> {
+    lines
+        .iter()
+        .find(|line| line.starts_with("admission-waits "))
+        .map(|line| line.trim_end().to_owned())
+        .ok_or_else(|| {
+            "the kernel's step report has no `admission-waits` line (DW2 M8 §13.12 part b)".into()
+        })
 }
 
 /// The kernel's `faults` line: faults served from the fault gate and the
@@ -240,6 +265,7 @@ mod tests {
         wait-longest-us=30 held-us=8000 held-longest-us=600\n\
         [DW0][INFO][steps] usage-check groups=4 mismatches=0\n\
         [DW0][INFO][steps] commit-steps count=7 admit-us=10 take-us=20 rest-us=5\n\
+        [DW0][INFO][steps] admission-waits create=2 commit=0 fault=1\r\n\
         [DW0][INFO][steps] records-dropped=0\n\
         [DW0][INFO] no process remains; powering off\n";
 
@@ -250,20 +276,17 @@ mod tests {
     #[test]
     fn a_touch_loop_line_is_found_in_the_job_output() {
         let output = b"run bin/hello touch-loop 64 20\r\njob budget-kib=524288\r\n\
-            touch-loop size-mib=64 rounds=20 pauses=0 min-ns-per-page=180 \
+            touch-loop size-mib=64 rounds=20 min-ns-per-page=180 \
             median-ns-per-page=205 max-ns-per-page=1234\r\n\
             job result job=4 classification=normal application=0 exception-class=0\r\n\
             wyrmsh> ";
-        let line = "touch-loop size-mib=64 rounds=20 pauses=0 min-ns-per-page=180 \
+        let line = "touch-loop size-mib=64 rounds=20 min-ns-per-page=180 \
                     median-ns-per-page=205 max-ns-per-page=1234";
         assert_eq!(touch_line(output).as_deref(), Some(line));
         assert_eq!(finished(output, SINGLE).unwrap(), line);
         // The command's echo is not the line, nor is a cut-off one.
         assert_eq!(touch_line(b"run bin/hello touch-loop 64 20\r\n"), None);
-        assert_eq!(
-            touch_line(b"touch-loop size-mib=64 rounds=20 pauses=0\r\n"),
-            None
-        );
+        assert_eq!(touch_line(b"touch-loop size-mib=64 rounds=20\r\n"), None);
     }
 
     #[test]
@@ -281,14 +304,14 @@ mod tests {
             failure.message
         );
         // A line with a status other than 0 fails too.
-        let output = b"touch-loop size-mib=64 rounds=20 pauses=0 min-ns-per-page=1 \
+        let output = b"touch-loop size-mib=64 rounds=20 min-ns-per-page=1 \
             median-ns-per-page=2 max-ns-per-page=3\r\n\
             job result job=4 classification=normal application=1 exception-class=0\r\n";
         assert!(finished(output, SINGLE).is_err());
     }
 
     #[test]
-    fn the_second_boot_prints_the_fault_lock_usage_check_and_commit_lines() {
+    fn the_second_boot_prints_the_fault_lock_usage_check_commit_and_admission_lines() {
         let lines = lines();
         let printed: Vec<&str> = second_boot_lines(&lines)
             .iter()
@@ -302,10 +325,40 @@ mod tests {
                 "t-lock",
                 "t-lock",
                 "usage-check",
-                "commit-steps"
+                "commit-steps",
+                "admission-waits"
             ]
         );
         assert!(second_boot_lines(&report_lines(b"")).is_empty());
+    }
+
+    #[test]
+    fn each_boot_needs_the_admission_waits_line_whatever_its_counts() {
+        assert_eq!(
+            admission_waits(&lines()),
+            Ok("admission-waits create=2 commit=0 fault=1".into())
+        );
+        // No wait at all is as good as many.
+        let none = report_lines(
+            b"[DW0][INFO][steps] admission-waits create=0 commit=0 fault=0\n\
+              [DW0][INFO][steps] records-dropped=0\n",
+        );
+        assert_eq!(
+            admission_waits(&none),
+            Ok("admission-waits create=0 commit=0 fault=0".into())
+        );
+        let missing: Vec<String> = lines()
+            .into_iter()
+            .filter(|line| !line.starts_with("admission-waits "))
+            .collect();
+        assert_eq!(
+            admission_waits(&missing),
+            Err(
+                "the kernel's step report has no `admission-waits` line (DW2 M8 §13.12 part b)"
+                    .into()
+            )
+        );
+        assert!(admission_waits(&report_lines(b"")).is_err());
     }
 
     #[test]
