@@ -33,11 +33,13 @@
 //! file and makes a directory on the root (W7) and shuts down with Ctrl-D.
 //! The second boot `cat`s the file back, removes it, under `--smp` runs
 //! `touch-loop` three at once and requires its faults counted, and shuts
-//! down; its fault, lock, usage-check and commit-step lines are printed. Each
-//! boot must end with the kernel's power-off line on its COM1 log, and its
-//! step report must carry `records-dropped=0` and a `usage-check` line with
-//! TaskGroups compared and no mismatch (DW2 M8 §13.12 part a). That is the
-//! smoke check for development commits.
+//! down; its fault, lock, usage-check, commit-step and admission-wait lines
+//! are printed. Each boot must end with the kernel's power-off line on its
+//! COM1 log, and its step report must carry `records-dropped=0`, a
+//! `usage-check` line with TaskGroups compared and no mismatch (DW2 M8
+//! §13.12 part a) and an `admission-waits` line, whatever its counts (DW2
+//! M8 §13.12 part b; the first boot's is printed too). That is the smoke
+//! check for development commits.
 //!
 //! `--icount` is a measurement mode: QEMU runs with `-icount shift=0`, so
 //! guest time advances by one nanosecond per guest instruction and the
@@ -365,6 +367,16 @@ fn check(
     if let Some(line) = first_touch {
         eprintln!("dev-boot: {line}");
     }
+    // The creates, commits and faults the kernel held until owed work could
+    // admit them (DW2 M8 §13.12 part b): the line must be there; its counts
+    // depend on timing.
+    let waits = touch::admission_waits(&steps).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
+    eprintln!("dev-boot: {waits}");
     let second = boot_once(
         boots[1].0,
         boots[1].1,
@@ -380,6 +392,12 @@ fn check(
     for line in touch::second_boot_lines(&lines) {
         eprintln!("dev-boot: kernel steps (second boot) {line}");
     }
+    touch::admission_waits(&lines).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: second boot: {reason}; see {}",
+            boots[1].1.display()
+        ))
+    })?;
     let first_touch =
         touch::first_touch(&lines, smp.then_some(touch::TOUCH_LOOP_PAGES)).map_err(|reason| {
             Failure::task(format!(
