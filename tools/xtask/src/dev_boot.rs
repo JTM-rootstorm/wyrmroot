@@ -355,7 +355,8 @@ fn check(
     })?;
     eprintln!("dev-boot: {finalize}");
     // A first touch's time in the kernel (DW2 M8 §13.5): the faults the
-    // first boot's `touch-loop` took, and where their time went.
+    // first boot's `touch-loop` took, under the main lock and fast (DW2 M8
+    // §13.16), and where their time went.
     let first_touch =
         touch::first_touch(&steps, Some(touch::TOUCH_LOOP_PAGES)).map_err(|reason| {
             Failure::task(format!(
@@ -363,9 +364,25 @@ fn check(
                 boots[0].1.display()
             ))
         })?;
-    if let Some(line) = first_touch {
+    for line in first_touch {
         eprintln!("dev-boot: {line}");
     }
+    // Alone, most of `touch-loop`'s faults are served fast (DW2 M8 §13.16).
+    touch::fast_share(&steps).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
+    // The fast serve's windows (DW2 M8 §13.16): the line must be there (it
+    // is printed with the other step-report lines); its counts are not
+    // checked.
+    touch::fault_windows(&steps).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
     // The creates, commits and faults the kernel held until owed work could
     // admit them (DW2 M8 §13.12 part b): the line must be there (it is
     // printed with the other step-report lines); its counts depend on
@@ -397,6 +414,12 @@ fn check(
             boots[1].1.display()
         ))
     })?;
+    touch::fault_windows(&lines).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: second boot: {reason}; see {}",
+            boots[1].1.display()
+        ))
+    })?;
     let first_touch =
         touch::first_touch(&lines, smp.then_some(touch::TOUCH_LOOP_PAGES)).map_err(|reason| {
             Failure::task(format!(
@@ -404,7 +427,7 @@ fn check(
                 boots[1].1.display()
             ))
         })?;
-    if let Some(line) = first_touch {
+    for line in first_touch {
         eprintln!("dev-boot: (second boot) {line}");
     }
     Ok(pass_line(started.elapsed().as_secs(), root, clock))
