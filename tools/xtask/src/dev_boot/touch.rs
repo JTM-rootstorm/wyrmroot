@@ -18,9 +18,10 @@
 //! `touch-loop` no longer waits out a refused create: the kernel waits for
 //! owed work inside the call (DW2 M8 §13.12 part b), so a refusal ends the
 //! job at its site. Each boot's step report must carry the kernel's
-//! `admission-waits create=<n> commit=<n> fault=<n>` line, which the check
-//! prints ([`admission_waits`]); it requires no particular counts, since
-//! whether a call waits depends on timing.
+//! `admission-waits create=<n> commit=<n> fault=<n>` line
+//! ([`admission_waits`]), printed once with each boot's other step-report
+//! lines; it requires no particular counts, since whether a call waits
+//! depends on timing.
 
 use std::{thread, time::Duration};
 

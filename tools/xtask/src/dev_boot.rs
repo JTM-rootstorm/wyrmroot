@@ -38,8 +38,7 @@
 //! COM1 log, and its step report must carry `records-dropped=0`, a
 //! `usage-check` line with TaskGroups compared and no mismatch (DW2 M8
 //! §13.12 part a) and an `admission-waits` line, whatever its counts (DW2
-//! M8 §13.12 part b; the first boot's is printed too). That is the smoke
-//! check for development commits.
+//! M8 §13.12 part b). That is the smoke check for development commits.
 //!
 //! `--icount` is a measurement mode: QEMU runs with `-icount shift=0`, so
 //! guest time advances by one nanosecond per guest instruction and the
@@ -368,15 +367,15 @@ fn check(
         eprintln!("dev-boot: {line}");
     }
     // The creates, commits and faults the kernel held until owed work could
-    // admit them (DW2 M8 §13.12 part b): the line must be there; its counts
-    // depend on timing.
-    let waits = touch::admission_waits(&steps).map_err(|reason| {
+    // admit them (DW2 M8 §13.12 part b): the line must be there (it is
+    // printed with the other step-report lines); its counts depend on
+    // timing.
+    touch::admission_waits(&steps).map_err(|reason| {
         Failure::task(format!(
             "dev-boot check: {reason}; see {}",
             boots[0].1.display()
         ))
     })?;
-    eprintln!("dev-boot: {waits}");
     let second = boot_once(
         boots[1].0,
         boots[1].1,
