@@ -374,10 +374,17 @@ fn check(
             boots[0].1.display()
         ))
     })?;
-    // The fast serve's windows (DW2 M8 §13.16): the line must be there (it
-    // is printed with the other step-report lines); its counts are not
+    // The fast serve's windows and why it declined faults (DW2 M8 §13.16):
+    // the `fault-windows` and `fault-declines` lines must be there (they are
+    // printed with the other step-report lines); their counts are not
     // checked.
     touch::fault_windows(&steps).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
+    touch::fault_declines(&steps).map_err(|reason| {
         Failure::task(format!(
             "dev-boot check: {reason}; see {}",
             boots[0].1.display()
@@ -415,6 +422,12 @@ fn check(
         ))
     })?;
     touch::fault_windows(&lines).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: second boot: {reason}; see {}",
+            boots[1].1.display()
+        ))
+    })?;
+    touch::fault_declines(&lines).map_err(|reason| {
         Failure::task(format!(
             "dev-boot check: second boot: {reason}; see {}",
             boots[1].1.display()

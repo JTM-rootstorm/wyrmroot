@@ -19,7 +19,10 @@
 //! kernel and its parts, one line for each way. In the first boot at least
 //! [`FAST_SHARE`] of the served fault passes must have been fast
 //! ([`fast_share`]). Each boot's step report must carry the
-//! `fault-windows` line ([`fault_windows`]); its counts are not checked.
+//! `fault-windows opened=<n> closed=<n>` line ([`fault_windows`]) and the
+//! `fault-declines identity=<n> mapping=<n> tables=<n> credit=<n>
+//! memory=<n> leaf=<n> return=<n>` line ([`fault_declines`]); their counts
+//! are not checked.
 //!
 //! `touch-loop` no longer waits out a refused create: the kernel waits for
 //! owed work inside the call (DW2 M8 §13.12 part b), so a refusal ends the
@@ -47,11 +50,12 @@ pub(super) const TOUCH_LOOP_PAGES: u64 = 64 * 256 * 20;
 /// The background jobs are touching once usage is this far above the base.
 const TOUCHING_KIB: u64 = 32 * 1024;
 /// The step report lines the check prints from the second boot.
-const SECOND_BOOT_PREFIXES: [&str; 9] = [
+const SECOND_BOOT_PREFIXES: [&str; 10] = [
     "faults ",
     "faults-fast ",
     "fault-passes ",
     "fault-windows ",
+    "fault-declines ",
     "t-lock ",
     "p-lock ",
     "usage-check ",
@@ -150,9 +154,10 @@ pub(super) fn report_lines(log: &[u8]) -> Vec<String> {
 }
 
 /// The second boot's lines the check prints: `faults`, `faults-fast`,
-/// `fault-passes`, `fault-windows`, `t-lock` and `p-lock` (one a CPU and
-/// source), `usage-check`, `commit-steps` and `admission-waits`. Each
-/// prefix ends in a space, so `faults ` does not stand for `faults-fast `.
+/// `fault-passes`, `fault-windows`, `fault-declines`, `t-lock` and `p-lock`
+/// (one a CPU and source), `usage-check`, `commit-steps` and
+/// `admission-waits`. Each prefix ends in a space, so `faults ` does not
+/// stand for `faults-fast `.
 pub(super) fn second_boot_lines(lines: &[String]) -> Vec<&String> {
     lines
         .iter()
@@ -194,14 +199,21 @@ pub(super) fn admission_waits(lines: &[String]) -> Result<String, String> {
     )
 }
 
-/// The kernel's `fault-windows opened=<n> closed=<n> declined-identity=<n>
-/// declined-mapping=<n> declined-tables=<n> declined-credit=<n>
-/// declined-memory=<n> declined-leaf=<n> declined-return=<n>` line in a
-/// boot's step report `lines`, without its line ending: the windows the
-/// fast serve opened and closed, and why it declined the others (DW2 M8
-/// §13.16). It must be there; its counts are not checked.
+/// The kernel's `fault-windows opened=<n> closed=<n>` line in a boot's step
+/// report `lines`, without its line ending: the windows the fast serve
+/// opened and closed (DW2 M8 §13.16). It must be there; its counts are not
+/// checked.
 pub(super) fn fault_windows(lines: &[String]) -> Result<String, String> {
     required_line(lines, "fault-windows ", "fault-windows", "DW2 M8 §13.16")
+}
+
+/// The kernel's `fault-declines identity=<n> mapping=<n> tables=<n>
+/// credit=<n> memory=<n> leaf=<n> return=<n>` line in a boot's step report
+/// `lines`, without its line ending: why the fast serve declined a fault,
+/// by reason (DW2 M8 §13.16). The kernel prints it right after
+/// `fault-windows`. It must be there; its counts are not checked.
+pub(super) fn fault_declines(lines: &[String]) -> Result<String, String> {
+    required_line(lines, "fault-declines ", "fault-declines", "DW2 M8 §13.16")
 }
 
 /// The kernel's `faults` line: faults served from the fault gate under the
@@ -397,9 +409,9 @@ mod tests {
         check-us=6000 commit-us=24000 tables-us=12000 return-us=15000\n\
         [DW0][INFO][steps] fault-passes served=399990 already-present=10 released=0 retry=0 \
         unserved=0 exhausted=0 fill-in-serves=0 fast=300000\n\
-        [DW0][INFO][steps] fault-windows opened=300004 closed=300004 declined-identity=0 \
-        declined-mapping=1 declined-tables=99990 declined-credit=0 declined-memory=0 \
-        declined-leaf=3 declined-return=0\n\
+        [DW0][INFO][steps] fault-windows opened=300004 closed=300004\n\
+        [DW0][INFO][steps] fault-declines identity=0 mapping=1 tables=99990 credit=0 \
+        memory=0 leaf=3 return=0\n\
         [DW0][INFO][steps] t-lock cpu=0 source=thread count=5000 wait-us=300 \
         wait-longest-us=40 held-us=9000 held-longest-us=700\n\
         [DW0][INFO][steps] t-lock cpu=1 source=idle count=4000 wait-us=200 \
@@ -482,6 +494,7 @@ mod tests {
                 "faults-fast",
                 "fault-passes",
                 "fault-windows",
+                "fault-declines",
                 "t-lock",
                 "t-lock",
                 "p-lock",
@@ -512,6 +525,7 @@ mod tests {
         let lookalikes = report_lines(
             b"[DW0][INFO][steps] faults-fastest served=1\n\
               [DW0][INFO][steps] fault-windowsill opened=1\n\
+              [DW0][INFO][steps] fault-declinesx identity=1\n\
               [DW0][INFO][steps] p-locked cpu=0\n",
         );
         assert!(second_boot_lines(&lookalikes).is_empty());
@@ -546,30 +560,60 @@ mod tests {
     fn each_boot_needs_the_fault_windows_line_whatever_its_counts() {
         assert_eq!(
             fault_windows(&lines()),
-            Ok(
-                "fault-windows opened=300004 closed=300004 declined-identity=0 \
-                declined-mapping=1 declined-tables=99990 declined-credit=0 \
-                declined-memory=0 declined-leaf=3 declined-return=0"
-                    .into()
-            )
+            Ok("fault-windows opened=300004 closed=300004".into())
         );
-        let none = report_lines(
-            b"[DW0][INFO][steps] fault-windows opened=0 closed=0 declined-identity=0 \
-              declined-mapping=0 declined-tables=0 declined-credit=0 declined-memory=0 \
-              declined-leaf=0 declined-return=0\r\n",
+        let none = report_lines(b"[DW0][INFO][steps] fault-windows opened=0 closed=0\r\n");
+        assert_eq!(
+            fault_windows(&none),
+            Ok("fault-windows opened=0 closed=0".into())
         );
-        assert!(fault_windows(&none).is_ok());
         assert_eq!(
             fault_windows(&without("fault-windows ")),
             Err("the kernel's step report has no `fault-windows` line (DW2 M8 §13.16)".into())
         );
-        // `fault-passes` does not stand for it.
+        // `fault-passes` and `fault-declines` do not stand for it.
+        let missing = without("fault-windows ");
+        assert!(missing.iter().any(|line| line.starts_with("fault-passes ")));
         assert!(
-            without("fault-windows ")
+            missing
                 .iter()
-                .any(|line| line.starts_with("fault-passes "))
+                .any(|line| line.starts_with("fault-declines "))
         );
         assert!(fault_windows(&report_lines(b"")).is_err());
+    }
+
+    #[test]
+    fn each_boot_needs_the_fault_declines_line_whatever_its_counts() {
+        assert_eq!(
+            fault_declines(&lines()),
+            Ok(
+                "fault-declines identity=0 mapping=1 tables=99990 credit=0 memory=0 leaf=3 \
+                return=0"
+                    .into()
+            )
+        );
+        let none = report_lines(
+            b"[DW0][INFO][steps] fault-declines identity=0 mapping=0 tables=0 credit=0 \
+              memory=0 leaf=0 return=0\r\n",
+        );
+        assert_eq!(
+            fault_declines(&none),
+            Ok(
+                "fault-declines identity=0 mapping=0 tables=0 credit=0 memory=0 leaf=0 return=0"
+                    .into()
+            )
+        );
+        assert_eq!(
+            fault_declines(&without("fault-declines ")),
+            Err("the kernel's step report has no `fault-declines` line (DW2 M8 §13.16)".into())
+        );
+        // `fault-windows` does not stand for it.
+        assert!(
+            without("fault-declines ")
+                .iter()
+                .any(|line| line.starts_with("fault-windows "))
+        );
+        assert!(fault_declines(&report_lines(b"")).is_err());
     }
 
     #[test]
