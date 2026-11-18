@@ -846,6 +846,41 @@ pub(super) fn records_dropped(log: &[u8]) -> Result<String, String> {
     }
 }
 
+/// The kernel's `usage-check groups=<g> mismatches=<m>` line in its step
+/// report (Deepwyrm DW2 M8 §13.12 part a): at power-off the kernel compares
+/// every live TaskGroup's kept usage counters with a scan. It must be there,
+/// `m` must be 0, and `g` must not be 0, since a check that compared nothing
+/// proves nothing. Read from the raw COM1 log, like [`records_dropped`].
+/// Returns the line.
+pub(super) fn usage_check(log: &[u8]) -> Result<String, String> {
+    let text = String::from_utf8_lossy(log);
+    let Some(line) = text
+        .lines()
+        .filter_map(|line| line.split_once("[steps] ").map(|(_, rest)| rest.trim_end()))
+        .find(|line| line.starts_with("usage-check "))
+    else {
+        return Err(
+            "the kernel's step report has no `usage-check` line (DW2 M8 §13.12 part a)".into(),
+        );
+    };
+    match (
+        line_field(line.as_bytes(), "groups"),
+        line_field(line.as_bytes(), "mismatches"),
+    ) {
+        (Some(0), Some(_)) => Err(format!(
+            "the kernel's usage check compared no TaskGroup (DW2 M8 §13.12 part a): {line:?}"
+        )),
+        (Some(_), Some(0)) => Ok(line.to_owned()),
+        (Some(_), Some(mismatches)) => Err(format!(
+            "the kernel's usage check found {mismatches} TaskGroups whose kept usage differs \
+             from a scan (DW2 M8 §13.12 part a): {line:?}"
+        )),
+        _ => Err(format!(
+            "the kernel's usage-check line does not parse (DW2 M8 §13.12 part a): {line:?}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1199,6 +1234,60 @@ mod tests {
         );
         // The line outside the step report does not count.
         assert!(records_dropped(log("records-dropped=0\n").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn the_usage_check_must_compare_groups_and_find_no_mismatch() {
+        let log = |line: &str| {
+            format!(
+                "[DW0][INFO][steps] timer-arm retries=0 deferred=0\n\
+                 {line}[DW0][INFO][steps] records-dropped=0\n\
+                 [DW0][INFO] no process remains; powering off\n"
+            )
+        };
+        let check = |line: &str| usage_check(log(line).as_bytes());
+        assert_eq!(
+            check("[DW0][INFO][steps] usage-check groups=4 mismatches=0\n"),
+            Ok("usage-check groups=4 mismatches=0".into())
+        );
+        // A CRLF line ending is not part of the line.
+        assert_eq!(
+            check("[DW0][INFO][steps] usage-check groups=4 mismatches=0\r\n"),
+            Ok("usage-check groups=4 mismatches=0".into())
+        );
+        assert_eq!(
+            check("[DW0][INFO][steps] usage-check groups=4 mismatches=3\n"),
+            Err(
+                "the kernel's usage check found 3 TaskGroups whose kept usage differs \
+                 from a scan (DW2 M8 §13.12 part a): \"usage-check groups=4 mismatches=3\""
+                    .into()
+            )
+        );
+        assert_eq!(
+            check("[DW0][INFO][steps] usage-check groups=0 mismatches=0\n"),
+            Err(
+                "the kernel's usage check compared no TaskGroup (DW2 M8 §13.12 part a): \
+                 \"usage-check groups=0 mismatches=0\""
+                    .into()
+            )
+        );
+        assert_eq!(
+            check(""),
+            Err("the kernel's step report has no `usage-check` line (DW2 M8 §13.12 part a)".into())
+        );
+        for unparseable in [
+            "[DW0][INFO][steps] usage-check groups=4 mismatches=some\n",
+            "[DW0][INFO][steps] usage-check groups=4\n",
+            "[DW0][INFO][steps] usage-check mismatches=0\n",
+        ] {
+            let reason = check(unparseable).unwrap_err();
+            assert!(
+                reason.contains("does not parse"),
+                "{unparseable:?}: {reason}"
+            );
+        }
+        // The line outside the step report does not count.
+        assert!(check("usage-check groups=4 mismatches=0\n").is_err());
     }
 
     #[test]
