@@ -1,5 +1,5 @@
 //! `hello touch-loop` (Deepwyrm DW2 M8 §13.5) driven against a recording
-//! system: its calls, its figures, its waits and its failures.
+//! system: its calls, its figures and its failures.
 
 use std::collections::VecDeque;
 
@@ -7,9 +7,7 @@ use deepwyrm_syscall::{
     DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND, DW_STATUS_NO_MEMORY, DW_STATUS_NO_RESOURCES,
     DW_STATUS_SUCCESS, DwHandle, DwMemoryObjectCreateFlags, DwStatus,
 };
-use wyrmroot_hello::probe::{
-    CHURN_REFUSALS_MAX, PAGE, TouchSummary, spread, touch_loop, touch_loop_arguments,
-};
+use wyrmroot_hello::probe::{PAGE, TouchSummary, spread, touch_loop, touch_loop_arguments};
 use wyrmroot_hello::{ChurnCalls, ProbeSite, TouchCalls, decode_probe_failure};
 use wyrmroot_loader as _;
 use wyrmroot_runtime as _;
@@ -26,7 +24,6 @@ enum Call {
     Clock,
     Touch(u64, u64),
     Unmap(u64, u64),
-    Pause,
 }
 
 /// Which call fails, and with what: the `n`th call of that kind (0 is the
@@ -81,13 +78,6 @@ impl Recorder {
             now += taken + 7;
         }
         self
-    }
-
-    fn pauses(&self) -> usize {
-        self.calls
-            .iter()
-            .filter(|call| **call == Call::Pause)
-            .count()
     }
 
     fn run(&mut self, size_mib: u64, rounds: u32) -> u32 {
@@ -150,10 +140,6 @@ impl ChurnCalls for Recorder {
             Some(Fail::Close(at, status)) if at == index => status,
             _ => DW_STATUS_SUCCESS,
         }
-    }
-
-    fn pause(&mut self) {
-        self.calls.push(Call::Pause);
     }
 }
 
@@ -245,11 +231,9 @@ fn the_line_carries_the_spread_of_the_rounds() {
     assert_eq!(recorder.run(1, 4), 0);
     assert_eq!(
         recorder.lines,
-        [
-            b"touch-loop size-mib=1 rounds=4 pauses=0 min-ns-per-page=10 \
+        [b"touch-loop size-mib=1 rounds=4 min-ns-per-page=10 \
            median-ns-per-page=20 max-ns-per-page=40\n"
-                .to_vec()
-        ]
+            .to_vec()]
     );
     // An odd count: the middle one.
     let elapsed: Vec<u64> = [7_u64, 3, 5].iter().map(|ns| ns * 256).collect();
@@ -257,11 +241,9 @@ fn the_line_carries_the_spread_of_the_rounds() {
     assert_eq!(recorder.run(1, 3), 0);
     assert_eq!(
         recorder.lines,
-        [
-            b"touch-loop size-mib=1 rounds=3 pauses=0 min-ns-per-page=3 \
+        [b"touch-loop size-mib=1 rounds=3 min-ns-per-page=3 \
            median-ns-per-page=5 max-ns-per-page=7\n"
-                .to_vec()
-        ]
+            .to_vec()]
     );
 }
 
@@ -270,21 +252,19 @@ fn the_line_text_is_exact() {
     let summary = TouchSummary {
         size_mib: 64,
         rounds: 20,
-        pauses: 3,
         min: 180,
         median: 205,
         max: 1_234,
     };
     assert_eq!(
         summary.line().as_bytes(),
-        b"touch-loop size-mib=64 rounds=20 pauses=3 min-ns-per-page=180 \
+        b"touch-loop size-mib=64 rounds=20 min-ns-per-page=180 \
           median-ns-per-page=205 max-ns-per-page=1234\n"
     );
     // The widest numbers fit.
     let widest = TouchSummary {
         size_mib: u64::MAX,
         rounds: u32::MAX,
-        pauses: u32::MAX,
         min: u64::MAX,
         median: u64::MAX,
         max: u64::MAX,
@@ -297,71 +277,34 @@ fn the_line_text_is_exact() {
 }
 
 #[test]
-fn a_create_refused_for_no_resources_pauses_retries_and_is_counted() {
-    let mut recorder = Recorder::new().rounds_taking(&[256, 256]);
-    // Two refusals before the first round, one before the second.
-    recorder.creates = [
-        Some(DW_STATUS_NO_RESOURCES),
-        Some(DW_STATUS_NO_RESOURCES),
-        None,
-        Some(DW_STATUS_NO_RESOURCES),
-    ]
-    .into_iter()
-    .collect();
-    assert_eq!(recorder.run(1, 2), 0);
-    assert_eq!(recorder.pauses(), 3);
-    assert_eq!(
-        recorder.calls[..4],
-        [
-            Call::Create(MIB, ON_DEMAND),
-            Call::Pause,
-            Call::Create(MIB, ON_DEMAND),
-            Call::Pause,
-        ]
-    );
-    let line = String::from_utf8(recorder.lines[0].clone()).unwrap();
-    assert!(line.contains(" rounds=2 pauses=3 "), "{line}");
-}
-
-#[test]
-fn an_accepted_create_resets_the_refusals_in_a_row() {
-    let mut recorder = Recorder::new().rounds_taking(&[256, 256]);
-    recorder.creates = std::iter::repeat_n(Some(DW_STATUS_NO_RESOURCES), 500)
-        .chain([None])
-        .chain(std::iter::repeat_n(Some(DW_STATUS_NO_RESOURCES), 500))
-        .collect();
-    assert_eq!(recorder.run(1, 2), 0);
-    assert_eq!(recorder.pauses(), 1000);
-}
-
-#[test]
-fn five_hundred_and_one_refusals_in_a_row_end_the_job() {
-    assert_eq!(CHURN_REFUSALS_MAX, 500);
-    let mut recorder = Recorder::new().rounds_taking(&[256, 256]);
-    // The first two rounds are accepted, then the third is refused for good.
-    recorder.creates = [None, None]
-        .into_iter()
-        .chain(std::iter::repeat_n(Some(DW_STATUS_NO_RESOURCES), 501))
-        .collect();
-    let status = recorder.run(1, 5);
-    assert_eq!(
-        status,
-        ProbeSite::TouchLoopCreateStillRefused.after(DW_STATUS_NO_RESOURCES, 2)
-    );
-    assert_eq!(decode_probe_failure(status), Some((62, 13, 2)));
-    assert_eq!(recorder.pauses(), 500);
-    assert!(matches!(recorder.calls.last(), Some(Call::Create(..))));
-    assert!(recorder.lines.is_empty());
-}
-
-#[test]
-fn a_create_refused_otherwise_ends_the_job_without_a_pause() {
-    let mut recorder = Recorder::new().rounds_taking(&[256]);
-    recorder.creates = [None, Some(DW_STATUS_NO_MEMORY)].into_iter().collect();
-    let status = recorder.run(1, 3);
-    assert_eq!(decode_probe_failure(status), Some((61, 12, 1)));
-    assert_eq!(recorder.pauses(), 0);
-    assert!(recorder.lines.is_empty());
+fn a_refused_create_ends_the_job_at_its_site_after_the_rounds_done() {
+    // NO_RESOURCES is not waited out: the kernel waits for owed work inside
+    // the call (DW2 M8 §13.12 part b), so a refusal ends the job like any
+    // other failed call.
+    for (refusal, code) in [(DW_STATUS_NO_RESOURCES, 13), (DW_STATUS_NO_MEMORY, 12)] {
+        for completed in [0_u64, 1, 2] {
+            let mut recorder = Recorder::new().rounds_taking(&[256; 3]);
+            recorder.creates = std::iter::repeat_n(None, completed as usize)
+                .chain([Some(refusal)])
+                .collect();
+            let status = recorder.run(1, 5);
+            assert_eq!(
+                status,
+                ProbeSite::TouchLoopCreate.after(refusal, completed as u32)
+            );
+            assert_eq!(
+                decode_probe_failure(status),
+                Some((61, code, completed as u8)),
+                "{refusal:?} {completed}"
+            );
+            // The completed rounds, then the refused create, which is the
+            // last call: nothing is retried, and nothing written.
+            let mut expected: Vec<Call> = (0..completed).flat_map(|n| round(101 + n, 1)).collect();
+            expected.push(Call::Create(MIB, ON_DEMAND));
+            assert_eq!(recorder.calls, expected, "{refusal:?} {completed}");
+            assert!(recorder.lines.is_empty());
+        }
+    }
 }
 
 #[test]

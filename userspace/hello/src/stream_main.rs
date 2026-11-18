@@ -112,9 +112,8 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
 /// - `churn-map`, `churn-create`, `churn-commit`: repeat a 256 MiB map
 ///   (keeping the mappings until a map is refused), eager create, or
 ///   on-demand commit forever, for the check to stop mid-call (probe 15).
-///   The last two wait out a create refused with `NO_RESOURCES` (closed
-///   objects count until their owed finalization is done; DW2 M8 §13.4
-///   item 2).
+///   A refused create ends the last two: the kernel waits for owed work
+///   inside the call (DW2 M8 §13.12 part b), so no probe waits itself.
 /// - `slow-ready`: commits forever before READY (see `hello_main`).
 /// - `touch-loop <MiB> <rounds>`: times a first touch of every page of a
 ///   fresh on-demand mapping, round after round, and prints the least,
@@ -222,26 +221,9 @@ mod memory {
             }
             "eager" => eager(region, write),
             "hold-touched" | "hold-released" => hold(region, mode == "hold-released"),
-            "churn-map" => probe::churn_map(&mut Calls {
-                region,
-                sleeper: None,
-            }),
-            "churn-create" | "churn-commit" => {
-                // The pause between refused creates, made once.
-                let sleeper = match Sleeper::new() {
-                    Ok(sleeper) => sleeper,
-                    Err(status) => return ProbeSite::ChurnSleeper.with(status),
-                };
-                let mut calls = Calls {
-                    region,
-                    sleeper: Some(sleeper),
-                };
-                if mode == "churn-create" {
-                    probe::churn_create(&mut calls)
-                } else {
-                    probe::churn_commit(&mut calls)
-                }
-            }
+            "churn-map" => probe::churn_map(&mut Calls { region }),
+            "churn-create" => probe::churn_create(&mut Calls { region }),
+            "churn-commit" => probe::churn_commit(&mut Calls { region }),
             "close-spin" => close_spin(write),
             "touch-loop" => {
                 let (size_mib, rounds) =
@@ -249,16 +231,7 @@ mod memory {
                         Ok(parsed) => parsed,
                         Err(status) => return status,
                     };
-                // The pause between refused creates, made once.
-                let sleeper = match Sleeper::new() {
-                    Ok(sleeper) => sleeper,
-                    Err(status) => return ProbeSite::TouchLoopSleeper.with(status),
-                };
-                let mut calls = Calls {
-                    region,
-                    sleeper: Some(sleeper),
-                };
-                probe::touch_loop(&mut calls, size_mib, rounds, write)
+                probe::touch_loop(&mut Calls { region }, size_mib, rounds, write)
             }
             "fragment" => match size_mib {
                 Some(filler) => fragment(budget, filler * MIB),
@@ -276,7 +249,6 @@ mod memory {
         // `slow-ready` maps nothing; the region is never used.
         let mut calls = Calls {
             region: DwHandle(0),
-            sleeper: None,
         };
         loop {
             let _ = probe::commit_once(&mut calls, 512 * MIB);
@@ -287,9 +259,6 @@ mod memory {
     /// raw syscalls and the touch pass's writes, and nothing else.
     struct Calls {
         region: DwHandle,
-        /// The pause's channel: only `churn-create`, `churn-commit` and
-        /// `touch-loop`, which pause, have one.
-        sleeper: Option<Sleeper>,
     }
 
     impl ChurnCalls for Calls {
@@ -315,12 +284,6 @@ mod memory {
 
         fn close(&mut self, handle: DwHandle) -> DwStatus {
             deepwyrm_syscall::handle_close(handle)
-        }
-
-        fn pause(&mut self) {
-            if let Some(sleeper) = &self.sleeper {
-                sleeper.sleep(probe::CHURN_PAUSE_US);
-            }
         }
     }
 
