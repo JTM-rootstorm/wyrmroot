@@ -1,7 +1,7 @@
 //! The first-touch measurement of `dev-boot --check` (Deepwyrm DW2 M8
 //! §13.5): `hello touch-loop`, which times a first touch of every page of a
 //! fresh on-demand mapping, and the kernel's step report lines on faults,
-//! the wait for the runtime lock, admission and commit steps.
+//! the wait for the runtime lock, the usage check and commit steps.
 //! - The first boot runs `touch-loop 64 20` alone, in the quiet part with
 //!   `close-spin`, before the CPU hogs start.
 //! - The second boot, under `--smp` only, spawns two `touch-loop 64 64`
@@ -36,7 +36,7 @@ const SECOND_BOOT_PREFIXES: [&str; 5] = [
     "faults ",
     "fault-passes ",
     "t-lock ",
-    "admission ",
+    "usage-check ",
     "commit-steps ",
 ];
 
@@ -132,7 +132,7 @@ pub(super) fn report_lines(log: &[u8]) -> Vec<String> {
 }
 
 /// The second boot's lines the check prints: `faults`, `fault-passes`,
-/// `t-lock` (one a CPU), `admission` and `commit-steps`.
+/// `t-lock` (one a CPU), `usage-check` and `commit-steps`.
 pub(super) fn second_boot_lines(lines: &[String]) -> Vec<&String> {
     lines
         .iter()
@@ -238,8 +238,7 @@ mod tests {
         wait-longest-us=40 held-us=9000 held-longest-us=700\n\
         [DW0][INFO][steps] t-lock cpu=1 source=idle count=4000 wait-us=200 \
         wait-longest-us=30 held-us=8000 held-longest-us=600\n\
-        [DW0][INFO][steps] admission page-scans=400000 object-scans=20 slots=256000000 \
-        reservations=25600000\n\
+        [DW0][INFO][steps] usage-check groups=4 mismatches=0\n\
         [DW0][INFO][steps] commit-steps count=7 admit-us=10 take-us=20 rest-us=5\n\
         [DW0][INFO][steps] records-dropped=0\n\
         [DW0][INFO] no process remains; powering off\n";
@@ -289,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn the_second_boot_prints_the_fault_lock_admission_and_commit_lines() {
+    fn the_second_boot_prints_the_fault_lock_usage_check_and_commit_lines() {
         let lines = lines();
         let printed: Vec<&str> = second_boot_lines(&lines)
             .iter()
@@ -302,7 +301,7 @@ mod tests {
                 "fault-passes",
                 "t-lock",
                 "t-lock",
-                "admission",
+                "usage-check",
                 "commit-steps"
             ]
         );

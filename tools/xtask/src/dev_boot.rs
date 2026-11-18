@@ -33,8 +33,11 @@
 //! file and makes a directory on the root (W7) and shuts down with Ctrl-D.
 //! The second boot `cat`s the file back, removes it, under `--smp` runs
 //! `touch-loop` three at once and requires its faults counted, and shuts
-//! down; its fault, lock, admission and commit-step lines are printed. Each
-//! boot must end with the kernel's power-off line on its COM1 log. That is the smoke check for development commits.
+//! down; its fault, lock, usage-check and commit-step lines are printed. Each
+//! boot must end with the kernel's power-off line on its COM1 log, and its
+//! step report must carry `records-dropped=0` and a `usage-check` line with
+//! TaskGroups compared and no mismatch (DW2 M8 §13.12 part a). That is the
+//! smoke check for development commits.
 //!
 //! `--icount` is a measurement mode: QEMU runs with `-icount shift=0`, so
 //! guest time advances by one nanosecond per guest instruction and the
@@ -668,6 +671,11 @@ fn drive(
     // 4). Both boots power off through the kernel's step report, the
     // second with all-zero counts, so both carry the line.
     memory::records_dropped(&log).map_err(|reason| {
+        Failure::task(format!("dev-boot check: {reason}; see {}", com1.display()))
+    })?;
+    // Every live TaskGroup's kept usage matches a scan at power-off (DW2 M8
+    // §13.12 part a). The kernel prints the line in both boots' step reports.
+    memory::usage_check(&log).map_err(|reason| {
         Failure::task(format!("dev-boot check: {reason}; see {}", com1.display()))
     })?;
     Ok(())
