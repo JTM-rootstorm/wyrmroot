@@ -41,8 +41,10 @@
 //! The second boot `cat`s the file back, removes it, under `--smp` runs
 //! `touch-loop` three at once and requires its faults counted, then three
 //! at once again with every job `committed` and requires its shared faults
-//! counted, and shuts down; its fault, shared-fault, commit-ahead, stream,
-//! lock, usage-check, commit-step and admission-wait lines are printed.
+//! counted, and shuts down; its fault (each with its parts line),
+//! shared-fault, fault-pass, commit-ahead, stream, lock, lock-hold
+//! (`p-held`, any number), usage-check, commit-step and admission-wait lines
+//! are printed.
 //! Each boot's step report must carry `faults-shared`,
 //! `fault-declines-shared`, `fault-ahead` and `streams` lines that parse,
 //! and each boot prints the frames committed ahead and their mean. Each boot must end with the kernel's power-off line on its

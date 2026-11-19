@@ -23,12 +23,19 @@
 //! lock (the `faults` line), fast without it, holding the paging lock
 //! exclusively (the `faults-fast` line; DW2 M8 §13.16), or fast with the
 //! paging lock shared, on a page already committed (the `faults-shared`
-//! line; DW2 M8b §15.2 step 1). Where the foreground run ran, the three
-//! lines' `served` counts together must reach at least the pages it touched
-//! ([`TOUCH_LOOP_PAGES`]); the check prints the mean a fault took in the
-//! kernel and its parts, one line for each way. In the first boot at least
-//! [`FAST_SHARE`] of the served fault passes must have been fast, shared
-//! serves included ([`fast_share`]). Each boot's step report must carry the
+//! line; DW2 M8b §15.2 step 1). The `faults` and `faults-fast` lines carry
+//! `served`, `total-us` and `longest-us`; each is followed by its parts on a
+//! line of its own, `faults-parts sync-us=<n> lookup-us=<n> admit-us=<n>
+//! commit-us=<n> tables-us=<n> return-us=<n>` and `faults-fast-parts
+//! check-us=<n> commit-us=<n> tables-us=<n> return-us=<n>` (DW2 §15.8),
+//! which must be there and parse wherever its first line is. Where the
+//! foreground run ran, the three lines' `served` counts together must reach
+//! at least the pages it touched ([`TOUCH_LOOP_PAGES`]); the check prints
+//! the mean a fault took in the kernel and its parts, one line for each way.
+//! In the first boot at least [`FAST_SHARE`] of the served fault passes must
+//! have been fast, shared serves included ([`fast_share`]), from the
+//! `fault-passes` line; its `fault-passes-other` line must be there and
+//! parse with it. Each boot's step report must carry the
 //! `fault-windows opened=<n> closed=<n>` line ([`fault_windows`]) and the
 //! `fault-declines identity=<n> mapping=<n> tables=<n> credit=<n>
 //! memory=<n> leaf=<n> return=<n>` line ([`fault_declines`]); their counts
@@ -59,6 +66,11 @@
 //! ([`admission_waits`]), printed once with each boot's other step-report
 //! lines; it requires no particular counts, since whether a call waits
 //! depends on timing.
+//!
+//! The kernel's `p-held by=<name> count=<n> waited=<n> wait-us=<n>
+//! held-us=<n> held-longest-us=<n>` lines, zero or more, give the paging
+//! lock's `runtime` holds by owner (DW2 §15.8). The second boot prints
+//! those that are there; none is required and none is parsed.
 
 use std::{thread, time::Duration};
 
@@ -109,11 +121,14 @@ pub(super) const SHARED_LEAST: u64 = TOUCH_LOOP_PAGES / 2;
 /// is seen. The committed run commits its own objects, so it adds little.
 pub(super) const AHEAD_LEAST: u64 = TOUCH_LOOP_PAGES / 2;
 /// The step report lines the check prints from the second boot.
-const SECOND_BOOT_PREFIXES: [&str; 14] = [
+const SECOND_BOOT_PREFIXES: [&str; 18] = [
     "faults ",
+    "faults-parts ",
     "faults-fast ",
+    "faults-fast-parts ",
     "faults-shared ",
     "fault-passes ",
+    "fault-passes-other ",
     "fault-windows ",
     "fault-ahead ",
     "streams ",
@@ -121,6 +136,7 @@ const SECOND_BOOT_PREFIXES: [&str; 14] = [
     "fault-declines-shared ",
     "t-lock ",
     "p-lock ",
+    "p-held ",
     "usage-check ",
     "commit-steps ",
     "admission-waits ",
@@ -290,12 +306,14 @@ pub(super) fn report_lines(log: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// The second boot's lines the check prints: `faults`, `faults-fast`,
-/// `faults-shared`, `fault-passes`, `fault-windows`, `fault-declines`,
-/// `fault-declines-shared`, `t-lock` and `p-lock` (one a CPU and source),
-/// `usage-check`, `commit-steps` and `admission-waits`. Each prefix ends in
-/// a space, so `faults ` does not stand for `faults-fast `, nor
-/// `fault-declines ` for `fault-declines-shared `.
+/// The second boot's lines the check prints: `faults` and `faults-parts`,
+/// `faults-fast` and `faults-fast-parts`, `faults-shared`, `fault-passes`
+/// and `fault-passes-other`, `fault-windows`, `fault-ahead`, `streams`,
+/// `fault-declines`, `fault-declines-shared`, `t-lock` and `p-lock` (one a
+/// CPU and source), `p-held` (one an owner, any number), `usage-check`,
+/// `commit-steps` and `admission-waits`. Each prefix ends in a space, so
+/// `faults ` does not stand for `faults-fast `, nor `fault-declines ` for
+/// `fault-declines-shared `.
 pub(super) fn second_boot_lines(lines: &[String]) -> Vec<&String> {
     lines
         .iter()
@@ -443,24 +461,53 @@ struct Faults {
     returning: u64,
 }
 
+/// The line in `lines` that starts with `prefix`, the second of a line
+/// split in two (DW2 §15.8), required because its first line is there;
+/// else an error naming it (`name`) and the `section` that asks for it.
+fn second_line<'a>(
+    lines: &'a [String],
+    prefix: &str,
+    name: &str,
+    section: &str,
+) -> Result<&'a String, String> {
+    lines
+        .iter()
+        .find(|line| line.starts_with(prefix))
+        .ok_or_else(|| format!("the kernel's step report has no `{name}` line ({section})"))
+}
+
 impl Faults {
-    /// `None` without a `faults` line; an error if it does not parse.
+    /// `None` without a `faults` line. With it, its `faults-parts` line must
+    /// be there too (DW2 §15.8); an error if either is missing or does not
+    /// parse.
     fn parse(lines: &[String]) -> Option<Result<Self, String>> {
         let line = lines.iter().find(|line| line.starts_with("faults "))?;
         let field = |name: &str| memory::line_field(line.as_bytes(), name);
+        let (Some(served), Some(total)) = (field("served"), field("total-us")) else {
+            return Some(Err(format!(
+                "the kernel's faults line does not parse: {line:?}"
+            )));
+        };
+        let parts = match second_line(lines, "faults-parts ", "faults-parts", "DW2 §15.8") {
+            Ok(parts) => parts,
+            Err(reason) => return Some(Err(reason)),
+        };
+        let part = |name: &str| memory::line_field(parts.as_bytes(), name);
         let parsed = (|| {
             Some(Self {
-                served: field("served")?,
-                total: field("total-us")?,
-                sync: field("sync-us")?,
-                lookup: field("lookup-us")?,
-                admit: field("admit-us")?,
-                commit: field("commit-us")?,
-                tables: field("tables-us")?,
-                returning: field("return-us")?,
+                served,
+                total,
+                sync: part("sync-us")?,
+                lookup: part("lookup-us")?,
+                admit: part("admit-us")?,
+                commit: part("commit-us")?,
+                tables: part("tables-us")?,
+                returning: part("return-us")?,
             })
         })();
-        Some(parsed.ok_or_else(|| format!("the kernel's faults line does not parse: {line:?}")))
+        Some(parsed.ok_or_else(|| {
+            format!("the kernel's faults-parts line does not parse (DW2 §15.8): {parts:?}")
+        }))
     }
 
     /// `first touch in the kernel: mean <ns> ns (sync <ns>, lookup <ns>,
@@ -501,22 +548,39 @@ struct FaultsFast {
 }
 
 impl FaultsFast {
-    /// `None` without a `faults-fast` line; an error if it does not parse.
+    /// `None` without a `faults-fast` line. With it, its `faults-fast-parts`
+    /// line must be there too (DW2 §15.8); an error if either is missing or
+    /// does not parse.
     fn parse(lines: &[String]) -> Option<Result<Self, String>> {
         let line = lines.iter().find(|line| line.starts_with("faults-fast "))?;
         let field = |name: &str| memory::line_field(line.as_bytes(), name);
+        let (Some(served), Some(total)) = (field("served"), field("total-us")) else {
+            return Some(Err(format!(
+                "the kernel's faults-fast line does not parse (DW2 M8 §13.16): {line:?}"
+            )));
+        };
+        let parts = match second_line(
+            lines,
+            "faults-fast-parts ",
+            "faults-fast-parts",
+            "DW2 §15.8",
+        ) {
+            Ok(parts) => parts,
+            Err(reason) => return Some(Err(reason)),
+        };
+        let part = |name: &str| memory::line_field(parts.as_bytes(), name);
         let parsed = (|| {
             Some(Self {
-                served: field("served")?,
-                total: field("total-us")?,
-                check: field("check-us")?,
-                commit: field("commit-us")?,
-                tables: field("tables-us")?,
-                returning: field("return-us")?,
+                served,
+                total,
+                check: part("check-us")?,
+                commit: part("commit-us")?,
+                tables: part("tables-us")?,
+                returning: part("return-us")?,
             })
         })();
         Some(parsed.ok_or_else(|| {
-            format!("the kernel's faults-fast line does not parse (DW2 M8 §13.16): {line:?}")
+            format!("the kernel's faults-fast-parts line does not parse (DW2 §15.8): {parts:?}")
         }))
     }
 
@@ -695,11 +759,12 @@ pub(super) fn first_touch(lines: &[String], least: Option<u64>) -> Result<Vec<St
 const FAST_SHARE: (u64, u64) = (1, 2);
 
 /// The kernel's `fault-passes served=<n> already-present=<n> released=<n>
-/// retry=<n> unserved=<n> exhausted=<n> fill-in-serves=<n> fast=<n>` line in
-/// a boot's step report `lines`: `fast`, the passes the fast serve answered
-/// (also counted under `served` or `already-present`), must be at least
-/// [`FAST_SHARE`] of `served` (DW2 M8 §13.16). The line must be there and
-/// parse.
+/// retry=<n> fast=<n>` line in a boot's step report `lines`: `fast`, the
+/// passes the fast serve answered (also counted under `served` or
+/// `already-present`), must be at least [`FAST_SHARE`] of `served` (DW2 M8
+/// §13.16). The line must be there and parse, and so must its second line,
+/// `fault-passes-other unserved=<n> exhausted=<n> fill-in-serves=<n>` (DW2
+/// §15.8), whose counts are not checked.
 pub(super) fn fast_share(lines: &[String]) -> Result<(), String> {
     let line = lines
         .iter()
@@ -711,6 +776,21 @@ pub(super) fn fast_share(lines: &[String]) -> Result<(), String> {
             "the kernel's fault-passes line does not parse (DW2 M8 §13.16): {line:?}"
         ));
     };
+    let other = second_line(
+        lines,
+        "fault-passes-other ",
+        "fault-passes-other",
+        "DW2 §15.8",
+    )?;
+    let count = |name: &str| memory::line_field(other.as_bytes(), name);
+    if count("unserved").is_none()
+        || count("exhausted").is_none()
+        || count("fill-in-serves").is_none()
+    {
+        return Err(format!(
+            "the kernel's fault-passes-other line does not parse (DW2 §15.8): {other:?}"
+        ));
+    }
     let (numerator, denominator) = FAST_SHARE;
     if u128::from(fast) * u128::from(denominator) < u128::from(served) * u128::from(numerator) {
         return Err(format!(
@@ -726,14 +806,17 @@ mod tests {
     use super::*;
 
     const LOG: &str = "[DW0][INFO][steps] call-steps map=4 unmap=3\n\
-        [DW0][INFO][steps] faults served=100000 total-us=30000 longest-us=900 sync-us=2500 \
-        lookup-us=2000 admit-us=10000 commit-us=7500 tables-us=3000 return-us=5000\n\
-        [DW0][INFO][steps] faults-fast served=300000 total-us=60000 longest-us=400 \
-        check-us=6000 commit-us=24000 tables-us=12000 return-us=15000\n\
+        [DW0][INFO][steps] faults served=100000 total-us=30000 longest-us=900\n\
+        [DW0][INFO][steps] faults-parts sync-us=2500 lookup-us=2000 admit-us=10000 \
+        commit-us=7500 tables-us=3000 return-us=5000\n\
+        [DW0][INFO][steps] faults-fast served=300000 total-us=60000 longest-us=400\n\
+        [DW0][INFO][steps] faults-fast-parts check-us=6000 commit-us=24000 tables-us=12000 \
+        return-us=15000\n\
         [DW0][INFO][steps] faults-shared served=200000 total-us=20000 longest-us=300 \
         check-us=4000 tables-us=8000 return-us=5000\n\
         [DW0][INFO][steps] fault-passes served=399990 already-present=10 released=0 retry=0 \
-        unserved=0 exhausted=0 fill-in-serves=0 fast=300000\n\
+        fast=300000\n\
+        [DW0][INFO][steps] fault-passes-other unserved=0 exhausted=0 fill-in-serves=0\n\
         [DW0][INFO][steps] fault-windows opened=300004 closed=300004\n\
         [DW0][INFO][steps] fault-ahead commits=7563 frames=483026 us=66822\n\
         [DW0][INFO][steps] streams started=519 ended=519\n\
@@ -749,6 +832,10 @@ mod tests {
         [DW0][INFO][steps] p-lock cpu=1 source=usercopy count=7 waited=0 wait-us=0 held-us=2\n\
         [DW0][INFO][steps] p-lock cpu=2 source=fault-shared count=200000 waited=3 wait-us=5 \
         held-us=15000\n\
+        [DW0][INFO][steps] p-held by=commit count=40 waited=2 wait-us=3 held-us=900 \
+        held-longest-us=60\n\
+        [DW0][INFO][steps] p-held by=fault count=9 waited=0 wait-us=0 held-us=50 \
+        held-longest-us=11\n\
         [DW0][INFO][steps] usage-check groups=4 mismatches=0\n\
         [DW0][INFO][steps] commit-steps count=7 admit-us=10 take-us=20 rest-us=5\n\
         [DW0][INFO][steps] admission-waits create=2 commit=0 fault=1\r\n\
@@ -821,9 +908,12 @@ mod tests {
             printed,
             [
                 "faults",
+                "faults-parts",
                 "faults-fast",
+                "faults-fast-parts",
                 "faults-shared",
                 "fault-passes",
+                "fault-passes-other",
                 "fault-windows",
                 "fault-ahead",
                 "streams",
@@ -834,6 +924,8 @@ mod tests {
                 "p-lock",
                 "p-lock",
                 "p-lock",
+                "p-held",
+                "p-held",
                 "usage-check",
                 "commit-steps",
                 "admission-waits"
@@ -865,9 +957,26 @@ mod tests {
               [DW0][INFO][steps] fault-declines-sharedx not-committed=1\n\
               [DW0][INFO][steps] fault-aheadx commits=1\n\
               [DW0][INFO][steps] streamsx started=1\n\
-              [DW0][INFO][steps] p-locked cpu=0\n",
+              [DW0][INFO][steps] p-locked cpu=0\n\
+              [DW0][INFO][steps] faults-partsx sync-us=1\n\
+              [DW0][INFO][steps] faults-fast-partsx check-us=1\n\
+              [DW0][INFO][steps] fault-passes-otherx unserved=1\n\
+              [DW0][INFO][steps] p-heldx by=commit count=1\n",
         );
         assert!(second_boot_lines(&lookalikes).is_empty());
+        // No `p-held` line is a report as good as any: the rest is printed.
+        let names = |lines: &[String]| -> Vec<String> {
+            second_boot_lines(lines)
+                .iter()
+                .map(|line| line.split_whitespace().next().unwrap().to_owned())
+                .collect()
+        };
+        let unheld = names(&without("p-held "));
+        assert!(!unheld.iter().any(|name| name == "p-held"));
+        assert_eq!(unheld.len(), names(&lines).len() - 2);
+        // A `p-held` line is printed as it stands, not parsed.
+        let odd = report_lines(b"[DW0][INFO][steps] p-held by=? count=x\n");
+        assert_eq!(second_boot_lines(&odd), [&"p-held by=? count=x".to_owned()]);
         // Without `fault-declines`, `fault-declines-shared` is still printed
         // once, by its own prefix; without `faults-shared`, nothing stands
         // for it.
@@ -993,12 +1102,11 @@ mod tests {
         );
         // Rounded down.
         let odd = vec![
-            "faults served=3 total-us=1 longest-us=1 sync-us=2 lookup-us=0 admit-us=0 \
-             commit-us=0 tables-us=0 return-us=0"
+            "faults served=3 total-us=1 longest-us=1".to_owned(),
+            "faults-parts sync-us=2 lookup-us=0 admit-us=0 commit-us=0 tables-us=0 return-us=0"
                 .to_owned(),
-            "faults-fast served=3 total-us=2 longest-us=1 check-us=1 commit-us=0 tables-us=0 \
-             return-us=0"
-                .to_owned(),
+            "faults-fast served=3 total-us=2 longest-us=1".to_owned(),
+            "faults-fast-parts check-us=1 commit-us=0 tables-us=0 return-us=0".to_owned(),
         ];
         assert_eq!(
             first_touch(&odd, None),
@@ -1130,10 +1238,10 @@ mod tests {
         assert!(first_touch(&garbled, Some(1)).is_err());
         let garbled_fast = replaced("check-us=6000", "check-us=x");
         let expected = Err(format!(
-            "the kernel's faults-fast line does not parse (DW2 M8 §13.16): {:?}",
+            "the kernel's faults-fast-parts line does not parse (DW2 §15.8): {:?}",
             garbled_fast
                 .iter()
-                .find(|line| line.starts_with("faults-fast "))
+                .find(|line| line.starts_with("faults-fast-parts "))
                 .unwrap()
         ));
         assert_eq!(first_touch(&garbled_fast, None), expected);
@@ -1148,10 +1256,13 @@ mod tests {
     fn at_least_half_of_the_served_passes_must_be_fast() {
         assert_eq!(FAST_SHARE, (1, 2));
         let passes = |served: u64, fast: u64| {
-            vec![format!(
-                "fault-passes served={served} already-present=10 released=0 retry=0 unserved=0 \
-                 exhausted=0 fill-in-serves=0 fast={fast}"
-            )]
+            vec![
+                format!(
+                    "fault-passes served={served} already-present=10 released=0 retry=0 \
+                     fast={fast}"
+                ),
+                "fault-passes-other unserved=0 exhausted=0 fill-in-serves=0".to_owned(),
+            ]
         };
         assert_eq!(fast_share(&lines()), Ok(()));
         // At one half, above it, and below it.
@@ -1201,6 +1312,122 @@ mod tests {
             ])
             .is_err()
         );
+        // The one line from before the split (DW2 §15.8) is not enough: its
+        // second line must be there.
+        assert_eq!(
+            fast_share(&[
+                "fault-passes served=10 already-present=0 released=0 retry=0 unserved=0 \
+                 exhausted=0 fill-in-serves=0 fast=10"
+                    .to_owned()
+            ]),
+            Err("the kernel's step report has no `fault-passes-other` line (DW2 §15.8)".into())
+        );
+    }
+
+    #[test]
+    fn the_fault_passes_line_needs_its_other_line() {
+        let missing = without("fault-passes-other ");
+        assert_eq!(
+            fast_share(&missing),
+            Err("the kernel's step report has no `fault-passes-other` line (DW2 §15.8)".into())
+        );
+        // `fault-passes` does not stand for it.
+        assert!(missing.iter().any(|line| line.starts_with("fault-passes ")));
+        // Nor does a line named only like it.
+        let lookalike = replaced("fault-passes-other ", "fault-passes-otherx ");
+        assert!(fast_share(&lookalike).is_err());
+        // Garbled, or without a count.
+        for (from, to) in [
+            ("unserved=0", "unserved=x"),
+            ("exhausted=0 ", ""),
+            ("fill-in-serves=0", "fill-in-serves="),
+        ] {
+            let garbled = replaced(from, to);
+            assert_eq!(
+                fast_share(&garbled),
+                Err(format!(
+                    "the kernel's fault-passes-other line does not parse (DW2 §15.8): {:?}",
+                    garbled
+                        .iter()
+                        .find(|line| line.starts_with("fault-passes-other "))
+                        .unwrap()
+                )),
+                "{from}"
+            );
+        }
+        // The other line alone, without `fault-passes`, is not the report.
+        assert_eq!(
+            fast_share(&without("fault-passes ")),
+            Err("the kernel's step report has no `fault-passes` line (DW2 M8 §13.16)".into())
+        );
+    }
+
+    #[test]
+    fn the_faults_lines_need_their_parts_lines() {
+        // Missing: an error where its first line is there, required or not.
+        let missing = without("faults-parts ");
+        let absent =
+            Err("the kernel's step report has no `faults-parts` line (DW2 §15.8)".to_owned());
+        assert_eq!(first_touch(&missing, None), absent);
+        assert_eq!(first_touch(&missing, Some(TOUCH_LOOP_PAGES)), absent);
+        let missing_fast = without("faults-fast-parts ");
+        let absent_fast =
+            Err("the kernel's step report has no `faults-fast-parts` line (DW2 §15.8)".to_owned());
+        assert_eq!(first_touch(&missing_fast, None), absent_fast);
+        assert_eq!(
+            first_touch(&missing_fast, Some(TOUCH_LOOP_PAGES)),
+            absent_fast
+        );
+        // Without its first line, a parts line is not needed, nor read.
+        let neither: Vec<String> = without("faults ")
+            .into_iter()
+            .filter(|line| !line.starts_with("faults-parts "))
+            .collect();
+        assert_eq!(first_touch(&neither, None).map(|lines| lines.len()), Ok(1));
+        // A line named only like it does not stand for it.
+        let lookalike = replaced("faults-parts ", "faults-partsx ");
+        assert_eq!(first_touch(&lookalike, None), absent);
+        let lookalike_fast = replaced("faults-fast-parts ", "faults-fast-partsx ");
+        assert_eq!(first_touch(&lookalike_fast, None), absent_fast);
+        // Garbled, or without a part, whether required or not.
+        for (from, to, name) in [
+            ("sync-us=2500", "sync-us=x", "faults-parts"),
+            ("lookup-us=2000 ", "", "faults-parts"),
+            (
+                "return-us=5000\n[DW0][INFO][steps] faults-fast ",
+                "return-us=\n[DW0][INFO][steps] faults-fast ",
+                "faults-parts",
+            ),
+            ("commit-us=24000", "commit-us=-1", "faults-fast-parts"),
+            ("tables-us=12000 ", "", "faults-fast-parts"),
+        ] {
+            let garbled = replaced(from, to);
+            let expected = Err(format!(
+                "the kernel's {name} line does not parse (DW2 §15.8): {:?}",
+                garbled
+                    .iter()
+                    .find(|line| line.starts_with(&format!("{name} ")))
+                    .unwrap()
+            ));
+            assert_eq!(first_touch(&garbled, None), expected, "{from}");
+            assert_eq!(first_touch(&garbled, Some(1)), expected, "{from}");
+        }
+        // The first lines' own fields stay required on them; a part on the
+        // first line does not stand for its parts line.
+        let garbled = replaced("total-us=30000", "total-us=x");
+        assert!(first_touch(&garbled, None).is_err());
+        let old = vec![
+            "faults served=3 total-us=1 longest-us=1 sync-us=2 lookup-us=0 admit-us=0 \
+             commit-us=0 tables-us=0 return-us=0"
+                .to_owned(),
+        ];
+        assert_eq!(first_touch(&old, None), absent);
+        let old_fast = vec![
+            "faults-fast served=3 total-us=2 longest-us=1 check-us=1 commit-us=0 tables-us=0 \
+             return-us=0"
+                .to_owned(),
+        ];
+        assert_eq!(first_touch(&old_fast, None), absent_fast);
     }
     #[test]
     fn a_committed_run_must_say_committed() {
