@@ -19,14 +19,16 @@
 //!   ([`TOUCHING_COMMITTED_KIB`]) is one only two jobs holding their objects
 //!   at once can pass.
 //!
-//! The kernel serves a first-touch fault either under its main lock (the
-//! `faults` line) or fast, without it (the `faults-fast` line; DW2 M8
-//! §13.16). Where the foreground run ran, the two lines' `served` counts
-//! together must reach at least the pages it touched
+//! The kernel serves a first-touch fault one of three ways: under its main
+//! lock (the `faults` line), fast without it, holding the paging lock
+//! exclusively (the `faults-fast` line; DW2 M8 §13.16), or fast with the
+//! paging lock shared, on a page already committed (the `faults-shared`
+//! line; DW2 M8b §15.2 step 1). Where the foreground run ran, the three
+//! lines' `served` counts together must reach at least the pages it touched
 //! ([`TOUCH_LOOP_PAGES`]); the check prints the mean a fault took in the
 //! kernel and its parts, one line for each way. In the first boot at least
-//! [`FAST_SHARE`] of the served fault passes must have been fast
-//! ([`fast_share`]). Each boot's step report must carry the
+//! [`FAST_SHARE`] of the served fault passes must have been fast, shared
+//! serves included ([`fast_share`]). Each boot's step report must carry the
 //! `fault-windows opened=<n> closed=<n>` line ([`fault_windows`]) and the
 //! `fault-declines identity=<n> mapping=<n> tables=<n> credit=<n>
 //! memory=<n> leaf=<n> return=<n>` line ([`fault_declines`]); their counts
@@ -39,6 +41,16 @@
 //! must carry both lines, and they must parse ([`shared_faults`],
 //! [`fault_declines_shared`]); where a committed foreground run ran, the
 //! shared serves must reach [`SHARED_LEAST`]. The check prints their mean.
+//!
+//! The kernel also commits ahead of a forward stream of touches (DW2 M8b
+//! §15.6 step 2): once a window shows a stream, the serve under the main
+//! lock commits the next pages at once, so the stream's later touches find
+//! them committed and are served shared. An ordinary `touch-loop` is such
+//! a stream. Each boot's step report must carry the `fault-ahead
+//! commits=<n> frames=<n> us=<n>` line ([`fault_ahead`]) and the `streams
+//! started=<n> ended=<n>` line ([`streams`]), and they must parse; in the
+//! first boot the frames committed ahead must reach [`AHEAD_LEAST`]. The
+//! check prints the frames, the holds and the mean a frame took.
 //!
 //! `touch-loop` no longer waits out a refused create: the kernel waits for
 //! owed work inside the call (DW2 M8 §13.12 part b), so a refusal ends the
@@ -84,15 +96,27 @@ const TOUCHING_COMMITTED_KIB: u64 = 96 * 1024;
 /// ran: half its pages (DW2 M8b §15.2 step 1). Not all of them: a touch
 /// that needs a new page table still goes through the main lock, and the
 /// fault after it through the exclusive fast serve, so some of every
-/// committed object's pages are served those ways.
+/// committed object's pages are served those ways. Since the kernel commits
+/// ahead of a stream (DW2 M8b §15.6 step 2), the ordinary runs' touches are
+/// mostly served shared too, so the count holds more than the committed
+/// run's; the bound and where it applies are unchanged.
 pub(super) const SHARED_LEAST: u64 = TOUCH_LOOP_PAGES / 2;
+/// The least of `fault-ahead frames=` in the first boot: half the pages of
+/// its ordinary foreground run (DW2 M8b §15.6 step 2). That run is a
+/// forward stream, so after each window's first touches the serve under the
+/// main lock commits the pages ahead of it; not all of them, since each
+/// round's first window, and each new page table, is served before a stream
+/// is seen. The committed run commits its own objects, so it adds little.
+pub(super) const AHEAD_LEAST: u64 = TOUCH_LOOP_PAGES / 2;
 /// The step report lines the check prints from the second boot.
-const SECOND_BOOT_PREFIXES: [&str; 12] = [
+const SECOND_BOOT_PREFIXES: [&str; 14] = [
     "faults ",
     "faults-fast ",
     "faults-shared ",
     "fault-passes ",
     "fault-windows ",
+    "fault-ahead ",
+    "streams ",
     "fault-declines ",
     "fault-declines-shared ",
     "t-lock ",
@@ -321,6 +345,80 @@ pub(super) fn fault_windows(lines: &[String]) -> Result<String, String> {
     required_line(lines, "fault-windows ", "fault-windows", "DW2 M8 §13.16")
 }
 
+/// The kernel's `fault-ahead commits=<n> frames=<n> us=<n>` line: the
+/// serves under the main lock that committed ahead of a stream, the frames
+/// they took and the microseconds they took (DW2 M8b §15.6 step 2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FaultAhead {
+    commits: u64,
+    frames: u64,
+    us: u64,
+}
+
+impl FaultAhead {
+    /// `commit ahead: <frames> frames in <commits> holds, mean <ns> ns a
+    /// frame`: the microseconds over the frames, in nanoseconds. `None`
+    /// with no frame taken.
+    fn mean_line(self) -> Option<String> {
+        if self.frames == 0 {
+            return None;
+        }
+        Some(format!(
+            "commit ahead: {} frames in {} holds, mean {} ns a frame",
+            self.frames,
+            self.commits,
+            u128::from(self.us) * 1000 / u128::from(self.frames)
+        ))
+    }
+}
+
+/// The kernel's `fault-ahead commits=<n> frames=<n> us=<n>` line in a
+/// boot's step report `lines` (DW2 M8b §15.6 step 2). The kernel prints it
+/// right after `fault-windows`. It must be there and parse; with `least`
+/// (the first boot, [`AHEAD_LEAST`]) its `frames` must reach it, and
+/// otherwise its counts are not checked. Returns
+/// [`FaultAhead::mean_line`] when a frame was taken.
+pub(super) fn fault_ahead(lines: &[String], least: Option<u64>) -> Result<Option<String>, String> {
+    let line = required_line(lines, "fault-ahead ", "fault-ahead", "DW2 M8b §15.6 step 2")?;
+    let field = |name: &str| memory::line_field(line.as_bytes(), name);
+    let (Some(commits), Some(frames), Some(us)) = (field("commits"), field("frames"), field("us"))
+    else {
+        return Err(format!(
+            "the kernel's fault-ahead line does not parse (DW2 M8b §15.6 step 2): {line:?}"
+        ));
+    };
+    let ahead = FaultAhead {
+        commits,
+        frames,
+        us,
+    };
+    if let Some(least) = least
+        && frames < least
+    {
+        return Err(format!(
+            "the kernel committed {frames} frames ahead of a stream, fewer than {least}, half \
+             the pages `touch-loop 64 20` touched (DW2 M8b §15.6 step 2)"
+        ));
+    }
+    Ok(ahead.mean_line())
+}
+
+/// The kernel's `streams started=<n> ended=<n>` line in a boot's step
+/// report `lines`, without its line ending: the forward streams the fault
+/// windows saw start and end (DW2 M8b §15.6 step 2). The kernel prints it
+/// right after `fault-ahead`. It must be there and parse; its counts are
+/// not checked.
+pub(super) fn streams(lines: &[String]) -> Result<String, String> {
+    let line = required_line(lines, "streams ", "streams", "DW2 M8b §15.6 step 2")?;
+    let field = |name: &str| memory::line_field(line.as_bytes(), name);
+    if field("started").is_none() || field("ended").is_none() {
+        return Err(format!(
+            "the kernel's streams line does not parse (DW2 M8b §15.6 step 2): {line:?}"
+        ));
+    }
+    Ok(line)
+}
+
 /// The kernel's `fault-declines identity=<n> mapping=<n> tables=<n>
 /// credit=<n> memory=<n> leaf=<n> return=<n>` line in a boot's step report
 /// `lines`, without its line ending: why the fast serve declined a fault,
@@ -499,6 +597,10 @@ impl FaultsShared {
     }
 }
 
+/// The failure of a step report without its `faults-shared` line.
+const NO_FAULTS_SHARED: &str =
+    "the kernel's step report has no `faults-shared` line (DW2 M8b §15.2 step 1)";
+
 /// A boot's shared serves against its step report `lines`: the
 /// `faults-shared served=<n> total-us=<n> longest-us=<n> check-us=<n>
 /// tables-us=<n> return-us=<n>` line must be there and parse, and with
@@ -509,8 +611,7 @@ pub(super) fn shared_faults(
     lines: &[String],
     least: Option<u64>,
 ) -> Result<Option<String>, String> {
-    let shared = FaultsShared::parse(lines)
-        .ok_or("the kernel's step report has no `faults-shared` line (DW2 M8b §15.2 step 1)")??;
+    let shared = FaultsShared::parse(lines).ok_or(NO_FAULTS_SHARED)??;
     if let Some(least) = least
         && shared.served < least
     {
@@ -545,15 +646,17 @@ pub(super) fn fault_declines_shared(lines: &[String]) -> Result<String, String> 
 }
 
 /// A boot's faults against its step report `lines`. With `least`, the
-/// `faults` and `faults-fast` lines must both be there and their `served`
-/// counts together reach at least `least` (DW2 M8 §13.16: a fault is served
-/// either under the main lock or fast); without, either may be missing.
-/// A line that is there must parse. Returns [`Faults::mean_line`] and then
-/// [`FaultsFast::mean_line`], each when its line is there with a fault
-/// served.
+/// `faults`, `faults-fast` and `faults-shared` lines must all be there and
+/// their `served` counts together reach at least `least` (a fault is served
+/// under the main lock, fast, or shared: DW2 M8 §13.16, DW2 M8b §15.2 step
+/// 1); without, any may be missing. A line that is there must parse.
+/// Returns [`Faults::mean_line`] and then [`FaultsFast::mean_line`], each
+/// when its line is there with a fault served; the shared mean is
+/// [`shared_faults`]'s.
 pub(super) fn first_touch(lines: &[String], least: Option<u64>) -> Result<Vec<String>, String> {
     let faults = Faults::parse(lines).transpose()?;
     let fast = FaultsFast::parse(lines).transpose()?;
+    let shared = FaultsShared::parse(lines).transpose()?;
     if let Some(least) = least {
         let Some(faults) = faults else {
             return Err("the kernel's step report has no `faults` line (DW2 M8 §13.5)".into());
@@ -563,12 +666,17 @@ pub(super) fn first_touch(lines: &[String], least: Option<u64>) -> Result<Vec<St
                 "the kernel's step report has no `faults-fast` line (DW2 M8 §13.16)".into(),
             );
         };
-        let served = u128::from(faults.served) + u128::from(fast.served);
+        let Some(shared) = shared else {
+            return Err(NO_FAULTS_SHARED.into());
+        };
+        let served =
+            u128::from(faults.served) + u128::from(fast.served) + u128::from(shared.served);
         if served < u128::from(least) {
             return Err(format!(
-                "the kernel served {served} faults ({} under the main lock, {} fast; \
-                 DW2 M8 §13.16), fewer than the {least} pages `touch-loop 64 20` touched",
-                faults.served, fast.served
+                "the kernel served {served} faults ({} under the main lock, {} fast, {} shared; \
+                 DW2 M8 §13.16, M8b §15.2), fewer than the {least} pages `touch-loop 64 20` \
+                 touched",
+                faults.served, fast.served, shared.served
             ));
         }
     }
@@ -627,6 +735,8 @@ mod tests {
         [DW0][INFO][steps] fault-passes served=399990 already-present=10 released=0 retry=0 \
         unserved=0 exhausted=0 fill-in-serves=0 fast=300000\n\
         [DW0][INFO][steps] fault-windows opened=300004 closed=300004\n\
+        [DW0][INFO][steps] fault-ahead commits=7563 frames=483026 us=66822\n\
+        [DW0][INFO][steps] streams started=519 ended=519\n\
         [DW0][INFO][steps] fault-declines identity=0 mapping=1 tables=99990 credit=0 \
         memory=0 leaf=3 return=0\n\
         [DW0][INFO][steps] fault-declines-shared not-committed=7\n\
@@ -715,6 +825,8 @@ mod tests {
                 "faults-shared",
                 "fault-passes",
                 "fault-windows",
+                "fault-ahead",
+                "streams",
                 "fault-declines",
                 "fault-declines-shared",
                 "t-lock",
@@ -751,6 +863,8 @@ mod tests {
               [DW0][INFO][steps] fault-windowsill opened=1\n\
               [DW0][INFO][steps] fault-declinesx identity=1\n\
               [DW0][INFO][steps] fault-declines-sharedx not-committed=1\n\
+              [DW0][INFO][steps] fault-aheadx commits=1\n\
+              [DW0][INFO][steps] streamsx started=1\n\
               [DW0][INFO][steps] p-locked cpu=0\n",
         );
         assert!(second_boot_lines(&lookalikes).is_empty());
@@ -923,33 +1037,65 @@ mod tests {
     }
 
     #[test]
-    fn a_boot_that_must_touch_needs_both_lines_and_enough_faults_between_them() {
+    fn a_boot_that_must_touch_needs_all_three_lines_and_enough_faults_between_them() {
         assert_eq!(TOUCH_LOOP_PAGES, 327_680);
-        let served = |locked: u64, fast: u64| {
+        let served = |locked: u64, fast: u64, shared: u64| {
             report_lines(
                 LOG.replace("faults served=100000", &format!("faults served={locked}"))
                     .replace(
                         "faults-fast served=300000",
                         &format!("faults-fast served={fast}"),
                     )
+                    .replace(
+                        "faults-shared served=200000",
+                        &format!("faults-shared served={shared}"),
+                    )
                     .as_bytes(),
             )
         };
-        // Enough only with both lines' counts.
-        assert!(first_touch(&served(27_680, 300_000), Some(TOUCH_LOOP_PAGES)).is_ok());
-        assert!(first_touch(&served(0, 327_680), Some(TOUCH_LOOP_PAGES)).is_ok());
-        assert!(first_touch(&served(327_680, 0), Some(TOUCH_LOOP_PAGES)).is_ok());
+        // Enough only with the three lines' counts together, at the edge.
+        assert!(first_touch(&served(7_680, 200_000, 120_000), Some(TOUCH_LOOP_PAGES)).is_ok());
+        assert!(first_touch(&served(0, 0, 327_680), Some(TOUCH_LOOP_PAGES)).is_ok());
+        assert!(first_touch(&served(0, 327_680, 0), Some(TOUCH_LOOP_PAGES)).is_ok());
+        assert!(first_touch(&served(327_680, 0, 0), Some(TOUCH_LOOP_PAGES)).is_ok());
         assert_eq!(
-            first_touch(&served(27_679, 300_000), Some(TOUCH_LOOP_PAGES)),
+            first_touch(&served(7_679, 200_000, 120_000), Some(TOUCH_LOOP_PAGES)),
             Err(
-                "the kernel served 327679 faults (27679 under the main lock, 300000 fast; \
-                 DW2 M8 §13.16), fewer than the 327680 pages `touch-loop 64 20` touched"
+                "the kernel served 327679 faults (7679 under the main lock, 200000 fast, \
+                 120000 shared; DW2 M8 §13.16, M8b §15.2), fewer than the 327680 pages \
+                 `touch-loop 64 20` touched"
                     .into()
             )
         );
-        // Neither line alone would do here.
-        assert!(first_touch(&served(200_000, 0), Some(TOUCH_LOOP_PAGES)).is_err());
-        assert!(first_touch(&served(0, 300_000), Some(TOUCH_LOOP_PAGES)).is_err());
+        // The boot that found the gap: its shared serves make up the rest.
+        assert!(first_touch(&served(9_372, 79_566, 0), Some(TOUCH_LOOP_PAGES)).is_err());
+        assert!(first_touch(&served(9_372, 79_566, 238_742), Some(TOUCH_LOOP_PAGES)).is_ok());
+        // No two lines alone would do here.
+        assert!(first_touch(&served(200_000, 120_000, 0), Some(TOUCH_LOOP_PAGES)).is_err());
+        assert!(first_touch(&served(0, 200_000, 120_000), Some(TOUCH_LOOP_PAGES)).is_err());
+        assert!(first_touch(&served(200_000, 0, 120_000), Some(TOUCH_LOOP_PAGES)).is_err());
+        // `faults-shared` missing: the failure `shared_faults` gives, when
+        // required, even with enough faults the other ways; else nothing.
+        let missing_shared: Vec<String> = served(400_000, 300_000, 0)
+            .into_iter()
+            .filter(|line| !line.starts_with("faults-shared "))
+            .collect();
+        assert_eq!(
+            first_touch(&missing_shared, Some(TOUCH_LOOP_PAGES)),
+            Err(NO_FAULTS_SHARED.into())
+        );
+        assert_eq!(
+            first_touch(&missing_shared, Some(TOUCH_LOOP_PAGES)),
+            shared_faults(&missing_shared, None).map(|_| Vec::new())
+        );
+        assert_eq!(
+            first_touch(&missing_shared, None).map(|lines| lines.len()),
+            Ok(2)
+        );
+        // A garbled `faults-shared` line fails whether required or not.
+        let garbled_shared = replaced("check-us=4000", "check-us=x");
+        assert!(first_touch(&garbled_shared, None).is_err());
+        assert!(first_touch(&garbled_shared, Some(1)).is_err());
         // `faults` missing: required, or not.
         let missing = without("faults ");
         assert_eq!(
@@ -959,7 +1105,7 @@ mod tests {
         assert_eq!(first_touch(&missing, None).map(|lines| lines.len()), Ok(1));
         // `faults-fast` missing: an error when required, even with enough
         // faults under the main lock; else only its mean is left out.
-        let missing_fast: Vec<String> = served(400_000, 300_000)
+        let missing_fast: Vec<String> = served(400_000, 300_000, 0)
             .into_iter()
             .filter(|line| !line.starts_with("faults-fast "))
             .collect();
@@ -993,8 +1139,8 @@ mod tests {
         assert_eq!(first_touch(&garbled_fast, None), expected);
         assert_eq!(first_touch(&garbled_fast, Some(1)), expected);
         // A boot that served none prints no mean.
-        assert_eq!(first_touch(&served(0, 0), None), Ok(Vec::new()));
-        assert!(first_touch(&served(0, 0), Some(1)).is_err());
+        assert_eq!(first_touch(&served(0, 0, 0), None), Ok(Vec::new()));
+        assert!(first_touch(&served(0, 0, 0), Some(1)).is_err());
         assert_eq!(first_touch(&report_lines(b""), None), Ok(Vec::new()));
     }
 
@@ -1201,11 +1347,13 @@ mod tests {
         assert_eq!(shared_faults(&garbled, Some(1)), expected);
         let no_tables = replaced("tables-us=8000 ", "");
         assert!(shared_faults(&no_tables, None).is_err());
-        // The shared line does not change what `first_touch` reads.
+        // `first_touch` needs it too where the foreground run ran, with the
+        // same failure; elsewhere it leaves it to `shared_faults`.
         assert_eq!(
-            first_touch(&missing, Some(TOUCH_LOOP_PAGES)),
-            first_touch(&lines(), Some(TOUCH_LOOP_PAGES))
+            first_touch(&missing, Some(TOUCH_LOOP_PAGES)).unwrap_err(),
+            absent.clone().unwrap_err()
         );
+        assert!(first_touch(&missing, None).is_ok());
     }
 
     #[test]
@@ -1294,5 +1442,119 @@ mod tests {
         // The name alone, without its fields, is not the line.
         assert!(fault_declines_shared(&["fault-declines-shared".to_owned()]).is_err());
         assert!(fault_declines_shared(&report_lines(b"")).is_err());
+    }
+    #[test]
+    fn each_boot_needs_the_fault_ahead_line_and_its_mean_is_printed() {
+        // 66,822 us over 483,026 frames is 138.3 ns, rounded down.
+        let mean = "commit ahead: 483026 frames in 7563 holds, mean 138 ns a frame";
+        assert_eq!(fault_ahead(&lines(), None), Ok(Some(mean.into())));
+        assert_eq!(
+            fault_ahead(&lines(), Some(AHEAD_LEAST)),
+            Ok(Some(mean.into()))
+        );
+        let odd = vec!["fault-ahead commits=1 frames=3 us=2".to_owned()];
+        assert_eq!(
+            fault_ahead(&odd, None),
+            Ok(Some(
+                "commit ahead: 3 frames in 1 holds, mean 666 ns a frame".into()
+            ))
+        );
+        // No frame taken: no line, but the line must still be there.
+        let none = vec!["fault-ahead commits=0 frames=0 us=0".to_owned()];
+        assert_eq!(fault_ahead(&none, None), Ok(None));
+        // Missing.
+        let missing = without("fault-ahead ");
+        let absent = Err(
+            "the kernel's step report has no `fault-ahead` line (DW2 M8b §15.6 step 2)".to_owned(),
+        );
+        assert_eq!(fault_ahead(&missing, None), absent);
+        assert_eq!(fault_ahead(&missing, Some(AHEAD_LEAST)), absent);
+        assert!(fault_ahead(&report_lines(b""), None).is_err());
+        // `fault-windows` and `streams` do not stand for it.
+        assert!(
+            missing
+                .iter()
+                .any(|line| line.starts_with("fault-windows "))
+        );
+        assert!(missing.iter().any(|line| line.starts_with("streams ")));
+        // Malformed, whether a floor applies or not.
+        for garbled in [
+            "fault-ahead commits=x frames=483026 us=66822",
+            "fault-ahead commits=7563 frames= us=66822",
+            "fault-ahead commits=7563 frames=483026",
+            "fault-ahead frames=483026 us=66822",
+        ] {
+            let expected = Err(format!(
+                "the kernel's fault-ahead line does not parse (DW2 M8b §15.6 step 2): {garbled:?}"
+            ));
+            assert_eq!(fault_ahead(&[garbled.to_owned()], None), expected);
+            assert_eq!(
+                fault_ahead(&[garbled.to_owned()], Some(AHEAD_LEAST)),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_boot_needs_half_its_ordinary_pages_committed_ahead() {
+        assert_eq!(AHEAD_LEAST, 163_840);
+        assert_eq!(AHEAD_LEAST * 2, TOUCH_LOOP_PAGES);
+        let frames = |count: u64| vec![format!("fault-ahead commits=10 frames={count} us=1000")];
+        // At the floor and above it.
+        assert!(fault_ahead(&frames(163_840), Some(AHEAD_LEAST)).is_ok());
+        assert!(fault_ahead(&frames(163_841), Some(AHEAD_LEAST)).is_ok());
+        // One below it.
+        assert_eq!(
+            fault_ahead(&frames(163_839), Some(AHEAD_LEAST)),
+            Err(
+                "the kernel committed 163839 frames ahead of a stream, fewer than 163840, half \
+                 the pages `touch-loop 64 20` touched (DW2 M8b §15.6 step 2)"
+                    .into()
+            )
+        );
+        assert!(fault_ahead(&frames(0), Some(AHEAD_LEAST)).is_err());
+        // The second boot has no floor.
+        assert_eq!(fault_ahead(&frames(0), None), Ok(None));
+        assert!(fault_ahead(&frames(163_839), None).is_ok());
+    }
+
+    #[test]
+    fn each_boot_needs_the_streams_line_whatever_its_counts() {
+        assert_eq!(
+            streams(&lines()),
+            Ok("streams started=519 ended=519".into())
+        );
+        let none = report_lines(b"[DW0][INFO][steps] streams started=0 ended=0\r\n");
+        assert_eq!(streams(&none), Ok("streams started=0 ended=0".into()));
+        // Unequal counts are not checked.
+        assert_eq!(
+            streams(&["streams started=5 ended=2".to_owned()]),
+            Ok("streams started=5 ended=2".into())
+        );
+        let missing = without("streams ");
+        assert_eq!(
+            streams(&missing),
+            Err("the kernel's step report has no `streams` line (DW2 M8b §15.6 step 2)".into())
+        );
+        // `fault-ahead` does not stand for it.
+        assert!(missing.iter().any(|line| line.starts_with("fault-ahead ")));
+        assert!(streams(&report_lines(b"")).is_err());
+        for garbled in [
+            "streams started=x ended=519",
+            "streams started=519",
+            "streams ended=519",
+            "streams started=519 ended=",
+        ] {
+            assert_eq!(
+                streams(&[garbled.to_owned()]),
+                Err(format!(
+                    "the kernel's streams line does not parse (DW2 M8b §15.6 step 2): \
+                     {garbled:?}"
+                )),
+                "{garbled}"
+            );
+        }
+        // The name alone is not the line.
+        assert!(streams(&["streams".to_owned()]).is_err());
     }
 }

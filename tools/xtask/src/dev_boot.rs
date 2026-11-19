@@ -19,7 +19,10 @@
 //! that spun on an AP, and its longest finalize gap is reported (Deepwyrm
 //! DW2 §10.19, `memory.rs`); runs `bin/hello touch-loop 64 20`, which
 //! times a first touch of an on-demand page, and requires the kernel's
-//! `faults` line to count its pages (DW2 M8 §13.5, `touch.rs`), then
+//! `faults`, `faults-fast` and `faults-shared` lines together to count its
+//! pages (DW2 M8 §13.5, `touch.rs`) and its `fault-ahead` line to count at
+//! least half of them as committed ahead of a stream (DW2 M8b §15.6 step
+//! 2), then
 //! `bin/hello touch-loop 64 20 committed`, which commits each object before
 //! touching it, and requires the kernel's `faults-shared` line to count at
 //! least half its pages as served with the paging lock shared (DW2 M8b
@@ -38,10 +41,11 @@
 //! The second boot `cat`s the file back, removes it, under `--smp` runs
 //! `touch-loop` three at once and requires its faults counted, then three
 //! at once again with every job `committed` and requires its shared faults
-//! counted, and shuts down; its fault, shared-fault, lock, usage-check,
-//! commit-step and admission-wait lines are printed. Each boot's step
-//! report must carry a `faults-shared` and a `fault-declines-shared` line
-//! that parse. Each boot must end with the kernel's power-off line on its
+//! counted, and shuts down; its fault, shared-fault, commit-ahead, stream,
+//! lock, usage-check, commit-step and admission-wait lines are printed.
+//! Each boot's step report must carry `faults-shared`,
+//! `fault-declines-shared`, `fault-ahead` and `streams` lines that parse,
+//! and each boot prints the frames committed ahead and their mean. Each boot must end with the kernel's power-off line on its
 //! COM1 log, and its step report must carry `records-dropped=0`, a
 //! `usage-check` line with TaskGroups compared and no mismatch (DW2 M8
 //! §13.12 part a) and an `admission-waits` line, whatever its counts (DW2
@@ -393,6 +397,24 @@ fn check(
             boots[0].1.display()
         ))
     })?;
+    // The ordinary run is a forward stream, so the kernel committed ahead
+    // of it (DW2 M8b §15.6 step 2): most of its pages must have been taken
+    // so, and the `streams` line must be there.
+    let ahead = touch::fault_ahead(&steps, Some(touch::AHEAD_LEAST)).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
+    if let Some(line) = ahead {
+        eprintln!("dev-boot: {line}");
+    }
+    touch::streams(&steps).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
     // Alone, most of `touch-loop`'s faults are served fast (DW2 M8 §13.16).
     touch::fast_share(&steps).map_err(|reason| {
         Failure::task(format!(
@@ -480,6 +502,21 @@ fn check(
         eprintln!("dev-boot: (second boot) {line}");
     }
     touch::fault_declines_shared(&lines).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: second boot: {reason}; see {}",
+            boots[1].1.display()
+        ))
+    })?;
+    let ahead = touch::fault_ahead(&lines, None).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: second boot: {reason}; see {}",
+            boots[1].1.display()
+        ))
+    })?;
+    if let Some(line) = ahead {
+        eprintln!("dev-boot: (second boot) {line}");
+    }
+    touch::streams(&lines).map_err(|reason| {
         Failure::task(format!(
             "dev-boot check: second boot: {reason}; see {}",
             boots[1].1.display()
