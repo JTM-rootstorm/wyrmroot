@@ -79,9 +79,9 @@ fn every_site_number_is_distinct_and_in_range() {
     assert_eq!(numbers.len(), ProbeSite::ALL.len());
     assert!(!numbers.contains(&0));
     // The retired sites of the waits for a refused create are not reused,
-    // and every other number from 1 to 67 is still a site.
+    // and every other number from 1 to 68 is still a site.
     let retired = [56, 57, 58, 60, 62];
-    let expected: BTreeSet<u8> = (1..=67).filter(|n| !retired.contains(n)).collect();
+    let expected: BTreeSet<u8> = (1..=68).filter(|n| !retired.contains(n)).collect();
     assert_eq!(numbers, expected);
 }
 

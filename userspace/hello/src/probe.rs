@@ -170,11 +170,14 @@ pub enum ProbeSite {
     TouchLoopUnmapMost = 66,
     /// `touch-loop`: `address_region_unmap` of the last page.
     TouchLoopUnmapLast = 67,
+    /// `touch-loop … committed`: `memory_object_commit` of the whole object
+    /// before it is mapped.
+    TouchLoopCommit = 68,
 }
 
 impl ProbeSite {
     /// Every site, for tests and decoders.
-    pub const ALL: [Self; 62] = [
+    pub const ALL: [Self; 63] = [
         Self::OnDemandCreate,
         Self::OnDemandInfo,
         Self::OnDemandMap,
@@ -237,6 +240,7 @@ impl ProbeSite {
         Self::TouchLoopClock,
         Self::TouchLoopUnmapMost,
         Self::TouchLoopUnmapLast,
+        Self::TouchLoopCommit,
     ];
 
     /// This site's failure with the kernel status of its call.
@@ -428,11 +432,18 @@ pub trait TouchCalls: ChurnCalls {
     fn touch(&mut self, base: u64, size: u64);
 }
 
-/// `touch-loop <MiB> <rounds>`'s arguments: the object's size in MiB
-/// (1..=[`TOUCH_MIB_MAX`]) and the rounds (1..=[`TOUCH_ROUNDS_MAX`]), each
-/// in decimal digits alone. A missing or bad one is the job status
+/// `touch-loop <MiB> <rounds> [committed]`'s arguments: the object's size
+/// in MiB (1..=[`TOUCH_MIB_MAX`]) and the rounds (1..=[`TOUCH_ROUNDS_MAX`]),
+/// each in decimal digits alone, and whether the third argument, exactly
+/// `committed`, asks each round to commit its object before touching it
+/// (Deepwyrm DW2 M8b §15.2 step 1). A missing or bad size or rounds, or a
+/// third argument other than `committed`, is the job status
 /// [`ProbeSite::TouchLoopArgument`] with code 0.
-pub fn touch_loop_arguments(size: Option<&str>, rounds: Option<&str>) -> Result<(u64, u32), u32> {
+pub fn touch_loop_arguments(
+    size: Option<&str>,
+    rounds: Option<&str>,
+    mode: Option<&str>,
+) -> Result<(u64, u32, bool), u32> {
     let bad = ProbeSite::TouchLoopArgument.alone();
     let size = size.and_then(decimal).ok_or(bad)?;
     let rounds = rounds.and_then(decimal).ok_or(bad)?;
@@ -440,8 +451,13 @@ pub fn touch_loop_arguments(size: Option<&str>, rounds: Option<&str>) -> Result<
     {
         return Err(bad);
     }
+    let committed = match mode {
+        None => false,
+        Some("committed") => true,
+        Some(_) => return Err(bad),
+    };
     // In range, so it fits.
-    Ok((size, rounds as u32))
+    Ok((size, rounds as u32, committed))
 }
 
 /// A short decimal number: one to six digits and nothing else.
@@ -457,7 +473,8 @@ fn decimal(text: &str) -> Option<u64> {
 }
 
 /// What `touch-loop` found: the least, the median (the lower middle of an
-/// even count) and the greatest of its rounds' nanoseconds a page.
+/// even count) and the greatest of its rounds' nanoseconds a page, and
+/// whether each round committed its object before touching it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TouchSummary {
     pub size_mib: u64,
@@ -465,11 +482,14 @@ pub struct TouchSummary {
     pub min: u64,
     pub median: u64,
     pub max: u64,
+    pub committed: bool,
 }
 
 impl TouchSummary {
     /// `touch-loop size-mib=<n> rounds=<n> min-ns-per-page=<n>
-    /// median-ns-per-page=<n> max-ns-per-page=<n>` and a newline.
+    /// median-ns-per-page=<n> max-ns-per-page=<n>`, then ` committed=1` when
+    /// the rounds committed their objects (nothing otherwise), and a
+    /// newline.
     #[must_use]
     pub fn line(&self) -> TouchLine {
         let mut line = TouchLine {
@@ -486,13 +506,16 @@ impl TouchSummary {
             line.text(name);
             line.number(value);
         }
+        if self.committed {
+            line.text(" committed=1");
+        }
         line.text("\n");
         line
     }
 }
 
-/// The longest [`TouchSummary::line`]: its names and five numbers of up to
-/// twenty digits each.
+/// The longest [`TouchSummary::line`]: its names, five numbers of up to
+/// twenty digits each and ` committed=1`.
 const TOUCH_LINE_BYTES: usize = 224;
 
 /// A [`TouchSummary`]'s line, built without allocation.
@@ -552,11 +575,13 @@ pub fn spread(times: &[u64]) -> Option<(u64, u64, u64)> {
     ))
 }
 
-/// `touch-loop <MiB> <rounds>` (Deepwyrm DW2 M8 §13.5): each round creates
-/// an on-demand object of `size_mib`, maps it whole read-write, closes its
-/// handle so only the mapping holds it, times one write to every page (each
-/// a first touch) with the monotonic clock, and unmaps all but the last page
-/// and then the last page. With no handle left, the first unmap's steps
+/// `touch-loop <MiB> <rounds> [committed]` (Deepwyrm DW2 M8 §13.5): each
+/// round creates an on-demand object of `size_mib`, with `committed`
+/// commits it whole (outside the timed pass, so every touch is of a page
+/// already committed: DW2 M8b §15.2 step 1), maps it whole read-write,
+/// closes its handle so only the mapping holds it, times one write to every
+/// page (each a first touch of the mapping) with the monotonic clock, and
+/// unmaps all but the last page and then the last page. With no handle left, the first unmap's steps
 /// return the pages they remove, and the object's own finalization, owed
 /// after the second, has one page left. A round's figure is the touch
 /// pass's nanoseconds divided by its pages.
@@ -566,11 +591,13 @@ pub fn spread(times: &[u64]) -> Option<(u64, u64, u64)> {
 /// nothing is retried. At the end `write` gets the summary's line
 /// ([`TouchSummary::line`]) and the job status is 0. Sizes and rounds
 /// outside [`touch_loop_arguments`]'s ranges fail at
-/// [`ProbeSite::TouchLoopArgument`] before any call.
+/// [`ProbeSite::TouchLoopArgument`] before any call. A commit that does not
+/// succeed ends the job at [`ProbeSite::TouchLoopCommit`].
 pub fn touch_loop(
     calls: &mut impl TouchCalls,
     size_mib: u64,
     rounds: u32,
+    committed: bool,
     write: &mut dyn FnMut(&[u8]) -> bool,
 ) -> u32 {
     if !(1..=TOUCH_MIB_MAX).contains(&size_mib) || !(1..=TOUCH_ROUNDS_MAX).contains(&rounds) {
@@ -585,6 +612,12 @@ pub fn touch_loop(
             Ok(object) => object,
             Err(status) => return ProbeSite::TouchLoopCreate.after(status, done),
         };
+        if committed {
+            let status = calls.commit(object, size);
+            if status != DW_STATUS_SUCCESS {
+                return ProbeSite::TouchLoopCommit.after(status, done);
+            }
+        }
         let base = match calls.map(object, size) {
             Ok(base) => base,
             Err(status) => return ProbeSite::TouchLoopMap.after(status, done),
@@ -619,6 +652,7 @@ pub fn touch_loop(
         min,
         median,
         max,
+        committed,
     };
     write(summary.line().as_bytes());
     0

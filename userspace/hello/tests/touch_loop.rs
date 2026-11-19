@@ -1,5 +1,6 @@
-//! `hello touch-loop` (Deepwyrm DW2 M8 §13.5) driven against a recording
-//! system: its calls, its figures and its failures.
+//! `hello touch-loop` (Deepwyrm DW2 M8 §13.5), and its `committed` mode
+//! (DW2 M8b §15.2 step 1), driven against a recording system: its calls,
+//! its figures and its failures.
 
 use std::collections::VecDeque;
 
@@ -19,6 +20,7 @@ const MIB: u64 = 1 << 20;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Call {
     Create(u64, u32),
+    Commit(DwHandle, u64),
     Map(DwHandle, u64),
     Close(DwHandle),
     Clock,
@@ -30,6 +32,7 @@ enum Call {
 /// first).
 #[derive(Clone, Copy, Debug)]
 enum Fail {
+    Commit(usize, DwStatus),
     Map(usize, DwStatus),
     Close(usize, DwStatus),
     Clock(usize, DwStatus),
@@ -46,6 +49,7 @@ struct Recorder {
     clock: VecDeque<u64>,
     fail: Option<Fail>,
     next: u64,
+    commits: usize,
     maps: usize,
     closes: usize,
     clocks: usize,
@@ -61,6 +65,7 @@ impl Recorder {
             clock: VecDeque::new(),
             fail: None,
             next: 100,
+            commits: 0,
             maps: 0,
             closes: 0,
             clocks: 0,
@@ -81,8 +86,17 @@ impl Recorder {
     }
 
     fn run(&mut self, size_mib: u64, rounds: u32) -> u32 {
+        self.run_mode(size_mib, rounds, false)
+    }
+
+    /// [`Self::run`] in the `committed` mode.
+    fn run_committed(&mut self, size_mib: u64, rounds: u32) -> u32 {
+        self.run_mode(size_mib, rounds, true)
+    }
+
+    fn run_mode(&mut self, size_mib: u64, rounds: u32, committed: bool) -> u32 {
         let mut lines = Vec::new();
-        let status = touch_loop(self, size_mib, rounds, &mut |line| {
+        let status = touch_loop(self, size_mib, rounds, committed, &mut |line| {
             lines.push(line.to_vec());
             true
         });
@@ -105,8 +119,14 @@ impl ChurnCalls for Recorder {
         Ok(DwHandle(self.next))
     }
 
-    fn commit(&mut self, _: DwHandle, _: u64) -> DwStatus {
-        unreachable!("touch-loop commits nothing")
+    fn commit(&mut self, object: DwHandle, size: u64) -> DwStatus {
+        self.calls.push(Call::Commit(object, size));
+        let index = self.commits;
+        self.commits += 1;
+        match self.fail {
+            Some(Fail::Commit(at, status)) if at == index => status,
+            _ => DW_STATUS_SUCCESS,
+        }
     }
 
     fn map(&mut self, object: DwHandle, size: u64) -> Result<u64, DwStatus> {
@@ -177,6 +197,14 @@ fn round(handle: u64, size_mib: u64) -> Vec<Call> {
         Call::Unmap(base, size - PAGE),
         Call::Unmap(base + size - PAGE, PAGE),
     ]
+}
+
+/// The calls of one `committed` round: the same, with the whole object
+/// committed between the create and the map.
+fn committed_round(handle: u64, size_mib: u64) -> Vec<Call> {
+    let mut calls = round(handle, size_mib);
+    calls.insert(1, Call::Commit(DwHandle(handle), size_mib * MIB));
+    calls
 }
 
 #[test]
@@ -255,6 +283,7 @@ fn the_line_text_is_exact() {
         min: 180,
         median: 205,
         max: 1_234,
+        committed: false,
     };
     assert_eq!(
         summary.line().as_bytes(),
@@ -268,10 +297,31 @@ fn the_line_text_is_exact() {
         min: u64::MAX,
         median: u64::MAX,
         max: u64::MAX,
+        committed: false,
     };
     let text = String::from_utf8(widest.line().as_bytes().to_vec()).unwrap();
     assert!(
         text.ends_with(" max-ns-per-page=18446744073709551615\n"),
+        "{text}"
+    );
+    // The `committed` mode appends one field, after the rest; the widest
+    // still fits.
+    let committed = TouchSummary {
+        committed: true,
+        ..summary
+    };
+    assert_eq!(
+        committed.line().as_bytes(),
+        b"touch-loop size-mib=64 rounds=20 min-ns-per-page=180 \
+          median-ns-per-page=205 max-ns-per-page=1234 committed=1\n"
+    );
+    let widest = TouchSummary {
+        committed: true,
+        ..widest
+    };
+    let text = String::from_utf8(widest.line().as_bytes().to_vec()).unwrap();
+    assert!(
+        text.ends_with(" max-ns-per-page=18446744073709551615 committed=1\n"),
         "{text}"
     );
 }
@@ -368,9 +418,18 @@ fn each_failed_call_ends_the_job_with_its_site_status_and_rounds() {
 
 #[test]
 fn bad_arguments_fail_with_their_site() {
-    assert_eq!(touch_loop_arguments(Some("64"), Some("20")), Ok((64, 20)));
-    assert_eq!(touch_loop_arguments(Some("1"), Some("1")), Ok((1, 1)));
-    assert_eq!(touch_loop_arguments(Some("256"), Some("64")), Ok((256, 64)));
+    assert_eq!(
+        touch_loop_arguments(Some("64"), Some("20"), None),
+        Ok((64, 20, false))
+    );
+    assert_eq!(
+        touch_loop_arguments(Some("1"), Some("1"), None),
+        Ok((1, 1, false))
+    );
+    assert_eq!(
+        touch_loop_arguments(Some("256"), Some("64"), None),
+        Ok((256, 64, false))
+    );
     let bad = ProbeSite::TouchLoopArgument.alone();
     assert_eq!(decode_probe_failure(bad), Some((59, 0, 0)));
     for (size, rounds) in [
@@ -389,7 +448,13 @@ fn bad_arguments_fail_with_their_site() {
         (Some("1234567"), Some("20")),
     ] {
         assert_eq!(
-            touch_loop_arguments(size, rounds),
+            touch_loop_arguments(size, rounds, None),
+            Err(bad),
+            "{size:?} {rounds:?}"
+        );
+        // `committed` does not mend a bad size or rounds.
+        assert_eq!(
+            touch_loop_arguments(size, rounds, Some("committed")),
             Err(bad),
             "{size:?} {rounds:?}"
         );
@@ -407,4 +472,141 @@ fn sixty_four_rounds_fit_on_the_stack() {
     let mut recorder = Recorder::new().rounds_taking(&[256; 64]);
     assert_eq!(recorder.run(1, 64), 0);
     assert_eq!(recorder.calls.len(), 64 * 8);
+}
+
+#[test]
+fn committed_is_the_only_third_argument() {
+    assert_eq!(
+        touch_loop_arguments(Some("64"), Some("20"), Some("committed")),
+        Ok((64, 20, true))
+    );
+    let bad = ProbeSite::TouchLoopArgument.alone();
+    assert_eq!(decode_probe_failure(bad), Some((59, 0, 0)));
+    for third in [
+        "",
+        "Committed",
+        "COMMITTED",
+        "commit",
+        "committed ",
+        " committed",
+        "committedx",
+        "1",
+        "on-demand",
+    ] {
+        assert_eq!(
+            touch_loop_arguments(Some("64"), Some("20"), Some(third)),
+            Err(bad),
+            "{third:?}"
+        );
+    }
+}
+
+#[test]
+fn a_committed_round_commits_the_whole_object_between_the_create_and_the_map() {
+    let mut recorder = Recorder::new().rounds_taking(&[16_384 * 250]);
+    assert_eq!(recorder.run_committed(64, 1), 0);
+    let size = 64 * MIB;
+    let base = 101 << 32;
+    assert_eq!(
+        recorder.calls,
+        [
+            Call::Create(size, ON_DEMAND),
+            Call::Commit(DwHandle(101), size),
+            Call::Map(DwHandle(101), size),
+            Call::Close(DwHandle(101)),
+            Call::Clock,
+            Call::Touch(base, size),
+            Call::Clock,
+            Call::Unmap(base, size - PAGE),
+            Call::Unmap(base + size - PAGE, PAGE),
+        ]
+    );
+    assert_eq!(recorder.calls, committed_round(101, 64));
+    // Every round commits its own object, outside the timed pass: only the
+    // touch is between the two clock reads.
+    let mut recorder = Recorder::new().rounds_taking(&[1, 2, 3]);
+    assert_eq!(recorder.run_committed(1, 3), 0);
+    let expected: Vec<Call> = [101, 102, 103]
+        .into_iter()
+        .flat_map(|h| committed_round(h, 1))
+        .collect();
+    assert_eq!(recorder.calls, expected);
+    // Without the mode, nothing is committed.
+    let mut recorder = Recorder::new().rounds_taking(&[1, 2, 3]);
+    assert_eq!(recorder.run(1, 3), 0);
+    assert!(
+        !recorder
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Commit(..)))
+    );
+}
+
+#[test]
+fn a_refused_commit_ends_the_job_at_its_site_after_the_rounds_done() {
+    assert_eq!(ProbeSite::TouchLoopCommit as u8, 68);
+    for (refusal, code) in [
+        (DW_STATUS_NO_RESOURCES, 13),
+        (DW_STATUS_NO_MEMORY, 12),
+        (DwStatus(-7), 7),
+    ] {
+        for completed in [0_u64, 1, 2] {
+            let mut recorder = Recorder::new().rounds_taking(&[256; 5]);
+            recorder.fail = Some(Fail::Commit(completed as usize, refusal));
+            let status = recorder.run_committed(1, 5);
+            assert_eq!(
+                status,
+                ProbeSite::TouchLoopCommit.after(refusal, completed as u32)
+            );
+            assert_eq!(
+                decode_probe_failure(status),
+                Some((68, code, completed as u8)),
+                "{refusal:?} {completed}"
+            );
+            // The completed rounds, then the round's create and its refused
+            // commit, which is the last call: nothing is mapped, closed,
+            // touched or retried after it, and nothing written.
+            let handle = 101 + completed;
+            let mut expected: Vec<Call> = (0..completed)
+                .flat_map(|n| committed_round(101 + n, 1))
+                .collect();
+            expected.push(Call::Create(MIB, ON_DEMAND));
+            expected.push(Call::Commit(DwHandle(handle), MIB));
+            assert_eq!(recorder.calls, expected, "{refusal:?} {completed}");
+            assert!(recorder.lines.is_empty());
+        }
+    }
+}
+
+#[test]
+fn the_committed_line_ends_in_committed_and_the_plain_one_does_not() {
+    // Per-page figures 30, 10, 20, 40 over 1 MiB (256 pages).
+    let elapsed: Vec<u64> = [30_u64, 10, 20, 40].iter().map(|ns| ns * 256).collect();
+    let mut recorder = Recorder::new().rounds_taking(&elapsed);
+    assert_eq!(recorder.run_committed(1, 4), 0);
+    assert_eq!(
+        recorder.lines,
+        [b"touch-loop size-mib=1 rounds=4 min-ns-per-page=10 \
+           median-ns-per-page=20 max-ns-per-page=40 committed=1\n"
+            .to_vec()]
+    );
+    let mut recorder = Recorder::new().rounds_taking(&elapsed);
+    assert_eq!(recorder.run(1, 4), 0);
+    assert_eq!(
+        recorder.lines,
+        [b"touch-loop size-mib=1 rounds=4 min-ns-per-page=10 \
+           median-ns-per-page=20 max-ns-per-page=40\n"
+            .to_vec()]
+    );
+    // The loop refuses a bad size or rounds before any call in the mode too.
+    let bad = ProbeSite::TouchLoopArgument.alone();
+    for (size, rounds) in [(0, 1), (257, 1), (1, 0), (1, 65)] {
+        let mut recorder = Recorder::new();
+        assert_eq!(recorder.run_committed(size, rounds), bad);
+        assert!(recorder.calls.is_empty());
+    }
+    // Sixty-four committed rounds fit too: nine calls a round.
+    let mut recorder = Recorder::new().rounds_taking(&[256; 64]);
+    assert_eq!(recorder.run_committed(1, 64), 0);
+    assert_eq!(recorder.calls.len(), 64 * 9);
 }
