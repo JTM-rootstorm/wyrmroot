@@ -19,7 +19,11 @@
 //! that spun on an AP, and its longest finalize gap is reported (Deepwyrm
 //! DW2 §10.19, `memory.rs`); runs `bin/hello touch-loop 64 20`, which
 //! times a first touch of an on-demand page, and requires the kernel's
-//! `faults` line to count its pages (DW2 M8 §13.5, `touch.rs`); spawns two
+//! `faults` line to count its pages (DW2 M8 §13.5, `touch.rs`), then
+//! `bin/hello touch-loop 64 20 committed`, which commits each object before
+//! touching it, and requires the kernel's `faults-shared` line to count at
+//! least half its pages as served with the paging lock shared (DW2 M8b
+//! §15.2 step 1); spawns two
 //! `bin/cpu-hog` jobs,
 //! which hold their own FP registers and FS base while they preempt each
 //! other; runs `bin/hello` with its on-demand MemoryObject probe, which must
@@ -32,9 +36,12 @@
 //! been still running; then writes a
 //! file and makes a directory on the root (W7) and shuts down with Ctrl-D.
 //! The second boot `cat`s the file back, removes it, under `--smp` runs
-//! `touch-loop` three at once and requires its faults counted, and shuts
-//! down; its fault, lock, usage-check, commit-step and admission-wait lines
-//! are printed. Each boot must end with the kernel's power-off line on its
+//! `touch-loop` three at once and requires its faults counted, then three
+//! at once again with every job `committed` and requires its shared faults
+//! counted, and shuts down; its fault, shared-fault, lock, usage-check,
+//! commit-step and admission-wait lines are printed. Each boot's step
+//! report must carry a `faults-shared` and a `fault-declines-shared` line
+//! that parse. Each boot must end with the kernel's power-off line on its
 //! COM1 log, and its step report must carry `records-dropped=0`, a
 //! `usage-check` line with TaskGroups compared and no mismatch (DW2 M8
 //! §13.12 part a) and an `admission-waits` line, whatever its counts (DW2
@@ -367,6 +374,25 @@ fn check(
     for line in first_touch {
         eprintln!("dev-boot: {line}");
     }
+    // The committed run's touches, of pages already committed, are served
+    // with the paging lock shared (DW2 M8b §15.2 step 1): most of them must
+    // be counted so, and their mean is printed. Why some shared serves fell
+    // back must be reported, whatever its count.
+    let shared = touch::shared_faults(&steps, Some(touch::SHARED_LEAST)).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
+    if let Some(line) = shared {
+        eprintln!("dev-boot: {line}");
+    }
+    touch::fault_declines_shared(&steps).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: {reason}; see {}",
+            boots[0].1.display()
+        ))
+    })?;
     // Alone, most of `touch-loop`'s faults are served fast (DW2 M8 §13.16).
     touch::fast_share(&steps).map_err(|reason| {
         Failure::task(format!(
@@ -443,6 +469,22 @@ fn check(
     for line in first_touch {
         eprintln!("dev-boot: (second boot) {line}");
     }
+    let shared =
+        touch::shared_faults(&lines, smp.then_some(touch::SHARED_LEAST)).map_err(|reason| {
+            Failure::task(format!(
+                "dev-boot check: second boot: {reason}; see {}",
+                boots[1].1.display()
+            ))
+        })?;
+    if let Some(line) = shared {
+        eprintln!("dev-boot: (second boot) {line}");
+    }
+    touch::fault_declines_shared(&lines).map_err(|reason| {
+        Failure::task(format!(
+            "dev-boot check: second boot: {reason}; see {}",
+            boots[1].1.display()
+        ))
+    })?;
     Ok(pass_line(started.elapsed().as_secs(), root, clock))
 }
 
@@ -539,8 +581,11 @@ fn first_boot(
     // is owed yet: the shell waits on the job, so the BSP is idle unless
     // the job is on it.
     *spins = memory::close_spin(shell)?;
-    // A first touch timed with one job (DW2 M8 §13.5), still quiet.
+    // A first touch timed with one job (DW2 M8 §13.5), still quiet; then
+    // the same with each object committed first, so its touches are served
+    // with the paging lock shared (DW2 M8b §15.2 step 1).
     touch::single(shell)?;
+    touch::single_committed(shell)?;
     // Two hogs hold their own FP registers and FS base and preempt each
     // other (and everything else) until they are terminated; a hog that saw
     // its state change, or did not start from the initial FP state, exits on
@@ -633,7 +678,8 @@ fn run_sdk(shell: &mut Shell<'_>, runs: &[(&str, &[u8])]) -> Result<(), Failure>
 
 /// The second boot reads the first boot's file back and removes it; under
 /// `--smp` it then times a first touch with three jobs at once (DW2 M8
-/// §13.5).
+/// §13.5), and once those have ended and usage is back, with three
+/// committed jobs at once (DW2 M8b §15.2 step 1).
 fn second_boot(shell: &mut Shell<'_>, token: &str, smp: bool) -> Result<(), Failure> {
     let command = format!("cat {PERSISTED_PATH}");
     shell.retry(&command, "the file written before the reboot", |output| {
@@ -645,7 +691,8 @@ fn second_boot(shell: &mut Shell<'_>, token: &str, smp: bool) -> Result<(), Fail
         return Err(Failure::task("dev-boot check: rm or mkdir did not persist"));
     }
     if smp {
-        touch::three_at_once(shell)?;
+        touch::three_at_once(shell, &touch::THREE_AT_ONCE)?;
+        touch::three_at_once(shell, &touch::THREE_AT_ONCE_COMMITTED)?;
     }
     Ok(())
 }

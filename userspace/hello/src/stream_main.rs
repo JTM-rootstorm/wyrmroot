@@ -82,7 +82,7 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
             .then(|| startup.arg(index).map(|argument| argument.as_str()))
             .flatten()
     };
-    let arguments = [argument(2), argument(3)];
+    let arguments = [argument(2), argument(3), argument(4)];
     let mut run = |region: DwHandle, budget: u64, write: &mut dyn FnMut(&[u8]) -> bool| {
         memory::run(mode.unwrap_or(""), arguments, region, budget, write)
     };
@@ -115,10 +115,12 @@ fn hello_main(startup: StartupBlock<'_>) -> u32 {
 ///   A refused create ends the last two: the kernel waits for owed work
 ///   inside the call (DW2 M8 §13.12 part b), so no probe waits itself.
 /// - `slow-ready`: commits forever before READY (see `hello_main`).
-/// - `touch-loop <MiB> <rounds>`: times a first touch of every page of a
-///   fresh on-demand mapping, round after round, and prints the least,
-///   median and greatest nanoseconds a page (DW2 M8 §13.5; the loop is
-///   `wyrmroot_hello::probe::touch_loop`).
+/// - `touch-loop <MiB> <rounds> [committed]`: times a first touch of every
+///   page of a fresh on-demand mapping, round after round, and prints the
+///   least, median and greatest nanoseconds a page (DW2 M8 §13.5; the loop
+///   is `wyrmroot_hello::probe::touch_loop`). With `committed`, each round
+///   commits its object before mapping it, so every touch is of a page
+///   already committed (DW2 M8b §15.2 step 1).
 ///
 /// A mode that fails ends its job with a `ProbeSite` status naming the
 /// place and the kernel status (`wyrmroot_hello::probe`, DW2 M8 §13.4
@@ -186,11 +188,11 @@ mod memory {
         )
     }
 
-    /// Runs `mode`; `arguments` are the job's two arguments after the mode,
-    /// where given.
+    /// Runs `mode`; `arguments` are the job's three arguments after the
+    /// mode, where given.
     pub(super) fn run(
         mode: &str,
-        arguments: [Option<&str>; 2],
+        arguments: [Option<&str>; 3],
         region: DwHandle,
         budget: u64,
         write: &mut dyn FnMut(&[u8]) -> bool,
@@ -226,12 +228,12 @@ mod memory {
             "churn-commit" => probe::churn_commit(&mut Calls { region }),
             "close-spin" => close_spin(write),
             "touch-loop" => {
-                let (size_mib, rounds) =
-                    match probe::touch_loop_arguments(arguments[0], arguments[1]) {
+                let (size_mib, rounds, committed) =
+                    match probe::touch_loop_arguments(arguments[0], arguments[1], arguments[2]) {
                         Ok(parsed) => parsed,
                         Err(status) => return status,
                     };
-                probe::touch_loop(&mut Calls { region }, size_mib, rounds, write)
+                probe::touch_loop(&mut Calls { region }, size_mib, rounds, committed, write)
             }
             "fragment" => match size_mib {
                 Some(filler) => fragment(budget, filler * MIB),
